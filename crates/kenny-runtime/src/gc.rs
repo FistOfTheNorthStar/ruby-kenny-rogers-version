@@ -92,8 +92,8 @@ pub struct PHeap {
     pub roots: Vec<*const Vec<V>>,
     /// Closure environments created since the last collection.
     pub envs: FxHashMap<usize, u32>,
-    pub saved_throws: FxHashMap<u64, Throw>,
-    pub next_throw: u64,
+    /// Throws saved while `ensure` clauses run (the running thread's; moves with it).
+    pub saved_throws: SavedThrows,
     /// Base (highest address) of the stack this thread is running on.
     pub stack_base: usize,
     /// RUNNING, PARKED (stopped for a collection) or IDLE (waiting, not touching the heap).
@@ -119,8 +119,7 @@ impl PHeap {
             since: 0,
             roots: Vec::new(),
             envs: FxHashMap::default(),
-            saved_throws: FxHashMap::default(),
-            next_throw: 1,
+            saved_throws: SavedThrows::default(),
             stack_base: 0,
             status: AtomicU8::new(RUNNING),
             saved_sp: 0,
@@ -196,6 +195,32 @@ pub fn init_stats() {
     if let Some(v) = std::env::var_os("KENNY_GC_STATS") {
         unsafe { atexit(print_stats) };
         *STATS_EVERY.get() = v == "2";
+    }
+    if std::env::var_os("KENNY_CRASH_TRACE").is_some() {
+        install_crash_trace();
+    }
+}
+
+/// KENNY_CRASH_TRACE=1 (debugging the runtime): on SIGSEGV/SIGBUS print the faulting address
+/// and the native backtrace of the crashing thread.
+fn install_crash_trace() {
+    extern "C" fn on_crash(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut std::ffi::c_void) {
+        let addr = unsafe { (*info).si_addr } as usize;
+        let name = std::thread::current().name().map(|s| s.to_string()).unwrap_or_default();
+        eprintln!("\n*** signal {sig} at address {addr:#x} on thread {name:?}\n{}", std::backtrace::Backtrace::force_capture());
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+    unsafe {
+        let stack = libc::stack_t { ss_sp: Box::into_raw(vec![0u8; 1 << 20].into_boxed_slice()) as *mut _, ss_size: 1 << 20, ss_flags: 0 };
+        libc::sigaltstack(&stack, std::ptr::null_mut());
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_crash as extern "C" fn(i32, *mut libc::siginfo_t, *mut std::ffi::c_void) as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
     }
 }
 
@@ -738,6 +763,7 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
     if !crate::mt::multi() {
         return f();
     }
+    crate::thread::before_blocking();
     let ph = &mut crate::core::pst().heap;
     spill_registers(&mut ph.regs);
     ph.saved_sp = approx_sp_here();
@@ -936,15 +962,31 @@ impl<T> From<Rooted<T>> for Vec<T> {
     }
 }
 
+/// A thread's throws in flight while its `ensure` clauses run, by handle.
+#[derive(Default)]
+pub struct SavedThrows {
+    pub map: FxHashMap<u64, Throw>,
+    next: u64,
+}
+
 pub fn save_throw(t: Throw) -> u64 {
-    let ph = &mut crate::core::pst().heap;
-    let id = ph.next_throw;
-    ph.next_throw += 1;
-    ph.saved_throws.insert(id, t);
-    id
+    let st = &mut crate::core::pst().heap.saved_throws;
+    st.next += 1;
+    st.map.insert(st.next, t);
+    st.next
 }
 pub fn take_throw(id: u64) -> Throw {
-    crate::core::pst().heap.saved_throws.remove(&id).unwrap_or(Throw::None)
+    crate::core::pst().heap.saved_throws.map.remove(&id).unwrap_or(Throw::None)
+}
+
+/// The values a throw carries (GC roots).
+pub fn throw_values(t: Throw, out: &mut Vec<V>) {
+    match t {
+        Throw::Raise(e) => out.push(e),
+        Throw::Break { val, .. } | Throw::Return { val, .. } | Throw::StopLoop(val) => out.push(val),
+        Throw::Throw { tag, val } => out.extend([tag, val]),
+        Throw::None | Throw::Kill => {}
+    }
 }
 
 // ---------- marking ----------
@@ -1693,7 +1735,7 @@ fn mark_roots(m: &mut Marker, h: &mut Heap, all_classes: bool) {
     }
     for &p in gc_ps().iter() {
         let ph = unsafe { &(*(p as *const PState)).heap };
-        for t in ph.saved_throws.values().copied().collect::<Vec<_>>() {
+        for t in ph.saved_throws.map.values().copied().collect::<Vec<_>>() {
             match t {
                 Throw::Raise(e) => m.value(e),
                 Throw::Break { val, .. } | Throw::Return { val, .. } | Throw::StopLoop(val) => m.value(val),

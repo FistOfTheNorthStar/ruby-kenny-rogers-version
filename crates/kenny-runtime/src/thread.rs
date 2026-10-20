@@ -2,9 +2,13 @@
 //!
 //! Every Ruby `Thread` runs on its own small stack (a stackful coroutine). Threads are spread
 //! over up to KENNY_THREADS OS threads ("Ps", default: one per core), each with its own run
-//! queue; a thread stays on the P it started on (no migration, so Rust thread-locals stay
-//! valid across switches). A P switches between its threads when one blocks (sleep, join,
-//! Queue#pop, Mutex#lock, CV#wait) and, for fairness, every 10ms at a safepoint. There is no
+//! queue. A P switches between its threads when one blocks (sleep, join, Queue#pop,
+//! Mutex#lock, CV#wait) and, for fairness, every 10ms at a safepoint. A P with nothing to
+//! run takes a waiting thread from a busy P's queue (work stealing), and a P about to block
+//! in a system call (file IO, SQLite) hands its waiting threads to an idle or spare P first.
+//! A thread can therefore resume on a different OS thread than it suspended on: runtime code
+//! never keeps a pointer to P state (`pst()`) across a call into Ruby, and per-thread state
+//! (pending throw, `$!`, definees, saved throws, the Fiber stack) moves with the thread. There is no
 //! GVL: threads on different Ps run Ruby code at the same time (see LANGUAGE.md rule 4 for
 //! what keeps that memory-safe). A program that never starts a thread runs on one P and pays
 //! nothing for any of this.
@@ -68,6 +72,8 @@ struct GThread {
     value: V,
     exc: V,
     ctx: usize,
+    /// Stays on its P (the main thread, the HTTP server's loops).
+    pinned: bool,
     // per-thread runtime state, swapped on switch (only touched by the thread's own P)
     pending: Throw,
     errinfo: V,
@@ -75,6 +81,8 @@ struct GThread {
     definee: Vec<*mut Class>,
     dm_stack: Vec<*const Method>,
     current_block: Vec<V>,
+    saved_throws: crate::gc::SavedThrows,
+    fiber_stack: Vec<usize>,
     // set by other threads (under the lock)
     interrupt: Option<Throw>,
     has_interrupt: AtomicBool,
@@ -127,6 +135,8 @@ struct PSlot {
     /// Threads of this P blocked with a timeout (checked by its loop).
     sleepers: Vec<usize>,
     nthreads: usize,
+    /// Parked in its loop with nothing to run (a candidate to steal work).
+    idle: bool,
 }
 
 struct Sched {
@@ -134,6 +144,8 @@ struct Sched {
     ctxs: Vec<Ctx>,
     waiters: HashMap<usize, VecDeque<usize>>,
     fibers: Vec<Box<GFiber>>,
+    /// `max_ps` Ps for running threads, then as many spares: a spare starts when a P is about
+    /// to block in a system call while threads wait in its queue and no P is idle.
     ps: Vec<PSlot>,
     max_ps: usize,
     next_p: usize,
@@ -148,6 +160,24 @@ struct Sched {
 static SCHED: L<Option<Sched>> = L::new(None);
 /// Live threads per P, readable without the lock (the HTTP server asks on every loop).
 static P_NTHREADS: [std::sync::atomic::AtomicUsize; 256] = [const { std::sync::atomic::AtomicUsize::new(0) }; 256];
+/// KENNY_SCHED_STATS=1: threads taken by idle Ps, handed off before blocking calls, spare Ps
+/// started (printed at exit).
+static STEALS: AtomicU64 = AtomicU64::new(0);
+static HANDOFFS: AtomicU64 = AtomicU64::new(0);
+static SPARES: AtomicU64 = AtomicU64::new(0);
+extern "C" fn print_sched_stats() {
+    eprintln!(
+        "sched: {} steals, {} handoffs before blocking calls, {} spare Ps started",
+        STEALS.load(Ordering::Relaxed),
+        HANDOFFS.load(Ordering::Relaxed),
+        SPARES.load(Ordering::Relaxed)
+    );
+}
+unsafe extern "C" {
+    fn atexit(f: extern "C" fn()) -> i32;
+}
+/// Length of each P's run queue, readable without the lock (checked before blocking calls).
+static P_RUNQ: [std::sync::atomic::AtomicUsize; 256] = [const { std::sync::atomic::AtomicUsize::new(0) }; 256];
 
 /// This P's view of the scheduler (part of PState).
 pub struct PThr {
@@ -225,9 +255,10 @@ pub fn static_roots(out: &mut Vec<V>) {
         out.extend([t.obj, t.value, t.exc, t.errinfo, t.last_match]);
         out.extend(t.current_block.iter().copied());
         for th in [Some(t.pending), t.interrupt].into_iter().flatten() {
-            if let Throw::Raise(e) = th {
-                out.push(e);
-            }
+            crate::gc::throw_values(th, out);
+        }
+        for &th in t.saved_throws.map.values() {
+            crate::gc::throw_values(th, out);
         }
     }
 }
@@ -253,6 +284,8 @@ fn save_state(t: &mut GThread) {
     t.definee = std::mem::take(&mut p.definee);
     t.dm_stack = std::mem::take(&mut p.dm_stack);
     t.current_block = std::mem::take(&mut p.current_block);
+    t.saved_throws = std::mem::take(&mut p.heap.saved_throws);
+    t.fiber_stack = std::mem::take(&mut p.thr.fiber_stack);
 }
 fn restore_state(t: &mut GThread) {
     let p = pst();
@@ -262,6 +295,8 @@ fn restore_state(t: &mut GThread) {
     p.definee = std::mem::take(&mut t.definee);
     p.dm_stack = std::mem::take(&mut t.dm_stack);
     p.current_block = std::mem::take(&mut t.current_block);
+    p.heap.saved_throws = std::mem::take(&mut t.saved_throws);
+    p.thr.fiber_stack = std::mem::take(&mut t.fiber_stack);
 }
 
 /// Give control back to this P's loop. The caller has set the thread's state (under the lock).
@@ -297,7 +332,9 @@ pub fn run_main(main: Box<dyn FnOnce() -> V>) -> V {
         ctxs: Vec::new(),
         waiters: HashMap::new(),
         fibers: Vec::new(),
-        ps: (0..max_ps).map(|i| PSlot { parker: Arc::new(Parker::new()), started: i == 0, runq: VecDeque::new(), sleepers: Vec::new(), nthreads: 0 }).collect(),
+        ps: (0..(max_ps * 2).min(256))
+            .map(|i| PSlot { parker: Arc::new(Parker::new()), started: i == 0, runq: VecDeque::new(), sleepers: Vec::new(), nthreads: 0, idle: false })
+            .collect(),
         max_ps,
         // new threads go to the other Ps first (P 0 runs the main thread)
         next_p: 1,
@@ -308,6 +345,9 @@ pub fn run_main(main: Box<dyn FnOnce() -> V>) -> V {
         thread_error,
         fiber_error,
     });
+    if std::env::var_os("KENNY_SCHED_STATS").is_some() {
+        unsafe { atexit(print_sched_stats) };
+    }
     crate::gc::heap().stack_provider = Some(suspended_stacks);
     crate::gc::heap().extra_roots.push(static_roots);
     let x = 0u8;
@@ -377,19 +417,22 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
             interrupt: None,
             has_interrupt: AtomicBool::new(false),
             waiting_on: 0,
+            pinned: on.is_some(),
+            saved_throws: Default::default(),
+            fiber_stack: Vec::new(),
         }));
-        s.ps[p].runq.push_back(tid);
         s.ps[p].nthreads += 1;
         P_NTHREADS[p].fetch_add(1, Ordering::Relaxed);
-        (tid, s.ps[p].parker.clone())
+        let kick = push_runq(s, p, tid);
+        (tid, kick)
     });
     if start_p {
         let started = locked!(s => std::mem::replace(&mut s.ps[p].started, true));
         if !started {
             start_os_thread(p);
         }
-    } else {
-        parker.unpark();
+    } else if let Some(pk) = parker {
+        pk.unpark();
     }
     if tid == 1 {
         start_timer();
@@ -448,13 +491,20 @@ fn p_loop(idx: usize) {
                 Pick::Exit
             } else {
                 let now = Instant::now();
+                s.ps[idx].idle = false;
                 wake_due_sleepers(s, idx, now);
                 let mut pick = None;
-                while let Some(tid) = s.ps[idx].runq.pop_front() {
-                    if s.threads[tid].state == St::Runnable {
+                while let Some(tid) = pop_runq(s, idx) {
+                    if s.threads[tid].state == St::Runnable && s.threads[tid].p == idx {
                         pick = Some(tid);
                         break;
                     }
+                }
+                if pick.is_none() && idx < s.max_ps {
+                    pick = steal(s, idx);
+                }
+                if pick.is_none() {
+                    s.ps[idx].idle = true;
                 }
                 match pick {
                     Some(t) => Pick::Run(t),
@@ -469,6 +519,7 @@ fn p_loop(idx: usize) {
                                 main.interrupt = Some(Throw::Raise(e));
                                 main.has_interrupt.store(true, Ordering::Release);
                                 main.state = St::Runnable;
+                                s.ps[idx].idle = false;
                                 Pick::Run(0)
                             }
                             // P 0 checks for deadlock now and then
@@ -481,7 +532,12 @@ fn p_loop(idx: usize) {
         });
         match pick {
             Pick::Exit => return,
-            Pick::Run(i) => resume_thread(i),
+            Pick::Run(i) => {
+                resume_thread(i);
+                if idx >= sraw().map(|s| s.max_ps).unwrap_or(usize::MAX) {
+                    give_back(i);
+                }
+            }
             Pick::Wait(t) => {
                 crate::kernel::flush_out();
                 let parker = locked!(s => s.ps[idx].parker.clone());
@@ -497,7 +553,7 @@ fn wake_due_sleepers(s: &mut Sched, idx: usize, now: Instant) {
     while i < s.ps[idx].sleepers.len() {
         let tid = s.ps[idx].sleepers[i];
         let t = &mut s.threads[tid];
-        if t.state != St::Blocked || t.wake_at.is_none() {
+        if t.state != St::Blocked || t.wake_at.is_none() || t.p != idx {
             s.ps[idx].sleepers.swap_remove(i);
             continue;
         }
@@ -507,6 +563,7 @@ fn wake_due_sleepers(s: &mut Sched, idx: usize, now: Instant) {
             t.wake_at = None;
             s.ps[idx].sleepers.swap_remove(i);
             s.ps[idx].runq.push_back(tid);
+            P_RUNQ[idx].store(s.ps[idx].runq.len(), Ordering::Relaxed);
             continue;
         }
         i += 1;
@@ -543,17 +600,25 @@ fn resume_thread(i: usize) {
     pst().heap.stack_base = p.os_base;
     match res {
         CoroutineResult::Yield(()) => {
-            locked!(s => {
+            let idx = p.idx;
+            let pk = locked!(s => {
                 let t = &mut s.threads[i];
                 t.co = Some(co);
                 s.ctxs[ctx].running = false;
+                // it waits in a queue (preempted, or woken while it was suspending): now
+                // that it is off this stack, an idle P may take it
+                if s.threads[i].state == St::Runnable && stealable(&s.threads[i]) { kick_idle(s, idx) } else { None }
             });
+            if let Some(pk) = pk {
+                pk.unpark();
+            }
         }
         CoroutineResult::Return(v) => {
             // the coroutine finished: its stack can go
             drop(co);
             let pending = std::mem::replace(&mut pst().pending, Throw::None);
             let mut report = None;
+            let mut wake = Vec::new();
             locked!(s => {
                 s.ctxs[ctx].live = false;
                 s.ctxs[ctx].running = false;
@@ -574,17 +639,27 @@ fn resume_thread(i: usize) {
                 }
                 t.state = St::Done;
                 let pi = t.p;
+                let obj = t.obj;
                 s.ps[pi].nthreads -= 1;
                 P_NTHREADS[pi].fetch_sub(1, Ordering::Relaxed);
+                // wake the joiners in the same step: between "done" and "joiners woken", P 0's
+                // deadlock check would see every thread finished or blocked
+                loop {
+                    match wake_one_locked(s, obj) {
+                        (true, pk) => wake.extend(pk),
+                        (false, _) => break,
+                    }
+                }
             });
+            for pk in wake {
+                pk.unpark();
+            }
             if let Some((obj, e)) = report {
                 if truthy(ivar_get(obj, sym("@__report"))) {
                     report_thread_exception(obj, e);
                     pst().pending = Throw::None;
                 }
             }
-            let obj = locked!(s => s.threads[i].obj);
-            wake_all(obj);
         }
     }
 }
@@ -683,8 +758,139 @@ fn make_runnable(s: &mut Sched, tid: usize) -> Option<Arc<Parker>> {
     t.state = St::Runnable;
     t.wake_at = None;
     let p = t.p;
+    push_runq(s, p, tid)
+}
+
+/// Queue runnable thread `tid` on P `p` (lock held). Returns a parker to poke: P `p` if it
+/// waits for work, else an idle P that can take the thread over.
+fn push_runq(s: &mut Sched, p: usize, tid: usize) -> Option<Arc<Parker>> {
     s.ps[p].runq.push_back(tid);
-    if p != pt().idx { Some(s.ps[p].parker.clone()) } else { None }
+    P_RUNQ[p].store(s.ps[p].runq.len(), Ordering::Relaxed);
+    let me = pst_idx();
+    if s.ps[p].idle {
+        s.ps[p].idle = false;
+        return if Some(p) != me { Some(s.ps[p].parker.clone()) } else { None };
+    }
+    if s.threads[tid].pinned { None } else { kick_idle(s, p) }
+}
+fn pop_runq(s: &mut Sched, p: usize) -> Option<usize> {
+    let t = s.ps[p].runq.pop_front();
+    P_RUNQ[p].store(s.ps[p].runq.len(), Ordering::Relaxed);
+    t
+}
+/// The index of the P this OS thread is, if it is one.
+fn pst_idx() -> Option<usize> {
+    pst_opt().map(|p| p.thr.idx)
+}
+/// An idle P other than `busy` to wake (it will steal), claimed so the next kick picks another.
+fn kick_idle(s: &mut Sched, busy: usize) -> Option<Arc<Parker>> {
+    let n = s.max_ps;
+    (0..n).map(|k| (busy + 1 + k) % n).find(|&v| v != busy && s.ps[v].started && s.ps[v].idle).map(|v| {
+        s.ps[v].idle = false;
+        s.ps[v].parker.clone()
+    })
+}
+/// A thread waiting in some queue that may run on another P: not pinned, not running or about
+/// to suspend (its coroutine is back), and not inside a Fiber (its Fiber stacks belong here).
+fn stealable(t: &GThread) -> bool {
+    static NO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NO.get_or_init(|| std::env::var_os("KENNY_NO_STEAL").is_some()) {
+        return false;
+    }
+    t.state == St::Runnable && !t.pinned && t.co.is_some() && t.fiber_stack.is_empty()
+}
+/// Move thread `tid` to P `to` (lock held): counts, and its timed wait if it has one.
+fn move_thread(s: &mut Sched, tid: usize, to: usize) {
+    let from = s.threads[tid].p;
+    if from == to {
+        return;
+    }
+    s.threads[tid].p = to;
+    s.ps[from].nthreads -= 1;
+    P_NTHREADS[from].fetch_sub(1, Ordering::Relaxed);
+    s.ps[to].nthreads += 1;
+    P_NTHREADS[to].fetch_add(1, Ordering::Relaxed);
+    if let Some(i) = s.ps[from].sleepers.iter().position(|&t| t == tid) {
+        s.ps[from].sleepers.swap_remove(i);
+        s.ps[to].sleepers.push(tid);
+    }
+}
+/// Take a waiting thread from another P's queue for idle P `idx` (lock held): the one that
+/// has waited longest on the P with the most waiting.
+fn steal(s: &mut Sched, idx: usize) -> Option<usize> {
+    let victim = (0..s.ps.len())
+        .filter(|&v| v != idx && s.ps[v].started && !s.ps[v].runq.is_empty())
+        .max_by_key(|&v| s.ps[v].runq.len())?;
+    let pos = s.ps[victim].runq.iter().position(|&t| stealable(&s.threads[t]))?;
+    let tid = s.ps[victim].runq.remove(pos)?;
+    P_RUNQ[victim].store(s.ps[victim].runq.len(), Ordering::Relaxed);
+    move_thread(s, tid, idx);
+    STEALS.fetch_add(1, Ordering::Relaxed);
+    Some(tid)
+}
+/// A spare P ran thread `tid` until it suspended: hand it back to the least loaded regular P.
+fn give_back(tid: usize) {
+    let pk = locked!(s => {
+        let t = &s.threads[tid];
+        if t.state == St::Done || t.pinned || !t.fiber_stack.is_empty() {
+            return;
+        }
+        let me = t.p;
+        let to = (0..s.max_ps).filter(|&v| s.ps[v].started).min_by_key(|&v| s.ps[v].nthreads).unwrap_or(0);
+        let queued = s.ps[me].runq.iter().position(|&x| x == tid);
+        if let Some(i) = queued {
+            s.ps[me].runq.remove(i);
+            P_RUNQ[me].store(s.ps[me].runq.len(), Ordering::Relaxed);
+        }
+        move_thread(s, tid, to);
+        if queued.is_some() { push_runq(s, to, tid) } else { None }
+    });
+    if let Some(pk) = pk {
+        pk.unpark();
+    }
+}
+
+/// About to block in a system call (gc::blocking): if threads wait in this P's queue, let an
+/// idle P take them, or start a spare P when every P is busy.
+pub fn before_blocking() {
+    let Some(p) = pst_opt() else { return };
+    let idx = p.thr.idx;
+    if p.thr.current.is_none() || P_RUNQ[idx].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let (pk, start) = locked!(s => {
+        if !s.ps[idx].runq.iter().any(|&t| stealable(&s.threads[t])) {
+            (None, None)
+        } else if let Some(pk) = kick_idle(s, idx) {
+            HANDOFFS.fetch_add(1, Ordering::Relaxed);
+            (Some(pk), None)
+        } else if let Some(v) = (s.max_ps..s.ps.len()).find(|&v| s.ps[v].idle || !s.ps[v].started) {
+            // a spare: give it one waiting thread now (it doesn't steal on its own)
+            let pos = s.ps[idx].runq.iter().position(|&t| stealable(&s.threads[t])).unwrap();
+            let tid = s.ps[idx].runq.remove(pos).unwrap();
+            P_RUNQ[idx].store(s.ps[idx].runq.len(), Ordering::Relaxed);
+            move_thread(s, tid, v);
+            HANDOFFS.fetch_add(1, Ordering::Relaxed);
+            s.ps[v].runq.push_back(tid);
+            P_RUNQ[v].store(s.ps[v].runq.len(), Ordering::Relaxed);
+            if s.ps[v].started {
+                s.ps[v].idle = false;
+                (Some(s.ps[v].parker.clone()), None)
+            } else {
+                s.ps[v].started = true;
+                SPARES.fetch_add(1, Ordering::Relaxed);
+                (None, Some(v))
+            }
+        } else {
+            (None, None)
+        }
+    });
+    if let Some(pk) = pk {
+        pk.unpark();
+    }
+    if let Some(v) = start {
+        start_os_thread(v);
+    }
 }
 
 fn wake_one_locked(s: &mut Sched, on: V) -> (bool, Option<Arc<Parker>>) {
@@ -727,12 +933,16 @@ pub fn pass() {
         }
         if s.ps[idx].runq.iter().any(|&t| s.threads[t].state == St::Runnable) {
             s.threads[cur].state = St::Runnable;
-            s.ps[idx].runq.push_back(cur);
-            true
+            let pk = push_runq(s, idx, cur);
+            (true, pk)
         } else {
-            false
+            (false, None)
         }
     });
+    let (switched, pk) = switched;
+    if let Some(pk) = pk {
+        pk.unpark();
+    }
     if switched {
         suspend_current();
     }
@@ -928,12 +1138,18 @@ pub fn fiber_resume(fv: V, args: &[V]) -> V {
     };
     let outer = pt().running_ctx.unwrap_or(0);
     leave_ctx(outer);
+    let (outer_base, outer_limit) = (pst().heap.stack_base, pst().stack_limit);
     f.resumer_ctx = outer;
     pt().fiber_stack.push(fid);
     let ctx = f.ctx;
     enter_ctx(ctx);
     let mut co = f.co.take().unwrap();
     let res = co.resume(input);
+    // Back on the resumer's stack: say so before anything that can stop for a collection
+    // (taking a lock can): the GC scans this P's stack from here up to `stack_base`.
+    pst().heap.stack_base = outer_base;
+    pst().stack_limit = outer_limit;
+    pt().running_ctx = Some(outer);
     pt().fiber_stack.pop();
     let f = unsafe { &mut *fiber_ptr(fid) };
     match res {

@@ -771,13 +771,21 @@ thread_local! {
 /// that is starting up waits instead of joining the list halfway through one.
 pub static ALL_PS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+/// This P's state. A Ruby thread can move to another P whenever it calls into Ruby or
+/// blocks (thread.rs), so never keep the result across such a call; and the lookup must
+/// not be merged with an earlier one in the same function (LLVM treats thread-local
+/// addresses as constant within a function), hence the opaque call.
 #[inline(always)]
 pub fn pst() -> &'static mut PState {
-    unsafe { &mut *PST.with(|c| c.get()) }
+    unsafe { &mut *pst_ptr() }
+}
+#[inline(never)]
+fn pst_ptr() -> *mut PState {
+    std::hint::black_box(PST.with(|c| c.get()))
 }
 /// This OS thread's state, if it runs Ruby code.
 pub fn pst_opt() -> Option<&'static mut PState> {
-    let p = PST.with(|c| c.get());
+    let p = pst_ptr();
     if p.is_null() { None } else { Some(unsafe { &mut *p }) }
 }
 /// Set up interpreter state for the calling OS thread.
@@ -990,20 +998,22 @@ pub fn ancestors(c: *mut Class) -> Vec<*mut Class> {
 
 struct AncestorCache {
     serial: u64,
-    map: rustc_hash::FxHashMap<usize, std::rc::Rc<[*mut Class]>>,
+    map: rustc_hash::FxHashMap<usize, std::sync::Arc<[*mut Class]>>,
     supers: rustc_hash::FxHashMap<(usize, usize, u32), *const Method>,
 }
 
+#[inline(never)]
 fn ancestor_cache() -> &'static mut AncestorCache {
-    // per OS thread (Rc values, and no locking on the hot path)
+    // per OS thread (no locking on the hot path). The values are Arcs: a caller may keep one
+    // across a call into Ruby, and its thread may then continue on another OS thread.
     thread_local!(static ANC: std::cell::Cell<*mut AncestorCache> = const { std::cell::Cell::new(std::ptr::null_mut()) });
     let serial = serial();
-    let p = ANC.with(|a| {
+    let p = std::hint::black_box(ANC.with(|a| {
         if a.get().is_null() {
             a.set(Box::into_raw(Box::new(AncestorCache { serial, map: Default::default(), supers: Default::default() })));
         }
         a.get()
-    });
+    }));
     let c = unsafe { &mut *p };
     // the method serial changes with every include/prepend (and method definition)
     if c.serial != serial {
@@ -1015,12 +1025,12 @@ fn ancestor_cache() -> &'static mut AncestorCache {
 }
 
 /// Ancestors in method-resolution order, cached per class until the hierarchy changes.
-pub fn ancestors_rc(c: *mut Class) -> std::rc::Rc<[*mut Class]> {
+pub fn ancestors_rc(c: *mut Class) -> std::sync::Arc<[*mut Class]> {
     let cache = ancestor_cache();
     if let Some(a) = cache.map.get(&(c as usize)) {
         return a.clone();
     }
-    let a: std::rc::Rc<[*mut Class]> = ancestors_uncached(c).into();
+    let a: std::sync::Arc<[*mut Class]> = ancestors_uncached(c).into();
     cache.map.insert(c as usize, a.clone());
     a
 }
