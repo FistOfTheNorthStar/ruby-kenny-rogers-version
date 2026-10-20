@@ -602,25 +602,31 @@ impl CountingAlloc {
     }
 }
 
-// Which allocator backs Rust allocations, chosen once at the first allocation (before main)
-// by KENNY_MALLOC=system|mimalloc. The default is the system allocator on macOS: serving on
-// many cores, objects are freed by other threads than the ones that allocated them (the GC
-// sweeps on whichever thread takes a page), which macOS's allocator absorbs well while
-// mimalloc's per-thread pages keep much more memory resident (the blog on 12 cores: 141 MB vs
-// 184 MB, same throughput). Elsewhere mimalloc (faster than glibc malloc, which also tends to
-// bloat with many threads).
+// Which allocator backs Rust allocations, chosen at the first allocation (before main) by
+// KENNY_MALLOC=system|mimalloc|auto. mimalloc is faster for one thread. With many Ps, objects
+// are freed by other threads than the ones that allocated them (the GC sweeps on whichever
+// thread takes a page), which macOS's allocator absorbs well while mimalloc's per-thread pages
+// keep much more memory resident (the blog on 12 cores: 141 MB vs 184 MB, same throughput).
+// So on macOS the default is `auto`: mimalloc while one P runs Ruby code, the system
+// allocator for allocations made once several do; a block is freed by the allocator that
+// owns it. Elsewhere mimalloc (faster than glibc malloc, which also bloats with threads).
 static WHICH_ALLOC: AtomicU8 = AtomicU8::new(0);
 const USE_SYSTEM: u8 = 1;
 const USE_MIMALLOC: u8 = 2;
+const USE_AUTO: u8 = 3;
+unsafe extern "C" {
+    fn mi_is_in_heap_region(p: *const u8) -> bool;
+}
 #[cold]
 fn choose_alloc() -> u8 {
     // (getenv doesn't allocate)
     let v = unsafe { libc::getenv(c"KENNY_MALLOC".as_ptr()) };
     let w = if v.is_null() {
-        if cfg!(target_os = "macos") { USE_SYSTEM } else { USE_MIMALLOC }
+        if cfg!(target_os = "macos") { USE_AUTO } else { USE_MIMALLOC }
     } else {
         match unsafe { std::ffi::CStr::from_ptr(v) }.to_bytes() {
             b"system" => USE_SYSTEM,
+            b"auto" => USE_AUTO,
             _ => USE_MIMALLOC,
         }
     };
@@ -630,9 +636,27 @@ fn choose_alloc() -> u8 {
     }
 }
 #[inline(always)]
-fn use_system() -> bool {
+fn which_alloc() -> u8 {
     let w = WHICH_ALLOC.load(Ordering::Relaxed);
-    (if w == 0 { choose_alloc() } else { w }) == USE_SYSTEM
+    if w == 0 { choose_alloc() } else { w }
+}
+/// New allocations go to the system allocator (always, or in auto mode once several Ps run).
+#[inline(always)]
+fn use_system() -> bool {
+    match which_alloc() {
+        USE_SYSTEM => true,
+        USE_AUTO => crate::mt::multi(),
+        _ => false,
+    }
+}
+/// Does the system allocator own block `p`? (In auto mode, ask mimalloc.)
+#[inline(always)]
+fn system_owns(p: *mut u8) -> bool {
+    match which_alloc() {
+        USE_SYSTEM => true,
+        USE_AUTO => !unsafe { mi_is_in_heap_region(p) },
+        _ => false,
+    }
 }
 
 unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
@@ -649,12 +673,25 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     #[inline]
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
         Self::note(-(l.size() as isize));
-        unsafe { if use_system() { std::alloc::System.dealloc(p, l) } else { mimalloc::MiMalloc.dealloc(p, l) } }
+        unsafe { if system_owns(p) { std::alloc::System.dealloc(p, l) } else { mimalloc::MiMalloc.dealloc(p, l) } }
     }
     #[inline]
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new_size: usize) -> *mut u8 {
         Self::note(new_size as isize - l.size() as isize);
-        unsafe { if use_system() { std::alloc::System.realloc(p, l, new_size) } else { mimalloc::MiMalloc.realloc(p, l, new_size) } }
+        unsafe {
+            let sys = system_owns(p);
+            if sys == use_system() {
+                return if sys { std::alloc::System.realloc(p, l, new_size) } else { mimalloc::MiMalloc.realloc(p, l, new_size) };
+            }
+            // (auto mode, a block from before several Ps ran: move it to the system allocator)
+            let nl = std::alloc::Layout::from_size_align_unchecked(new_size, l.align());
+            let q = std::alloc::System.alloc(nl);
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, l.size().min(new_size));
+                if sys { std::alloc::System.dealloc(p, l) } else { mimalloc::MiMalloc.dealloc(p, l) }
+            }
+            q
+        }
     }
 }
 
@@ -833,12 +870,14 @@ pub fn release_malloc_memory() {
         #[cfg(target_os = "macos")]
         fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
     }
-    if use_system() {
+    let w = which_alloc();
+    if w != USE_MIMALLOC {
         #[cfg(target_os = "macos")]
         unsafe {
             malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
         }
-    } else {
+    }
+    if w != USE_SYSTEM {
         unsafe { mi_collect(true) };
     }
 }
