@@ -254,6 +254,7 @@ pub fn static_roots(out: &mut Vec<V>) {
     for t in &s.threads {
         out.extend([t.obj, t.value, t.exc, t.errinfo, t.last_match]);
         out.extend(t.current_block.iter().copied());
+        crate::gc::definee_values(&t.definee, &t.dm_stack, out);
         for th in [Some(t.pending), t.interrupt].into_iter().flatten() {
             crate::gc::throw_values(th, out);
         }

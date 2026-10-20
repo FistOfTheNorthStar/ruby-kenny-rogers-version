@@ -190,6 +190,31 @@ pub(crate) unsafe fn dispatch(cache: *mut CallCache, recv: V, mid: V) -> *const 
     }
     unsafe { dispatch_miss(c, e, k, serial, mid) }
 }
+/// Free the entries that an eval unit's call-site and constant caches point to (the unit is
+/// being freed: nothing can run its code). `owned` lists (word offset, kind): 1 = CallCache,
+/// 2 = ConstCache (kenny_compiler::OWNED_CALL / OWNED_CONST).
+pub fn free_owned_caches(caches: usize, owned: &[(u32, u8)]) {
+    use std::sync::atomic::Ordering;
+    for &(off, kind) in owned {
+        let p = caches + off as usize * 8;
+        match kind {
+            1 => {
+                let e = unsafe { &*(p as *const CallCache) }.entry.swap(std::ptr::null_mut(), Ordering::AcqRel);
+                if !e.is_null() {
+                    drop(unsafe { Box::from_raw(e) });
+                }
+            }
+            2 => {
+                let e = unsafe { &*(p as *const ConstCache) }.entry.swap(std::ptr::null_mut(), Ordering::AcqRel);
+                if !e.is_null() {
+                    drop(unsafe { Box::from_raw(e) });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The entry `old` (if still current) with (k, m) added; a full entry drops its oldest class.
 fn ic_with(old: *mut CacheEntry, serial: u64, k: *mut Class, m: *const Method) -> CacheEntry {
     let mut e = CacheEntry { serial, n: 0, klass: [std::ptr::null_mut(); IC_WAYS], method: [std::ptr::null(); IC_WAYS] };

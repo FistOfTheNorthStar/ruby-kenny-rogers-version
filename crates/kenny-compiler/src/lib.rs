@@ -33,6 +33,9 @@ pub const QNIL: i64 = 0x08;
 pub const QTRUE: i64 = 0x14;
 pub const UNDEF: i64 = 0x34;
 pub const KW_MISSING: i64 = 0x24;
+/// Kinds of `owned_caches` (must match kenny_runtime::abi::free_owned_caches).
+pub const OWNED_CALL: u8 = 1;
+pub const OWNED_CONST: u8 = 2;
 
 /// Offsets into runtime structs read by compiled code.
 pub const PROC_ENV_OFFSET: i32 = 24;
@@ -124,6 +127,9 @@ pub struct Compiler<M: Module> {
     pub(crate) strs: Vec<u8>,
     pub(crate) str_offsets: HashMap<Vec<u8>, usize>,
     pub(crate) cache_words: usize,
+    /// Cache slots whose first word points to a heap entry the runtime allocates (word
+    /// offset, OWNED_CALL / OWNED_CONST): freed with an eval unit.
+    pub(crate) owned_caches: Vec<(u32, u8)>,
     pub(crate) caches_id: DataId,
     pub(crate) syms_id: DataId,
     pub(crate) strs_id: DataId,
@@ -381,6 +387,7 @@ impl<M: Module> Compiler<M> {
             strs: Vec::new(),
             str_offsets: HashMap::new(),
             cache_words: 0,
+            owned_caches: Vec::new(),
             caches_id,
             syms_id,
             strs_id,
@@ -700,6 +707,13 @@ impl<M: Module> Compiler<M> {
     }
     pub(crate) fn cache_ptr(&mut self, fx: &mut Fx, words: usize) -> Value {
         let i = self.cache_alloc(words);
+        fx.b.ins().iadd_imm_s(fx.caches, (i * 8) as i64)
+    }
+    /// A call-site (OWNED_CALL) or constant (OWNED_CONST) cache: 3 words, the first pointing to
+    /// an entry the runtime allocates.
+    pub(crate) fn owned_cache_ptr(&mut self, fx: &mut Fx, kind: u8) -> Value {
+        let i = self.cache_alloc(3);
+        self.owned_caches.push((i as u32, kind));
         fx.b.ins().iadd_imm_s(fx.caches, (i * 8) as i64)
     }
     pub(crate) fn slot_ptr(&mut self, fx: &mut Fx, idx: usize) -> Value {

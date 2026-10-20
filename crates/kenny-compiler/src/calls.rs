@@ -60,7 +60,7 @@ impl<M: Module> Compiler<M> {
     /// `blk` None: the call passes no block at all.
     fn send_raw(&mut self, fx: &mut Fx, recv: Value, name: &[u8], args: &Args, blk: Option<Value>, explicit: bool) -> Value {
         self.mark_loc(fx);
-        let cache = self.cache_ptr(fx, 3);
+        let cache = self.owned_cache_ptr(fx, OWNED_CALL);
         let mid = self.sym_val(fx, name);
         if blk.is_none() && args.splat.is_none() && args.vals.len() <= 2 && self.refine_scope.is_none() {
             return self.send_simple(fx, cache, recv, mid, &args.vals, explicit);
@@ -328,7 +328,7 @@ impl<M: Module> Compiler<M> {
             self.binop(fx, &name, recv, a)
         } else if c.is_variable_call() {
             self.mark_loc(fx);
-            let cache = self.cache_ptr(fx, 3);
+            let cache = self.owned_cache_ptr(fx, OWNED_CALL);
             let mid = self.sym_val(fx, &name);
             self.callc(fx, "kn_vcall", &[cache, recv, mid])
         } else if let Some(v) = match &recv_node {

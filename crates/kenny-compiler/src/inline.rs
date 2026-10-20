@@ -214,7 +214,7 @@ impl<M: Module> Compiler<M> {
         fx.b.append_block_param(done, I64);
         let inl = fx.b.create_block();
         let fallback = fx.b.create_block();
-        let cache = self.cache_ptr(fx, 3);
+        let cache = self.owned_cache_ptr(fx, OWNED_CALL);
         let mid = self.sym_val(fx, &name);
         // Range#each and Array#each share the call: try Array first, then Range
         let (range_inl, guard_kind) = if kind == Kind::Each { (Some(fx.b.create_block()), Kind::Each) } else { (None, kind) };
