@@ -688,10 +688,19 @@ pub const REM_OBJ: u8 = 3;
 pub const REM_CMAP_VALUES: u8 = 4;
 pub const REM_CMAP_METHODS: u8 = 5;
 static REMEMBERED: std::sync::Mutex<Vec<(u8, usize)>> = std::sync::Mutex::new(Vec::new());
+/// (KENNY_GC_VERIFY) what the write barrier recorded for the collection being verified
+static DBG_REMEMBERED: crate::mt::L<FxHashSet<usize>> = crate::mt::L::new(FxHashSet::with_hasher(rustc_hash::FxBuildHasher));
 
 /// An old object's container got new values (see SVec/KMap `wb`): the next minor collection
 /// scans it as a root.
 pub fn remember(kind: u8, p: usize) {
+    // (KENNY_GC_VERIFY) a mutator running while a collection runs: a stop-the-world hole
+    if verify_mode() && IN_COLLECT.load(Ordering::Relaxed) {
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            eprintln!("[gc verify] write barrier ran during a collection (thread {:?}):\n{}", std::thread::current().name(), std::backtrace::Backtrace::force_capture());
+        }
+    }
     match crate::core::pst_opt() {
         Some(ps) => ps.heap.remembered.push((kind, p)),
         None => REMEMBERED.lock().unwrap_or_else(|e| e.into_inner()).push((kind, p)),
@@ -1152,6 +1161,7 @@ fn park() {
     let ph = &mut crate::core::pst().heap;
     spill_registers(&mut ph.regs);
     ph.saved_sp = approx_sp_here();
+    loop {
     ph.status.store(PARKED, Ordering::SeqCst);
     {
         let mut e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
@@ -1177,6 +1187,13 @@ fn park() {
         }
     }
     ph.status.store(RUNNING, Ordering::SeqCst);
+    // A new collection may have started between the check above and announcing RUNNING, and
+    // its collector may have read our status as still PARKED: look again now that RUNNING is
+    // visible (the collector sets STW_BIT before it reads the statuses), and stay if so.
+    if KN_GC_PENDING.load(Ordering::SeqCst) & STW_BIT == 0 && !COLLECTING.load(Ordering::SeqCst) {
+        break;
+    }
+    }
 }
 
 /// Called by a thread spinning on a runtime lock: stop here if a collection is waiting.
@@ -1502,6 +1519,7 @@ impl Marker {
                                 let marked = hdr(p as V).flags & FL_MARK != 0;
                                 let extra = match hdr(p as V).kind {
                                     Kind::Array => format!(" svec_flags={:#x}", rary(p as V).v.capacity()),
+                                    Kind::Hash => format!(" kmap_gen={} remembered_this_gc={}", rhash(p as V).m.gen_bits(), DBG_REMEMBERED.raw().contains(&(&rhash(p as V).m as *const _ as usize))),
                                     _ => String::new(),
                                 };
                                 eprintln!("    {:#x} {:?} {} marked={}{}", p, hdr(p as V).kind, class_name(hdr(p as V).klass), marked, extra);
@@ -1946,6 +1964,9 @@ fn collect_locked() {
     for &p in gc_ps().iter() {
         let ph = unsafe { &mut (*(p as *mut PState)).heap };
         remembered.append(&mut ph.remembered);
+    }
+    if verify_mode() {
+        *DBG_REMEMBERED.raw() = remembered.iter().map(|r| r.1).collect();
     }
     let mut retired = crate::mt::take_retired();
     for &p in gc_ps().iter() {
@@ -2423,6 +2444,68 @@ fn movable(p: usize) -> bool {
     !crate::core::GENERIC_IVARS.raw().as_ref().is_some_and(|t| t.contains_key(&p))
 }
 
+/// (KENNY_GC_COMPACT_VERIFY) After compacting: every field the compactor rewrites must point
+/// to a live, unmoved, marked object.
+fn compact_verify(h: &Heap) {
+    let check = |from: usize, what: &str, x: V| {
+        if x & 15 != 0 || x < 4096 {
+            return;
+        }
+        let inside = x as usize >= h.page_lo && (x as usize) < h.page_hi;
+        if !inside {
+            return;
+        }
+        if !is_object(x as usize) {
+            if slot_containing(x as usize).is_none() {
+                eprintln!("[compact verify] {from:#x} ({:?}) {what} -> {x:#x}: a free slot", hdr(from as V).kind);
+            }
+            return;
+        }
+        let hd = hdr(x);
+        if hd.flags & FL_MOVED != 0 || hd.flags & FL_MARK == 0 {
+            eprintln!("[compact verify] {from:#x} ({:?}) {what} -> {x:#x}: flags {:#x}", hdr(from as V).kind, hd.flags);
+        }
+    };
+    for pg in h.pages.iter() {
+        for wi in 0..pg.alloc.len() {
+            let mut bits = pg.alloc[wi];
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let p = pg.base + (wi * 64 + b) * pg.slot;
+                let v = p as V;
+                match hdr(v).kind {
+                    Kind::Object => obj(v).ivars.as_slice().iter().for_each(|&x| check(p, "ivar", x)),
+                    Kind::Array => rary(v).v.as_slice().iter().for_each(|&x| check(p, "elem", x)),
+                    Kind::Hash => {
+                        for (k, x) in rhash(v).m.iter() {
+                            check(p, "key", k.0);
+                            check(p, "val", *x);
+                        }
+                    }
+                    Kind::Range => {
+                        check(p, "lo", rrange(v).lo);
+                        check(p, "hi", rrange(v).hi);
+                    }
+                    Kind::Proc => check(p, "self", rproc(v).self_),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Rewrite moved objects' addresses in a container's elements, in place.
+fn rewrite_elems((p, n): (*mut V, usize)) {
+    for i in 0..n {
+        let x = unsafe { *p.add(i) };
+        let y = forwarded(x);
+        if y != x {
+            unsafe { *p.add(i) = y };
+        }
+    }
+}
+
 /// The new address of a moved object, else `v` itself.
 #[inline]
 fn forwarded(v: V) -> V {
@@ -2535,26 +2618,10 @@ fn compact(h: &mut Heap, forced: bool) -> (usize, usize) {
                 }
                 let v = p as V;
                 match hd.kind {
-                    Kind::Object => {
-                        let iv = &mut obj(v).ivars;
-                        for i in 0..iv.len() {
-                            let x = iv[i];
-                            let y = forwarded(x);
-                            if y != x {
-                                iv[i] = y;
-                            }
-                        }
-                    }
-                    Kind::Array => {
-                        let a = &mut rary(v).v;
-                        for i in 0..a.len() {
-                            let x = a[i];
-                            let y = forwarded(x);
-                            if y != x {
-                                a[i] = y;
-                            }
-                        }
-                    }
+                    // (plain stores: the write barrier is for mutators; generations don't change)
+                    // (plain stores, no write barrier: generations don't change)
+                    Kind::Object => rewrite_elems(obj(v).ivars.raw_parts()),
+                    Kind::Array => rewrite_elems(rary(v).v.raw_parts()),
                     Kind::Hash => {
                         let hh = rhash(v);
                         hh.m.remap(forwarded);
@@ -2589,6 +2656,9 @@ fn compact(h: &mut Heap, forced: bool) -> (usize, usize) {
         touched.insert(si);
     }
     let emptied = touched.iter().filter(|&&i| used(&h.pages[i]) == 0).count();
+    if !moved.is_empty() && std::env::var_os("KENNY_GC_COMPACT_VERIFY").is_some() {
+        compact_verify(h);
+    }
     if !moved.is_empty() {
         // (constant caches may hold a moved value)
         crate::core::bump_const_serial();

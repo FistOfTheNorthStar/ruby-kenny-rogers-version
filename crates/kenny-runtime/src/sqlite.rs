@@ -40,6 +40,10 @@ struct Db {
     /// busy_timeout in ms (see `timeout_cb`).
     busy_ms: i64,
     busy_since: Option<std::time::Instant>,
+    /// Ruby code may run inside SQLite calls (functions, aggregates, trace, authorizer, busy
+    /// handler blocks). Until then a query is plain C: it runs as a blocking call (gc::blocking),
+    /// so a slow query holds up neither a collection nor the other threads of this P.
+    ruby_cb: bool,
 }
 
 struct Stmt {
@@ -89,7 +93,7 @@ fn db_of(v: V) -> &'static mut Db {
     if let Some(d) = data_of::<Db>(v, "@__db") {
         return d;
     }
-    ivar_set(v, sym("@__db"), wrap(Db { db: std::ptr::null_mut(), self_v: v, exc: false, busy_ms: 0, busy_since: None }, free_db));
+    ivar_set(v, sym("@__db"), wrap(Db { db: std::ptr::null_mut(), self_v: v, exc: false, busy_ms: 0, busy_since: None, ruby_cb: false }, free_db));
     data_of::<Db>(v, "@__db").unwrap()
 }
 fn stmt_of(v: V) -> &'static mut Stmt {
@@ -688,6 +692,7 @@ fn define_function_with_flags(s: V, name: V, flags: V, blk: V) -> V {
     };
     let arity = tri!(send(blk, sym("arity"), &[], QNIL));
     let arity = if is_fix(arity) { fix(arity) as c_int } else { -1 };
+    d.ruby_cb = true;
     let fd = Box::into_raw(Box::new(FuncData { db: d as *mut Db, block: blk }));
     let n = cstring(&rstr(name).b);
     let status = unsafe {
@@ -727,6 +732,7 @@ fn define_aggregator2(s: V, aggregator: V, name: V) -> V {
     let aggs = if is_ary(aggs) { aggs } else { let a = ary_new(Vec::new()); ivar_set(s, sym("@__aggregators"), a); a };
     rary(aggs).v.push(aggregator);
     rary(aggs).v.push(instances);
+    d.ruby_cb = true;
     let ad = Box::into_raw(Box::new(AggData { db: d as *mut Db, klass: aggregator, instances }));
     let n = cstring(&rstr(name).b);
     let status = unsafe {
@@ -788,6 +794,7 @@ fn init_database(m: *mut Class) {
             blk = b;
         }
         ivar_set(s, sym("@tracefunc"), blk);
+        d.ruby_cb |= blk != QNIL;
         #[allow(deprecated)]
         unsafe {
             ffi::sqlite3_trace(d.db, if blk == QNIL { None } else { Some(trace_cb) }, d as *mut Db as *mut c_void)
@@ -825,6 +832,7 @@ fn init_database(m: *mut Class) {
     });
     defn(c, "authorizer=", 1, 1, |s, a, _| {
         let d = open_db!(s);
+        d.ruby_cb |= a[0] != QNIL;
         let status = unsafe { ffi::sqlite3_set_authorizer(d.db, if a[0] == QNIL { None } else { Some(auth_cb) }, d as *mut Db as *mut c_void) };
         tri!(check(d.db, status));
         ivar_set(s, sym("@authorizer"), a[0]);
@@ -837,6 +845,7 @@ fn init_database(m: *mut Class) {
             blk = b;
         }
         ivar_set(s, sym("@busy_handler"), blk);
+        d.ruby_cb |= blk != QNIL;
         let status = unsafe { ffi::sqlite3_busy_handler(d.db, if blk == QNIL { None } else { Some(busy_cb) }, d as *mut Db as *mut c_void) };
         tri!(check(d.db, status));
         s
@@ -936,8 +945,16 @@ fn stmt_initialize(s: V, db: V, sql: V) -> V {
     }
     let st = stmt_of(s);
     let bytes = str_bytes(sql);
-    let mut tail: *const c_char = std::ptr::null();
-    let status = unsafe { ffi::sqlite3_prepare_v2(d.db, bytes.as_ptr() as *const c_char, bytes.len() as c_int, &mut st.st, &mut tail) };
+    let (dbp, sql_p, sql_n) = (d.db as usize, bytes.as_ptr() as usize, bytes.len() as c_int);
+    let prepare = move || {
+        let mut raw: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+        let mut tail: *const c_char = std::ptr::null();
+        let status = unsafe { ffi::sqlite3_prepare_v2(dbp as *mut ffi::sqlite3, sql_p as *const c_char, sql_n, &mut raw, &mut tail) };
+        (status, raw as usize, tail as usize)
+    };
+    let (status, raw, t) = if d.ruby_cb { prepare() } else { crate::gc::blocking(prepare) };
+    st.st = raw as *mut ffi::sqlite3_stmt;
+    let tail = t as *const c_char;
     if take_exc(d) {
         return UNDEF;
     }
@@ -964,7 +981,13 @@ fn stmt_step(s: V) -> V {
     }
     let conn = ivar_get(s, sym("@connection"));
     let stmt = st.st;
-    let value = unsafe { ffi::sqlite3_step(stmt) };
+    let quiet = is_heap(conn) && !db_of(conn).ruby_cb;
+    let value = if quiet {
+        let p = stmt as usize;
+        crate::gc::blocking(move || unsafe { ffi::sqlite3_step(p as *mut ffi::sqlite3_stmt) })
+    } else {
+        unsafe { ffi::sqlite3_step(stmt) }
+    };
     if is_heap(conn) {
         let d = db_of(conn);
         if take_exc(d) {

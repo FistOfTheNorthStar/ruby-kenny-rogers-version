@@ -74,6 +74,11 @@ impl<T: Copy> SVec<T> {
         let (p, n) = self.snap();
         unsafe { std::slice::from_raw_parts(p, n) }
     }
+    /// (GC, every other thread stopped) The elements' address and count, for rewriting
+    /// moved objects without the write barrier.
+    pub fn raw_parts(&self) -> (*mut T, usize) {
+        self.snap()
+    }
     #[inline(always)]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         self.wb();

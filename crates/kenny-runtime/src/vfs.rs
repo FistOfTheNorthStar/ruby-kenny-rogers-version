@@ -386,7 +386,8 @@ pub fn read_file(p: &[u8]) -> std::io::Result<Cow<'static, [u8]>> {
     if let Some(b) = read(p) {
         return Ok(Cow::Borrowed(b));
     }
-    std::fs::read(OsStr::from_bytes(&disk(p))).map(Cow::Owned)
+    let path = disk(p);
+    crate::gc::blocking(|| std::fs::read(OsStr::from_bytes(&path))).map(Cow::Owned)
 }
 
 /// The real path to write `p` to (see `prepare_write`).

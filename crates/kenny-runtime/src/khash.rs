@@ -225,6 +225,10 @@ impl KMap {
             }
         }
     }
+    /// (debugging) the generational bits: 1 = old, 2 = remembered
+    pub fn gen_bits(&self) -> u8 {
+        self.gc_gen.load(Relaxed)
+    }
     pub fn set_old(&self) {
         if self.gc_gen.load(Relaxed) & G_OLD == 0 {
             self.gc_gen.fetch_or(G_OLD, Relaxed);

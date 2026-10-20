@@ -479,12 +479,9 @@ impl IoState {
                     flush_out(); // keep ordering with Kenny's stdout buffer
                 }
                 let fd = self.wfd;
-                if is_regular_file(fd) {
-                    sys_write_all(fd, &b)
-                } else {
-                    // a socket or pipe may block until the other end reads
-                    crate::gc::blocking(|| sys_write_all(fd, &b))
-                }
+                // (a socket or pipe may block until the other end reads, a disk write may be
+                // slow: neither holds up a collection or this P's other threads)
+                crate::gc::blocking(|| sys_write_all(fd, &b))
             }
         }
     }
@@ -548,7 +545,9 @@ impl IoState {
         self.rbuf.resize(old + (1 << 16), 0);
         loop {
             // (wait_fd waited until a pipe, socket or terminal has data; regular files don't block)
-            let n = unsafe { libc::read(self.fd, self.rbuf[old..].as_mut_ptr() as *mut c_void, 1 << 16) };
+            // (a disk read may be slow: it holds up neither a collection nor this P's threads)
+            let (fd, buf) = (self.fd, self.rbuf[old..].as_mut_ptr() as usize);
+            let n = crate::gc::blocking(move || unsafe { libc::read(fd, buf as *mut c_void, 1 << 16) });
             if n < 0 {
                 let e = errno();
                 if e == libc::EINTR {
@@ -2679,7 +2678,8 @@ pub fn init() {
         let stt = ok!(st(s));
         ok!(stt.flush());
         if stt.std == 0 {
-            unsafe { libc::fsync(stt.wfd) };
+            let fd = stt.wfd;
+            crate::gc::blocking(move || unsafe { libc::fsync(fd) });
         }
         mkfix(0)
     });
