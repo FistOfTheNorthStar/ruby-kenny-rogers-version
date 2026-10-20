@@ -318,19 +318,45 @@ fn is_regular_file(fd: i32) -> bool {
 }
 
 fn wait_fd(fd: i32, events: i16) -> Result<(), V> {
-    if crate::thread::idle_timeout().is_none() {
+    if is_regular_file(fd) {
         return Ok(());
     }
+    poll_wait(&mut [libc::pollfd { fd, events, revents: 0 }], None).map(|_| ())
+}
+
+/// poll(2) on `pfds` until something is ready (returns poll's count) or `timeout` passes
+/// (Ok(0)), without holding up this P's other threads or a collection: while the P has
+/// other threads, poll without waiting and yield to them; alone, block in short slices
+/// (counted as stopped for the GC), so a thread that comes to this P meanwhile (woken up,
+/// or a sleeper whose time came) waits at most a slice.
+fn poll_wait(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32, V> {
+    const SLICE_MS: i32 = 20;
+    let start = std::time::Instant::now();
     loop {
-        let mut p = libc::pollfd { fd, events, revents: 0 };
-        if unsafe { libc::poll(&mut p, 1, 0) } != 0 {
-            return Ok(());
+        let remaining = timeout.map(|t| t.saturating_sub(start.elapsed()));
+        let shared = crate::thread::idle_timeout().is_some();
+        let ms = if shared { 0 } else { remaining.map_or(SLICE_MS, |r| (r.as_millis() as i32).min(SLICE_MS)) };
+        let (ptr, len) = (pfds.as_mut_ptr() as usize, pfds.len() as libc::nfds_t);
+        let n = if ms == 0 {
+            unsafe { libc::poll(ptr as *mut libc::pollfd, len, 0) }
+        } else {
+            crate::gc::blocking(|| unsafe { libc::poll(ptr as *mut libc::pollfd, len, ms) })
+        };
+        if n > 0 || (n < 0 && errno() != libc::EINTR) {
+            return Ok(n);
         }
-        if crate::thread::idle_timeout().is_none() {
-            return Ok(());
+        if remaining.is_some_and(|r| r.is_zero()) || timeout.is_some_and(|t| start.elapsed() >= t) {
+            return Ok(0);
         }
-        if crate::thread::sleep(Some(Duration::from_millis(2))) == UNDEF {
-            return Err(UNDEF);
+        if shared {
+            if crate::thread::sleep(Some(Duration::from_millis(2))) == UNDEF {
+                return Err(UNDEF);
+            }
+        } else {
+            crate::thread::pass();
+            if pst().pending_is_set() {
+                return Err(UNDEF);
+            }
         }
     }
 }
@@ -471,12 +497,8 @@ impl IoState {
         let old = self.rbuf.len();
         self.rbuf.resize(old + (1 << 16), 0);
         loop {
-            // a pipe, socket or terminal may block indefinitely: let collections run meanwhile
-            // (this thread touches no Ruby objects until the read returns)
-            // (regular files don't block for long: read them directly)
-            let (fd, buf) = (self.fd, self.rbuf[old..].as_mut_ptr() as usize);
-            let read = || unsafe { libc::read(fd, buf as *mut c_void, 1 << 16) };
-            let n = if is_regular_file(fd) { read() } else { crate::gc::blocking(read) };
+            // (wait_fd waited until a pipe, socket or terminal has data; regular files don't block)
+            let n = unsafe { libc::read(self.fd, self.rbuf[old..].as_mut_ptr() as *mut c_void, 1 << 16) };
             if n < 0 {
                 let e = errno();
                 if e == libc::EINTR {
@@ -484,8 +506,7 @@ impl IoState {
                 }
                 self.rbuf.truncate(old);
                 if e == libc::EAGAIN {
-                    let mut p = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
-                    crate::gc::blocking(|| unsafe { libc::poll(&mut p, 1, -1) });
+                    wait_fd(self.fd, libc::POLLIN)?;
                     self.rbuf.resize(old + (1 << 16), 0);
                     continue;
                 }
@@ -3129,64 +3150,47 @@ pub fn init() {
             }
         };
         let (rs, ws) = (list(a.first()), list(a.get(1)));
-        let timeout = a.get(3).and_then(|t| num_to_f(*t));
-        let start = std::time::Instant::now();
-        loop {
-            let mut ready_r = Vec::new();
-            let mut ready_w = Vec::new();
-            let mut pfds = Vec::new();
-            for &x in &rs {
-                let s = ok!(st(x));
-                if s.avail() > 0 || s.mem.is_some() {
-                    ready_r.push(x);
-                }
-                // an embedded file (fd -1) is always readable; poll skips negative fds
-                pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.fd }, events: libc::POLLIN, revents: 0 });
+        let timeout = a.get(3).and_then(|t| num_to_f(*t)).map(|t| Duration::from_secs_f64(t.max(0.0)));
+        let mut ready_r = Vec::new();
+        let mut ready_w = Vec::new();
+        let mut pfds = Vec::new();
+        for &x in &rs {
+            let s = ok!(st(x));
+            if s.avail() > 0 || s.mem.is_some() {
+                ready_r.push(x);
             }
-            for &x in &ws {
-                let s = ok!(st(x));
-                pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.wfd }, events: libc::POLLOUT, revents: 0 });
+            // an embedded file (fd -1) is always readable; poll skips negative fds
+            pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.fd }, events: libc::POLLIN, revents: 0 });
+        }
+        for &x in &ws {
+            let s = ok!(st(x));
+            pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.wfd }, events: libc::POLLOUT, revents: 0 });
+        }
+        let n = if ready_r.is_empty() {
+            match poll_wait(&mut pfds, timeout) {
+                Ok(n) => n,
+                Err(e) => return e,
             }
-            let threads = crate::thread::idle_timeout().is_some();
-            let wait_ms = if !ready_r.is_empty() || threads {
-                0
-            } else {
-                match timeout {
-                    Some(t) => ((t - start.elapsed().as_secs_f64()).max(0.0) * 1000.0) as i32,
-                    None => -1,
-                }
-            };
-            let n = if wait_ms == 0 {
-                unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) }
-            } else {
-                // waiting (no other thread on this P): collections must not wait for us
-                crate::gc::blocking(|| unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, wait_ms) })
-            };
-            if n > 0 {
-                for (i, p) in pfds.iter().enumerate() {
-                    if p.revents != 0 {
-                        if i < rs.len() {
-                            if !ready_r.contains(&rs[i]) {
-                                ready_r.push(rs[i]);
-                            }
-                        } else {
-                            ready_w.push(ws[i - rs.len()]);
+        } else {
+            unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) }
+        };
+        if n > 0 {
+            for (i, p) in pfds.iter().enumerate() {
+                if p.revents != 0 {
+                    if i < rs.len() {
+                        if !ready_r.contains(&rs[i]) {
+                            ready_r.push(rs[i]);
                         }
+                    } else {
+                        ready_w.push(ws[i - rs.len()]);
                     }
                 }
             }
-            if !ready_r.is_empty() || !ready_w.is_empty() {
-                return ary_new(vec![ary_new(ready_r), ary_new(ready_w), ary_new(vec![])]);
-            }
-            if let Some(t) = timeout {
-                if start.elapsed().as_secs_f64() >= t {
-                    return QNIL;
-                }
-            }
-            if threads && crate::thread::sleep(Some(Duration::from_millis(2))) == UNDEF {
-                return UNDEF;
-            }
         }
+        if ready_r.is_empty() && ready_w.is_empty() {
+            return QNIL;
+        }
+        ary_new(vec![ary_new(ready_r), ary_new(ready_w), ary_new(vec![])])
     });
     defs(io, "try_convert", 1, 1, |_, a, _| if try_st(a[0]).is_some() { a[0] } else { QNIL });
 

@@ -107,11 +107,12 @@ struct Parker {
     /// Set while the P's loop waits in its own poller instead (the HTTP server's event
     /// loop): wakes that poller when the P gets work (a new thread, a thread woken up).
     hook: Mutex<Option<WakeHook>>,
+    has_hook: AtomicBool,
 }
 type WakeHook = Box<dyn Fn() + Send + Sync>;
 impl Parker {
     fn new() -> Self {
-        Parker { m: Mutex::new(false), cv: Condvar::new(), hook: Mutex::new(None) }
+        Parker { m: Mutex::new(false), cv: Condvar::new(), hook: Mutex::new(None), has_hook: AtomicBool::new(false) }
     }
     fn unpark(&self) {
         *self.m.lock().unwrap_or_else(|e| e.into_inner()) = true;
@@ -439,7 +440,10 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
         if !started {
             start_os_thread(p);
         }
-    } else if let Some(pk) = parker {
+    }
+    // push_runq claimed a P to run or steal the thread (this one, or an idle one it kicked):
+    // it must be woken even when this call also started P `p`, or it stays claimed but asleep
+    if let Some(pk) = parker {
         pk.unpark();
     }
     if tid == 1 {
@@ -779,6 +783,11 @@ fn push_runq(s: &mut Sched, p: usize, tid: usize) -> Option<Arc<Parker>> {
         s.ps[p].idle = false;
         return if Some(p) != me { Some(s.ps[p].parker.clone()) } else { None };
     }
+    // a P whose loop waits in its own poller (the HTTP server) isn't idle but may be blocked
+    // there with no timeout, and in a server every P is such a loop: wake it to run the thread
+    if Some(p) != me && s.ps[p].parker.has_hook.load(Ordering::Acquire) {
+        return Some(s.ps[p].parker.clone());
+    }
     if s.threads[tid].pinned { None } else { kick_idle(s, p) }
 }
 fn pop_runq(s: &mut Sched, p: usize) -> Option<usize> {
@@ -851,7 +860,14 @@ fn give_back(tid: usize) {
             P_RUNQ[me].store(s.ps[me].runq.len(), Ordering::Relaxed);
         }
         move_thread(s, tid, to);
-        if queued.is_some() { push_runq(s, to, tid) } else { None }
+        if queued.is_some() {
+            push_runq(s, to, tid)
+        } else if s.ps[to].parker.has_hook.load(Ordering::Acquire) {
+            // a timed wait moved to a P blocked in its own poller: it must recompute its timeout
+            Some(s.ps[to].parker.clone())
+        } else {
+            None
+        }
     });
     if let Some(pk) = pk {
         pk.unpark();
@@ -1048,6 +1064,7 @@ pub fn set_wake_hook(wake: Box<dyn Fn() + Send + Sync>) {
     let idx = pt().idx;
     let pk = locked!(s => s.ps[idx].parker.clone());
     *pk.hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake);
+    pk.has_hook.store(true, Ordering::Release);
 }
 
 /// How long an IO loop may block waiting for events (None = forever: no other threads on

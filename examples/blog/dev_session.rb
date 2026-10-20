@@ -45,8 +45,23 @@ def hello_action(body)
   end
 end
 
+def asset(page, ext)
+  page.body[%r{"(/assets/application[^"]*\.#{ext})"}, 1]
+end
+
 begin
-  check "index", get("/posts"), 200, "<h1>Posts</h1>"
+  index = get("/posts")
+  check "index", index, 200, "<h1>Posts</h1>"
+
+  # assets compiled live (Sass, CoffeeScript), and again after an edit
+  css, js = asset(index, "css"), asset(index, "js")
+  check "stylesheet (Sass)", get(css.to_s), 200, "font-family"
+  check "javascript (CoffeeScript)", get(js.to_s), 200, "Turbolinks"
+  edit("app/assets/stylesheets/posts.scss") { |s| s + "\n$edited: #123456;\n.kenny-edit { color: $edited; }\n" }
+  edit("app/assets/javascripts/posts.coffee") { |s| s + "\nwindow.kennyEdit = -> 42\n" }
+  index = get("/posts")
+  check "stylesheet after edit", get(asset(index, "css").to_s), 200, ".kenny-edit", "#123456"
+  check "javascript after edit", get(asset(index, "js").to_s), 200, "kennyEdit"
 
   edit("app/views/posts/index.html.erb") { |s| s.sub("<h1>Posts</h1>", "<h1>Posts (edited view)</h1>") }
   check "view edit", get("/posts"), 200, "<h1>Posts (edited view)</h1>"
