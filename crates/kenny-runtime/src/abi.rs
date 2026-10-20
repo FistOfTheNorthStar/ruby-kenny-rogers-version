@@ -666,6 +666,48 @@ struct Autoload {
     flag: *mut V,
     path: String,
 }
+
+/// Autoloads running right now (see settle_autoload).
+static LOADING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A constant found in `k` while another thread is still running the autoload that defines it
+/// (its `class` statement has run, the body maybe not): wait for that load to finish first.
+/// CRuby makes other threads wait for an autoload too, so they never see a half-built class
+/// (websocket-extensions' Parser without its methods, Action Cable's TaggedLoggerProxy).
+pub fn settle_autoload(k: *mut Class, id: u32) {
+    if LOADING.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let entry = autoloads().get(&(k as usize, id)).map(|a| (a.loader, a.flag, a.path.clone()));
+    let Some((loader, flag, path)) = entry else { return };
+    wait_for_autoload(loader, flag, &path);
+}
+/// Like settle_autoload, for a constant found in a scope this code didn't track (the
+/// compiler's lexical lookup): any autoload of that name another thread is running.
+pub fn settle_id(id: u32) {
+    if LOADING.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let entries: Vec<(Option<CompiledFn>, *mut V, String)> =
+        autoloads().iter().filter(|((_, i), _)| *i == id).map(|(_, a)| (a.loader, a.flag, a.path.clone())).collect();
+    for (loader, flag, path) in entries {
+        wait_for_autoload(loader, flag, &path);
+    }
+}
+fn wait_for_autoload(loader: Option<CompiledFn>, flag: *mut V, path: &str) {
+    let (f, flag) = match loader {
+        Some(f) => (f, flag),
+        None => match crate::compat::compiled_entry(path) {
+            Some(e) => e,
+            None => return,
+        },
+    };
+    let st = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire);
+    if st == 0 || st == 1 || st == crate::thread::current_token() {
+        return;
+    }
+    crate::compat::run_file_once(f, flag); // waits for the loading thread
+}
 static AUTOLOADS: crate::mt::L<std::collections::HashMap<(usize, u32), Autoload, FxBuild>> = crate::mt::L::new(std::collections::HashMap::with_hasher(FxBuild::new()));
 
 fn autoloads() -> crate::mt::LGuard<'static, std::collections::HashMap<(usize, u32), Autoload, FxBuild>> {
@@ -755,7 +797,10 @@ pub unsafe extern "C" fn kn_const_get_l(cache: *mut ConstCache, crefp: *const [V
         }
     }
     let v = match (found, pending) {
-        (Some(v), _) => v,
+        (Some(v), _) => {
+            settle_id(id);
+            v
+        }
         (None, Some(owner)) => const_missing_in(k, id, Some(owner)),
         (None, None) => {
             let mut r = None;
@@ -769,7 +814,10 @@ pub unsafe extern "C" fn kn_const_get_l(cache: *mut ConstCache, crefp: *const [V
                 }
             }
             match r.or_else(|| unsafe { (*rt().c.object).consts.get(&id).copied() }) {
-                Some(v) => v,
+                Some(v) => {
+                    settle_id(id);
+                    v
+                }
                 None => const_missing_in(k, id, chain.iter().copied().find(|&l| has_autoload(l, id))),
             }
         }
@@ -817,11 +865,20 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
     if let Some(owner) = owner.or_else(|| find_autoload(c)(id)) {
         // the entry stays until the file has run, so another thread referencing the constant
         // meanwhile finds it and waits for the load instead of raising NameError
-        let a = autoloads().get(&(owner as usize, id)).map(|a| (a.loader, a.flag, a.path.clone())).unwrap();
+        let entry = autoloads().get(&(owner as usize, id)).map(|a| (a.loader, a.flag, a.path.clone()));
+        let Some(a) = entry else {
+            // another thread finished this autoload just now
+            if let Some(v) = after_autoload(owner, c, id) {
+                return v;
+            }
+            return send(c as V, sym("const_missing"), &[mksym(id)], QNIL);
+        };
         let a = Autoload { loader: a.0, flag: a.1, path: a.2 };
         match a.loader {
             Some(f) => {
+                LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 let r = crate::compat::run_file_once(f, a.flag);
+                LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 autoloads().remove(&(owner as usize, id));
                 if r == UNDEF {
                     return UNDEF;
@@ -830,7 +887,12 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
                     return v;
                 }
             }
-            None if crate::compat::require_compiled(&a.path).is_some() => {
+            None if {
+                LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let r = crate::compat::require_compiled(&a.path);
+                LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                r.is_some()
+            } => {
                 autoloads().remove(&(owner as usize, id));
                 if pst().pending_is_set() {
                     return UNDEF;
@@ -948,6 +1010,7 @@ pub fn const_get_scoped(c: *mut Class, id: u32) -> Option<V> {
             break;
         }
         if let Some(&v) = unsafe { (*a).consts.get(&id) } {
+            settle_autoload(a, id);
             return Some(v);
         }
         if has_autoload(a, id) {
@@ -987,18 +1050,26 @@ pub extern "C" fn kn_const_defined(cref: V, id: V) -> u64 {
 /// Returns false if loading raised.
 fn autoload_before_define(outer: *mut Class, id: u32) -> bool {
     let Some(a) = autoloads().get(&(outer as usize, id)).map(|a| Autoload { loader: a.loader, flag: a.flag, path: a.path.clone() }) else { return true };
+    // the entry goes once the file has run: while it runs (this `class` statement may be the
+    // file's own), other threads that find the constant wait for it (settle_autoload)
+    let done = |flag: *mut V| unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire) == 1;
     match a.loader {
         Some(f) => {
             let r = crate::compat::run_file_once(f, a.flag);
-            autoloads().remove(&(outer as usize, id));
+            if done(a.flag) {
+                autoloads().remove(&(outer as usize, id));
+            }
             if r == UNDEF {
                 return false;
             }
         }
         None => {
-            autoloads().remove(&(outer as usize, id));
             if crate::compat::require_compiled(&a.path).is_some() && pst().pending_is_set() {
+                autoloads().remove(&(outer as usize, id));
                 return false;
+            }
+            if crate::compat::compiled_entry(&a.path).is_none_or(|(_, flag)| done(flag)) {
+                autoloads().remove(&(outer as usize, id));
             }
         }
     }

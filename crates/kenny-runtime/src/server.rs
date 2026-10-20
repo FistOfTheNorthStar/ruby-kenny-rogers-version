@@ -537,11 +537,12 @@ fn handle(app: V, req: &Request, port: u16, peer: &str, fd: i32) -> (Vec<u8>, bo
     hset(env, "rack.multiprocess", bool_v(MULTIPROCESS.load(std::sync::atomic::Ordering::Relaxed)));
     hset(env, "rack.run_once", QFALSE);
     hset(env, "rack.hijack?", QTRUE);
-    let hijacked = std::rc::Rc::new(std::cell::Cell::new(false));
+    // (Arc: the proc may be freed by a collection on another OS thread)
+    let hijacked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = hijacked.clone();
     let hijack = proc_new_native_rooted(
         Box::new(move |_, _, _| {
-            if flag.get() {
+            if flag.load(std::sync::atomic::Ordering::Acquire) {
                 return rhash(env).m.get(&HKey(str_from("rack.hijack_io"))).copied().unwrap_or(QNIL);
             }
             let io = hijack_io(fd);
@@ -549,7 +550,7 @@ fn handle(app: V, req: &Request, port: u16, peer: &str, fd: i32) -> (Vec<u8>, bo
                 return UNDEF;
             }
             hset(env, "rack.hijack_io", io);
-            flag.set(true);
+            flag.store(true, std::sync::atomic::Ordering::Release);
             io
         }),
         0,
@@ -585,9 +586,12 @@ fn handle(app: V, req: &Request, port: u16, peer: &str, fd: i32) -> (Vec<u8>, bo
     hset(env, "SERVER_NAME", str_from(&server_name));
 
     let resp = send(app, sym("call"), &[env], QNIL);
-    if hijacked.get() {
-        // full hijack: the response is ignored (Rack: the app wrote its own)
+    if hijacked.load(std::sync::atomic::Ordering::Acquire) {
+        // full hijack: the response is ignored (Rack: the app wrote its own), but its body
+        // is still closed, like Puma does: Rails' executor completes the request there
+        // (otherwise the request keeps its share of the autoload interlock)
         pst().pending = Throw::None;
+        close_body(resp);
         return (Vec::new(), false, true);
     }
     if resp == UNDEF {
@@ -620,6 +624,7 @@ fn handle(app: V, req: &Request, port: u16, peer: &str, fd: i32) -> (Vec<u8>, bo
             }
         }
         pst().pending = Throw::None;
+        close_body(resp);
         return (Vec::new(), false, true);
     }
     match serialize(resp, keep, req.method == "HEAD") {
@@ -627,6 +632,17 @@ fn handle(app: V, req: &Request, port: u16, peer: &str, fd: i32) -> (Vec<u8>, bo
         Err(msg) => {
             err_out(format!("{} {}: {}\n", req.method, req.target, msg).as_bytes());
             (error_response(500, keep), keep, false)
+        }
+    }
+}
+
+/// `body.close` of a Rack response the server doesn't send (hijacked connections).
+fn close_body(resp: V) {
+    if resp != UNDEF && is_ary(resp) && rary(resp).v.len() == 3 {
+        let body = rary(resp).v[2];
+        if respond_to(body, sym("close")) {
+            let _ = send0(body, "close");
+            pst().pending = Throw::None;
         }
     }
 }

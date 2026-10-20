@@ -95,3 +95,23 @@ module OpenSSL
     end
   end
 end
+
+module OpenSSL
+  # No TLS sockets in Kenny; the classes exist so `io.is_a?(OpenSSL::SSL::SSLSocket)` checks
+  # (nio4r's selector, Net::HTTP) work.
+  module SSL
+    class SSLError < OpenSSL::OpenSSLError; end unless const_defined?(:SSLError, false)
+
+    class SSLSocket
+      def initialize(*)
+        raise NotImplementedError, "TLS sockets (OpenSSL::SSL::SSLSocket) are not supported by Kenny"
+      end
+    end
+
+    class SSLContext
+      def initialize(*)
+        raise NotImplementedError, "TLS (OpenSSL::SSL::SSLContext) is not supported by Kenny"
+      end
+    end unless const_defined?(:SSLContext, false)
+  end
+end

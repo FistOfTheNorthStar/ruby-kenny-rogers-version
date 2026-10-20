@@ -334,7 +334,16 @@ pub fn run_main(main: Box<dyn FnOnce() -> V>) -> V {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+        .unwrap_or_else(|| {
+            // Rails' development mode (the classic autoloader, code reloading) counts on a GVL:
+            // two requests autoloading the same module at once each create their own. One P
+            // gives the same one-at-a-time interleaving; KENNY_THREADS overrides it.
+            let env = std::env::var("RAILS_ENV").or_else(|_| std::env::var("RACK_ENV")).unwrap_or_default();
+            if env == "development" {
+                return 1;
+            }
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        })
         .min(256);
     *SCHED.get() = Some(Sched {
         threads: Vec::new(),

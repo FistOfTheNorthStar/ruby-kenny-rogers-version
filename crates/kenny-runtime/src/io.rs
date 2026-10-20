@@ -289,6 +289,38 @@ pub struct IoState {
     pub mem: Option<&'static crate::vfs::Entry>,
     /// read position in `mem`
     pub mpos: usize,
+    /// Several threads may use one IO (Action Cable writes to a socket from its worker
+    /// threads while its event loop reads): the buffers change under these flags, so a race
+    /// mixes up data at worst and never touches freed memory.
+    wbusy: std::sync::atomic::AtomicBool,
+    rbusy: std::sync::atomic::AtomicBool,
+}
+
+/// Holds an IO buffer flag (see IoState::wbusy) until dropped. Waiting yields to other
+/// threads instead of blocking the OS thread (the holder may be in a slow write).
+struct BufLock<'a>(&'a std::sync::atomic::AtomicBool);
+impl<'a> BufLock<'a> {
+    fn take(f: &'a std::sync::atomic::AtomicBool) -> Self {
+        use std::sync::atomic::Ordering;
+        let mut spins = 0u32;
+        while f.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else if crate::thread::active() {
+                crate::thread::pass();
+                crate::gc::blocking(|| std::thread::sleep(Duration::from_micros(50)));
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        BufLock(f)
+    }
+}
+impl Drop for BufLock<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 fn sys_write_all(fd: i32, mut b: &[u8]) -> Result<(), i32> {
@@ -382,6 +414,8 @@ impl IoState {
             stdio_copy: false,
             mem: None,
             mpos: 0,
+            wbusy: std::sync::atomic::AtomicBool::new(false),
+            rbusy: std::sync::atomic::AtomicBool::new(false),
         })
     }
     fn detail(&self) -> Vec<u8> {
@@ -427,6 +461,9 @@ impl IoState {
         if self.wbuf.is_empty() {
             return Ok(());
         }
+        // held through the write: one flush's bytes stay together
+        let wbusy = unsafe { &*(&self.wbusy as *const std::sync::atomic::AtomicBool) };
+        let _g = BufLock::take(wbusy);
         let b = std::mem::take(&mut self.wbuf);
         match self.std {
             1 => {
@@ -441,7 +478,13 @@ impl IoState {
                 if self.wfd <= 2 || self.stdio_copy {
                     flush_out(); // keep ordering with Kenny's stdout buffer
                 }
-                sys_write_all(self.wfd, &b)
+                let fd = self.wfd;
+                if is_regular_file(fd) {
+                    sys_write_all(fd, &b)
+                } else {
+                    // a socket or pipe may block until the other end reads
+                    crate::gc::blocking(|| sys_write_all(fd, &b))
+                }
             }
         }
     }
@@ -462,8 +505,13 @@ impl IoState {
             }
             2 => err_out(b),
             _ => {
-                self.wbuf.extend_from_slice(b);
-                if self.sync || self.wbuf.len() >= 8192 {
+                let full = {
+                    let wbusy = unsafe { &*(&self.wbusy as *const std::sync::atomic::AtomicBool) };
+                    let _g = BufLock::take(wbusy);
+                    self.wbuf.extend_from_slice(b);
+                    self.wbuf.len() >= 8192
+                };
+                if self.sync || full {
                     self.flush()?;
                 }
             }
@@ -494,6 +542,8 @@ impl IoState {
             flush_out();
         }
         wait_fd(self.fd, libc::POLLIN)?;
+        let rbusy = unsafe { &*(&self.rbusy as *const std::sync::atomic::AtomicBool) };
+        let _g = BufLock::take(rbusy);
         let old = self.rbuf.len();
         self.rbuf.resize(old + (1 << 16), 0);
         loop {

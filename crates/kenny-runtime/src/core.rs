@@ -1071,9 +1071,10 @@ fn own_chain(k: *mut Class, below: &[*mut Class], depth: u32) -> (Vec<*mut Class
             if m == k {
                 continue;
             }
+            // unlike include, prepend doesn't skip a module the superclass chain already has
+            // (ActiveSupport prepends its to_json module to Object and to String)
             let chain = module_chain(m, depth + 1);
-            let new: Vec<*mut Class> =
-                chain.into_iter().filter(|x| *x != k && !pre.contains(x) && !part.contains(x) && !below.contains(x)).collect();
+            let new: Vec<*mut Class> = chain.into_iter().filter(|x| *x != k && !pre.contains(x) && !part.contains(x)).collect();
             pre.splice(0..0, new);
         }
     }
@@ -1509,6 +1510,7 @@ pub fn const_lookup(cref: *mut Class, id: u32) -> Option<V> {
         let mut k = cref;
         while !k.is_null() && k != object {
             if let Some(&v) = (*k).consts.get(&id) {
+                crate::abi::settle_autoload(k, id);
                 return Some(v);
             }
             // a pending autoload here wins over outer/top-level constants (caller triggers it)
@@ -1520,6 +1522,7 @@ pub fn const_lookup(cref: *mut Class, id: u32) -> Option<V> {
         if !cref.is_null() {
             for &a in ancestors_rc(cref).iter() {
                 if let Some(&v) = (*a).consts.get(&id) {
+                    crate::abi::settle_autoload(a, id);
                     return Some(v);
                 }
                 // an autoload in an earlier ancestor wins over a constant in a later one
@@ -1528,12 +1531,18 @@ pub fn const_lookup(cref: *mut Class, id: u32) -> Option<V> {
                 }
             }
         }
-        (*rt().c.object).consts.get(&id).copied()
+        let o = rt().c.object;
+        let v = (*o).consts.get(&id).copied();
+        if v.is_some() {
+            crate::abi::settle_autoload(o, id);
+        }
+        v
     }
 }
 pub fn const_get_under(c: *mut Class, id: u32) -> Option<V> {
     for &a in ancestors_rc(c).iter() {
         if let Some(&v) = unsafe { (*a).consts.get(&id) } {
+            crate::abi::settle_autoload(a, id);
             return Some(v);
         }
         // `Engine::Configuration` with `autoload :Configuration` in Engine must load it rather

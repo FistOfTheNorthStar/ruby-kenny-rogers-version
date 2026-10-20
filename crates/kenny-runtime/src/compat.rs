@@ -650,6 +650,12 @@ fn kernel_load(a: &[V]) -> V {
     }
 }
 
+/// The compiled file `require name` would run, and its loaded flag.
+pub fn compiled_entry(name: &str) -> Option<(CompiledFn, *mut V)> {
+    let key = name.trim_end_matches(".rb");
+    FILE_TABLE.get().as_ref()?.get(key).map(|e| (e.0, e.1))
+}
+
 pub fn require_compiled(name: &str) -> Option<V> {
     let key = name.trim_end_matches(".rb");
     let (f, flag, _) = *FILE_TABLE.get().as_ref()?.get(key)?;
