@@ -21,7 +21,8 @@ cargo build --release
     $(ruby tools/gem-paths.rb sqlite3 1.7.3) && ./rails_api_ar
 
 # a whole generated Rails 5.2 app (`rails new` + a scaffold); its gems come from its Gemfile.lock.
-# `kenny build` also precompiles its assets (Sass, CoffeeScript, Uglifier) into public/assets
+# `kenny build` also precompiles its assets (Sass, CoffeeScript, Uglifier) into public/assets,
+# then embeds the app's files (views, config, public/) in the binary
 (cd examples/blog && RAILS_ENV=production SECRET_KEY_BASE=x bundle exec rails db:migrate)
 ./target/release/kenny build examples/blog/config.ru -o blog
 (cd examples/blog && RAILS_ENV=production RAILS_SERVE_STATIC_FILES=1 SECRET_KEY_BASE=$(openssl rand -hex 64) ../../blog)
@@ -35,6 +36,24 @@ system Ruby's `Gem.path`, `~/.gem`, rvm, rbenv) and compiles them in; groups lis
 `Bundler.require(*Rails.groups)` work in the binary. Without a lock file, `-I` adds load paths:
 `tools/gem-paths.rb NAME VERSION` prints the `-I` flags for an installed gem and its
 dependencies. Every file in those directories is compiled into the binary.
+
+A Rack app's binary is self-contained: `kenny build` also embeds the app's directory (views,
+`config/`, locales, `public/` with the precompiled assets) and every compiled gem's directory,
+compressed (4 MB for `examples/blog`). Runtime data is left out: `log/`, `tmp/`,
+`node_modules/`, `storage/`, SQLite databases, and `config/master.key` (give it as
+`RAILS_MASTER_KEY` or a file on the server). To deploy, copy the binary and start it in the
+directory that holds its data:
+
+```
+mkdir -p /srv/blog/db && cp blog /srv/blog/ && cp examples/blog/db/production.sqlite3 /srv/blog/db/
+cd /srv/blog && RAILS_ENV=production RAILS_SERVE_STATIC_FILES=1 SECRET_KEY_BASE=... ./blog
+```
+
+Embedded files are always read from the binary, as they were at build time. Everything else
+under the app's directory (the database, `log/`, `tmp/`, uploads) lives in the directory the
+binary was started in, or in `$KENNY_APP_ROOT`. Started inside its build directory (or above
+it), the binary uses the build directory itself. Writing to an embedded file first copies it
+there. `--embed <dir>` embeds a directory for any program; `--no-embed` turns embedding off.
 
 ## How it works
 
@@ -118,7 +137,7 @@ Working:
   with output identical to Ruby's:
   `examples/rails_api` (ActionController::API, routing, params, JSON),
   `examples/rails_html` (ActionController::Base with ERB layouts, partials and view helpers;
-  templates are read at runtime and compiled once by the embedded JIT), and
+  templates are embedded in the binary, read at runtime and compiled once by the embedded JIT), and
   `examples/rails_api_ar` (below).
   ActiveRecord 5.2 works with the SQLite adapter (migrations/schema, associations, validations,
   scopes, transactions, eager loading): `examples/rails_api_ar` is a JSON API backed by it.
@@ -140,9 +159,6 @@ Not yet:
   imports are resolved by the Sass compiler on the load paths.
 - Rails' development mode (code reloading, `listen`) and Action Cable's WebSocket server are
   untested; production mode is the target.
-- A self-contained deployment: the binary contains all Ruby code, but reads the app's
-  non-Ruby files (views, `config/*.yml`, locales, `public/`) and the gems' locale files from
-  where they were at build time.
 - Freeing JIT-compiled code and singleton classes: code that `eval`s a *new* string or
   `extend`s objects on every request grows memory (compiled `eval` units are cached by source
   and packed into shared code pages, so repeated or boot-time evals stay cheap; `instance_exec`

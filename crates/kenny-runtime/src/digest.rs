@@ -183,9 +183,9 @@ fn init_instance(inst: *mut Class) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(()) => return UNDEF,
         };
-        match std::fs::read(&path) {
+        match crate::vfs::read_file(path.as_bytes()) {
             Ok(b) => {
-                tri!(send1(s, "update", bin_str(b)));
+                tri!(send1(s, "update", bin_str(b.into_owned())));
                 s
             }
             Err(_) => {

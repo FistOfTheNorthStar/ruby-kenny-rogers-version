@@ -46,6 +46,7 @@ pub mod string;
 pub mod strscan;
 pub mod svec;
 pub mod thread;
+pub mod vfs;
 pub mod visibility;
 pub mod yaml;
 pub mod zlib;

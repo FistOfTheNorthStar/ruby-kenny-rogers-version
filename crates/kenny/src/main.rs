@@ -4,12 +4,13 @@
 //!   kenny run app.rb [args...]
 
 mod bundle;
+mod embed;
 
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
 const USAGE: &str = "usage:
-  kenny build <file.rb> [-o <output>] [-I <dir>]... [--ext <dir>]...
+  kenny build <file.rb> [-o <output>] [-I <dir>]... [--ext <dir>]... [--embed <dir> | --no-embed]
   kenny run <file.rb> [-I <dir>]... [--ext <dir>]... [-- args...]
   kenny --version
 
@@ -17,7 +18,13 @@ const USAGE: &str = "usage:
                 (with a Gemfile.lock next to the program, or in a parent directory, the
                 locked gems are found automatically; groups in BUNDLE_WITHOUT, by default
                 development:test, are left out)
-  --ext <dir>   compile a C extension (its *.c files) into the binary; `require \"name\"` runs Init_name";
+  --ext <dir>   compile a C extension (its *.c files) into the binary; `require \"name\"` runs Init_name
+  --embed <dir> embed the files of <dir> (the app's directory) and of the compiled gems'
+                directories in the binary, so it runs without them; the default for a
+                config.ru is its directory. At runtime the binary reads those files from
+                itself; everything else under <dir> (database, log/, tmp/) is in the
+                directory it is started in (or $KENNY_APP_ROOT)
+  --no-embed    don't embed files: read them from where they are at build time";
 
 const RUBY_H: &str = include_str!("../../../include/ruby.h");
 const CAPI_SHIM: &str = include_str!("../../../include/kenny_capi.c");
@@ -143,10 +150,15 @@ struct Opts {
     load_paths: Vec<PathBuf>,
     exts: Vec<PathBuf>,
     run_args: Vec<String>,
+    /// Some(dir): embed dir; None with no_embed false: the default (a config.ru's directory)
+    embed: Option<PathBuf>,
+    no_embed: bool,
+    /// `kenny run`: build into a temporary file and run it (no build chatter)
+    running: bool,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
-    let mut o = Opts { src: PathBuf::new(), out: None, load_paths: Vec::new(), exts: Vec::new(), run_args: Vec::new() };
+    let mut o = Opts { src: PathBuf::new(), out: None, load_paths: Vec::new(), exts: Vec::new(), run_args: Vec::new(), embed: None, no_embed: false, running: false };
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -163,6 +175,14 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--ext" => {
                 o.exts.push(PathBuf::from(next(i)?));
                 i += 2;
+            }
+            "--embed" => {
+                o.embed = Some(PathBuf::from(next(i)?));
+                i += 2;
+            }
+            "--no-embed" => {
+                o.no_embed = true;
+                i += 1;
             }
             "--" => {
                 o.run_args.extend(args[i + 1..].iter().cloned());
@@ -371,6 +391,15 @@ fn build(o: &Opts, out: &Path) -> Result<bool, String> {
             objs.push(assets_stub(&work)?);
         }
         let rt = runtime_lib(compiled.needs_jit)?;
+        // A Rails app precompiles its own assets (the program with the asset compilers linked
+        // in) before its files are embedded, so the binary carries the fresh ones.
+        if assets && !o.running {
+            if let Some(reason) = precompile_reason(o)? {
+                link(&objs, &rt, out)?;
+                precompile_assets(o, out, reason)?;
+            }
+        }
+        objs.extend(embed_files(o, &opts, out, &work)?);
         link(&objs, &rt, out)
     })();
     let _ = std::fs::remove_dir_all(&work);
@@ -408,20 +437,21 @@ fn newest_mtime(p: &Path, newest: &mut Option<std::time::SystemTime>) {
     }
 }
 
-/// After `kenny build` of a Rails app that uses the asset pipeline (sassc/execjs gems and an
-/// app/assets directory next to config.ru): when public/assets has no Sprockets manifest, or
-/// the app's assets, Gemfile.lock or asset config are newer than it, run the new binary with
-/// KENNY_ASSETS_PRECOMPILE=1 to precompile them (`rails assets:precompile`, without Ruby).
+/// During `kenny build` of a Rails app that uses the asset pipeline (sassc/execjs gems and an
+/// app/assets directory next to config.ru): why its assets need precompiling, if they do —
+/// public/assets has no Sprockets manifest, or the app's assets, Gemfile.lock or asset config
+/// are newer than it. The build then runs the linked program with KENNY_ASSETS_PRECOMPILE=1
+/// (`rails assets:precompile`, without Ruby) before embedding the app's files.
 /// KENNY_PRECOMPILE=1 always precompiles, KENNY_PRECOMPILE=0 never.
-fn precompile_assets(o: &Opts, bin: &Path, linked: bool) -> Result<(), String> {
+fn precompile_reason(o: &Opts) -> Result<Option<&'static str>, String> {
     let force = std::env::var("KENNY_PRECOMPILE").ok();
-    if force.as_deref() == Some("0") || !linked {
-        return Ok(());
+    if force.as_deref() == Some("0") {
+        return Ok(None);
     }
     let src = std::fs::canonicalize(&o.src).map_err(|e| format!("{}: {e}", o.src.display()))?;
     let root = src.parent().unwrap_or(Path::new(".")).to_path_buf();
     if !root.join("app/assets").is_dir() || !root.join("config/application.rb").is_file() {
-        return Ok(());
+        return Ok(None);
     }
     let out_dir = root.join("public/assets");
     let manifest = std::fs::read_dir(&out_dir).ok().and_then(|rd| {
@@ -441,7 +471,14 @@ fn precompile_assets(o: &Opts, bin: &Path, linked: bool) -> Result<(), String> {
             }
         }
     };
-    let Some(reason) = reason else { return Ok(()) };
+    Ok(reason)
+}
+
+/// Run the just-linked binary `bin` with KENNY_ASSETS_PRECOMPILE=1 in the app directory.
+fn precompile_assets(o: &Opts, bin: &Path, reason: &str) -> Result<(), String> {
+    let src = std::fs::canonicalize(&o.src).map_err(|e| format!("{}: {e}", o.src.display()))?;
+    let root = src.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let out_dir = root.join("public/assets");
     if std::env::var_os("KENNY_QUIET").is_none() {
         eprintln!("kenny: precompiling assets into {} ({reason})", out_dir.display());
     }
@@ -485,6 +522,41 @@ fn assets_stub(work: &Path) -> Result<PathBuf, String> {
     Ok(obj)
 }
 
+/// The app directory to embed: --embed, or a config.ru's directory (see `embed.rs`).
+fn app_root(o: &Opts) -> Option<PathBuf> {
+    if o.no_embed || std::env::var_os("KENNY_NO_EMBED").is_some() {
+        return None;
+    }
+    if let Some(d) = &o.embed {
+        return Some(d.clone());
+    }
+    if o.src.file_name().is_some_and(|n| n == "config.ru") {
+        let dir = o.src.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        return Some(dir.to_path_buf());
+    }
+    None
+}
+
+/// Embed the app's files and the gems' directories; returns the object file holding them.
+fn embed_files(o: &Opts, opts: &kenny_compiler::Options, out: &Path, work: &Path) -> Result<Vec<PathBuf>, String> {
+    let Some(root) = app_root(o) else { return Ok(vec![]) };
+    let mut dirs = opts.embed_dirs.clone();
+    dirs.extend(opts.dep_dirs.iter().cloned());
+    let image = work.join("embedded-files.bin");
+    let e = embed::write_image(&root, &dirs, &[out.to_path_buf()], &image)?;
+    if std::env::var_os("KENNY_QUIET").is_none() && !o.running {
+        eprintln!("kenny: embedded {} files ({:.1} MB) from {} and the gems' directories", e.files, e.bytes as f64 / 1048576.0, root.display());
+    }
+    let c = work.join("kenny_embedded_files.c");
+    std::fs::write(&c, embed::image_c_source(&image, e.bytes as u64)).map_err(|e| e.to_string())?;
+    let obj = work.join("kenny_embedded_files.o");
+    let r = cc().args(["-c", "-O0", "-w"]).arg(&c).arg("-o").arg(&obj).output().map_err(|e| format!("failed to run the C compiler: {e}"))?;
+    if !r.status.success() {
+        return Err(format!("embedding files failed:\n{}", String::from_utf8_lossy(&r.stderr)));
+    }
+    Ok(vec![obj])
+}
+
 fn link(objs: &[PathBuf], rt: &Path, out: &Path) -> Result<(), String> {
     let mut c = cc();
     c.arg("-o").arg(out).args(objs).arg(rt);
@@ -512,8 +584,7 @@ fn main() {
         Some("build") => {
             let o = parse(&args[2..]).unwrap_or_else(|e| fail(e));
             let out = o.out.clone().unwrap_or_else(|| PathBuf::from(o.src.file_stem().unwrap_or_default()));
-            let assets = build(&o, &out).unwrap_or_else(|e| fail(e));
-            precompile_assets(&o, &out, assets).unwrap_or_else(|e| fail(e));
+            build(&o, &out).unwrap_or_else(|e| fail(e));
         }
         Some("check") => {
             // compile only (no linking): report compile errors/warnings for one file
@@ -534,7 +605,8 @@ fn main() {
             }
         }
         Some("run") => {
-            let o = parse(&args[2..]).unwrap_or_else(|e| fail(e));
+            let mut o = parse(&args[2..]).unwrap_or_else(|e| fail(e));
+            o.running = true;
             let dir = std::env::temp_dir().join(format!("kenny-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             let out = dir.join(o.src.file_stem().unwrap_or_default());

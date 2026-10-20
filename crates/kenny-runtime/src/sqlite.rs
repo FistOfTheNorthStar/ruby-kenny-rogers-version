@@ -575,11 +575,19 @@ fn open_v2(s: V, a: &[V]) -> V {
         unsafe { sqlite3_close_v2(d.db) };
         d.db = std::ptr::null_mut();
     }
-    let path = cstring(&rstr(file).b);
+    let path = cstring(&db_path(&rstr(file).b));
     let status = unsafe { ffi::sqlite3_open_v2(path.as_ptr(), &mut d.db, mode, vfs.as_ref().map_or(std::ptr::null(), |v| v.as_ptr())) };
     after_open(d);
     tri!(check(d.db, status));
     s
+}
+/// The real file of a database path (crate::vfs: under the app's directory it lives in the
+/// run directory; an embedded database is copied there first).
+fn db_path(p: &[u8]) -> Vec<u8> {
+    if p.is_empty() || p == b":memory:" || p.starts_with(b"file:") {
+        return p.to_vec();
+    }
+    crate::vfs::write_path(p)
 }
 /// The bundled library defaults foreign keys to ON; the gem's (and SQLite's) default is OFF.
 fn after_open(d: &mut Db) {
@@ -743,7 +751,7 @@ fn init_database(m: *mut Class) {
         // Kenny strings are UTF-8 (or binary); open the path as given.
         let file = tri!(string_value(a[0]));
         let d = db_of(s);
-        let path = cstring(&rstr(file).b);
+        let path = cstring(&db_path(&rstr(file).b));
         let status = unsafe { ffi::sqlite3_open(path.as_ptr(), &mut d.db) };
         after_open(d);
         tri!(check(d.db, status));
