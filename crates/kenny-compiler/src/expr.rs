@@ -583,8 +583,12 @@ impl<M: Module> Compiler<M> {
                 }
             }
             Node::AliasGlobalVariableNode { .. } => {
-                self.unsupported(fx, at, "global variable aliases are not supported by Kenny");
-                self.nil(fx)
+                let a = node.as_alias_global_variable_node().unwrap();
+                let new = a.new_name().location().as_slice().to_vec();
+                let old = a.old_name().location().as_slice().to_vec();
+                let nv = self.sym_val(fx, &new);
+                let ov = self.sym_val(fx, &old);
+                self.call(fx, "kn_gvar_alias", &[nv, ov])
             }
             Node::UndefNode { .. } => {
                 let u = node.as_undef_node().unwrap();

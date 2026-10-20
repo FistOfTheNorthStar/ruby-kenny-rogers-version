@@ -80,7 +80,30 @@ pub fn inspect_lossy(v: V) -> String {
 pub fn any_to_s(v: V) -> String {
     format!("#<{}:0x{:016x}>", class_name(real_class(v)), v)
 }
+thread_local! {
+    /// Objects whose `inspect` is running on this thread (Ruby's recursion guard: an object
+    /// that contains itself prints as `#<Foo ...>`, `[...]`, `{...}`).
+    static INSPECTING: std::cell::RefCell<Vec<V>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+fn guarded(v: V, on_cycle: impl FnOnce() -> String, f: impl FnOnce() -> Result<String, ()>) -> Result<String, ()> {
+    if INSPECTING.with(|s| s.borrow().contains(&v)) {
+        return Ok(on_cycle());
+    }
+    INSPECTING.with(|s| s.borrow_mut().push(v));
+    let r = f();
+    INSPECTING.with(|s| {
+        let mut s = s.borrow_mut();
+        if let Some(i) = s.iter().rposition(|x| *x == v) {
+            s.remove(i);
+        }
+    });
+    r
+}
+
 pub fn obj_inspect(v: V) -> Result<String, ()> {
+    guarded(v, || format!("#<{}:0x{:016x} ...>", class_name(real_class(v)), v), || obj_inspect_inner(v))
+}
+fn obj_inspect_inner(v: V) -> Result<String, ()> {
     let ivs = ivar_list(v);
     let mut s = format!("#<{}:0x{:016x}", class_name(real_class(v)), v);
     for (i, (name, val)) in ivs.iter().enumerate() {
@@ -181,6 +204,9 @@ fn is_ident(s: &str) -> bool {
 
 /// Ruby 3.4 style hash key: `name: 1`, `"str" => 1`
 pub fn hash_inspect(v: V) -> Result<String, ()> {
+    guarded(v, || "{...}".into(), || hash_inspect_inner(v))
+}
+fn hash_inspect_inner(v: V) -> Result<String, ()> {
     let h = rhash(v);
     if h.m.is_empty() {
         return Ok("{}".into());
@@ -204,6 +230,9 @@ pub fn hash_inspect(v: V) -> Result<String, ()> {
 }
 
 pub fn ary_inspect(v: V) -> Result<String, ()> {
+    guarded(v, || "[...]".into(), || ary_inspect_inner(v))
+}
+fn ary_inspect_inner(v: V) -> Result<String, ()> {
     let mut s = String::from("[");
     let items = rary(v).v.clone();
     for (i, x) in items.iter().enumerate() {

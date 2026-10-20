@@ -183,6 +183,8 @@ pub enum EvalMode {
     Eval,
     /// Module#class_eval: a class body with self = the module.
     ClassEval,
+    /// `load` of a source file at runtime: a top-level file body named `file`.
+    File,
 }
 
 pub struct JitUnit {
@@ -208,8 +210,9 @@ pub fn compile(src: &[u8], mode: EvalMode, file: &str, symbols: &[(&'static str,
     let path = Path::new(file);
     let mut c = Compiler::with_module(module, path, src)?;
     c.eval_unit = true;
+    c.file_unit = mode == EvalMode::File;
     let kind = match mode {
-        EvalMode::Eval => ScopeKind::Top,
+        EvalMode::Eval | EvalMode::File => ScopeKind::Top,
         EvalMode::ClassEval => ScopeKind::Class,
     };
     let fid = c.compile_unit(src, path, kind);

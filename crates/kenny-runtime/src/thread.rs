@@ -96,14 +96,21 @@ struct GFiber {
 struct Parker {
     m: Mutex<bool>,
     cv: Condvar,
+    /// Set while the P's loop waits in its own poller instead (the HTTP server's event
+    /// loop): wakes that poller when the P gets work (a new thread, a thread woken up).
+    hook: Mutex<Option<WakeHook>>,
 }
+type WakeHook = Box<dyn Fn() + Send + Sync>;
 impl Parker {
     fn new() -> Self {
-        Parker { m: Mutex::new(false), cv: Condvar::new() }
+        Parker { m: Mutex::new(false), cv: Condvar::new(), hook: Mutex::new(None) }
     }
     fn unpark(&self) {
         *self.m.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.cv.notify_one();
+        if let Some(h) = &*self.hook.lock().unwrap_or_else(|e| e.into_inner()) {
+            h();
+        }
     }
     /// Wait until unparked (or the timeout); counts as idle for the GC.
     fn park(&self, timeout: Option<Duration>) {
@@ -819,6 +826,17 @@ pub fn sleep(d: Option<Duration>) -> V {
         Wake::Interrupted => UNDEF,
         _ => QNIL,
     }
+}
+
+/// The current P's loop blocks in its own poller (the HTTP server): `wake` must interrupt
+/// that wait whenever another P hands this one work, since `idle_timeout` may have been None.
+pub fn set_wake_hook(wake: Box<dyn Fn() + Send + Sync>) {
+    if !active() {
+        return;
+    }
+    let idx = pt().idx;
+    let pk = locked!(s => s.ps[idx].parker.clone());
+    *pk.hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake);
 }
 
 /// How long an IO loop may block waiting for events (None = forever: no other threads on

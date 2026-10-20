@@ -39,6 +39,7 @@ const OVERLAY: &[(&str, &str)] = &[
     ("bootsnap/setup.rb", include_str!("../../../lib/kenny/bootsnap/setup.rb")),
     ("ffi.rb", include_str!("../../../lib/kenny/ffi.rb")),
     ("socket.rb", include_str!("../../../lib/kenny/socket.rb")),
+    ("nio.rb", include_str!("../../../lib/kenny/nio.rb")),
     ("pp.rb", include_str!("../../../lib/kenny/pp.rb")),
     ("yaml.rb", include_str!("../../../lib/kenny/yaml.rb")),
     ("psych.rb", include_str!("../../../lib/kenny/psych.rb")),

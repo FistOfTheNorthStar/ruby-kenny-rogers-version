@@ -268,9 +268,18 @@ pub unsafe extern "C" fn kn_super(owner_slot: *const V, self_: V, mid: V, argc: 
         if sym_str(sym_id(mid)) == "respond_to_missing?" {
             return QFALSE;
         }
+        // like Ruby: a missing superclass method goes to method_missing (SimpleDelegator
+        // subclasses rely on it: `def path = super.spec.to_s` in Rails' RouteWrapper)
+        let mm = find_method(class_of(self_), sym("method_missing"));
+        if !mm.is_null() && !matches!(unsafe { &(*mm).body }, Body::Native(..)) {
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(mid);
+            a.extend_from_slice(args);
+            return invoke(mm, self_, &a, blk);
+        }
         return raise(
             rt().c.no_method_error,
-            &format!("super: no superclass method '{}' for {}", sym_str(sym_id(mid)), crate::fmt::inspect_lossy(self_)),
+            &format!("super: no superclass method '{}' for {}", sym_str(sym_id(mid)), describe_recv(self_)),
         );
     }
     invoke(m, self_, args, blk)
@@ -505,19 +514,55 @@ pub unsafe extern "C" fn kn_ivar_set(self_: V, id: V, val: V, cache: *mut IvCach
     }
     ivar_set(self_, sym_id(id), val)
 }
+/// `alias $new $old` (English.rb and friends): new name -> resolved old name.
+static GV_ALIASES: std::sync::RwLock<Vec<(u32, u32)>> = std::sync::RwLock::new(Vec::new());
+static GV_HAS_ALIASES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn gvar_resolve(id: u32) -> u32 {
+    if !GV_HAS_ALIASES.load(std::sync::atomic::Ordering::Acquire) {
+        return id;
+    }
+    let a = GV_ALIASES.read().unwrap_or_else(|e| e.into_inner());
+    a.iter().find(|(n, _)| *n == id).map(|(_, o)| *o).unwrap_or(id)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_gvar_alias(new: V, old: V) -> V {
+    let (n, o) = (sym_id(new), gvar_resolve(sym_id(old)));
+    if n != o {
+        let mut a = GV_ALIASES.write().unwrap_or_else(|e| e.into_inner());
+        a.retain(|(x, _)| *x != n);
+        // names that pointed at `new` follow it to `old`
+        for e in a.iter_mut() {
+            if e.1 == n {
+                e.1 = o;
+            }
+        }
+        a.push((n, o));
+        GV_HAS_ALIASES.store(true, std::sync::atomic::Ordering::Release);
+    }
+    QNIL
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_gvar_get(id: V) -> V {
+    let id = gvar_resolve(sym_id(id));
     // `$~` and `$!` belong to the running thread
-    match sym_name(sym_id(id)) {
+    match sym_name(id) {
         b"$~" => return pst().last_match,
         b"$!" => return pst().errinfo,
+        b"$@" => {
+            let e = pst().errinfo;
+            return if e == QNIL { QNIL } else { send0(e, "backtrace") };
+        }
+        b"$&" => return crate::regex::kn_backref(b'&' as u64),
+        b"$`" => return crate::regex::kn_backref(b'`' as u64),
+        b"$'" => return crate::regex::kn_backref(b'\'' as u64),
+        b"$+" => return crate::regex::kn_backref(b'+' as u64),
         _ => {}
     }
-    rt().gvars.get(&sym_id(id)).copied().unwrap_or(QNIL)
+    rt().gvars.get(&id).copied().unwrap_or(QNIL)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_gvar_set(id: V, v: V) -> V {
-    rt().gvars.insert(sym_id(id), v);
+    rt().gvars.insert(gvar_resolve(sym_id(id)), v);
     v
 }
 fn cvar_base(c: *mut Class) -> *mut Class {
@@ -1331,7 +1376,7 @@ pub extern "C" fn kn_ivar_defined(self_: V, id: V) -> u64 {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_gvar_defined(id: V) -> u64 {
-    rt().gvars.contains_key(&sym_id(id)) as u64
+    rt().gvars.contains_key(&gvar_resolve(sym_id(id))) as u64
 }
 
 // ---------- misc helpers used by compiled code ----------

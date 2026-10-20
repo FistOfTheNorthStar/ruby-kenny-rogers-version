@@ -437,7 +437,10 @@ impl IoState {
         let old = self.rbuf.len();
         self.rbuf.resize(old + (1 << 16), 0);
         loop {
-            let n = unsafe { libc::read(self.fd, self.rbuf[old..].as_mut_ptr() as *mut c_void, 1 << 16) };
+            // a pipe, socket or terminal may block indefinitely: let collections run meanwhile
+            // (this thread touches no Ruby objects until the read returns)
+            let (fd, buf) = (self.fd, self.rbuf[old..].as_mut_ptr() as usize);
+            let n = crate::gc::blocking(|| unsafe { libc::read(fd, buf as *mut c_void, 1 << 16) });
             if n < 0 {
                 let e = errno();
                 if e == libc::EINTR {
@@ -446,7 +449,7 @@ impl IoState {
                 self.rbuf.truncate(old);
                 if e == libc::EAGAIN {
                     let mut p = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
-                    unsafe { libc::poll(&mut p, 1, -1) };
+                    crate::gc::blocking(|| unsafe { libc::poll(&mut p, 1, -1) });
                     self.rbuf.resize(old + (1 << 16), 0);
                     continue;
                 }
@@ -3018,7 +3021,12 @@ pub fn init() {
                     None => -1,
                 }
             };
-            let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, wait_ms) };
+            let n = if wait_ms == 0 {
+                unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) }
+            } else {
+                // waiting (no other thread on this P): collections must not wait for us
+                crate::gc::blocking(|| unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, wait_ms) })
+            };
             if n > 0 {
                 for (i, p) in pfds.iter().enumerate() {
                     if p.revents != 0 {

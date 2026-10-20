@@ -92,6 +92,7 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_respond_to", kenny_runtime::abi::kn_respond_to as *const u8),
         ("kn_ivar_defined", kenny_runtime::abi::kn_ivar_defined as *const u8),
         ("kn_gvar_defined", kenny_runtime::abi::kn_gvar_defined as *const u8),
+        ("kn_gvar_alias", kenny_runtime::abi::kn_gvar_alias as *const u8),
         ("kn_eq", kenny_runtime::abi::kn_eq as *const u8),
         ("kn_regexp_lit", kenny_runtime::regex::kn_regexp_lit as *const u8),
         ("kn_regexp_new", kenny_runtime::regex::kn_regexp_new as *const u8),
@@ -178,6 +179,40 @@ fn eval_hook(src: &[u8], mode: u8, self_: V) -> V {
     unsafe { f(self_, 0, std::ptr::null(), QNIL) }
 }
 
+/// `load` / `require` of a source file at runtime (changed since the build, or not compiled in).
+fn load_hook(src: &[u8], path: &str) -> V {
+    let guard = COMPILE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = CACHE.get().get_or_insert_with(HashMap::new);
+    let mut k = path.as_bytes().to_vec();
+    k.push(0);
+    k.extend_from_slice(src);
+    let key = (2u8, k);
+    let f = match cache.get(&key) {
+        Some(f) => *f,
+        None => {
+            if std::env::var_os("KENNY_DEBUG_EVAL").is_some() {
+                eprintln!("[load] compiling {path} ({} bytes)", src.len());
+            }
+            match jit::compile(src, EvalMode::File, path, SYMS.get()) {
+                Ok(unit) => {
+                    install(&unit);
+                    let f: CompiledFn = unsafe { std::mem::transmute(unit.entry) };
+                    cache.insert(key, f);
+                    f
+                }
+                Err(e) => {
+                    drop(guard);
+                    let c = const_lookup(rt().c.object, sym("SyntaxError")).map(|c| c as *mut Class).unwrap_or(rt().c.script_error);
+                    return raise(c, &e);
+                }
+            }
+        }
+    };
+    drop(guard);
+    let r = unsafe { f(rt().main_obj, 0, std::ptr::null(), QNIL) };
+    if r == UNDEF { UNDEF } else { QTRUE }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_start_jit(
     argc: i32,
@@ -192,6 +227,7 @@ pub unsafe extern "C" fn kn_start_jit(
 ) -> i32 {
     *SYMS.get() = symbols();
     *kenny_runtime::kernel::EVAL_HOOK.get() = Some(eval_hook);
+    *kenny_runtime::compat::LOAD_HOOK.get() = Some(load_hook);
     unsafe { kenny_runtime::abi::kn_start(argc, argv, symnames, nsyms, symtab, toplevel, script, caches, cache_words) }
 }
 
