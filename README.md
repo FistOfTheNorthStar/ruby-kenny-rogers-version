@@ -20,8 +20,10 @@ cargo build --release
     $(ruby tools/gem-paths.rb actionpack 5.2.8.1) $(ruby tools/gem-paths.rb activerecord 5.2.8.1) \
     $(ruby tools/gem-paths.rb sqlite3 1.7.3) && ./rails_api_ar
 
-# a whole generated Rails 5.2 app (`rails new` + a scaffold); its gems come from its Gemfile.lock
-(cd examples/blog && RAILS_ENV=production SECRET_KEY_BASE=x bundle exec rails db:migrate assets:precompile)
+# a whole generated Rails 5.2 app (`rails new` + a scaffold); its gems come from its Gemfile.lock.
+# `kenny build` also precompiles its assets (Sass, CoffeeScript, Uglifier) into public/assets,
+# then embeds the app's files (views, config, public/) in the binary
+(cd examples/blog && RAILS_ENV=production SECRET_KEY_BASE=x bundle exec rails db:migrate)
 ./target/release/kenny build examples/blog/config.ru -o blog
 (cd examples/blog && RAILS_ENV=production RAILS_SERVE_STATIC_FILES=1 SECRET_KEY_BASE=$(openssl rand -hex 64) ../../blog)
 ruby examples/blog/compare.rb blog   # the same session against Puma and the binary: identical
@@ -34,6 +36,24 @@ system Ruby's `Gem.path`, `~/.gem`, rvm, rbenv) and compiles them in; groups lis
 `Bundler.require(*Rails.groups)` work in the binary. Without a lock file, `-I` adds load paths:
 `tools/gem-paths.rb NAME VERSION` prints the `-I` flags for an installed gem and its
 dependencies. Every file in those directories is compiled into the binary.
+
+A Rack app's binary is self-contained: `kenny build` also embeds the app's directory (views,
+`config/`, locales, `public/` with the precompiled assets) and every compiled gem's directory,
+compressed (4 MB for `examples/blog`). Runtime data is left out: `log/`, `tmp/`,
+`node_modules/`, `storage/`, SQLite databases, and `config/master.key` (give it as
+`RAILS_MASTER_KEY` or a file on the server). To deploy, copy the binary and start it in the
+directory that holds its data:
+
+```
+mkdir -p /srv/blog/db && cp blog /srv/blog/ && cp examples/blog/db/production.sqlite3 /srv/blog/db/
+cd /srv/blog && RAILS_ENV=production RAILS_SERVE_STATIC_FILES=1 SECRET_KEY_BASE=... ./blog
+```
+
+Embedded files are always read from the binary, as they were at build time. Everything else
+under the app's directory (the database, `log/`, `tmp/`, uploads) lives in the directory the
+binary was started in, or in `$KENNY_APP_ROOT`. Started inside its build directory (or above
+it), the binary uses the build directory itself. Writing to an embedded file first copies it
+there. `--embed <dir>` embeds a directory for any program; `--no-embed` turns embedding off.
 
 ## How it works
 
@@ -99,16 +119,25 @@ Working:
   quick-xml underneath, its own XPath 1.0 engine, and nokogiri's Ruby layer on top), so loofah and
   the Rails HTML sanitizers work without libxml2. The `sqlite3` gem's C extension is native
   too (on the bundled SQLite library); the gem's own Ruby files load on top of it.
+- **Asset pipeline without Ruby or Node:** the `sassc` gem's API runs on a native Sass
+  compiler ([grass](https://github.com/connorskees/grass)), with Sass functions such as
+  `asset-path` calling back into Ruby, and ExecJS runs on an embedded JavaScript engine
+  ([QuickJS](https://github.com/quickjs-ng/quickjs)), so `uglifier` and `coffee-script` work
+  in-process. `kenny build` of a Rails app with app/assets precompiles its assets (what
+  `rails assets:precompile` does, run by the new binary itself) when public/assets has no
+  manifest or the assets changed; `KENNY_PRECOMPILE=1` forces it, `=0` skips it. The blog's
+  JavaScript comes out byte-identical to Ruby's; its CSS differs only in whitespace. Both are
+  linked only into programs that use those gems.
 - **Rails:** a whole generated Rails 5.2 application boots and serves production traffic:
   `examples/blog` is `rails new` plus a scaffold, unchanged (Railties boot, Bundler, every
   framework of `rails/all`, initializers, eager loading of `app/`, the scaffold's HTML forms with
   CSRF protection, its jbuilder JSON views, sessions, flash, the 404/422/500 pages and
-  precompiled assets served by ActionDispatch::Static). `examples/blog/compare.rb` runs the same
+  its assets, precompiled by Kenny and served by ActionDispatch::Static). `examples/blog/compare.rb` runs the same
   24-request session against Puma and the binary: the responses are identical. Smaller examples,
   with output identical to Ruby's:
   `examples/rails_api` (ActionController::API, routing, params, JSON),
   `examples/rails_html` (ActionController::Base with ERB layouts, partials and view helpers;
-  templates are read at runtime and compiled once by the embedded JIT), and
+  templates are embedded in the binary, read at runtime and compiled once by the embedded JIT), and
   `examples/rails_api_ar` (below).
   ActiveRecord 5.2 works with the SQLite adapter (migrations/schema, associations, validations,
   scopes, transactions, eager loading): `examples/rails_api_ar` is a JSON API backed by it.
@@ -126,13 +155,10 @@ Working:
   (`rack.multithread` is true); `WEB_CONCURRENCY=n` forks n processes instead.
 
 Not yet:
-- Compiling assets in the binary (Sprockets with sass/coffee/uglifier needs libsass through FFI
-  and a JavaScript runtime): precompile them with Ruby (`rails assets:precompile`); serving
-  them works. Rails' development mode (code reloading, `listen`) and Action Cable's
-  WebSocket server are untested; production mode is the target.
-- A self-contained deployment: the binary contains all Ruby code, but reads the app's
-  non-Ruby files (views, `config/*.yml`, locales, `public/`) and the gems' locale files from
-  where they were at build time.
+- Sass source maps, and sassc-rails' ERB (`.scss.erb`) and glob (`@import "dir/*"`) imports:
+  imports are resolved by the Sass compiler on the load paths.
+- Rails' development mode (code reloading, `listen`) and Action Cable's WebSocket server are
+  untested; production mode is the target.
 - Freeing JIT-compiled code and singleton classes: code that `eval`s a *new* string or
   `extend`s objects on every request grows memory (compiled `eval` units are cached by source
   and packed into shared code pages, so repeated or boot-time evals stay cheap; `instance_exec`
@@ -187,6 +213,6 @@ by `eval`/`class_eval`; an uncaught exception and a failed request print the ful
 ## Roadmap
 
 1. Moving threads between cores (work stealing) and non-blocking file/SQLite IO
-2. Less memory per core (shared caches, returning idle pages sooner); assets compiled in the binary
+2. Less memory per core (shared caches, returning idle pages sooner)
 3. Direct calls between compiled methods (guarded by the inline cache) and inlining of small methods
 4. Precise stack maps (Cranelift) for compiled frames, the first step towards a compacting GC

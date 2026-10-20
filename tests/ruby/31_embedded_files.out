@@ -1,0 +1,25 @@
+[true, true, true, false]
+"title: Kenny\nitems:\n  - fast\n  - native\n"
+[["title", "Kenny"], ["items", ["fast", "native"]]]
+[42, false, true, false]
+["<h1><%= title %></h1>", "line two", "line three"]
+[22, 9, 11]
+["config", "config/app.yml", "views", "views/pages", "views/pages/_item.html.erb", "views/pages/show.html.erb"]
+["views/pages/_item.html.erb", "views/pages/show.html.erb"]
+["_item.html.erb", "show.html.erb"]
+[".", "..", "_item.html.erb", "show.html.erb"]
+["app.yml"]
+[true, false, "directory", true]
+true
+true
+"<h1><%= title %></h1>\n"
+22
+"<%= t"
+"three\n"
+3
+[42, 42, true]
+"<h1><%= title %></h1>\nline two\nline three\n"
+true
+["pages", "pages/_item.html.erb", "pages/show.html.erb"]
+"partial\n"
+true

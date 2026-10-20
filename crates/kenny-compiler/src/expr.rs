@@ -496,7 +496,7 @@ impl<M: Module> Compiler<M> {
                 let n = node.as_constant_read_node().unwrap();
                 let crefp = self.slot_ptr(fx, fx.cref_slot);
                 let s = self.sym_val(fx, n.name().as_slice());
-                let cache = self.cache_ptr(fx, 3);
+                let cache = self.owned_cache_ptr(fx, OWNED_CONST);
                 self.callc(fx, "kn_const_get_l", &[cache, crefp, s])
             }
             Node::ConstantPathNode { .. } => {

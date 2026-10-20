@@ -199,6 +199,16 @@ fn report(prefix: &str) {
 /// Called after the program's top level ran. Returns an exit code if a server ran.
 pub fn maybe_serve() -> Option<i32> {
     let mut app = (*APP.get())?;
+    // `kenny build` precompiles a Rails app's assets with the app's own binary: the app is
+    // loaded, then lib/kenny/kenny/assets_precompile.rb runs instead of the server
+    if std::env::var_os("KENNY_ASSETS_PRECOMPILE").is_some() {
+        let r = send(rt().main_obj, sym("require"), &[str_from("kenny/assets_precompile")], QNIL);
+        if r == UNDEF || !matches!(pst().pending, Throw::None) {
+            report("assets:precompile failed");
+            return Some(1);
+        }
+        return Some(0);
+    }
     for (mw, args, blk) in MIDDLEWARE.get().clone().into_iter().rev() {
         let mut a = vec![app];
         a.extend(args);

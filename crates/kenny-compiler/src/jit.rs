@@ -13,8 +13,10 @@ use std::sync::{Mutex, OnceLock};
 // unit is written into it, so a page holding finished code is never made non-executable:
 // on Apple Silicon code chunks are MAP_JIT and only the compiling thread switches to write
 // mode (pthread_jit_write_protect_np); elsewhere a new unit starts on a fresh page.
-// Compilation itself is serialised by the caller. Unit memory is never freed (units are
-// cached for the program's life).
+// Compilation itself is serialised by the caller. A unit's memory is returned with
+// `free_unit` once the runtime knows nothing can run it any more (see the eval cache in
+// kenny-runtime-jit); freed ranges are reused by later units (code ranges only where pages
+// stay writable for the compiling thread, i.e. MAP_JIT on Apple Silicon).
 
 const CHUNK: usize = 256 << 10;
 
@@ -24,6 +26,8 @@ struct Pool {
     pos: usize,
     /// (non-MAP_JIT code pools) everything below this is finished, read+execute code
     sealed: usize,
+    /// Freed ranges (start, len), sorted by address and coalesced.
+    free: Vec<(usize, usize)>,
 }
 
 const MAC_JIT: bool = cfg!(all(target_arch = "aarch64", target_os = "macos"));
@@ -59,6 +63,8 @@ struct SharedMemory {
     data: Pool,
     /// code written since the last finalize: (start, len)
     dirty: Vec<(usize, usize)>,
+    /// everything allocated for the unit being compiled: (start, len, is_code)
+    unit: Vec<(usize, usize, bool)>,
 }
 
 static SHARED: Mutex<Option<SharedMemory>> = Mutex::new(None);
@@ -105,7 +111,47 @@ fn flush_icache(start: usize, len: usize) {
 }
 
 impl Pool {
+    const fn new() -> Pool {
+        Pool { base: 0, len: 0, pos: 0, sealed: 0, free: Vec::new() }
+    }
+    /// First fit from the freed ranges.
+    fn alloc_freed(&mut self, size: usize, align: usize) -> Option<usize> {
+        for i in 0..self.free.len() {
+            let (start, len) = self.free[i];
+            let at = (start + align - 1) & !(align - 1);
+            if at + size <= start + len {
+                let (head, tail) = (at - start, start + len - (at + size));
+                self.free.remove(i);
+                if tail > 0 {
+                    self.free.insert(i, (at + size, tail));
+                }
+                if head > 0 {
+                    self.free.insert(i, (start, head));
+                }
+                return Some(at);
+            }
+        }
+        None
+    }
+    fn release(&mut self, start: usize, len: usize) {
+        let i = self.free.partition_point(|r| r.0 < start);
+        self.free.insert(i, (start, len));
+        // coalesce with the neighbours
+        if i + 1 < self.free.len() && self.free[i].0 + self.free[i].1 == self.free[i + 1].0 {
+            self.free[i].1 += self.free[i + 1].1;
+            self.free.remove(i + 1);
+        }
+        if i > 0 && self.free[i - 1].0 + self.free[i - 1].1 == self.free[i].0 {
+            self.free[i - 1].1 += self.free[i].1;
+            self.free.remove(i);
+        }
+    }
     fn alloc(&mut self, size: usize, align: usize, code: bool) -> std::io::Result<(usize, bool)> {
+        if !code || MAC_JIT {
+            if let Some(at) = self.alloc_freed(size, align) {
+                return Ok((at, false));
+            }
+        }
         let mut at = (self.base + self.pos + align - 1) & !(align - 1);
         if code && !MAC_JIT {
             at = at.max(self.sealed);
@@ -114,6 +160,9 @@ impl Pool {
         if self.base == 0 || at + size > self.base + self.len {
             let len = CHUNK.max((size + page_size() - 1) & !(page_size() - 1));
             self.base = if code { map_code(len)? } else { map_rw(len)? };
+            if std::env::var_os("KENNY_DEBUG_EVAL").is_some() {
+                eprintln!("[eval] new {} chunk of {} KB (free ranges: {}, {} KB)", if code { "code" } else { "data" }, len >> 10, self.free.len(), self.free.iter().map(|r| r.1).sum::<usize>() >> 10);
+            }
             self.len = len;
             self.pos = 0;
             at = self.base;
@@ -130,13 +179,10 @@ struct SharedJitMemory;
 impl JITMemoryProvider for SharedJitMemory {
     fn allocate(&mut self, size: usize, align: u64, kind: JITMemoryKind) -> std::io::Result<*mut u8> {
         let mut g = SHARED.lock().unwrap();
-        let s = g.get_or_insert_with(|| SharedMemory {
-            code: Pool { base: 0, len: 0, pos: 0, sealed: 0 },
-            data: Pool { base: 0, len: 0, pos: 0, sealed: 0 },
-            dirty: Vec::new(),
-        });
+        let s = g.get_or_insert_with(|| SharedMemory { code: Pool::new(), data: Pool::new(), dirty: Vec::new(), unit: Vec::new() });
         let align = (align as usize).max(16);
-        let size = size.max(1);
+        // whole 16-byte granules, so freed neighbours coalesce (no padding left between them)
+        let size = (size.max(1) + 15) & !15;
         match kind {
             JITMemoryKind::Executable => {
                 let (p, _fresh) = s.code.alloc(size, align, true)?;
@@ -145,10 +191,15 @@ impl JITMemoryProvider for SharedJitMemory {
                     jit_write_mode(true);
                 }
                 s.dirty.push((p, size));
+                s.unit.push((p, size, true));
                 Ok(p as *mut u8)
             }
             // read-only data stays writable: it is only ever written by the JIT itself
-            JITMemoryKind::Writable | JITMemoryKind::ReadOnly => Ok(s.data.alloc(size, align, false)?.0 as *mut u8),
+            JITMemoryKind::Writable | JITMemoryKind::ReadOnly => {
+                let p = s.data.alloc(size, align, false)?.0;
+                s.unit.push((p, size, false));
+                Ok(p as *mut u8)
+            }
         }
     }
 
@@ -197,6 +248,28 @@ pub struct JitUnit {
     /// label and file are offsets into `strs`
     pub debug: Vec<(usize, u32, u32, u32, Vec<(u32, u32)>)>,
     pub strs: *const u8,
+    /// The unit's memory: (start, len, is_code); see `free_unit`.
+    pub memory: Vec<(usize, usize, bool)>,
+    /// Cache slots holding runtime-allocated entries: (word offset into `caches`, kind).
+    pub owned_caches: Vec<(u32, u8)>,
+}
+
+/// Give a unit's memory back for reuse. Only when no thread can be running its code or
+/// reach its data (the caller's job), and with compilation serialised like `compile`.
+pub fn free_unit(memory: &[(usize, usize, bool)]) {
+    let mut g = SHARED.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    for &(p, len, code) in memory {
+        if code {
+            // (outside MAP_JIT the pages are read+execute for good: never reused)
+            if MAC_JIT {
+                s.code.release(p, len);
+            }
+        } else {
+            unsafe { std::ptr::write_bytes(p as *mut u8, 0, len) };
+            s.data.release(p, len);
+        }
+    }
 }
 
 /// Compile `src` into a native function `fn(self, argc, argv, blk) -> V`.
@@ -208,6 +281,9 @@ pub fn compile(src: &[u8], mode: EvalMode, file: &str, symbols: &[(&'static str,
     b.memory_provider(Box::new(SharedJitMemory));
     let module = JITModule::new(b);
     let path = Path::new(file);
+    if let Some(s) = SHARED.lock().unwrap().as_mut() {
+        s.unit.clear();
+    }
     let mut c = Compiler::with_module(module, path, src)?;
     c.eval_unit = true;
     c.file_unit = mode == EvalMode::File;
@@ -243,7 +319,10 @@ pub fn compile(src: &[u8], mode: EvalMode, file: &str, symbols: &[(&'static str,
         .into_iter()
         .map(|f| (c.module.get_finalized_function(f.id) as usize, f.size, f.label, f.file, f.calls))
         .collect();
+    let memory = SHARED.lock().unwrap().as_mut().map(|s| std::mem::take(&mut s.unit)).unwrap_or_default();
     let unit = JitUnit {
+        owned_caches: std::mem::take(&mut c.owned_caches),
+        memory,
         debug,
         strs: strs_ptr,
         entry,

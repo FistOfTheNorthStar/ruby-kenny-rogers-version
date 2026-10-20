@@ -13,7 +13,9 @@ struct Func {
     label: *const u8,
     file: *const u8,
     /// (return-address offset, line), sorted by offset; points into the compiled tables
+    /// (or, for eval units, a boxed copy: `owned`, freed by `unregister_jit`)
     calls: &'static [[u32; 2]],
+    owned: bool,
 }
 unsafe impl Send for Func {}
 unsafe impl Sync for Func {}
@@ -53,6 +55,7 @@ pub unsafe extern "C" fn kn_register_debug(fns: *const u8, n: u64, calls: *const
             label: unsafe { strs.add(f.label as usize) },
             file: unsafe { strs.add(f.file as usize) },
             calls: cs,
+            owned: false,
         });
     }
     t.sorted = false;
@@ -63,7 +66,7 @@ pub unsafe extern "C" fn kn_register_debug(fns: *const u8, n: u64, calls: *const
 pub fn register_jit(funcs: &[(usize, u32, u32, u32, Vec<(u32, u32)>)], strs: *const u8) {
     let mut t = TABLE.write().unwrap();
     for (addr, size, label, file, calls) in funcs {
-        // eval units live for the program's lifetime, and so does their table
+        // (only read with the table locked; freed when the unit is: `unregister_jit`)
         let cs: &'static [[u32; 2]] = Box::leak(calls.iter().map(|&(r, l)| [r, l]).collect::<Vec<_>>().into_boxed_slice());
         t.funcs.push(Func {
             start: *addr,
@@ -71,9 +74,26 @@ pub fn register_jit(funcs: &[(usize, u32, u32, u32, Vec<(u32, u32)>)], strs: *co
             label: unsafe { strs.add(*label as usize) },
             file: unsafe { strs.add(*file as usize) },
             calls: cs,
+            owned: true,
         });
     }
     t.sorted = false;
+}
+
+/// Forget eval-unit functions starting at these addresses (their code is being freed).
+pub fn unregister_jit(starts: &[usize]) {
+    let set: std::collections::HashSet<usize> = starts.iter().copied().collect();
+    let mut t = TABLE.write().unwrap();
+    t.funcs.retain(|f| {
+        if !set.contains(&f.start) {
+            return true;
+        }
+        if f.owned {
+            // readers only use a table while holding the lock
+            drop(unsafe { Box::from_raw(f.calls as *const [[u32; 2]] as *mut [[u32; 2]]) });
+        }
+        false
+    });
 }
 
 fn cstr(p: *const u8) -> String {

@@ -1013,7 +1013,7 @@ fn init_json() {
     defs(json, "restore", 1, 3, |_, a, _| load(a));
     defs(json, "load_file", 1, 2, |_, a, _| {
         let path = String::from_utf8_lossy(&crate::fmt::to_s(a[0]).unwrap_or_default()).into_owned();
-        match std::fs::read(&path) {
+        match crate::vfs::read_file(path.as_bytes()) {
             Ok(b) => parse_bytes(&b, parse_opts(a.get(1).copied(), default_po())),
             Err(_) => {
                 let errno = const_lookup(rt().c.object, sym("Errno")).unwrap() as *mut Class;

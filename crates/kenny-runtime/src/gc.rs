@@ -92,8 +92,8 @@ pub struct PHeap {
     pub roots: Vec<*const Vec<V>>,
     /// Closure environments created since the last collection.
     pub envs: FxHashMap<usize, u32>,
-    pub saved_throws: FxHashMap<u64, Throw>,
-    pub next_throw: u64,
+    /// Throws saved while `ensure` clauses run (the running thread's; moves with it).
+    pub saved_throws: SavedThrows,
     /// Base (highest address) of the stack this thread is running on.
     pub stack_base: usize,
     /// RUNNING, PARKED (stopped for a collection) or IDLE (waiting, not touching the heap).
@@ -119,8 +119,7 @@ impl PHeap {
             since: 0,
             roots: Vec::new(),
             envs: FxHashMap::default(),
-            saved_throws: FxHashMap::default(),
-            next_throw: 1,
+            saved_throws: SavedThrows::default(),
             stack_base: 0,
             status: AtomicU8::new(RUNNING),
             saved_sp: 0,
@@ -196,6 +195,32 @@ pub fn init_stats() {
     if let Some(v) = std::env::var_os("KENNY_GC_STATS") {
         unsafe { atexit(print_stats) };
         *STATS_EVERY.get() = v == "2";
+    }
+    if std::env::var_os("KENNY_CRASH_TRACE").is_some() {
+        install_crash_trace();
+    }
+}
+
+/// KENNY_CRASH_TRACE=1 (debugging the runtime): on SIGSEGV/SIGBUS print the faulting address
+/// and the native backtrace of the crashing thread.
+fn install_crash_trace() {
+    extern "C" fn on_crash(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut std::ffi::c_void) {
+        let addr = unsafe { (*info).si_addr } as usize;
+        let name = std::thread::current().name().map(|s| s.to_string()).unwrap_or_default();
+        eprintln!("\n*** signal {sig} at address {addr:#x} on thread {name:?}\n{}", std::backtrace::Backtrace::force_capture());
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+    unsafe {
+        let stack = libc::stack_t { ss_sp: Box::into_raw(vec![0u8; 1 << 20].into_boxed_slice()) as *mut _, ss_size: 1 << 20, ss_flags: 0 };
+        libc::sigaltstack(&stack, std::ptr::null_mut());
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_crash as extern "C" fn(i32, *mut libc::siginfo_t, *mut std::ffi::c_void) as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
     }
 }
 
@@ -361,6 +386,8 @@ pub fn is_object(w: usize) -> bool {
 // (rendered pages, request strings) doesn't grow the process between collections.
 
 static MALLOC_SINCE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Net bytes allocated by Rust code (to within a per-thread batch), for KENNY_GC_STATS.
+pub static MALLOC_LIVE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static MALLOC_LIMIT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(isize::MAX);
 
 pub struct CountingAlloc;
@@ -388,6 +415,7 @@ impl CountingAlloc {
     }
     #[inline(never)]
     fn flush(v: isize) {
+        MALLOC_LIVE.fetch_add(v, Ordering::Relaxed);
         let since = MALLOC_SINCE.fetch_add(v, Ordering::Relaxed) + v;
         if since > MALLOC_LIMIT.load(Ordering::Relaxed) {
             KN_GC_PENDING.fetch_or(1, Ordering::Relaxed);
@@ -498,6 +526,39 @@ fn scan_regions() -> bool {
 pub fn register_region(ptr: usize, words: usize) {
     let _g = heap_lock();
     heap().regions.push((ptr, words));
+}
+pub fn unregister_region(ptr: usize) {
+    let _g = heap_lock();
+    heap().regions.retain(|r| r.0 != ptr);
+}
+/// Unpin the literals cached in a region (an eval unit's inline caches) before it is freed.
+pub fn unpin_region(ptr: usize, words: usize) {
+    let vals: FxHashSet<V> = unsafe { std::slice::from_raw_parts(ptr as *const V, words) }.iter().copied().filter(|&v| is_heap(v)).collect();
+    if !vals.is_empty() {
+        PINNED.get().retain(|v| !vals.contains(v));
+    }
+}
+
+// ---------- freeing eval'd code ----------
+//
+// The eval cache (kenny-runtime-jit) evicts units it hasn't used for a while and hands them
+// here. A major collection frees an evicted unit once nothing can run its code: no method in
+// any class table and no Proc points into it, no stack holds a return address into it, and
+// no Method object was made for one of its methods.
+
+struct OrphanUnit {
+    id: u64,
+    code: Vec<(usize, usize)>,
+}
+static ORPHANS: crate::mt::L<Vec<OrphanUnit>> = crate::mt::L::new(Vec::new());
+static DEAD_UNITS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+/// An evicted eval unit and its code ranges (start, len).
+pub fn orphan_code(id: u64, code: Vec<(usize, usize)>) {
+    ORPHANS.get().push(OrphanUnit { id, code });
+}
+/// Units found unreachable since the last call: their memory can be reused.
+pub fn take_dead_units() -> Vec<u64> {
+    std::mem::take(&mut *DEAD_UNITS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 /// The registered classes (a copy: other threads may be adding to the list).
 pub fn all_classes() -> Vec<*mut Class> {
@@ -738,6 +799,7 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
     if !crate::mt::multi() {
         return f();
     }
+    crate::thread::before_blocking();
     let ph = &mut crate::core::pst().heap;
     spill_registers(&mut ph.regs);
     ph.saved_sp = approx_sp_here();
@@ -936,15 +998,31 @@ impl<T> From<Rooted<T>> for Vec<T> {
     }
 }
 
+/// A thread's throws in flight while its `ensure` clauses run, by handle.
+#[derive(Default)]
+pub struct SavedThrows {
+    pub map: FxHashMap<u64, Throw>,
+    next: u64,
+}
+
 pub fn save_throw(t: Throw) -> u64 {
-    let ph = &mut crate::core::pst().heap;
-    let id = ph.next_throw;
-    ph.next_throw += 1;
-    ph.saved_throws.insert(id, t);
-    id
+    let st = &mut crate::core::pst().heap.saved_throws;
+    st.next += 1;
+    st.map.insert(st.next, t);
+    st.next
 }
 pub fn take_throw(id: u64) -> Throw {
-    crate::core::pst().heap.saved_throws.remove(&id).unwrap_or(Throw::None)
+    crate::core::pst().heap.saved_throws.map.remove(&id).unwrap_or(Throw::None)
+}
+
+/// The values a throw carries (GC roots).
+pub fn throw_values(t: Throw, out: &mut Vec<V>) {
+    match t {
+        Throw::Raise(e) => out.push(e),
+        Throw::Break { val, .. } | Throw::Return { val, .. } | Throw::StopLoop(val) => out.push(val),
+        Throw::Throw { tag, val } => out.extend([tag, val]),
+        Throw::None | Throw::Kill => {}
+    }
 }
 
 // ---------- marking ----------
@@ -970,11 +1048,20 @@ struct Marker {
     newly_marked: usize,
     /// a minor collection (skips classes traced before)
     minor: bool,
+    /// a major collection: stack words are also checked against the class set (a singleton
+    /// class referenced only from a stack must not be freed)
+    major: bool,
+    /// (major collections with evicted eval units) their code ranges (start, end, unit index),
+    /// sorted, and which units something still points into
+    code: Vec<(usize, usize, usize)>,
+    code_lo: usize,
+    code_hi: usize,
+    code_hit: Vec<bool>,
 }
 
 impl Marker {
     fn new(retired: Vec<(usize, usize, usize)>, keep: Vec<bool>, retired_lo: usize, retired_hi: usize) -> Self {
-        Marker { stack: Vec::new(), envs: Vec::new(), marked_envs: FxHashSet::default(), seen_classes: FxHashSet::default(), retired, keep, retired_lo, retired_hi, verify: None, verify_fail: 0, newly_marked: 0, cur: 0, parents: FxHashMap::default(), minor: false }
+        Marker { stack: Vec::new(), envs: Vec::new(), marked_envs: FxHashSet::default(), seen_classes: FxHashSet::default(), retired, keep, retired_lo, retired_hi, verify: None, verify_fail: 0, newly_marked: 0, cur: 0, parents: FxHashMap::default(), minor: false, major: false, code: Vec::new(), code_lo: usize::MAX, code_hi: 0, code_hit: Vec::new() }
     }
     #[inline]
     fn value(&mut self, v: V) {
@@ -1024,6 +1111,9 @@ impl Marker {
         if !self.retired.is_empty() {
             self.retired_word(w);
         }
+        if w >= self.code_lo && w < self.code_hi {
+            self.code_word(w);
+        }
         if w & 7 != 0 || w < 4096 {
             return;
         }
@@ -1036,6 +1126,8 @@ impl Marker {
             }
         } else if heap().envs.contains_key(&w) {
             self.env(w);
+        } else if self.major && heap().class_set.contains(&w) {
+            self.class(w as *mut Class);
         }
     }
     /// A stack word pointing into (or just past) a retired buffer keeps it: a Rust frame may
@@ -1050,6 +1142,17 @@ impl Marker {
             let (start, bytes, _) = self.retired[i - 1];
             if w <= start + bytes {
                 self.keep[i - 1] = true;
+            }
+        }
+    }
+    /// A word pointing into an evicted eval unit's code (a return address, a function pointer).
+    #[inline(never)]
+    fn code_word(&mut self, w: usize) {
+        let i = self.code.partition_point(|r| r.0 <= w);
+        if i > 0 {
+            let (_, hi, u) = self.code[i - 1];
+            if w < hi {
+                self.code_hit[u] = true;
             }
         }
     }
@@ -1178,6 +1281,10 @@ impl Marker {
             }
             Kind::Proc => {
                 let p = rproc(v);
+                let f = p.func as usize;
+                if f >= self.code_lo && f < self.code_hi {
+                    self.code_word(f);
+                }
                 self.env(p.env as usize);
                 self.value(p.self_);
                 for &x in &p.roots {
@@ -1388,6 +1495,19 @@ fn collect_locked() {
         *lap = std::time::Instant::now();
     };
     m.minor = !major;
+    m.major = major;
+    let orphans = if major { std::mem::take(&mut *ORPHANS.raw()) } else { Vec::new() };
+    if !orphans.is_empty() {
+        for (u, o) in orphans.iter().enumerate() {
+            for &(p, len) in &o.code {
+                m.code.push((p, p + len, u));
+            }
+        }
+        m.code.sort_unstable();
+        m.code_lo = m.code.first().map(|r| r.0).unwrap_or(usize::MAX);
+        m.code_hi = m.code.iter().map(|r| r.1).max().unwrap_or(0);
+        m.code_hit = vec![false; orphans.len()];
+    }
     mark_roots(&mut m, h, major);
     h.new_classes.clear();
     phase("roots", &mut lap);
@@ -1517,6 +1637,10 @@ fn collect_locked() {
         }
         unsafe { free_obj(p) };
     }
+    let freed_classes = if major { free_dead_singletons(h, &m.seen_classes) } else { 0 };
+    if !orphans.is_empty() {
+        free_dead_units(h, &mut m, orphans);
+    }
     crate::mt::set_in_sweep(false);
     let marked_envs = m.marked_envs;
     let free_env = |p: usize, n: u32| free_malloc_env(p, n);
@@ -1580,13 +1704,14 @@ fn collect_locked() {
     if *STATS_EVERY.get() {
         let txt: Vec<String> = phases.iter().map(|(n, t)| format!("{n}={t:.2}")).collect();
         eprintln!(
-            "[gc] {} phases ms: {} (data_marked={} malloc_envs={}/{} classes={} region_words={} remembered={} promoted={} swept_pages={}/{} freed={} lazily_freed={} helped={}/{})",
+            "[gc] {} phases ms: {} (data_marked={} malloc_envs={}/{} classes={} (freed {}) region_words={} remembered={} promoted={} swept_pages={}/{} freed={} lazily_freed={} helped={}/{})",
             if major { "major" } else { "minor" },
             txt.join(" "),
             DBG_NDATA.load(std::sync::atomic::Ordering::Relaxed),
             n_young_envs,
             h.envs.len(),
             h.classes.len(),
+            freed_classes,
             region_words,
             remembered.len(),
             m.newly_marked,
@@ -1690,10 +1815,15 @@ fn mark_roots(m: &mut Marker, h: &mut Heap, all_classes: bool) {
         for &b in &p.current_block {
             m.value(b);
         }
+        let mut cls = Vec::new();
+        definee_values(&p.definee, &p.dm_stack, &mut cls);
+        for v in cls {
+            m.value(v);
+        }
     }
     for &p in gc_ps().iter() {
         let ph = unsafe { &(*(p as *const PState)).heap };
-        for t in ph.saved_throws.values().copied().collect::<Vec<_>>() {
+        for t in ph.saved_throws.map.values().copied().collect::<Vec<_>>() {
             match t {
                 Throw::Raise(e) => m.value(e),
                 Throw::Break { val, .. } | Throw::Return { val, .. } | Throw::StopLoop(val) => m.value(val),
@@ -1728,6 +1858,106 @@ fn mark_roots(m: &mut Marker, h: &mut Heap, all_classes: bool) {
             scan_range(m, p, p + n * 8);
         }
     }
+}
+
+/// Classes that running class bodies define into and that running `define_method` methods
+/// belong to (GC roots; a definee entry with the low bit set is an object whose singleton
+/// class is made on demand).
+pub fn definee_values(definee: &[*mut Class], dm_stack: &[*const Method], out: &mut Vec<V>) {
+    for &c in definee {
+        out.push(if c as usize & 1 != 0 { (c as usize & !1) as V } else { c as V });
+    }
+    for &m in dm_stack {
+        if !m.is_null() {
+            out.push(unsafe { (*m).owner } as V);
+        }
+    }
+}
+
+/// Code of methods that a Method/UnboundMethod object was made for: never freed (the object
+/// can call it after the method is removed from its class).
+static METHOD_OBJECT_CODE: crate::mt::L<Option<FxHashSet<usize>>> = crate::mt::L::new(None);
+pub fn note_method_object(m: *const Method) {
+    if let Body::Compiled(f) = unsafe { &(*m).body } {
+        METHOD_OBJECT_CODE.get().get_or_insert_with(FxHashSet::default).insert(*f as usize);
+    }
+}
+pub fn method_object_code() -> Vec<usize> {
+    METHOD_OBJECT_CODE.get().as_ref().map(|s| s.iter().copied().collect()).unwrap_or_default()
+}
+
+/// Evicted eval units that nothing reached in this major collection: methods of live classes
+/// and Method objects count too (procs and stacks were checked while marking).
+fn free_dead_units(h: &mut Heap, m: &mut Marker, orphans: Vec<OrphanUnit>) {
+    for &c in &h.classes {
+        for &meth in unsafe { &*c }.methods.values() {
+            if meth.is_null() {
+                continue;
+            }
+            if let Body::Compiled(f) = unsafe { &(*meth).body } {
+                let f = *f as usize;
+                if f >= m.code_lo && f < m.code_hi {
+                    m.code_word(f);
+                }
+            }
+        }
+    }
+    for f in method_object_code() {
+        if f >= m.code_lo && f < m.code_hi {
+            m.code_word(f);
+        }
+    }
+    let mut dead = Vec::new();
+    let mut keep = Vec::new();
+    for (u, o) in orphans.into_iter().enumerate() {
+        if m.code_hit[u] { keep.push(o) } else { dead.push(o.id) }
+    }
+    if std::env::var_os("KENNY_DEBUG_EVAL").is_some() {
+        eprintln!("[eval] collection: {} evicted units freed, {} still reachable; Rust heap {} KB", dead.len(), keep.len(), MALLOC_LIVE.load(Ordering::Relaxed) >> 10);
+    }
+    ORPHANS.raw().extend(keep);
+    if !dead.is_empty() {
+        // call caches may still hold methods whose code this was
+        crate::core::bump_serial();
+        DEAD_UNITS.lock().unwrap_or_else(|e| e.into_inner()).extend(dead);
+    }
+}
+
+/// After a major collection's sweep: free the singleton classes of objects that died (the
+/// marker never reached them) with their method tables. Method caches are keyed by class
+/// address, so they are invalidated (a new class may get the same address).
+fn free_dead_singletons(h: &mut Heap, seen: &FxHashSet<usize>) -> usize {
+    let mut dead: FxHashSet<usize> = FxHashSet::default();
+    let class_set = &h.class_set;
+    h.classes.retain(|&c| {
+        let k = unsafe { &*c };
+        let attached_is_class = class_set.contains(&(k.attached as usize));
+        if k.is_singleton && !attached_is_class && !seen.contains(&(c as usize)) {
+            dead.insert(c as usize);
+            false
+        } else {
+            true
+        }
+    });
+    if dead.is_empty() {
+        return 0;
+    }
+    for c in &dead {
+        h.class_set.remove(c);
+    }
+    h.new_classes.retain(|c| !dead.contains(&(*c as usize)));
+    crate::core::bump_serial();
+    crate::core::bump_const_serial();
+    for &c in &dead {
+        let k = unsafe { Box::from_raw(c as *mut Class) };
+        for &m in k.methods.values() {
+            if !m.is_null() && unsafe { (*m).owner } == c as *mut Class {
+                drop(unsafe { Box::from_raw(m as *mut Method) });
+            }
+        }
+        drop(k);
+    }
+    dead.len()
 }
 
 /// Before a major collection: every object starts unmarked (young and old alike).

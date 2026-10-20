@@ -133,8 +133,31 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
     ]
 }
 
-static CACHE: G<Option<HashMap<(u8, Vec<u8>), CompiledFn>>> = G::new(None);
+/// Compiled eval units by (mode, source). The least recently used ones are evicted past
+/// KENNY_EVAL_CACHE entries (default 2000); an evicted unit's memory is reused once the GC
+/// finds nothing can run it (methods it defined, blocks, frames: see gc::orphan_code).
+struct Cached {
+    f: CompiledFn,
+    unit: u64,
+    used: u64,
+}
+static CACHE: G<Option<HashMap<(u8, Vec<u8>), Cached>>> = G::new(None);
+/// What freeing a unit needs: its memory, functions (for backtraces) and inline caches.
+struct UnitMem {
+    memory: Vec<(usize, usize, bool)>,
+    funcs: Vec<usize>,
+    caches: usize,
+    cache_words: usize,
+    owned_caches: Vec<(u32, u8)>,
+}
+static UNITS: G<Option<HashMap<u64, UnitMem>>> = G::new(None);
+static CLOCK: G<u64> = G::new(0);
 static SYMS: G<Vec<(&'static str, *const u8)>> = G::new(Vec::new());
+
+fn cache_limit() -> usize {
+    static L: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *L.get_or_init(|| std::env::var("KENNY_EVAL_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(2000).max(1))
+}
 
 fn install(unit: &JitUnit) {
     kenny_runtime::backtrace::register_jit(&unit.debug, unit.strs);
@@ -144,73 +167,109 @@ fn install(unit: &JitUnit) {
     kenny_runtime::gc::register_region(unit.caches as usize, unit.cache_words);
 }
 
+/// (compile lock held) Evict the least recently used tenth of the cache when it is full.
+fn evict(cache: &mut HashMap<(u8, Vec<u8>), Cached>) {
+    let limit = cache_limit();
+    if cache.len() < limit {
+        return;
+    }
+    let mut ages: Vec<u64> = cache.values().map(|c| c.used).collect();
+    ages.sort_unstable();
+    let cut = ages[(limit / 10).min(ages.len() - 1)];
+    let units = UNITS.get().get_or_insert_with(HashMap::new);
+    cache.retain(|_, c| {
+        if c.used > cut {
+            return true;
+        }
+        if let Some(u) = units.get(&c.unit) {
+            let code = u.memory.iter().filter(|m| m.2).map(|m| (m.0, m.1)).collect();
+            kenny_runtime::gc::orphan_code(c.unit, code);
+        }
+        false
+    });
+}
+
+/// (compile lock held) Give back the memory of evicted units the GC found unreachable.
+fn free_dead_units() {
+    let dead = kenny_runtime::gc::take_dead_units();
+    if dead.is_empty() {
+        return;
+    }
+    let units = UNITS.get().get_or_insert_with(HashMap::new);
+    for id in dead {
+        if let Some(u) = units.remove(&id) {
+            kenny_runtime::backtrace::unregister_jit(&u.funcs);
+            kenny_runtime::gc::unpin_region(u.caches, u.cache_words);
+            kenny_runtime::abi::free_owned_caches(u.caches, &u.owned_caches);
+            kenny_runtime::gc::unregister_region(u.caches);
+            jit::free_unit(&u.memory);
+        }
+    }
+}
+
 /// One compilation at a time (the cache and the JIT memory are shared by all threads).
 /// Compiling never calls Ruby, so holding a plain mutex here can't block a collection for
 /// longer than the compile itself.
 static COMPILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn eval_hook(src: &[u8], mode: u8, self_: V) -> V {
+/// The compiled unit for `key` (compiling `src` as `mode`, named `file`, on a miss), or the
+/// SyntaxError raised.
+fn compiled(key: (u8, Vec<u8>), src: &[u8], mode: EvalMode, file: &str) -> Result<CompiledFn, V> {
     let guard = COMPILE.lock().unwrap_or_else(|e| e.into_inner());
     let cache = CACHE.get().get_or_insert_with(HashMap::new);
-    let key = (mode, src.to_vec());
-    let f = match cache.get(&key) {
-        Some(f) => *f,
-        None => {
-            let m = if mode == 1 { EvalMode::ClassEval } else { EvalMode::Eval };
-            if std::env::var_os("KENNY_DEBUG_EVAL").is_some() {
-                eprintln!("[eval] compiling {} bytes at {}: {}", src.len(), current_loc().unwrap_or_default(), String::from_utf8_lossy(&src[..src.len().min(80)]).replace('\n', " "));
-            }
-            match jit::compile(src, m, "(eval)", SYMS.get()) {
-                Ok(unit) => {
-                    install(&unit);
-                    let f: CompiledFn = unsafe { std::mem::transmute(unit.entry) };
-                    cache.insert(key, f);
-                    f
-                }
-                Err(e) => {
-                    drop(guard);
-                    let c = const_lookup(rt().c.object, sym("SyntaxError")).map(|c| c as *mut Class).unwrap_or(rt().c.script_error);
-                    return raise(c, &e);
-                }
-            }
-        }
+    let now = {
+        let c = CLOCK.get();
+        *c += 1;
+        *c
     };
-    drop(guard);
-    unsafe { f(self_, 0, std::ptr::null(), QNIL) }
+    if let Some(c) = cache.get_mut(&key) {
+        c.used = now;
+        return Ok(c.f);
+    }
+    free_dead_units();
+    evict(cache);
+    if std::env::var_os("KENNY_DEBUG_EVAL").is_some() {
+        eprintln!("[eval] compiling {} bytes of {file} at {}: {}", src.len(), current_loc().unwrap_or_default(), String::from_utf8_lossy(&src[..src.len().min(80)]).replace('\n', " "));
+    }
+    match jit::compile(src, mode, file, SYMS.get()) {
+        Ok(unit) => {
+            install(&unit);
+            let f: CompiledFn = unsafe { std::mem::transmute(unit.entry) };
+            let id = now;
+            let funcs = unit.debug.iter().map(|d| d.0).collect();
+            UNITS.get().get_or_insert_with(HashMap::new).insert(id, UnitMem { memory: unit.memory, funcs, caches: unit.caches as usize, cache_words: unit.cache_words, owned_caches: unit.owned_caches });
+            cache.insert(key, Cached { f, unit: id, used: now });
+            Ok(f)
+        }
+        Err(e) => {
+            drop(guard);
+            let c = const_lookup(rt().c.object, sym("SyntaxError")).map(|c| c as *mut Class).unwrap_or(rt().c.script_error);
+            Err(raise(c, &e))
+        }
+    }
 }
 
-/// `load` / `require` of a source file at runtime (changed since the build, or not compiled in).
+fn eval_hook(src: &[u8], mode: u8, self_: V) -> V {
+    let m = if mode == 1 { EvalMode::ClassEval } else { EvalMode::Eval };
+    match compiled((mode, src.to_vec()), src, m, "(eval)") {
+        Ok(f) => unsafe { f(self_, 0, std::ptr::null(), QNIL) },
+        Err(e) => e,
+    }
+}
+
+/// `load` / `require` of a source file at runtime (changed since the build, or not compiled
+/// in): Rails code reloading in development.
 fn load_hook(src: &[u8], path: &str) -> V {
-    let guard = COMPILE.lock().unwrap_or_else(|e| e.into_inner());
-    let cache = CACHE.get().get_or_insert_with(HashMap::new);
     let mut k = path.as_bytes().to_vec();
     k.push(0);
     k.extend_from_slice(src);
-    let key = (2u8, k);
-    let f = match cache.get(&key) {
-        Some(f) => *f,
-        None => {
-            if std::env::var_os("KENNY_DEBUG_EVAL").is_some() {
-                eprintln!("[load] compiling {path} ({} bytes)", src.len());
-            }
-            match jit::compile(src, EvalMode::File, path, SYMS.get()) {
-                Ok(unit) => {
-                    install(&unit);
-                    let f: CompiledFn = unsafe { std::mem::transmute(unit.entry) };
-                    cache.insert(key, f);
-                    f
-                }
-                Err(e) => {
-                    drop(guard);
-                    let c = const_lookup(rt().c.object, sym("SyntaxError")).map(|c| c as *mut Class).unwrap_or(rt().c.script_error);
-                    return raise(c, &e);
-                }
-            }
+    match compiled((2, k), src, EvalMode::File, path) {
+        Ok(f) => {
+            let r = unsafe { f(rt().main_obj, 0, std::ptr::null(), QNIL) };
+            if r == UNDEF { UNDEF } else { QTRUE }
         }
-    };
-    drop(guard);
-    let r = unsafe { f(rt().main_obj, 0, std::ptr::null(), QNIL) };
-    if r == UNDEF { UNDEF } else { QTRUE }
+        Err(e) => e,
+    }
 }
 
 #[unsafe(no_mangle)]

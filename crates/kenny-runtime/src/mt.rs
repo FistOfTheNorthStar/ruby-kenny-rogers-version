@@ -75,10 +75,12 @@ use std::sync::atomic::{AtomicUsize, AtomicU32};
 /// this thread (the lock holder may be the one that wants to collect). Set by the GC.
 pub static SPIN_HOOK: std::sync::atomic::AtomicPtr<()> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-#[inline]
+/// Identifies the OS thread (opaque, so it is never merged with a lookup made before a Ruby
+/// thread moved to another OS thread).
+#[inline(never)]
 fn my_token() -> usize {
     thread_local!(static T: u8 = const { 0 });
-    T.with(|t| t as *const u8 as usize)
+    std::hint::black_box(T.with(|t| t as *const u8 as usize))
 }
 
 pub fn spin_pause(spins: &mut u32) {

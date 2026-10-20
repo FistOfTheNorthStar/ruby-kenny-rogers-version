@@ -15,6 +15,12 @@ fn wrap(class: *mut Class, recv: V, m: *const Method, name: u32) -> V {
     ivar_set(o, sym("@__m"), mkfix(m as i64));
     ivar_set(o, sym("@__recv"), recv);
     ivar_set(o, sym("@__name"), mksym(name));
+    if !m.is_null() {
+        // keeps the method's class (and so the method and its code) alive: a singleton class
+        // is freed once nothing reaches it
+        ivar_set(o, sym("@__owner"), unsafe { (*m).owner } as V);
+        crate::gc::note_method_object(m);
+    }
     o
 }
 

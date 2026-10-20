@@ -217,13 +217,13 @@ pub fn eval_string(src: V, mode: u8, self_: V) -> V {
 /// The class `def` currently defines into. An entry may stand for "the singleton class of
 /// this object" (low bit set; see `with_singleton_definee`), created only when needed.
 pub fn definee_top() -> Option<*mut Class> {
-    let d = &mut pst().definee;
-    let &c = d.last()?;
+    let &c = pst().definee.last()?;
     if c as usize & 1 == 0 {
         return Some(c);
     }
     let sc = singleton_class((c as usize & !1) as V);
-    *d.last_mut().unwrap() = sc;
+    // (re-read: making the class may run Ruby code, and the thread may have moved P)
+    *pst().definee.last_mut().unwrap() = sc;
     Some(sc)
 }
 
@@ -380,6 +380,9 @@ pub fn init() {
                 ivar_set(a[0], sym("@__message"), a[1]);
             }
             a[0]
+        } else if respond_to(a[0], sym("exception")) {
+            // any object with #exception, e.g. a rejected Concurrent::Promise
+            tri!(send(a[0], sym("exception"), &a[1..a.len().min(2)], QNIL))
         } else {
             return type_error("exception class/object expected");
         };
