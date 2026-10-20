@@ -3,9 +3,8 @@
 # stands in for the ffi gem so that a gem binding a C library through FFI still loads: the
 # declarations (ffi_lib, typedef, enum, callback, attach_function, Struct/Union layouts) are
 # recorded, and calling an attached function raises NotImplementedError — the same contract
-# as Kenny's other dropped features in dependencies (docs/LANGUAGE.md). For example
-# sass-rails loads `sassc` (an FFI binding of libsass) in every Rails 5.2 app, but production
-# only serves precompiled assets and never compiles Sass.
+# as Kenny's other dropped features in dependencies (docs/LANGUAGE.md). (`sassc`, the FFI
+# binding of libsass that sass-rails loads, has its own replacement: lib/kenny/sassc.rb.)
 module FFI
   VERSION = "1.17.4"
 

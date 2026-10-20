@@ -20,8 +20,9 @@ cargo build --release
     $(ruby tools/gem-paths.rb actionpack 5.2.8.1) $(ruby tools/gem-paths.rb activerecord 5.2.8.1) \
     $(ruby tools/gem-paths.rb sqlite3 1.7.3) && ./rails_api_ar
 
-# a whole generated Rails 5.2 app (`rails new` + a scaffold); its gems come from its Gemfile.lock
-(cd examples/blog && RAILS_ENV=production SECRET_KEY_BASE=x bundle exec rails db:migrate assets:precompile)
+# a whole generated Rails 5.2 app (`rails new` + a scaffold); its gems come from its Gemfile.lock.
+# `kenny build` also precompiles its assets (Sass, CoffeeScript, Uglifier) into public/assets
+(cd examples/blog && RAILS_ENV=production SECRET_KEY_BASE=x bundle exec rails db:migrate)
 ./target/release/kenny build examples/blog/config.ru -o blog
 (cd examples/blog && RAILS_ENV=production RAILS_SERVE_STATIC_FILES=1 SECRET_KEY_BASE=$(openssl rand -hex 64) ../../blog)
 ruby examples/blog/compare.rb blog   # the same session against Puma and the binary: identical
@@ -99,11 +100,20 @@ Working:
   quick-xml underneath, its own XPath 1.0 engine, and nokogiri's Ruby layer on top), so loofah and
   the Rails HTML sanitizers work without libxml2. The `sqlite3` gem's C extension is native
   too (on the bundled SQLite library); the gem's own Ruby files load on top of it.
+- **Asset pipeline without Ruby or Node:** the `sassc` gem's API runs on a native Sass
+  compiler ([grass](https://github.com/connorskees/grass)), with Sass functions such as
+  `asset-path` calling back into Ruby, and ExecJS runs on an embedded JavaScript engine
+  ([QuickJS](https://github.com/quickjs-ng/quickjs)), so `uglifier` and `coffee-script` work
+  in-process. `kenny build` of a Rails app with app/assets precompiles its assets (what
+  `rails assets:precompile` does, run by the new binary itself) when public/assets has no
+  manifest or the assets changed; `KENNY_PRECOMPILE=1` forces it, `=0` skips it. The blog's
+  JavaScript comes out byte-identical to Ruby's; its CSS differs only in whitespace. Both are
+  linked only into programs that use those gems.
 - **Rails:** a whole generated Rails 5.2 application boots and serves production traffic:
   `examples/blog` is `rails new` plus a scaffold, unchanged (Railties boot, Bundler, every
   framework of `rails/all`, initializers, eager loading of `app/`, the scaffold's HTML forms with
   CSRF protection, its jbuilder JSON views, sessions, flash, the 404/422/500 pages and
-  precompiled assets served by ActionDispatch::Static). `examples/blog/compare.rb` runs the same
+  its assets, precompiled by Kenny and served by ActionDispatch::Static). `examples/blog/compare.rb` runs the same
   24-request session against Puma and the binary: the responses are identical. Smaller examples,
   with output identical to Ruby's:
   `examples/rails_api` (ActionController::API, routing, params, JSON),
@@ -126,10 +136,10 @@ Working:
   (`rack.multithread` is true); `WEB_CONCURRENCY=n` forks n processes instead.
 
 Not yet:
-- Compiling assets in the binary (Sprockets with sass/coffee/uglifier needs libsass through FFI
-  and a JavaScript runtime): precompile them with Ruby (`rails assets:precompile`); serving
-  them works. Rails' development mode (code reloading, `listen`) and Action Cable's
-  WebSocket server are untested; production mode is the target.
+- Sass source maps, and sassc-rails' ERB (`.scss.erb`) and glob (`@import "dir/*"`) imports:
+  imports are resolved by the Sass compiler on the load paths.
+- Rails' development mode (code reloading, `listen`) and Action Cable's WebSocket server are
+  untested; production mode is the target.
 - A self-contained deployment: the binary contains all Ruby code, but reads the app's
   non-Ruby files (views, `config/*.yml`, locales, `public/`) and the gems' locale files from
   where they were at build time.
@@ -187,6 +197,6 @@ by `eval`/`class_eval`; an uncaught exception and a failed request print the ful
 ## Roadmap
 
 1. Moving threads between cores (work stealing) and non-blocking file/SQLite IO
-2. Less memory per core (shared caches, returning idle pages sooner); assets compiled in the binary
+2. Less memory per core (shared caches, returning idle pages sooner)
 3. Direct calls between compiled methods (guarded by the inline cache) and inlining of small methods
 4. Precise stack maps (Cranelift) for compiled frames, the first step towards a compacting GC

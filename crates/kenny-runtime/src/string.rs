@@ -359,8 +359,9 @@ pub fn init() {
         }
         QNIL
     });
-    defn(c, "to_s", 0, 0, |s, _, _| s);
-    defn(c, "to_str", 0, 0, |s, _, _| s);
+    // on an instance of a subclass (e.g. ActiveSupport::StringInquirer): a plain String
+    defn(c, "to_s", 0, 0, |s, _, _| if real_class(s) == rt().c.string { s } else { str_new(rstr(s).b.clone()) });
+    defn(c, "to_str", 0, 0, |s, _, _| if real_class(s) == rt().c.string { s } else { str_new(rstr(s).b.clone()) });
     defn(c, "inspect", 0, 0, |s, _, _| new_str_v(str_inspect_v(s)));
     defn(c, "dump", 0, 0, |s, _, _| new_str_v(str_inspect(&rstr(s).b)));
     defn(c, "hash", 0, 0, |s, _, _| mkfix((hash_of(s) >> 2) as i64));

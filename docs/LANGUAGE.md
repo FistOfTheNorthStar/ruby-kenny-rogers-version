@@ -22,7 +22,7 @@ Kenny compiles Ruby ahead of time to a single native binary, like Go.
 | `TracePoint`, `set_trace_func` | No hooks on every call/line (a debug build flag replaces them) |
 | String encodings other than UTF-8, ASCII-8BIT (binary), US-ASCII | Strings skip per-operation encoding checks |
 | `require` / `load` / `autoload` of files not known at build time | Whole program is compiled together |
-| Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in with `--ext`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError` |
+| Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in with `--ext`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError`. The `sassc` gem (libsass through FFI) is replaced by a native Sass compiler |
 | `Thread#raise` / `Thread#kill` landing at arbitrary instructions | Delivered only at safe points (calls, loop back-edges, IO) |
 | `RubyVM::*`, `Ractor`, `$;`, `$,`, `callcc`, flip-flop, `BEGIN`/`END` | CRuby internals, superseded, or deprecated |
 

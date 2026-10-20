@@ -7,6 +7,7 @@
 static ALLOC: gc::CountingAlloc = gc::CountingAlloc;
 
 pub mod abi;
+pub mod assets;
 pub mod backtrace;
 pub mod array;
 pub mod bigdecimal;
