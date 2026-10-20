@@ -4,7 +4,8 @@
 # fresh copy of the database, and compares status, key headers and bodies (CSRF tokens,
 # session cookies, request ids and timestamps are normalized).
 #
-#   ruby examples/blog/compare.rb [path/to/kenny-binary]     (system Ruby, from anywhere)
+#   ruby examples/blog/compare.rb [path/to/kenny-binary]     (system Ruby, from anywhere;
+#   COMPARE_PORT=n uses ports n and n+1 instead of 47311/47312)
 #
 # The app: `rails _5.2.8.1_ new examples/blog --skip-bundle --skip-git`,
 # `rails g scaffold Post title:string body:text`, `root "posts#index"`. The only other
@@ -131,8 +132,9 @@ ensure
   FileUtils.mv("#{DB}.compare-backup", DB)
 end
 
-ruby = run("ruby (puma)", %w[bundle exec puma -t 1:1 -p 47311 config.ru], 47311)
-kenny = run("kenny", [BIN], 47312)
+port = Integer(ENV.fetch("COMPARE_PORT", "47311"))
+ruby = run("ruby (puma)", %W[bundle exec puma -t 1:1 -p #{port} config.ru], port)
+kenny = run("kenny", [BIN], port + 1)
 diffs = ruby.zip(kenny).reject { |a, b| a == b }
 diffs.each do |a, b|
   puts "--- ruby\n#{a[0, 1500]}\n+++ kenny\n#{b.to_s[0, 1500]}\n"
