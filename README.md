@@ -1,4 +1,5 @@
-![Uploading Gemini_Generated_Image_obri9hobri9hobri.jpeg…]()
+<img width="2752" height="1536" alt="Gemini_Generated_Image_obri9hobri9hobri" src="https://github.com/user-attachments/assets/72be7f46-324f-41bf-98a5-ff60c31325e7" />
+
 # Kenny — Ruby, compiled
 
 Kenny compiles Ruby to a single native executable, like Go. You keep Ruby's syntax and drop
