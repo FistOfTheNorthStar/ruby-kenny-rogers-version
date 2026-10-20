@@ -872,6 +872,8 @@ pub fn init() {
         // Struct.new("Name", ...) also names the class Struct::Name
         let (cname, a) = match a.first() {
             Some(&f) if is_str(f) => (Some(String::from_utf8_lossy(&rstr(f).b).into_owned()), &a[1..]),
+            // Struct.new(nil, ...): no class name (websocket-driver's `Struct.new(nil)`)
+            Some(&f) if f == QNIL => (None, &a[1..]),
             _ => (None, a),
         };
         let mut members = Vec::new();
@@ -983,6 +985,9 @@ pub fn init() {
                 Ok(b) => out.push_str(&String::from_utf8_lossy(&b)),
                 Err(()) => return UNDEF,
             }
+        }
+        if out.ends_with(' ') {
+            out.pop(); // no members: `#<struct E>`
         }
         out.push('>');
         new_str_v(out)
@@ -1196,13 +1201,17 @@ pub fn init() {
     let rbc = new_module("RbConfig");
     set_global_const("RbConfig", rbc as V);
     let cfg = hash_new();
+    // "darwin24" like CRuby (with the running kernel's major version): gems match on it, e.g.
+    // listen only uses FSEvents for /darwin(1|2)\d+/
+    let os = if cfg!(target_os = "macos") { format!("darwin{}", kernel_major().unwrap_or(24)) } else { "linux".into() };
+    for k in ["host_os", "target_os"] {
+        crate::hash::hset(cfg, str_from(k), str_from(&os));
+    }
     for (k, v) in [
         ("ruby_version", "3.4.0"),
         ("MAJOR", "3"),
         ("MINOR", "4"),
         ("TEENY", "0"),
-        ("host_os", if cfg!(target_os = "macos") { "darwin" } else { "linux" }),
-        ("target_os", if cfg!(target_os = "macos") { "darwin" } else { "linux" }),
         ("host_cpu", if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" }),
         ("arch", if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" }),
         ("EXEEXT", ""),
@@ -1225,6 +1234,16 @@ pub fn init() {
     set_global_const("RUBY_PATCHLEVEL", mkfix(0));
     set_global_const("RUBY_RELEASE_DATE", str_from("2026-10-19"));
     set_global_const("RUBY_COPYRIGHT", str_from("Kenny Ruby"));
+}
+
+/// Major version of the running kernel (`uname -r`: "24.6.0" -> 24).
+fn kernel_major() -> Option<u32> {
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut u) } != 0 {
+        return None;
+    }
+    let rel = unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) }.to_string_lossy().into_owned();
+    rel.split('.').next()?.parse().ok()
 }
 
 

@@ -50,6 +50,7 @@ const OVERLAY: &[(&str, &str)] = &[
     ("execjs.rb", include_str!("../../../lib/kenny/execjs.rb")),
     ("kenny/assets_precompile.rb", include_str!("../../../lib/kenny/kenny/assets_precompile.rb")),
     ("socket.rb", include_str!("../../../lib/kenny/socket.rb")),
+    ("nio.rb", include_str!("../../../lib/kenny/nio.rb")),
     ("pp.rb", include_str!("../../../lib/kenny/pp.rb")),
     ("yaml.rb", include_str!("../../../lib/kenny/yaml.rb")),
     ("psych.rb", include_str!("../../../lib/kenny/psych.rb")),

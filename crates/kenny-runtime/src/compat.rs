@@ -41,6 +41,8 @@ fn init_encoding() {
             "UTF-8" | "UTF8" | "LOCALE" | "EXTERNAL" | "FILESYSTEM" => enc_obj("UTF_8"),
             "ASCII-8BIT" | "BINARY" => enc_obj("BINARY"),
             "US-ASCII" | "ASCII" => enc_obj("US_ASCII"),
+            // Encoding.default_internal (never set in Kenny)
+            "INTERNAL" => QNIL,
             _ => arg_error(&format!("unknown encoding name - {n}")),
         }
     });
@@ -515,21 +517,99 @@ pub fn require_feature(base: &str) -> Option<V> {
 
 // ---------- precompiled files reachable by runtime `require` / autoload ----------
 
-static FILE_TABLE: G<Option<std::collections::HashMap<String, (CompiledFn, *mut V)>>> = G::new(None);
+/// key -> (top-level function, loaded flag, content hash of the source it was compiled from)
+static FILE_TABLE: G<Option<std::collections::HashMap<String, (CompiledFn, *mut V, u64)>>> = G::new(None);
 
 /// Called by the program's `main` before the runtime starts (no Ruby objects involved).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn kn_register_file(key: *const u8, len: u64, f: CompiledFn, flag: *mut V) {
+pub unsafe extern "C" fn kn_register_file(key: *const u8, len: u64, f: CompiledFn, flag: *mut V, hash: u64) {
     let k = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(key, len as usize) }).into_owned();
-    FILE_TABLE.get().get_or_insert_with(std::collections::HashMap::new).entry(k).or_insert((f, flag));
+    FILE_TABLE.get().get_or_insert_with(std::collections::HashMap::new).entry(k).or_insert((f, flag, hash));
+}
+
+/// Same as `kenny_compiler::src_hash` (FNV-1a 64): the hash recorded for each compiled file.
+pub fn src_hash(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &x in b {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Runtime compiler for source files (installed by the JIT-enabled runtime): runs the file's
+/// top level and returns QTRUE, or UNDEF if it raised. Arguments: source, absolute path.
+/// `load` uses it for a file that changed since the build or isn't compiled in (Rails code
+/// reloading in development), `require` for an absolute path that isn't compiled in.
+pub static LOAD_HOOK: G<Option<fn(&[u8], &str) -> V>> = G::new(None);
+
+fn file_entry(name: &str) -> Option<(CompiledFn, *mut V, u64)> {
+    let t = FILE_TABLE.get();
+    let t = t.as_ref()?;
+    if let Some(&e) = t.get(name.trim_end_matches(".rb")) {
+        return Some(e);
+    }
+    let canon = std::fs::canonicalize(name).ok()?;
+    t.get(canon.to_string_lossy().trim_end_matches(".rb")).copied()
+}
+
+/// The file `name` names (as given, or with `.rb` when `with_rb`): (absolute path, source,
+/// served from the binary's embedded image). In the image or on disk (see vfs.rs: in a
+/// deployed binary the image wins; in development the app's files come from disk).
+fn disk_source(name: &str, with_rb: bool) -> Option<(String, Vec<u8>, bool)> {
+    let mut cands = vec![name.to_string()];
+    if with_rb && !name.ends_with(".rb") {
+        cands.insert(0, format!("{name}.rb"));
+    }
+    for c in cands {
+        if let Some((k, e)) = crate::vfs::find_with_path(c.as_bytes()).filter(|(_, e)| !e.dir) {
+            return Some((String::from_utf8_lossy(&k).into_owned(), crate::vfs::contents(e).to_vec(), true));
+        }
+        let d = crate::vfs::disk(c.as_bytes()).into_owned();
+        let p = std::path::Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&d));
+        if p.is_file() {
+            let abs = std::fs::canonicalize(p).ok()?;
+            let src = std::fs::read(&abs).ok()?;
+            return Some((abs.to_string_lossy().into_owned(), src, false));
+        }
+    }
+    None
+}
+
+/// Files `require`d from disk through the runtime compiler (absolute paths).
+static DISK_REQUIRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// `require "/abs/path"` of a file that isn't compiled in but exists (e.g. a file added to a
+/// Rails app while it runs in development): compile it at runtime, once.
+pub fn require_from_disk(name: &str) -> Option<V> {
+    let hook = (*LOAD_HOOK.get())?;
+    if !(name.starts_with('/') || name.starts_with("./") || name.starts_with("../")) {
+        return None;
+    }
+    let (abs, src, _) = disk_source(name, true)?;
+    if FILE_TABLE.get().as_ref().is_some_and(|t| t.contains_key(abs.trim_end_matches(".rb"))) {
+        return require_compiled(&abs);
+    }
+    {
+        let mut d = DISK_REQUIRED.lock().unwrap_or_else(|e| e.into_inner());
+        if d.contains(&abs) {
+            return Some(QFALSE);
+        }
+        d.push(abs.clone());
+    }
+    if let Some(&lf) = rt().gvars.get(&sym("$LOADED_FEATURES")) {
+        if is_ary(lf) {
+            rary(lf).v.push(str_from(&abs));
+        }
+    }
+    Some(hook(&src, &abs))
 }
 
 /// Run a precompiled file for `require name`: Some(true) loaded now, Some(false) already loaded,
 /// Some(UNDEF) raised, None if it isn't in the binary.
 /// `load(path)`: run a compiled-in file again (unlike require, every time).
 pub fn load_compiled(name: &str) -> Option<V> {
-    let key = name.trim_end_matches(".rb");
-    let (f, flag) = *FILE_TABLE.get().as_ref()?.get(key)?;
+    let (f, flag, _) = file_entry(name)?;
     unsafe {
         (*(flag as *const std::sync::atomic::AtomicU64)).store(1, std::sync::atomic::Ordering::Release);
         let r = f(rt().main_obj, 0, std::ptr::null(), QNIL);
@@ -546,6 +626,19 @@ fn kernel_load(a: &[V]) -> V {
         return type_error("no implicit conversion into String");
     }
     let name = String::from_utf8_lossy(&rstr(path).b).into_owned();
+    // a file that changed on disk since the build, or isn't compiled in: compile it now
+    if let Some(hook) = *LOAD_HOOK.get() {
+        if let Some((abs, src, embedded)) = disk_source(&name, false) {
+            let entry = file_entry(&abs);
+            // an embedded file that is compiled in: its compiled code is the same source
+            if !(embedded && entry.is_some()) && entry.is_none_or(|e| e.2 != src_hash(&src)) {
+                if let Some((_, flag, _)) = entry {
+                    unsafe { (*(flag as *const std::sync::atomic::AtomicU64)).store(1, std::sync::atomic::Ordering::Release) };
+                }
+                return hook(&src, &abs);
+            }
+        }
+    }
     match load_compiled(&name) {
         Some(r) => r,
         None => {
@@ -557,9 +650,15 @@ fn kernel_load(a: &[V]) -> V {
     }
 }
 
+/// The compiled file `require name` would run, and its loaded flag.
+pub fn compiled_entry(name: &str) -> Option<(CompiledFn, *mut V)> {
+    let key = name.trim_end_matches(".rb");
+    FILE_TABLE.get().as_ref()?.get(key).map(|e| (e.0, e.1))
+}
+
 pub fn require_compiled(name: &str) -> Option<V> {
     let key = name.trim_end_matches(".rb");
-    let (f, flag) = *FILE_TABLE.get().as_ref()?.get(key)?;
+    let (f, flag, _) = *FILE_TABLE.get().as_ref()?.get(key)?;
     let st = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire);
     if st == 0 {
         if let Some(&lf) = rt().gvars.get(&sym("$LOADED_FEATURES")) {

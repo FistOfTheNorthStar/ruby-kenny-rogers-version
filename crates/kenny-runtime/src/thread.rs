@@ -105,14 +105,22 @@ struct GFiber {
 struct Parker {
     m: Mutex<bool>,
     cv: Condvar,
+    /// Set while the P's loop waits in its own poller instead (the HTTP server's event
+    /// loop): wakes that poller when the P gets work (a new thread, a thread woken up).
+    hook: Mutex<Option<WakeHook>>,
+    has_hook: AtomicBool,
 }
+type WakeHook = Box<dyn Fn() + Send + Sync>;
 impl Parker {
     fn new() -> Self {
-        Parker { m: Mutex::new(false), cv: Condvar::new() }
+        Parker { m: Mutex::new(false), cv: Condvar::new(), hook: Mutex::new(None), has_hook: AtomicBool::new(false) }
     }
     fn unpark(&self) {
         *self.m.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.cv.notify_one();
+        if let Some(h) = &*self.hook.lock().unwrap_or_else(|e| e.into_inner()) {
+            h();
+        }
     }
     /// Wait until unparked (or the timeout); counts as idle for the GC.
     fn park(&self, timeout: Option<Duration>) {
@@ -343,7 +351,16 @@ pub fn run_main(main: Box<dyn FnOnce() -> V>) -> V {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+        .unwrap_or_else(|| {
+            // Rails' development mode (the classic autoloader, code reloading) counts on a GVL:
+            // two requests autoloading the same module at once each create their own. One P
+            // gives the same one-at-a-time interleaving; KENNY_THREADS overrides it.
+            let env = std::env::var("RAILS_ENV").or_else(|_| std::env::var("RACK_ENV")).unwrap_or_default();
+            if env == "development" {
+                return 1;
+            }
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        })
         .min(256);
     *SCHED.get() = Some(Sched {
         threads: Vec::new(),
@@ -450,7 +467,10 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
         if !started {
             start_os_thread(p);
         }
-    } else if let Some(pk) = parker {
+    }
+    // push_runq claimed a P to run or steal the thread (this one, or an idle one it kicked):
+    // it must be woken even when this call also started P `p`, or it stays claimed but asleep
+    if let Some(pk) = parker {
         pk.unpark();
     }
     if tid == 1 {
@@ -790,6 +810,11 @@ fn push_runq(s: &mut Sched, p: usize, tid: usize) -> Option<Arc<Parker>> {
         s.ps[p].idle = false;
         return if Some(p) != me { Some(s.ps[p].parker.clone()) } else { None };
     }
+    // a P whose loop waits in its own poller (the HTTP server) isn't idle but may be blocked
+    // there with no timeout, and in a server every P is such a loop: wake it to run the thread
+    if Some(p) != me && s.ps[p].parker.has_hook.load(Ordering::Acquire) {
+        return Some(s.ps[p].parker.clone());
+    }
     if s.threads[tid].pinned { None } else { kick_idle(s, p) }
 }
 fn pop_runq(s: &mut Sched, p: usize) -> Option<usize> {
@@ -862,7 +887,14 @@ fn give_back(tid: usize) {
             P_RUNQ[me].store(s.ps[me].runq.len(), Ordering::Relaxed);
         }
         move_thread(s, tid, to);
-        if queued.is_some() { push_runq(s, to, tid) } else { None }
+        if queued.is_some() {
+            push_runq(s, to, tid)
+        } else if s.ps[to].parker.has_hook.load(Ordering::Acquire) {
+            // a timed wait moved to a P blocked in its own poller: it must recompute its timeout
+            Some(s.ps[to].parker.clone())
+        } else {
+            None
+        }
     });
     if let Some(pk) = pk {
         pk.unpark();
@@ -1048,6 +1080,18 @@ pub fn sleep(d: Option<Duration>) -> V {
         Wake::Interrupted => UNDEF,
         _ => QNIL,
     }
+}
+
+/// The current P's loop blocks in its own poller (the HTTP server): `wake` must interrupt
+/// that wait whenever another P hands this one work, since `idle_timeout` may have been None.
+pub fn set_wake_hook(wake: Box<dyn Fn() + Send + Sync>) {
+    if !active() {
+        return;
+    }
+    let idx = pt().idx;
+    let pk = locked!(s => s.ps[idx].parker.clone());
+    *pk.hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake);
+    pk.has_hook.store(true, Ordering::Release);
 }
 
 /// How long an IO loop may block waiting for events (None = forever: no other threads on

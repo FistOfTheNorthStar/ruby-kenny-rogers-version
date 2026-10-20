@@ -1047,33 +1047,58 @@ pub fn ancestors_rc(c: *mut Class) -> std::sync::Arc<[*mut Class]> {
     a
 }
 
+/// Ruby's order: each `include` (in the order they happened) inserts the module and the
+/// modules it includes right after the class, skipping any module already in the chain
+/// below that point (so a module that a superclass already includes, directly or through
+/// another module, is not inserted again: concurrent-ruby's SerialExecutorService brings
+/// ExecutorService, which RubyThreadPoolExecutor's superclass already has).
 fn ancestors_uncached(c: *mut Class) -> Vec<*mut Class> {
-    let mut out = Vec::new();
-    let mut k = c;
     unsafe {
-        while !k.is_null() {
-            for &p in (*k).prepends.iter().rev() {
-                if !out.contains(&p) {
-                    out.push(p);
-                    push_includes(p, &mut out);
-                }
-            }
-            out.push(k);
-            push_includes(k, &mut out);
-            k = (*k).superclass;
-        }
+        let rest: std::sync::Arc<[*mut Class]> = if (*c).superclass.is_null() { std::sync::Arc::from(Vec::new()) } else { ancestors_rc((*c).superclass) };
+        let (pre, part) = own_chain(c, &rest, 0);
+        let mut out = pre;
+        out.push(c);
+        out.extend(part);
+        out.extend(rest.iter().copied());
+        out
     }
-    out
 }
-fn push_includes(k: *mut Class, out: &mut Vec<*mut Class>) {
+/// (prepended chain, included chain) of `k`, leaving out anything already in `below`.
+fn own_chain(k: *mut Class, below: &[*mut Class], depth: u32) -> (Vec<*mut Class>, Vec<*mut Class>) {
+    let mut part: Vec<*mut Class> = Vec::new();
+    let mut pre: Vec<*mut Class> = Vec::new();
+    if depth > 64 {
+        return (pre, part);
+    }
     unsafe {
-        for &m in (*k).includes.iter().rev() {
-            if !out.contains(&m) {
-                out.push(m);
-                push_includes(m, out);
+        for &m in (*k).includes.iter() {
+            if m == k {
+                continue;
             }
+            let chain = module_chain(m, depth + 1);
+            let new: Vec<*mut Class> = chain.into_iter().filter(|x| *x != k && !part.contains(x) && !below.contains(x)).collect();
+            part.splice(0..0, new);
+        }
+        for &m in (*k).prepends.iter() {
+            if m == k {
+                continue;
+            }
+            // unlike include, prepend doesn't skip a module the superclass chain already has
+            // (ActiveSupport prepends its to_json module to Object and to String)
+            let chain = module_chain(m, depth + 1);
+            let new: Vec<*mut Class> = chain.into_iter().filter(|x| *x != k && !pre.contains(x) && !part.contains(x)).collect();
+            pre.splice(0..0, new);
         }
     }
+    (pre, part)
+}
+/// A module with what it includes and prepends, in method-resolution order.
+fn module_chain(m: *mut Class, depth: u32) -> Vec<*mut Class> {
+    let (pre, part) = own_chain(m, &[], depth);
+    let mut out = pre;
+    out.push(m);
+    out.extend(part);
+    out
 }
 
 /// First level of the global method cache: direct-mapped, so a call site whose inline cache
@@ -1119,41 +1144,14 @@ fn find_method_slow(c: *mut Class, mid: u32, slot: usize) -> *const Method {
     r.mc[slot] = McEntry { klass: c as usize, mid, serial, m };
     m
 }
+/// The first definition along the ancestors (in Ruby's order, see `ancestors_uncached`).
 fn find_method_uncached(c: *mut Class, mid: u32) -> *const Method {
-    let mut k = c;
-    unsafe {
-        while !k.is_null() {
-            for &p in (*k).prepends.iter().rev() {
-                if let Some(&m) = (*p).methods.get(&mid) {
-                    return if matches!((*m).body, Body::Undefined) { std::ptr::null() } else { m };
-                }
-                if let Some(m) = find_in_includes(p, mid) {
-                    return if matches!((*m).body, Body::Undefined) { std::ptr::null() } else { m };
-                }
-            }
-            if let Some(&m) = (*k).methods.get(&mid) {
-                return if matches!((*m).body, Body::Undefined) { std::ptr::null() } else { m };
-            }
-            if let Some(m) = find_in_includes(k, mid) {
-                return if matches!((*m).body, Body::Undefined) { std::ptr::null() } else { m };
-            }
-            k = (*k).superclass;
+    for &k in ancestors_rc(c).iter() {
+        if let Some(&m) = unsafe { (*k).methods.get(&mid) } {
+            return if matches!(unsafe { &(*m).body }, Body::Undefined) { std::ptr::null() } else { m };
         }
     }
     std::ptr::null()
-}
-fn find_in_includes(k: *mut Class, mid: u32) -> Option<*const Method> {
-    unsafe {
-        for &m in (*k).includes.iter().rev() {
-            if let Some(&meth) = (*m).methods.get(&mid) {
-                return Some(meth);
-            }
-            if let Some(x) = find_in_includes(m, mid) {
-                return Some(x);
-            }
-        }
-    }
-    None
 }
 pub fn find_super_method(self_: V, owner: *mut Class, mid: u32) -> *const Method {
     let k = class_of(self_);
@@ -1321,7 +1319,7 @@ pub fn no_method_error(recv: V, mid: u32, vcall: bool) -> V {
     }
     raise(rt().c.no_method_error, &format!("undefined method '{}' for {}", name, describe_recv(recv)))
 }
-fn describe_recv(v: V) -> String {
+pub fn describe_recv(v: V) -> String {
     if v == QNIL {
         "nil".into()
     } else if v == QTRUE {
@@ -1540,6 +1538,7 @@ pub fn const_lookup(cref: *mut Class, id: u32) -> Option<V> {
         let mut k = cref;
         while !k.is_null() && k != object {
             if let Some(&v) = (*k).consts.get(&id) {
+                crate::abi::settle_autoload(k, id);
                 return Some(v);
             }
             // a pending autoload here wins over outer/top-level constants (caller triggers it)
@@ -1551,6 +1550,7 @@ pub fn const_lookup(cref: *mut Class, id: u32) -> Option<V> {
         if !cref.is_null() {
             for &a in ancestors_rc(cref).iter() {
                 if let Some(&v) = (*a).consts.get(&id) {
+                    crate::abi::settle_autoload(a, id);
                     return Some(v);
                 }
                 // an autoload in an earlier ancestor wins over a constant in a later one
@@ -1559,12 +1559,18 @@ pub fn const_lookup(cref: *mut Class, id: u32) -> Option<V> {
                 }
             }
         }
-        (*rt().c.object).consts.get(&id).copied()
+        let o = rt().c.object;
+        let v = (*o).consts.get(&id).copied();
+        if v.is_some() {
+            crate::abi::settle_autoload(o, id);
+        }
+        v
     }
 }
 pub fn const_get_under(c: *mut Class, id: u32) -> Option<V> {
     for &a in ancestors_rc(c).iter() {
         if let Some(&v) = unsafe { (*a).consts.get(&id) } {
+            crate::abi::settle_autoload(a, id);
             return Some(v);
         }
         // `Engine::Configuration` with `autoload :Configuration` in Engine must load it rather

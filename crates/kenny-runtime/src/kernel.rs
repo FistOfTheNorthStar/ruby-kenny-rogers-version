@@ -346,6 +346,9 @@ pub fn init() {
         if let Some(r) = crate::compat::require_compiled(&name) {
             return r;
         }
+        if let Some(r) = crate::compat::require_from_disk(&name) {
+            return r;
+        }
         if let Some(r) = crate::capi::require_ext(&name) {
             return r;
         }
@@ -1054,12 +1057,51 @@ pub fn init() {
         }
         Err(e) => e,
     });
+    // Ruby's semantics: never calls const_missing (ActiveSupport::Dependencies relies on that
+    // when it decides whether to search outer modules); a pending autoload counts as defined.
+    fn const_defined_in(c: *mut Class, id: u32, inherit: bool) -> bool {
+        let here = |k: *mut Class| unsafe { (*k).consts.contains_key(&id) } || crate::abi::has_autoload(k, id);
+        if here(c) {
+            return true;
+        }
+        if !inherit {
+            return false;
+        }
+        if ancestors_rc(c).iter().any(|&a| here(a)) {
+            return true;
+        }
+        // modules also see Object's constants
+        (unsafe { (*c).is_module }) && ancestors_rc(rt().c.object).iter().any(|&a| here(a))
+    }
     defn(md, "const_defined?", 1, 2, |s, a, _| match str_arg(a[0]) {
         Some(b) => {
-            let saved = pst().pending;
-            let r = const_get_path(s, &b);
-            pst().pending = saved;
-            bool_v(r != UNDEF)
+            let inherit = a.len() < 2 || truthy(a[1]);
+            let path = String::from_utf8_lossy(&b).into_owned();
+            let parts: Vec<&str> = path.split("::").collect();
+            let mut cur = s as *mut Class;
+            for (i, part) in parts.iter().enumerate() {
+                if part.is_empty() && i == 0 && parts.len() > 1 {
+                    cur = rt().c.object;
+                    continue;
+                }
+                if !part.chars().next().is_some_and(|c| c.is_uppercase()) || part.contains(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                    return raise(rt().c.name_error, &format!("wrong constant name {path}"));
+                }
+                let id = sym(part);
+                if !const_defined_in(cur, id, inherit) {
+                    return QFALSE;
+                }
+                if i + 1 < parts.len() {
+                    let saved = pst().pending;
+                    let v = const_get_path(cur as V, part.as_bytes());
+                    pst().pending = saved;
+                    if v == UNDEF || !is_class(v) {
+                        return QFALSE;
+                    }
+                    cur = v as *mut Class;
+                }
+            }
+            QTRUE
         }
         None => QFALSE,
     });

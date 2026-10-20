@@ -147,6 +147,11 @@ pub struct Compiler<M: Module> {
     pub needs_jit: bool,
     /// Compiling an eval'd string: `def` uses the dynamic definee.
     pub(crate) eval_unit: bool,
+    /// (with eval_unit) a source file loaded at runtime (`load` of a changed or new file):
+    /// top-level `def` and labels as in a required file.
+    pub(crate) file_unit: bool,
+    /// content hash of every compiled file (`load` recompiles a file whose disk copy differs)
+    pub(crate) src_hashes: HashMap<PathBuf, u64>,
     pub(crate) load_paths: Vec<PathBuf>,
     /// Canonical load paths and dependency directories (code compiled with gem semantics).
     pub(crate) dep_roots: Vec<PathBuf>,
@@ -264,6 +269,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_respond_to", &[I64, I64], &[I64]),
     ("kn_ivar_defined", &[I64, I64], &[I64]),
     ("kn_gvar_defined", &[I64], &[I64]),
+    ("kn_gvar_alias", &[I64, I64], &[I64]),
     ("kn_eq", &[I64, I64], &[I64]),
     ("kn_regexp_lit", &[I64, I64, I64, I64], &[I64]),
     ("kn_regexp_new", &[I64, I64], &[I64]),
@@ -288,7 +294,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_set_lexical_parent", &[I64, I64], &[I64]),
     ("kn_rational_lit", &[I64, I64], &[I64]),
     ("kn_binding_new", &[I64], &[I64]),
-    ("kn_register_file", &[I64, I64, I64, I64], &[]),
+    ("kn_register_file", &[I64, I64, I64, I64, I64], &[]),
     ("kn_register_debug", &[I64, I64, I64, I64], &[]),
     ("kn_send_refined", &[I64, I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_send0", &[I64, I64, I64, I64], &[I64]),
@@ -402,6 +408,8 @@ impl<M: Module> Compiler<M> {
             loading: HashSet::new(),
             needs_jit: false,
             eval_unit: false,
+            file_unit: false,
+            src_hashes: HashMap::new(),
             load_paths: Vec::new(),
             dep_roots: Vec::new(),
             warnings: Vec::new(),
@@ -450,14 +458,15 @@ impl Compiler<ObjectModule> {
             let reg = self.module.declare_func_in_func(reg_id, b.func);
             let caches_base = gv(&mut self.module, &mut b, self.caches_id);
             let strs_base = gv(&mut self.module, &mut b, self.strs_id);
-            for (key, fid, flag) in self.file_table() {
+            for (key, fid, flag, hash) in self.file_table() {
                 let off = self.str_offset(key.as_bytes());
                 let kp = b.ins().iadd_imm_s(strs_base, off as i64);
                 let kl = b.ins().iconst(I64, key.len() as i64);
                 let fr = self.module.declare_func_in_func(fid, b.func);
                 let fa = b.ins().func_addr(I64, fr);
                 let fl = b.ins().iadd_imm_s(caches_base, (flag * 8) as i64);
-                b.ins().call(reg, &[kp, kl, fa, fl]);
+                let h = b.ins().iconst(I64, hash as i64);
+                b.ins().call(reg, &[kp, kl, fa, fl, h]);
             }
             // backtrace tables: functions (address, size, label, calls) and their call sites
             {
@@ -798,16 +807,17 @@ impl<M: Module> Compiler<M> {
 
     /// (require key, function, loaded-flag slot) for every compiled file, keyed by path relative
     /// to each load path (without .rb) and by absolute path.
-    pub(crate) fn file_table(&self) -> Vec<(String, FuncId, usize)> {
+    pub(crate) fn file_table(&self) -> Vec<(String, FuncId, usize, u64)> {
         let mut out = Vec::new();
         let lps: Vec<PathBuf> = self.load_paths.iter().map(|p| p.canonicalize().unwrap_or(p.clone())).collect();
         for (path, (fid, flag)) in &self.loaded {
+            let hash = self.src_hashes.get(path).copied().unwrap_or(0);
             let abs = path.display().to_string();
-            out.push((abs.trim_end_matches(".rb").to_string(), *fid, *flag));
+            out.push((abs.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
             for lp in &lps {
                 if let Ok(rel) = path.strip_prefix(lp) {
                     let r = rel.display().to_string();
-                    out.push((r.trim_end_matches(".rb").to_string(), *fid, *flag));
+                    out.push((r.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
                 }
             }
         }
@@ -836,4 +846,15 @@ impl<M: Module> Compiler<M> {
         self.check(fx, v);
         self.nil(fx)
     }
+}
+
+/// Content hash of a source file (FNV-1a, 64 bit); the runtime's `load` computes the same over
+/// the file on disk to see whether it changed since the build (`kenny_runtime::compat::src_hash`).
+pub fn src_hash(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &x in b {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }

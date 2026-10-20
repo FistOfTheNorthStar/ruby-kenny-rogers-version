@@ -294,6 +294,11 @@ impl<M: Module> Compiler<M> {
         if matches!(name.as_slice(), b"eval" | b"class_eval" | b"module_eval" | b"instance_eval") && !arg_nodes.is_empty() {
             self.needs_jit = true;
         }
+        // `load(path)` at runtime recompiles a file that changed since the build (or isn't
+        // compiled in), so it needs the runtime compiler too
+        if name.as_slice() == b"load" && !arg_nodes.is_empty() {
+            self.needs_jit = true;
+        }
 
         let recv = match &recv_node {
             Some(r) => self.expr(fx, r),
@@ -377,6 +382,14 @@ impl<M: Module> Compiler<M> {
         let mut full = base.join(&rel);
         if full.extension().is_none() {
             full.set_extension("rb");
+        }
+        if self.file_unit {
+            // a file compiled at runtime: the program's own copy of the file (compiled in, or
+            // loaded from disk by the runtime), not a second one inside this unit
+            let abs = full.canonicalize().unwrap_or(full);
+            let s = self.self_val(fx);
+            let p = self.str_lit(fx, abs.display().to_string().as_bytes());
+            return self.send(fx, s, b"require", &[p], None);
         }
         self.require_path(fx, full, at)
     }

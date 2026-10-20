@@ -13,6 +13,7 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsRawFd, IntoRawFd};
 
 static APP: G<Option<V>> = G::new(None);
 
@@ -326,9 +327,13 @@ struct Conn {
     output: Vec<u8>,
     close_after: bool,
     peer: String,
+    /// taken over by the app through `rack.hijack`
+    hijacked: bool,
 }
 
 const LISTENER: Token = Token(0);
+/// Another P gave this one work (a thread to run): see thread::set_wake_hook.
+const WAKER: Token = Token(usize::MAX);
 
 fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
     let mut poll = match Poll::new() {
@@ -340,6 +345,12 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
     };
     let mut listener = TcpListener::from_std(std_listener.try_clone().expect("listener"));
     poll.registry().register(&mut listener, LISTENER, Interest::READABLE).expect("register listener");
+    if let Ok(w) = mio::Waker::new(poll.registry(), WAKER) {
+        let w = std::sync::Arc::new(w);
+        crate::thread::set_wake_hook(Box::new(move || {
+            let _ = w.wake();
+        }));
+    }
     let mut conns: HashMap<Token, Conn> = HashMap::new();
     let mut next = 1usize;
     let mut events = Events::with_capacity(1024);
@@ -367,6 +378,9 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
             LAST_ACTIVITY.store(Stamp::now(), std::sync::atomic::Ordering::Relaxed);
         }
         for ev in events.iter() {
+            if ev.token() == WAKER {
+                continue;
+            }
             if ev.token() == LISTENER {
                 loop {
                     match listener.accept() {
@@ -375,7 +389,7 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
                             next += 1;
                             let _ = stream.set_nodelay(true);
                             if poll.registry().register(&mut stream, t, Interest::READABLE).is_ok() {
-                                conns.insert(t, Conn { stream, input: Vec::new(), output: Vec::new(), close_after: false, peer: addr.ip().to_string() });
+                                conns.insert(t, Conn { stream, input: Vec::new(), output: Vec::new(), close_after: false, peer: addr.ip().to_string(), hijacked: false });
                             }
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -414,7 +428,12 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
                             }
                             Parsed::Done(req, used) => {
                                 c.input.drain(..used);
-                                let (resp, keep) = handle(app, &req, port, &c.peer);
+                                let (resp, keep, hijacked) = handle(app, &req, port, &c.peer, c.stream.as_raw_fd());
+                                if hijacked {
+                                    // the app owns the socket now (WebSockets: Action Cable)
+                                    c.hijacked = true;
+                                    break;
+                                }
                                 c.output.extend_from_slice(&resp);
                                 if !keep {
                                     c.close_after = true;
@@ -423,7 +442,10 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
                         }
                     }
                 }
-                if !c.output.is_empty() {
+                if c.hijacked {
+                    done = true;
+                }
+                if !c.output.is_empty() && !c.hijacked {
                     loop {
                         match c.stream.write(&c.output) {
                             Ok(0) => {
@@ -456,6 +478,10 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
             if done {
                 if let Some(mut c) = conns.remove(&t) {
                     let _ = poll.registry().deregister(&mut c.stream);
+                    if c.hijacked {
+                        // keep the file descriptor open: its IO object closes it
+                        let _ = c.stream.into_raw_fd();
+                    }
                 }
             }
         }
@@ -521,7 +547,19 @@ fn hset(h: V, k: &str, v: V) {
     rhash(h).m.insert(HKey(str_from(k)), v);
 }
 
-fn handle(app: V, req: &Request, port: u16, peer: &str) -> (Vec<u8>, bool) {
+/// The connection's socket as a Ruby IO (blocking, like the sockets other Rack servers hand
+/// out), for `rack.hijack`.
+fn hijack_io(fd: i32) -> V {
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
+    }
+    send(rt().c.io as V, sym("new"), &[mkfix(fd as i64), str_from("r+")], QNIL)
+}
+
+/// Returns (response bytes, keep-alive, hijacked). A hijacked connection (full hijack:
+/// `env["rack.hijack"].call`; partial: a `rack.hijack` response header) belongs to the app.
+fn handle(app: V, req: &Request, port: u16, peer: &str, fd: i32) -> (Vec<u8>, bool, bool) {
     let mut keep = req.version == 1;
     let env = hash_new();
     let (path, query) = match req.target.split_once('?') {
@@ -541,7 +579,28 @@ fn handle(app: V, req: &Request, port: u16, peer: &str) -> (Vec<u8>, bool) {
     hset(env, "rack.multithread", bool_v(crate::thread::max_ps() > 1));
     hset(env, "rack.multiprocess", bool_v(MULTIPROCESS.load(std::sync::atomic::Ordering::Relaxed)));
     hset(env, "rack.run_once", QFALSE);
-    hset(env, "rack.hijack?", QFALSE);
+    hset(env, "rack.hijack?", QTRUE);
+    // (Arc: the proc may be freed by a collection on another OS thread)
+    let hijacked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = hijacked.clone();
+    let hijack = proc_new_native_rooted(
+        Box::new(move |_, _, _| {
+            if flag.load(std::sync::atomic::Ordering::Acquire) {
+                return rhash(env).m.get(&HKey(str_from("rack.hijack_io"))).copied().unwrap_or(QNIL);
+            }
+            let io = hijack_io(fd);
+            if io == UNDEF {
+                return UNDEF;
+            }
+            hset(env, "rack.hijack_io", io);
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            io
+        }),
+        0,
+        -1,
+        vec![env],
+    );
+    hset(env, "rack.hijack", hijack);
     let mut server_name = "localhost".to_string();
     for (name, value) in &req.headers {
         let v = str_new(value.clone());
@@ -570,17 +629,76 @@ fn handle(app: V, req: &Request, port: u16, peer: &str) -> (Vec<u8>, bool) {
     hset(env, "SERVER_NAME", str_from(&server_name));
 
     let resp = send(app, sym("call"), &[env], QNIL);
+    if hijacked.load(std::sync::atomic::Ordering::Acquire) {
+        // full hijack: the response is ignored (Rack: the app wrote its own), but its body
+        // is still closed, like Puma does: Rails' executor completes the request there
+        // (otherwise the request keeps its share of the autoload interlock)
+        pst().pending = Throw::None;
+        close_body(resp);
+        return (Vec::new(), false, true);
+    }
     if resp == UNDEF {
         report(&format!("{} {}", req.method, req.target));
-        return (error_response(500, keep), keep);
+        return (error_response(500, keep), keep, false);
+    }
+    if let Some(cb) = partial_hijack(resp) {
+        // partial hijack: send the status line and headers, then hand the socket to `cb`
+        let mut head = format!("HTTP/1.1 {} {}\r\n", fix(rary(resp).v[0]), reason(fix(rary(resp).v[0]))).into_bytes();
+        for (k, v) in crate::hash::pairs(rary(resp).v[1]) {
+            let name = crate::fmt::to_s(k).unwrap_or_default();
+            if name.eq_ignore_ascii_case(b"rack.hijack") {
+                continue;
+            }
+            let values: Vec<V> = if is_ary(v) { rary(v).v.clone() } else { vec![v] };
+            for val in values {
+                for line in crate::fmt::to_s(val).unwrap_or_default().split(|c| *c == b'\n') {
+                    head.extend_from_slice(&name);
+                    head.extend_from_slice(b": ");
+                    head.extend_from_slice(line);
+                    head.extend_from_slice(b"\r\n");
+                }
+            }
+        }
+        head.extend_from_slice(b"\r\n");
+        let io = hijack_io(fd);
+        if io != UNDEF && send(io, sym("write"), &[str_new(head)], QNIL) != UNDEF && send(io, sym("flush"), &[], QNIL) != UNDEF {
+            if send(cb, sym("call"), &[io], QNIL) == UNDEF {
+                report(&format!("{} {} (rack.hijack)", req.method, req.target));
+            }
+        }
+        pst().pending = Throw::None;
+        close_body(resp);
+        return (Vec::new(), false, true);
     }
     match serialize(resp, keep, req.method == "HEAD") {
-        Ok(bytes) => (bytes, keep),
+        Ok(bytes) => (bytes, keep, false),
         Err(msg) => {
             err_out(format!("{} {}: {}\n", req.method, req.target, msg).as_bytes());
-            (error_response(500, keep), keep)
+            (error_response(500, keep), keep, false)
         }
     }
+}
+
+/// `body.close` of a Rack response the server doesn't send (hijacked connections).
+fn close_body(resp: V) {
+    if resp != UNDEF && is_ary(resp) && rary(resp).v.len() == 3 {
+        let body = rary(resp).v[2];
+        if respond_to(body, sym("close")) {
+            let _ = send0(body, "close");
+            pst().pending = Throw::None;
+        }
+    }
+}
+
+/// The callable of a `rack.hijack` response header, if any.
+fn partial_hijack(resp: V) -> Option<V> {
+    if !is_ary(resp) || rary(resp).v.len() != 3 || !is_fix(rary(resp).v[0]) || !is_hash(rary(resp).v[1]) {
+        return None;
+    }
+    crate::hash::pairs(rary(resp).v[1])
+        .into_iter()
+        .find(|(k, _)| crate::fmt::to_s(*k).is_ok_and(|b| b.eq_ignore_ascii_case(b"rack.hijack")))
+        .map(|(_, v)| v)
 }
 
 fn error_response(code: i64, keep: bool) -> Vec<u8> {

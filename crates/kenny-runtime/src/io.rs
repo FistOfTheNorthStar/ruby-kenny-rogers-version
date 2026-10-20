@@ -289,6 +289,38 @@ pub struct IoState {
     pub mem: Option<&'static crate::vfs::Entry>,
     /// read position in `mem`
     pub mpos: usize,
+    /// Several threads may use one IO (Action Cable writes to a socket from its worker
+    /// threads while its event loop reads): the buffers change under these flags, so a race
+    /// mixes up data at worst and never touches freed memory.
+    wbusy: std::sync::atomic::AtomicBool,
+    rbusy: std::sync::atomic::AtomicBool,
+}
+
+/// Holds an IO buffer flag (see IoState::wbusy) until dropped. Waiting yields to other
+/// threads instead of blocking the OS thread (the holder may be in a slow write).
+struct BufLock<'a>(&'a std::sync::atomic::AtomicBool);
+impl<'a> BufLock<'a> {
+    fn take(f: &'a std::sync::atomic::AtomicBool) -> Self {
+        use std::sync::atomic::Ordering;
+        let mut spins = 0u32;
+        while f.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else if crate::thread::active() {
+                crate::thread::pass();
+                crate::gc::blocking(|| std::thread::sleep(Duration::from_micros(50)));
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        BufLock(f)
+    }
+}
+impl Drop for BufLock<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 fn sys_write_all(fd: i32, mut b: &[u8]) -> Result<(), i32> {
@@ -312,20 +344,51 @@ fn sys_write_all(fd: i32, mut b: &[u8]) -> Result<(), i32> {
 }
 
 /// Block until `fd` is readable, letting other green threads run meanwhile.
+fn is_regular_file(fd: i32) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe { libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFREG }
+}
+
 fn wait_fd(fd: i32, events: i16) -> Result<(), V> {
-    if crate::thread::idle_timeout().is_none() {
+    if is_regular_file(fd) {
         return Ok(());
     }
+    poll_wait(&mut [libc::pollfd { fd, events, revents: 0 }], None).map(|_| ())
+}
+
+/// poll(2) on `pfds` until something is ready (returns poll's count) or `timeout` passes
+/// (Ok(0)), without holding up this P's other threads or a collection: while the P has
+/// other threads, poll without waiting and yield to them; alone, block in short slices
+/// (counted as stopped for the GC), so a thread that comes to this P meanwhile (woken up,
+/// or a sleeper whose time came) waits at most a slice.
+fn poll_wait(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32, V> {
+    const SLICE_MS: i32 = 20;
+    let start = std::time::Instant::now();
     loop {
-        let mut p = libc::pollfd { fd, events, revents: 0 };
-        if unsafe { libc::poll(&mut p, 1, 0) } != 0 {
-            return Ok(());
+        let remaining = timeout.map(|t| t.saturating_sub(start.elapsed()));
+        let shared = crate::thread::idle_timeout().is_some();
+        let ms = if shared { 0 } else { remaining.map_or(SLICE_MS, |r| (r.as_millis() as i32).min(SLICE_MS)) };
+        let (ptr, len) = (pfds.as_mut_ptr() as usize, pfds.len() as libc::nfds_t);
+        let n = if ms == 0 {
+            unsafe { libc::poll(ptr as *mut libc::pollfd, len, 0) }
+        } else {
+            crate::gc::blocking(|| unsafe { libc::poll(ptr as *mut libc::pollfd, len, ms) })
+        };
+        if n > 0 || (n < 0 && errno() != libc::EINTR) {
+            return Ok(n);
         }
-        if crate::thread::idle_timeout().is_none() {
-            return Ok(());
+        if remaining.is_some_and(|r| r.is_zero()) || timeout.is_some_and(|t| start.elapsed() >= t) {
+            return Ok(0);
         }
-        if crate::thread::sleep(Some(Duration::from_millis(2))) == UNDEF {
-            return Err(UNDEF);
+        if shared {
+            if crate::thread::sleep(Some(Duration::from_millis(2))) == UNDEF {
+                return Err(UNDEF);
+            }
+        } else {
+            crate::thread::pass();
+            if pst().pending_is_set() {
+                return Err(UNDEF);
+            }
         }
     }
 }
@@ -351,6 +414,8 @@ impl IoState {
             stdio_copy: false,
             mem: None,
             mpos: 0,
+            wbusy: std::sync::atomic::AtomicBool::new(false),
+            rbusy: std::sync::atomic::AtomicBool::new(false),
         })
     }
     fn detail(&self) -> Vec<u8> {
@@ -396,6 +461,9 @@ impl IoState {
         if self.wbuf.is_empty() {
             return Ok(());
         }
+        // held through the write: one flush's bytes stay together
+        let wbusy = unsafe { &*(&self.wbusy as *const std::sync::atomic::AtomicBool) };
+        let _g = BufLock::take(wbusy);
         let b = std::mem::take(&mut self.wbuf);
         match self.std {
             1 => {
@@ -410,7 +478,13 @@ impl IoState {
                 if self.wfd <= 2 || self.stdio_copy {
                     flush_out(); // keep ordering with Kenny's stdout buffer
                 }
-                sys_write_all(self.wfd, &b)
+                let fd = self.wfd;
+                if is_regular_file(fd) {
+                    sys_write_all(fd, &b)
+                } else {
+                    // a socket or pipe may block until the other end reads
+                    crate::gc::blocking(|| sys_write_all(fd, &b))
+                }
             }
         }
     }
@@ -431,8 +505,13 @@ impl IoState {
             }
             2 => err_out(b),
             _ => {
-                self.wbuf.extend_from_slice(b);
-                if self.sync || self.wbuf.len() >= 8192 {
+                let full = {
+                    let wbusy = unsafe { &*(&self.wbusy as *const std::sync::atomic::AtomicBool) };
+                    let _g = BufLock::take(wbusy);
+                    self.wbuf.extend_from_slice(b);
+                    self.wbuf.len() >= 8192
+                };
+                if self.sync || full {
                     self.flush()?;
                 }
             }
@@ -463,9 +542,12 @@ impl IoState {
             flush_out();
         }
         wait_fd(self.fd, libc::POLLIN)?;
+        let rbusy = unsafe { &*(&self.rbusy as *const std::sync::atomic::AtomicBool) };
+        let _g = BufLock::take(rbusy);
         let old = self.rbuf.len();
         self.rbuf.resize(old + (1 << 16), 0);
         loop {
+            // (wait_fd waited until a pipe, socket or terminal has data; regular files don't block)
             let n = unsafe { libc::read(self.fd, self.rbuf[old..].as_mut_ptr() as *mut c_void, 1 << 16) };
             if n < 0 {
                 let e = errno();
@@ -474,8 +556,7 @@ impl IoState {
                 }
                 self.rbuf.truncate(old);
                 if e == libc::EAGAIN {
-                    let mut p = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
-                    unsafe { libc::poll(&mut p, 1, -1) };
+                    wait_fd(self.fd, libc::POLLIN)?;
                     self.rbuf.resize(old + (1 << 16), 0);
                     continue;
                 }
@@ -3119,59 +3200,47 @@ pub fn init() {
             }
         };
         let (rs, ws) = (list(a.first()), list(a.get(1)));
-        let timeout = a.get(3).and_then(|t| num_to_f(*t));
-        let start = std::time::Instant::now();
-        loop {
-            let mut ready_r = Vec::new();
-            let mut ready_w = Vec::new();
-            let mut pfds = Vec::new();
-            for &x in &rs {
-                let s = ok!(st(x));
-                if s.avail() > 0 || s.mem.is_some() {
-                    ready_r.push(x);
-                }
-                // an embedded file (fd -1) is always readable; poll skips negative fds
-                pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.fd }, events: libc::POLLIN, revents: 0 });
+        let timeout = a.get(3).and_then(|t| num_to_f(*t)).map(|t| Duration::from_secs_f64(t.max(0.0)));
+        let mut ready_r = Vec::new();
+        let mut ready_w = Vec::new();
+        let mut pfds = Vec::new();
+        for &x in &rs {
+            let s = ok!(st(x));
+            if s.avail() > 0 || s.mem.is_some() {
+                ready_r.push(x);
             }
-            for &x in &ws {
-                let s = ok!(st(x));
-                pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.wfd }, events: libc::POLLOUT, revents: 0 });
+            // an embedded file (fd -1) is always readable; poll skips negative fds
+            pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.fd }, events: libc::POLLIN, revents: 0 });
+        }
+        for &x in &ws {
+            let s = ok!(st(x));
+            pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.wfd }, events: libc::POLLOUT, revents: 0 });
+        }
+        let n = if ready_r.is_empty() {
+            match poll_wait(&mut pfds, timeout) {
+                Ok(n) => n,
+                Err(e) => return e,
             }
-            let threads = crate::thread::idle_timeout().is_some();
-            let wait_ms = if !ready_r.is_empty() || threads {
-                0
-            } else {
-                match timeout {
-                    Some(t) => ((t - start.elapsed().as_secs_f64()).max(0.0) * 1000.0) as i32,
-                    None => -1,
-                }
-            };
-            let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, wait_ms) };
-            if n > 0 {
-                for (i, p) in pfds.iter().enumerate() {
-                    if p.revents != 0 {
-                        if i < rs.len() {
-                            if !ready_r.contains(&rs[i]) {
-                                ready_r.push(rs[i]);
-                            }
-                        } else {
-                            ready_w.push(ws[i - rs.len()]);
+        } else {
+            unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) }
+        };
+        if n > 0 {
+            for (i, p) in pfds.iter().enumerate() {
+                if p.revents != 0 {
+                    if i < rs.len() {
+                        if !ready_r.contains(&rs[i]) {
+                            ready_r.push(rs[i]);
                         }
+                    } else {
+                        ready_w.push(ws[i - rs.len()]);
                     }
                 }
             }
-            if !ready_r.is_empty() || !ready_w.is_empty() {
-                return ary_new(vec![ary_new(ready_r), ary_new(ready_w), ary_new(vec![])]);
-            }
-            if let Some(t) = timeout {
-                if start.elapsed().as_secs_f64() >= t {
-                    return QNIL;
-                }
-            }
-            if threads && crate::thread::sleep(Some(Duration::from_millis(2))) == UNDEF {
-                return UNDEF;
-            }
         }
+        if ready_r.is_empty() && ready_w.is_empty() {
+            return QNIL;
+        }
+        ary_new(vec![ary_new(ready_r), ary_new(ready_w), ary_new(vec![])])
     });
     defs(io, "try_convert", 1, 1, |_, a, _| if try_st(a[0]).is_some() { a[0] } else { QNIL });
 

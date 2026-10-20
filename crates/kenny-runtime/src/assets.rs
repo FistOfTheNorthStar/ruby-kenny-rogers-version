@@ -393,6 +393,11 @@ fn js_eval(c: V, src: V) -> V {
     let source = rstr(src).b.to_vec();
     let guard = jb.0.lock().unwrap_or_else(|e| e.into_inner());
     let out: Result<Option<String>, (bool, String)> = guard.ctx.with(|ctx| {
+        // QuickJS measures its stack limit from where the runtime was created; each Kenny
+        // thread runs on its own stack, so start from this one (rquickjs only does this with
+        // its "parallel" feature). Otherwise any thread but the first gets "RangeError:
+        // Maximum call stack size exceeded" (CoffeeScript compiled in a request, development)
+        unsafe { rquickjs::qjs::JS_UpdateStackTop(rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr())) };
         // sloppy-mode global code, as in the browser and Node (rquickjs defaults to strict)
         let mut opts = rquickjs::context::EvalOptions::default();
         opts.strict = false;

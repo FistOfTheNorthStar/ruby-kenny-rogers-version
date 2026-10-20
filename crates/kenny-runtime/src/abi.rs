@@ -293,9 +293,18 @@ pub unsafe extern "C" fn kn_super(owner_slot: *const V, self_: V, mid: V, argc: 
         if sym_str(sym_id(mid)) == "respond_to_missing?" {
             return QFALSE;
         }
+        // like Ruby: a missing superclass method goes to method_missing (SimpleDelegator
+        // subclasses rely on it: `def path = super.spec.to_s` in Rails' RouteWrapper)
+        let mm = find_method(class_of(self_), sym("method_missing"));
+        if !mm.is_null() && !matches!(unsafe { &(*mm).body }, Body::Native(..)) {
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(mid);
+            a.extend_from_slice(args);
+            return invoke(mm, self_, &a, blk);
+        }
         return raise(
             rt().c.no_method_error,
-            &format!("super: no superclass method '{}' for {}", sym_str(sym_id(mid)), crate::fmt::inspect_lossy(self_)),
+            &format!("super: no superclass method '{}' for {}", sym_str(sym_id(mid)), describe_recv(self_)),
         );
     }
     invoke(m, self_, args, blk)
@@ -530,19 +539,55 @@ pub unsafe extern "C" fn kn_ivar_set(self_: V, id: V, val: V, cache: *mut IvCach
     }
     ivar_set(self_, sym_id(id), val)
 }
+/// `alias $new $old` (English.rb and friends): new name -> resolved old name.
+static GV_ALIASES: std::sync::RwLock<Vec<(u32, u32)>> = std::sync::RwLock::new(Vec::new());
+static GV_HAS_ALIASES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn gvar_resolve(id: u32) -> u32 {
+    if !GV_HAS_ALIASES.load(std::sync::atomic::Ordering::Acquire) {
+        return id;
+    }
+    let a = GV_ALIASES.read().unwrap_or_else(|e| e.into_inner());
+    a.iter().find(|(n, _)| *n == id).map(|(_, o)| *o).unwrap_or(id)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_gvar_alias(new: V, old: V) -> V {
+    let (n, o) = (sym_id(new), gvar_resolve(sym_id(old)));
+    if n != o {
+        let mut a = GV_ALIASES.write().unwrap_or_else(|e| e.into_inner());
+        a.retain(|(x, _)| *x != n);
+        // names that pointed at `new` follow it to `old`
+        for e in a.iter_mut() {
+            if e.1 == n {
+                e.1 = o;
+            }
+        }
+        a.push((n, o));
+        GV_HAS_ALIASES.store(true, std::sync::atomic::Ordering::Release);
+    }
+    QNIL
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_gvar_get(id: V) -> V {
+    let id = gvar_resolve(sym_id(id));
     // `$~` and `$!` belong to the running thread
-    match sym_name(sym_id(id)) {
+    match sym_name(id) {
         b"$~" => return pst().last_match,
         b"$!" => return pst().errinfo,
+        b"$@" => {
+            let e = pst().errinfo;
+            return if e == QNIL { QNIL } else { send0(e, "backtrace") };
+        }
+        b"$&" => return crate::regex::kn_backref(b'&' as u64),
+        b"$`" => return crate::regex::kn_backref(b'`' as u64),
+        b"$'" => return crate::regex::kn_backref(b'\'' as u64),
+        b"$+" => return crate::regex::kn_backref(b'+' as u64),
         _ => {}
     }
-    rt().gvars.get(&sym_id(id)).copied().unwrap_or(QNIL)
+    rt().gvars.get(&id).copied().unwrap_or(QNIL)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_gvar_set(id: V, v: V) -> V {
-    rt().gvars.insert(sym_id(id), v);
+    rt().gvars.insert(gvar_resolve(sym_id(id)), v);
     v
 }
 fn cvar_base(c: *mut Class) -> *mut Class {
@@ -620,6 +665,48 @@ struct Autoload {
     loader: Option<CompiledFn>,
     flag: *mut V,
     path: String,
+}
+
+/// Autoloads running right now (see settle_autoload).
+static LOADING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A constant found in `k` while another thread is still running the autoload that defines it
+/// (its `class` statement has run, the body maybe not): wait for that load to finish first.
+/// CRuby makes other threads wait for an autoload too, so they never see a half-built class
+/// (websocket-extensions' Parser without its methods, Action Cable's TaggedLoggerProxy).
+pub fn settle_autoload(k: *mut Class, id: u32) {
+    if LOADING.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let entry = autoloads().get(&(k as usize, id)).map(|a| (a.loader, a.flag, a.path.clone()));
+    let Some((loader, flag, path)) = entry else { return };
+    wait_for_autoload(loader, flag, &path);
+}
+/// Like settle_autoload, for a constant found in a scope this code didn't track (the
+/// compiler's lexical lookup): any autoload of that name another thread is running.
+pub fn settle_id(id: u32) {
+    if LOADING.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let entries: Vec<(Option<CompiledFn>, *mut V, String)> =
+        autoloads().iter().filter(|((_, i), _)| *i == id).map(|(_, a)| (a.loader, a.flag, a.path.clone())).collect();
+    for (loader, flag, path) in entries {
+        wait_for_autoload(loader, flag, &path);
+    }
+}
+fn wait_for_autoload(loader: Option<CompiledFn>, flag: *mut V, path: &str) {
+    let (f, flag) = match loader {
+        Some(f) => (f, flag),
+        None => match crate::compat::compiled_entry(path) {
+            Some(e) => e,
+            None => return,
+        },
+    };
+    let st = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire);
+    if st == 0 || st == 1 || st == crate::thread::current_token() {
+        return;
+    }
+    crate::compat::run_file_once(f, flag); // waits for the loading thread
 }
 static AUTOLOADS: crate::mt::L<std::collections::HashMap<(usize, u32), Autoload, FxBuild>> = crate::mt::L::new(std::collections::HashMap::with_hasher(FxBuild::new()));
 
@@ -710,7 +797,10 @@ pub unsafe extern "C" fn kn_const_get_l(cache: *mut ConstCache, crefp: *const [V
         }
     }
     let v = match (found, pending) {
-        (Some(v), _) => v,
+        (Some(v), _) => {
+            settle_id(id);
+            v
+        }
         (None, Some(owner)) => const_missing_in(k, id, Some(owner)),
         (None, None) => {
             let mut r = None;
@@ -724,7 +814,10 @@ pub unsafe extern "C" fn kn_const_get_l(cache: *mut ConstCache, crefp: *const [V
                 }
             }
             match r.or_else(|| unsafe { (*rt().c.object).consts.get(&id).copied() }) {
-                Some(v) => v,
+                Some(v) => {
+                    settle_id(id);
+                    v
+                }
                 None => const_missing_in(k, id, chain.iter().copied().find(|&l| has_autoload(l, id))),
             }
         }
@@ -772,11 +865,20 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
     if let Some(owner) = owner.or_else(|| find_autoload(c)(id)) {
         // the entry stays until the file has run, so another thread referencing the constant
         // meanwhile finds it and waits for the load instead of raising NameError
-        let a = autoloads().get(&(owner as usize, id)).map(|a| (a.loader, a.flag, a.path.clone())).unwrap();
+        let entry = autoloads().get(&(owner as usize, id)).map(|a| (a.loader, a.flag, a.path.clone()));
+        let Some(a) = entry else {
+            // another thread finished this autoload just now
+            if let Some(v) = after_autoload(owner, c, id) {
+                return v;
+            }
+            return send(c as V, sym("const_missing"), &[mksym(id)], QNIL);
+        };
         let a = Autoload { loader: a.0, flag: a.1, path: a.2 };
         match a.loader {
             Some(f) => {
+                LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 let r = crate::compat::run_file_once(f, a.flag);
+                LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 autoloads().remove(&(owner as usize, id));
                 if r == UNDEF {
                     return UNDEF;
@@ -785,7 +887,12 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
                     return v;
                 }
             }
-            None if crate::compat::require_compiled(&a.path).is_some() => {
+            None if {
+                LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let r = crate::compat::require_compiled(&a.path);
+                LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                r.is_some()
+            } => {
                 autoloads().remove(&(owner as usize, id));
                 if pst().pending_is_set() {
                     return UNDEF;
@@ -903,6 +1010,7 @@ pub fn const_get_scoped(c: *mut Class, id: u32) -> Option<V> {
             break;
         }
         if let Some(&v) = unsafe { (*a).consts.get(&id) } {
+            settle_autoload(a, id);
             return Some(v);
         }
         if has_autoload(a, id) {
@@ -942,18 +1050,26 @@ pub extern "C" fn kn_const_defined(cref: V, id: V) -> u64 {
 /// Returns false if loading raised.
 fn autoload_before_define(outer: *mut Class, id: u32) -> bool {
     let Some(a) = autoloads().get(&(outer as usize, id)).map(|a| Autoload { loader: a.loader, flag: a.flag, path: a.path.clone() }) else { return true };
+    // the entry goes once the file has run: while it runs (this `class` statement may be the
+    // file's own), other threads that find the constant wait for it (settle_autoload)
+    let done = |flag: *mut V| unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire) == 1;
     match a.loader {
         Some(f) => {
             let r = crate::compat::run_file_once(f, a.flag);
-            autoloads().remove(&(outer as usize, id));
+            if done(a.flag) {
+                autoloads().remove(&(outer as usize, id));
+            }
             if r == UNDEF {
                 return false;
             }
         }
         None => {
-            autoloads().remove(&(outer as usize, id));
             if crate::compat::require_compiled(&a.path).is_some() && pst().pending_is_set() {
+                autoloads().remove(&(outer as usize, id));
                 return false;
+            }
+            if crate::compat::compiled_entry(&a.path).is_none_or(|(_, flag)| done(flag)) {
+                autoloads().remove(&(outer as usize, id));
             }
         }
     }
@@ -1356,7 +1472,7 @@ pub extern "C" fn kn_ivar_defined(self_: V, id: V) -> u64 {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_gvar_defined(id: V) -> u64 {
-    rt().gvars.contains_key(&sym_id(id)) as u64
+    rt().gvars.contains_key(&gvar_resolve(sym_id(id))) as u64
 }
 
 // ---------- misc helpers used by compiled code ----------

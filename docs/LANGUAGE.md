@@ -21,7 +21,7 @@ Kenny compiles Ruby ahead of time to a single native binary, like Go.
 | `ObjectSpace.each_object` (except for `Class`/`Module`), `ObjectSpace._id2ref` | Heap doesn't need to be walkable; GC can move objects. Classes are tracked anyway, so `each_object(Class)` works |
 | `TracePoint`, `set_trace_func` | No hooks on every call/line (a debug build flag replaces them) |
 | String encodings other than UTF-8, ASCII-8BIT (binary), US-ASCII | Strings skip per-operation encoding checks |
-| `require` / `load` / `autoload` of files not known at build time | Whole program is compiled together |
+| `require` / `autoload` of a library by name (searched on `$LOAD_PATH`) that wasn't compiled in | Whole program is compiled together. `load` of a file, and `require` of an absolute path, that is new or changed since the build are compiled at runtime by the embedded JIT (Rails' code reloading in development) |
 | Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in with `--ext`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError`. The `sassc` gem (libsass through FFI) is replaced by a native Sass compiler |
 | `Thread#raise` / `Thread#kill` landing at arbitrary instructions | Delivered only at safe points (calls, loop back-edges, IO) |
 | `RubyVM::*`, `Ractor`, `$;`, `$,`, `callcc`, flip-flop, `BEGIN`/`END` | CRuby internals, superseded, or deprecated |
@@ -63,7 +63,8 @@ No GVL. No new concurrency API. The existing ones become lightweight:
 - **`Thread.new` is a lightweight task**, like a goroutine: its own small stack, cheap to create,
   switched by a scheduler when it blocks and every 10ms for fairness.
 - **Status:** threads of one process run on all cores at once (M:N): one scheduler per OS
-  thread (`KENNY_THREADS`, default one per core), each with its own run queue, allocator and
+  thread (`KENNY_THREADS`, default one per core; one under `RAILS_ENV`/`RACK_ENV=development`,
+  since Rails' classic autoloader counts on a GVL), each with its own run queue, allocator and
   caches. A thread stays on the OS thread it started on (no migration between cores yet), so
   load is balanced when threads are created, not afterwards.
 - **All IO is non-blocking automatically.** A built-in network poller (kqueue/epoll/io_uring)

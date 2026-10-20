@@ -1,0 +1,34 @@
+1
+2
+"helper_new.rb"
+2
+false
+:syntax_error
+true
+false
+true
+false
+true
+true
+false
+true
+true
+"o w"
+"boom"
+6
+[[1, 2], {layout: "x"}, nil]
+"/x!"
+"super: no superclass method 'foo' for an instance of Lonely"
+[AbstractService, Deprecates, Service, Logs]
+:real
+[Enc, String]
+"#<Node:X @me=#<Node:X ...>, @list=[#<Node:X ...>]>"
+String
+String
+#<Encoding:ASCII-8BIT>
+#<struct Empty>
+1
+[:ready, :ready, :ready, :ready]
+nil
+"late\n"
+3

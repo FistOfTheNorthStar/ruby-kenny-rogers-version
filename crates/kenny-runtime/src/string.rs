@@ -351,17 +351,36 @@ pub fn init() {
             return crate::kernel::class_new_instance(s, a, b);
         }
         let bytes = a.first().filter(|x| is_str(**x)).map(|x| rstr(*x).b.clone()).unwrap_or_default();
-        str_new(bytes)
+        let n = str_new(bytes);
+        if let Some(&x) = a.first().filter(|x| is_str(**x)) {
+            copy_enc(n, x);
+        }
+        n
     });
     defn(c, "initialize", 0, 3, |s, a, _| {
         if let Some(&x) = a.first().filter(|x| is_str(**x)) {
             b(s).set(rstr(x).b.clone());
+            copy_enc(s, x);
         }
         QNIL
     });
-    // on an instance of a subclass (e.g. ActiveSupport::StringInquirer): a plain String
-    defn(c, "to_s", 0, 0, |s, _, _| if real_class(s) == rt().c.string { s } else { str_new(rstr(s).b.clone()) });
-    defn(c, "to_str", 0, 0, |s, _, _| if real_class(s) == rt().c.string { s } else { str_new(rstr(s).b.clone()) });
+    /// `String.new(str)` keeps str's encoding
+    fn copy_enc(dst: V, src: V) {
+        let enc = crate::compat::FL_BINARY | (crate::compat::FL_BINARY << 1);
+        hdr(dst).flags = (hdr(dst).flags & !enc) | (hdr(src).flags & enc);
+    }
+    // on an instance of a String subclass (ActiveSupport::StringInquirer, SafeBuffer...) they
+    // return a plain String, like Ruby (Sprockets digests `Rails.env.to_s` by class)
+    fn plain(s: V) -> V {
+        if real_class(s) == rt().c.string {
+            return s;
+        }
+        let n = str_new(rstr(s).b.clone());
+        copy_enc(n, s);
+        n
+    }
+    defn(c, "to_s", 0, 0, |s, _, _| plain(s));
+    defn(c, "to_str", 0, 0, |s, _, _| plain(s));
     defn(c, "inspect", 0, 0, |s, _, _| new_str_v(str_inspect_v(s)));
     defn(c, "dump", 0, 0, |s, _, _| new_str_v(str_inspect(&rstr(s).b)));
     defn(c, "hash", 0, 0, |s, _, _| mkfix((hash_of(s) >> 2) as i64));

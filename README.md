@@ -27,6 +27,11 @@ cargo build --release
 ./target/release/kenny build examples/blog/config.ru -o blog
 (cd examples/blog && RAILS_ENV=production RAILS_SERVE_STATIC_FILES=1 SECRET_KEY_BASE=$(openssl rand -hex 64) ../../blog)
 ruby examples/blog/compare.rb blog   # the same session against Puma and the binary: identical
+
+# development mode: code reloading, live Sass/CoffeeScript, Rails' error pages, Action Cable
+(cd examples/blog && bundle exec rails db:migrate)
+BUNDLE_WITHOUT=test ./target/release/kenny build examples/blog/config.ru -o blog-dev
+(cd examples/blog && RAILS_ENV=development ../../blog-dev)
 ```
 
 When the program has a `Gemfile.lock` next to it (or in a parent directory), `kenny build`
@@ -54,6 +59,9 @@ under the app's directory (the database, `log/`, `tmp/`, uploads) lives in the d
 binary was started in, or in `$KENNY_APP_ROOT`. Started inside its build directory (or above
 it), the binary uses the build directory itself. Writing to an embedded file first copies it
 there. `--embed <dir>` embeds a directory for any program; `--no-embed` turns embedding off.
+In development (`RAILS_ENV`/`RACK_ENV=development`, started in its build directory) the app's
+own files are read from disk instead, so edits show up; `KENNY_LIVE_FILES=1` turns that on
+anywhere, `=0` off. The gems' files always come from the binary.
 
 ## How it works
 
@@ -106,6 +114,8 @@ Working:
   thread per core), with `Queue`, `SizedQueue`, `Mutex`, `ConditionVariable`, `Monitor`, a
   10 ms fairness timer, `Thread#raise`/`kill`, and deadlock detection. No GVL: a data race can
   lose an update but never crashes the process ([docs/LANGUAGE.md](docs/LANGUAGE.md), rule 4).
+  As in CRuby, a thread that reaches a constant another thread is autoloading waits until that
+  file has run, and one IO object can be used by several threads at once.
   External enumerators (`next`) run on Fibers.
 - **`eval` / `class_eval` / `instance_eval` with strings:** compiled at runtime by an embedded
   Cranelift JIT, linked in only when a program needs it. `binding` captures `self` (not locals),
@@ -143,6 +153,22 @@ Working:
   scopes, transactions, eager loading): `examples/rails_api_ar` is a JSON API backed by it.
   Rack 2.2 apps run, and all 1,456 source files of Rails 5.2, ActiveSupport 7.1 and their
   dependencies compile.
+- **Rails development mode and Action Cable:** a binary built with the development gems
+  (`BUNDLE_WITHOUT=test`) and run with `RAILS_ENV=development` reloads code like `rails
+  server`: `load` (which the classic autoloader, the routes reloader and initializers use)
+  compiles a file with the embedded JIT when it differs from the copy compiled into the binary
+  or is new, so edited controllers, models, routes and views, and newly added files, take
+  effect on the next request. `listen` watches the files through FSEvents. Sprockets compiles
+  Sass and CoffeeScript live. Exceptions and routing errors show Rails' development error
+  pages. The server supports Rack hijacking (full and partial), so Action Cable's WebSockets
+  work, on nio4r's pure-Ruby selector and websocket-driver's Ruby masking, in development and
+  in production (async adapter). `examples/blog/dev_session.rb` (edits a running app's view,
+  stylesheet, CoffeeScript, controller, model and routes, adds a file, raises) and
+  `examples/blog/cable_session.rb` (two WebSocket clients subscribe, broadcast from a channel
+  action and from a request, unsubscribe) pass against the binary and against Puma alike.
+  Development mode runs Ruby threads on one core by default: Rails' classic autoloader counts
+  on a GVL (two requests autoloading one module at once each define their own);
+  `KENNY_THREADS` overrides it.
 - **Reflection:** method visibility (`private`/`protected`, enforced on explicit receivers),
   `Method`/`UnboundMethod`, `Module#dup`, `Rational`/`Complex`.
 - **Backtraces:** full `caller`, `caller_locations` and `Exception#backtrace`, at no cost to
@@ -152,13 +178,15 @@ Working:
   `TCPSocket`/`TCPServer`/`Socket` name resolution (blocking); FFI bindings load (their
   declarations work) but calling a C function through FFI raises NotImplementedError.
 - **Built-in HTTP server** for Rack apps: one process serves requests on every core
-  (`rack.multithread` is true); `WEB_CONCURRENCY=n` forks n processes instead.
+  (`rack.multithread` is true); `WEB_CONCURRENCY=n` forks n processes instead. `rack.hijack`
+  (full and partial) hands the connection's socket to the app.
 
 Not yet:
 - Sass source maps, and sassc-rails' ERB (`.scss.erb`) and glob (`@import "dir/*"`) imports:
   imports are resolved by the Sass compiler on the load paths.
-- Rails' development mode (code reloading, `listen`) and Action Cable's WebSocket server are
-  untested; production mode is the target.
+- In development: debuggers (`byebug` loads, but calling `byebug` raises LoadError: its core
+  is a C extension), and Action Cable's redis adapter (untested: the redis gem isn't installed
+  here).
 - Freeing JIT-compiled code and singleton classes: code that `eval`s a *new* string or
   `extend`s objects on every request grows memory (compiled `eval` units are cached by source
   and packed into shared code pages, so repeated or boot-time evals stay cheap; `instance_exec`

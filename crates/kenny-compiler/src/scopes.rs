@@ -135,6 +135,7 @@ impl<M: Module> Compiler<M> {
         self.loading.remove(&path);
         let fid = r.ok()?;
         let flag = self.cache_alloc(1);
+        self.src_hashes.insert(path.clone(), src_hash(&src));
         self.loaded.insert(path, (fid, flag));
         Some((fid, flag))
     }
@@ -164,7 +165,7 @@ impl<M: Module> Compiler<M> {
         let sig = if is_block { self.block_sig() } else { self.method_sig() };
         // the frame's name in backtraces, as CRuby labels it
         let bt_label = match spec.kind {
-            ScopeKind::Top | ScopeKind::Class if self.eval_unit && self.fn_labels.is_empty() => "<eval>".to_string(),
+            ScopeKind::Top | ScopeKind::Class if self.eval_unit && !self.file_unit && self.fn_labels.is_empty() => "<eval>".to_string(),
             ScopeKind::Top if self.fn_labels.is_empty() && self.file == self.main_file => "<main>".to_string(),
             ScopeKind::Top => "<top (required)>".to_string(),
             ScopeKind::Block => {
@@ -221,9 +222,24 @@ impl<M: Module> Compiler<M> {
                     env_slots.insert(n.clone(), i);
                 }
             }
+            // a bare `super` inside a block also passes the method's anonymous `*` / `**`
+            // (`def render(*) = logger.silence { super }`), which aren't in the locals list
+            if caps.zsuper_in_block && spec.kind == ScopeKind::Method {
+                for n in [&b"*"[..], b"**"] {
+                    if !env_slots.contains_key(n) {
+                        let i = env_slots.len();
+                        env_slots.insert(n.to_vec(), i);
+                    }
+                }
+            }
             let has_env = caps.has_block;
             let nil = b.ins().iconst(I64, QNIL);
             let mut locals = HashMap::new();
+            for (n, &i) in env_slots.iter() {
+                if !spec.locals.contains(n) {
+                    locals.insert(n.clone(), Local::Env(i));
+                }
+            }
             for n in &spec.locals {
                 if let Some(&i) = env_slots.get(n) {
                     locals.insert(n.clone(), Local::Env(i));
@@ -697,8 +713,9 @@ impl<M: Module> Compiler<M> {
                 fx.zsuper.push((n.strip_suffix(b":").unwrap_or(&n).to_vec(), 2));
             }
         }
-        if let Some(n) = kwrest.as_ref().and_then(|k| k.as_keyword_rest_parameter_node()).and_then(|k| k.name()) {
-            fx.zsuper.push((n.as_slice().to_vec(), 3));
+        if let Some(k) = kwrest.as_ref().and_then(|k| k.as_keyword_rest_parameter_node()) {
+            // anonymous `**` is bound as the local `**`
+            fx.zsuper.push((k.name().map(|n| n.as_slice().to_vec()).unwrap_or(b"**".to_vec()), 3));
         }
         for (i, r) in reqs.iter().enumerate() {
             let v = self.arg_const(fx, i);
@@ -934,7 +951,7 @@ impl<M: Module> Compiler<M> {
                 let s = self.self_val(fx);
                 let k = match fx.kind {
                     ScopeKind::Class => 0,
-                    ScopeKind::Top if !self.eval_unit => 1,
+                    ScopeKind::Top if !self.eval_unit || self.file_unit => 1,
                     _ => 2,
                 };
                 (s, k)

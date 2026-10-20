@@ -13,6 +13,10 @@
 //! - writing to or deleting an embedded file goes to the real file in the run directory
 //!   (copied from the image first), which from then on replaces the embedded copy.
 //! - `Dir.chdir` into an embedded directory that has no real counterpart is virtual.
+//! - live app files: in development (`RAILS_ENV`/`RACK_ENV` = development, run in its build
+//!   directory) or with `KENNY_LIVE_FILES=1`, the app's own files come from disk, not the
+//!   image, so edits show up (Rails code reloading, templates, routes); `KENNY_LIVE_FILES=0`
+//!   turns that off. The gems' files still come from the image.
 //!
 //! Image layout (little-endian), written by `crates/kenny/src/embed.rs`:
 //!   "KNVFS001", u32 root count, roots (u8 is_app, u32 len, bytes),
@@ -41,6 +45,8 @@ pub struct Entry {
 
 struct Image {
     entries: HashMap<&'static [u8], Entry>,
+    /// the app's files are read from disk (see "live app files" above)
+    live: bool,
     /// the app's directory at build time
     app_root: Option<&'static [u8]>,
     /// where the app's real (non-embedded) files live at runtime, if not `app_root`
@@ -147,7 +153,15 @@ fn parse(b: &'static [u8]) -> Option<Image> {
         }
         Some(t)
     });
-    Some(Image { entries, app_root, run_root })
+    let live = match std::env::var("KENNY_LIVE_FILES").ok().as_deref() {
+        Some("1") | Some("true") => true,
+        Some(_) => false,
+        None => {
+            let env = std::env::var("RAILS_ENV").or_else(|_| std::env::var("RACK_ENV")).unwrap_or_default();
+            env == "development" && run_root.is_none() && app_root.is_some_and(|r| std::fs::metadata(OsStr::from_bytes(r)).is_ok_and(|m| m.is_dir()))
+        }
+    };
+    Some(Image { entries, live, app_root, run_root })
 }
 
 fn image() -> Option<&'static Image> {
@@ -264,6 +278,11 @@ fn key<'a>(img: &Image, p: &'a [u8]) -> Cow<'a, [u8]> {
     a
 }
 
+/// Live app files: the image doesn't answer for paths in the app's directory.
+fn live_skip(img: &Image, k: &[u8]) -> bool {
+    img.live && img.app_root.is_some_and(|r| under(k, r).is_some())
+}
+
 fn shadowed(k: &[u8]) -> bool {
     ANY_SHADOWED.load(Ordering::Relaxed) && SHADOWED.lock().unwrap().as_ref().is_some_and(|s| s.contains(k))
 }
@@ -276,7 +295,7 @@ pub fn find(p: &[u8]) -> Option<&'static Entry> {
     }
     let k = key(img, p);
     let e = img.entries.get(&*k)?;
-    if shadowed(&k) {
+    if shadowed(&k) || live_skip(img, &k) {
         return None;
     }
     Some(e)
@@ -290,7 +309,7 @@ pub fn find_with_path(p: &[u8]) -> Option<(Vec<u8>, &'static Entry)> {
     }
     let k = key(img, p);
     let e = img.entries.get(&*k)?;
-    if shadowed(&k) {
+    if shadowed(&k) || live_skip(img, &k) {
         return None;
     }
     Some((k.into_owned(), e))
