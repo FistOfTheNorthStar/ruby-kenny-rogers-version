@@ -43,16 +43,49 @@ pub struct Page {
     /// Objects were allocated here since the last collection (a minor collection sweeps
     /// only these pages: every other page holds old objects only).
     pub young: bool,
-    /// Holds dead objects not freed yet: a minor collection leaves sweeping to the thread
-    /// that next allocates from the page (`refill`), outside the pause.
-    pub unswept: bool,
+    /// SWEPT, UNSWEPT (holds dead objects not freed yet: a minor collection leaves sweeping
+    /// to the background sweeper or the thread that next allocates from the page, outside
+    /// the pause) or SWEEPING (one of them is at it).
+    pub unswept: AtomicU8,
+}
+pub const SWEPT: u8 = 0;
+pub const UNSWEPT: u8 = 1;
+pub const SWEEPING: u8 = 2;
+
+impl Page {
+    fn is_unswept(&self) -> bool {
+        self.unswept.load(Ordering::Acquire) != SWEPT
+    }
+    /// Sweep the page if it is unswept and nobody else is; wait if someone is.
+    fn ensure_swept(&mut self) {
+        loop {
+            match self.unswept.compare_exchange(UNSWEPT, SWEEPING, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    lazy_sweep(self);
+                    self.unswept.store(SWEPT, Ordering::Release);
+                    return;
+                }
+                Err(SWEEPING) => std::hint::spin_loop(),
+                Err(_) => return,
+            }
+        }
+    }
 }
 
 /// The shared heap. Mutators change it only under `heap_lock()` (taking a page, registering
 /// a class or a code region); the collector changes it while every other thread is stopped.
 pub struct Heap {
-    pub pages: Vec<Page>,
+    /// Boxed: a thread keeps a page's address after releasing the heap lock (`refill`), while
+    /// others may add pages.
+    pub pages: Vec<Box<Page>>,
     pub page_index: FxHashMap<usize, usize>,
+    /// Lowest page base and highest page end: a quick filter for `is_object` (most words a
+    /// stack scan sees are not heap pointers).
+    pub page_lo: usize,
+    pub page_hi: usize,
+    /// Page index + 1 for each 64 KB block from `page_lo` (0: not a page), while that span is
+    /// small enough; otherwise empty and `page_index` is used.
+    pub page_table: Vec<u32>,
     /// Pages with free slots that no thread is allocating from, fullest last (popped first).
     pub pool: [Vec<usize>; 4],
     pub live: usize,
@@ -147,6 +180,9 @@ pub fn heap() -> &'static mut Heap {
         Heap {
             pages: Vec::new(),
             page_index: FxHashMap::default(),
+            page_lo: usize::MAX,
+            page_hi: 0,
+            page_table: Vec::new(),
             pool: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             live: 0,
             class_set: FxHashSet::default(),
@@ -178,14 +214,15 @@ unsafe extern "C" {
 extern "C" fn print_stats() {
     let h = heap();
     eprintln!(
-        "[gc] collections={} gc_time={:.1}ms stop_wait={:.1}ms live={} pages={} peak_pages={} ({} KB peak)",
+        "[gc] collections={} gc_time={:.1}ms stop_wait={:.1}ms live={} pages={} peak_pages={} ({} KB peak) rust_heap={} KB",
         h.collections,
         h.gc_nanos as f64 / 1e6,
         STOP_NANOS.load(Ordering::Relaxed) as f64 / 1e6,
         h.live + h.envs.len(),
         h.pages.len(),
         h.peak_pages,
-        h.peak_pages * PAGE / 1024
+        h.peak_pages * PAGE / 1024,
+        MALLOC_LIVE.load(Ordering::Relaxed) >> 10
     );
 }
 static STATS_EVERY: G<bool> = G::new(false);
@@ -234,9 +271,16 @@ fn new_page(h: &mut Heap, ci: usize) -> usize {
     }
     let nslots = PAGE / slot;
     let idx = h.pages.len();
-    h.pages.push(Page { base, slot, nslots, alloc: vec![0; nslots.div_ceil(64)], class_idx: ci, young: true, unswept: false });
+    h.pages.push(Box::new(Page { base, slot, nslots, alloc: vec![0; nslots.div_ceil(64)], class_idx: ci, young: true, unswept: AtomicU8::new(SWEPT) }));
     h.peak_pages = h.peak_pages.max(h.pages.len());
     h.page_index.insert(base, idx);
+    if base < h.page_lo || base + PAGE > h.page_hi {
+        h.page_lo = h.page_lo.min(base);
+        h.page_hi = h.page_hi.max(base + PAGE);
+        rebuild_page_table(h);
+    } else if !h.page_table.is_empty() {
+        h.page_table[(base - h.page_lo) / PAGE] = idx as u32 + 1;
+    }
     idx
 }
 
@@ -295,22 +339,34 @@ fn refill(ph: &mut PHeap, ci: usize) -> usize {
             Some(pi) => pi,
             None => new_page(h, ci),
         };
-        let pg = &mut h.pages[pi] as *mut Page;
+        let pg = &mut *h.pages[pi] as *mut Page;
         drop(g);
         // the page is this thread's now: sweep it here, outside the lock and the pause
         let pg = unsafe { &mut *pg };
-        if pg.unswept {
-            lazy_sweep(pg);
-        }
+        pg.ensure_swept();
         pg.young = true;
         if let Some(p) = take_free_slots(ph, ci, pg) {
             return p;
         }
     }
 }
-/// Free the dead objects of a page left unswept by a minor collection.
+/// Rebuild the flat page table after the heap's span changed (heap lock held, or collecting).
+fn rebuild_page_table(h: &mut Heap) {
+    // up to 4M entries (16 MB) covers a 256 GB span; beyond that use the hash map
+    let n = if h.page_hi > h.page_lo { (h.page_hi - h.page_lo) / PAGE } else { 0 };
+    if n == 0 || n > (1 << 22) {
+        h.page_table = Vec::new();
+        return;
+    }
+    let mut t = vec![0u32; n];
+    for (i, pg) in h.pages.iter().enumerate() {
+        t[(pg.base - h.page_lo) / PAGE] = i as u32 + 1;
+    }
+    h.page_table = t;
+}
+
+/// Free the dead objects of a page left unswept by a minor collection (the caller claimed it).
 fn lazy_sweep(pg: &mut Page) {
-    pg.unswept = false;
     crate::mt::LAZY_SWEEP.with(|l| l.set(true));
     let mut freed = 0usize;
     for wi in 0..pg.alloc.len() {
@@ -337,6 +393,64 @@ fn lazy_sweep(pg: &mut Page) {
     LAZY_FREED.fetch_add(freed, Ordering::Relaxed);
 }
 static LAZY_FREED: AtomicUsize = AtomicUsize::new(0);
+
+// ---------- background sweeping ----------
+//
+// With several Ps, the pages a minor collection leaves unswept are swept by a background
+// thread right after it, so the dead objects' buffers (strings, arrays) are freed within
+// milliseconds instead of whenever a P next takes the page (which, with many Ps and many
+// pages, could be a whole cycle later, or never once the program goes idle). A P that takes
+// an unswept page sweeps it itself; the sweeper and the P claim a page through its state.
+// A collection pauses the sweeper (BG_LOCK) and gives it a fresh list at the end.
+
+/// Unswept pages for the sweeper (boxed pages: their addresses are stable between
+/// collections, and pages are freed only during one).
+static BG_LIST: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static BG_CV: std::sync::Condvar = std::sync::Condvar::new();
+/// Held by the sweeper while it sweeps a page, and by the collector for a whole collection.
+static BG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static BG_STARTED: AtomicBool = AtomicBool::new(false);
+static BG_FREED: AtomicUsize = AtomicUsize::new(0);
+
+fn bg_sweep_pages(pages: Vec<usize>) {
+    if pages.is_empty() {
+        return;
+    }
+    if !BG_STARTED.swap(true, Ordering::AcqRel) {
+        std::thread::Builder::new().name("kenny-gc-sweep".into()).spawn(bg_sweep_loop).expect("gc sweep thread");
+    }
+    *BG_LIST.lock().unwrap_or_else(|e| e.into_inner()) = pages;
+    BG_CV.notify_one();
+}
+
+fn bg_sweep_loop() {
+    loop {
+        {
+            let mut l = BG_LIST.lock().unwrap_or_else(|e| e.into_inner());
+            while l.is_empty() {
+                l = BG_CV.wait(l).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        let g = BG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let next = BG_LIST.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        if let Some(p) = next {
+            let pg = unsafe { &mut *(p as *mut Page) };
+            if pg.unswept.compare_exchange(UNSWEPT, SWEEPING, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                let before = LAZY_FREED.load(Ordering::Relaxed);
+                lazy_sweep(pg);
+                pg.unswept.store(SWEPT, Ordering::Release);
+                BG_FREED.fetch_add(LAZY_FREED.load(Ordering::Relaxed).saturating_sub(before), Ordering::Relaxed);
+            }
+        }
+        drop(g);
+    }
+}
+/// The collector stops the sweeper (it holds the returned guard for the collection).
+fn bg_sweep_pause() -> std::sync::MutexGuard<'static, ()> {
+    let g = BG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    BG_LIST.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    g
+}
 /// This thread's free list for size class `ci` from page `pg`; None if it is full.
 fn take_free_slots(ph: &mut PHeap, ci: usize, pg: &mut Page) -> Option<usize> {
     let fl = &mut ph.free[ci];
@@ -363,9 +477,20 @@ pub fn is_object(w: usize) -> bool {
         return false;
     }
     let h = heap();
+    if w < h.page_lo || w >= h.page_hi {
+        return false;
+    }
     let base = w & !(PAGE - 1);
-    match h.page_index.get(&base) {
-        Some(&pi) => {
+    let found = if h.page_table.is_empty() {
+        h.page_index.get(&base).copied()
+    } else {
+        match h.page_table[(base - h.page_lo) / PAGE] {
+            0 => None,
+            i => Some(i as usize - 1),
+        }
+    };
+    match found {
+        Some(pi) => {
             let pg = &h.pages[pi];
             let off = w - base;
             if off % pg.slot != 0 {
@@ -423,26 +548,59 @@ impl CountingAlloc {
     }
 }
 
+// Which allocator backs Rust allocations, chosen once at the first allocation (before main)
+// by KENNY_MALLOC=system|mimalloc. The default is the system allocator on macOS: serving on
+// many cores, objects are freed by other threads than the ones that allocated them (the GC
+// sweeps on whichever thread takes a page), which macOS's allocator absorbs well while
+// mimalloc's per-thread pages keep much more memory resident (the blog on 12 cores: 141 MB vs
+// 184 MB, same throughput). Elsewhere mimalloc (faster than glibc malloc, which also tends to
+// bloat with many threads).
+static WHICH_ALLOC: AtomicU8 = AtomicU8::new(0);
+const USE_SYSTEM: u8 = 1;
+const USE_MIMALLOC: u8 = 2;
+#[cold]
+fn choose_alloc() -> u8 {
+    // (getenv doesn't allocate)
+    let v = unsafe { libc::getenv(c"KENNY_MALLOC".as_ptr()) };
+    let w = if v.is_null() {
+        if cfg!(target_os = "macos") { USE_SYSTEM } else { USE_MIMALLOC }
+    } else {
+        match unsafe { std::ffi::CStr::from_ptr(v) }.to_bytes() {
+            b"system" => USE_SYSTEM,
+            _ => USE_MIMALLOC,
+        }
+    };
+    match WHICH_ALLOC.compare_exchange(0, w, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => w,
+        Err(prev) => prev,
+    }
+}
+#[inline(always)]
+fn use_system() -> bool {
+    let w = WHICH_ALLOC.load(Ordering::Relaxed);
+    (if w == 0 { choose_alloc() } else { w }) == USE_SYSTEM
+}
+
 unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     #[inline]
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
         Self::note(l.size() as isize);
-        unsafe { mimalloc::MiMalloc.alloc(l) }
+        unsafe { if use_system() { std::alloc::System.alloc(l) } else { mimalloc::MiMalloc.alloc(l) } }
     }
     #[inline]
     unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
         Self::note(l.size() as isize);
-        unsafe { mimalloc::MiMalloc.alloc_zeroed(l) }
+        unsafe { if use_system() { std::alloc::System.alloc_zeroed(l) } else { mimalloc::MiMalloc.alloc_zeroed(l) } }
     }
     #[inline]
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
         Self::note(-(l.size() as isize));
-        unsafe { mimalloc::MiMalloc.dealloc(p, l) }
+        unsafe { if use_system() { std::alloc::System.dealloc(p, l) } else { mimalloc::MiMalloc.dealloc(p, l) } }
     }
     #[inline]
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new_size: usize) -> *mut u8 {
         Self::note(new_size as isize - l.size() as isize);
-        unsafe { mimalloc::MiMalloc.realloc(p, l, new_size) }
+        unsafe { if use_system() { std::alloc::System.realloc(p, l, new_size) } else { mimalloc::MiMalloc.realloc(p, l, new_size) } }
     }
 }
 
@@ -675,10 +833,135 @@ fn stop_the_world_collect() {
     STW_CV.notify_all();
 }
 
+// ---------- parallel stack scanning ----------
+//
+// Most words on the stacks of stopped threads point nowhere interesting. The stopped threads
+// (waiting in `park`) split the stacks into chunks and keep only the words that might matter
+// to the marker (heap objects, retired buffers, evicted code, classes in a major
+// collection); the collector then marks from those. The filter only reads collector state.
+
+struct ScanFilter {
+    page_lo: usize,
+    page_hi: usize,
+    retired_lo: usize,
+    retired_hi: usize,
+    code_lo: usize,
+    code_hi: usize,
+    envs: bool,
+    classes: bool,
+}
+static SCAN_FILTER: G<ScanFilter> = G::new(ScanFilter { page_lo: 0, page_hi: 0, retired_lo: 1, retired_hi: 0, code_lo: 1, code_hi: 0, envs: false, classes: false });
+static SCAN_RANGES: G<Vec<(usize, usize)>> = G::new(Vec::new());
+static SCAN_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SCAN_NEXT: AtomicUsize = AtomicUsize::new(0);
+static SCAN_PENDING: AtomicUsize = AtomicUsize::new(0);
+static SCAN_OUT: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+const SCAN_CHUNK_WORDS: usize = 4096;
+
+#[inline]
+fn scan_candidate(f: &ScanFilter, w: usize) -> bool {
+    if w >= f.retired_lo && w <= f.retired_hi {
+        return true;
+    }
+    if w >= f.code_lo && w < f.code_hi {
+        return true;
+    }
+    if w & 7 != 0 || w < 4096 {
+        return false;
+    }
+    if w >= f.page_lo && w < f.page_hi + 16 && (is_object(w) || is_object(w - 16)) {
+        return true;
+    }
+    (f.envs && heap().envs.contains_key(&w)) || (f.classes && heap().class_set.contains(&w))
+}
+
+/// Filter stack chunks (a stopped thread helping, or the collector). True if it did any.
+fn scan_help() -> bool {
+    if !SCAN_ACTIVE.load(Ordering::Acquire) {
+        return false;
+    }
+    let ranges = SCAN_RANGES.get();
+    let f = SCAN_FILTER.get();
+    let mut out = Vec::new();
+    let mut worked = false;
+    loop {
+        let i = SCAN_NEXT.fetch_add(1, Ordering::AcqRel);
+        if i >= ranges.len() {
+            break;
+        }
+        worked = true;
+        let (lo, hi) = ranges[i];
+        let mut p = lo;
+        while p + 8 <= hi {
+            let w = unsafe { *(p as *const usize) };
+            if scan_candidate(f, w) {
+                out.push(w);
+            }
+            p += 8;
+        }
+        // hand in the chunk's words before counting it done (the collector takes them all
+        // once nothing is pending)
+        if !out.is_empty() {
+            SCAN_OUT.lock().unwrap_or_else(|e| e.into_inner()).append(&mut out);
+        }
+        SCAN_PENDING.fetch_sub(1, Ordering::AcqRel);
+    }
+    worked
+}
+
+/// Scan these stack ranges with the stopped threads' help, marking what they find.
+fn scan_ranges_parallel(m: &mut Marker, ranges: &[(usize, usize)]) {
+    let h = heap();
+    *SCAN_FILTER.get() = ScanFilter {
+        page_lo: h.page_lo,
+        page_hi: h.page_hi,
+        retired_lo: if m.retired.is_empty() { 1 } else { m.retired_lo },
+        retired_hi: if m.retired.is_empty() { 0 } else { m.retired_hi },
+        code_lo: m.code_lo,
+        code_hi: m.code_hi,
+        envs: !h.envs.is_empty(),
+        classes: m.major,
+    };
+    let chunks = SCAN_RANGES.get();
+    chunks.clear();
+    for &(lo, hi) in ranges {
+        if hi > lo && hi - lo > (1usize << 31) {
+            eprintln!("[gc] bad stack range {lo:#x}..{hi:#x}");
+            std::process::abort();
+        }
+        let mut p = (lo + 7) & !7;
+        while p < hi {
+            let e = (p + SCAN_CHUNK_WORDS * 8).min(hi);
+            chunks.push((p, e));
+            p = e;
+        }
+        SCANNED_WORDS.fetch_add(hi.saturating_sub(lo) / 8, Ordering::Relaxed);
+    }
+    SCAN_NEXT.store(0, Ordering::Relaxed);
+    SCAN_PENDING.store(chunks.len(), Ordering::SeqCst);
+    SCAN_ACTIVE.store(true, Ordering::SeqCst);
+    STW_CV.notify_all();
+    scan_help();
+    let mut spins = 0u32;
+    while SCAN_PENDING.load(Ordering::Acquire) != 0 {
+        spins += 1;
+        if spins < 1000 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+    SCAN_ACTIVE.store(false, Ordering::SeqCst);
+    let found = std::mem::take(&mut *SCAN_OUT.lock().unwrap_or_else(|e| e.into_inner()));
+    for w in found {
+        m.word(w);
+    }
+}
+
 // ---------- parallel sweep ----------
 
 struct SweepJob {
-    pages: *mut Page,
+    pages: *mut Box<Page>,
     /// indices of the pages to sweep
     idx: *const usize,
     n: usize,
@@ -717,9 +1000,9 @@ fn sweep_help() -> bool {
         }
         worked = true;
         for k in start..(start + SWEEP_CHUNK).min(n) {
-            let pg = unsafe { &mut *pages.add(*idx.add(k)) };
+            let pg = unsafe { &mut **pages.add(*idx.add(k)) };
             pg.young = false;
-            pg.unswept = false;
+            pg.unswept.store(SWEPT, Ordering::Relaxed);
             for (wi, word) in pg.alloc.iter_mut().enumerate() {
                 let mut bits = *word;
                 while bits != 0 {
@@ -769,6 +1052,14 @@ fn park() {
     {
         let mut e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
         while KN_GC_PENDING.load(Ordering::SeqCst) & STW_BIT != 0 || COLLECTING.load(Ordering::SeqCst) {
+            if SCAN_ACTIVE.load(Ordering::Acquire) {
+                drop(e);
+                let worked = scan_help();
+                e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
+                if worked {
+                    continue;
+                }
+            }
             if SWEEP_ACTIVE.load(Ordering::Acquire) {
                 drop(e);
                 let worked = sweep_help();
@@ -1037,6 +1328,10 @@ struct Marker {
     keep: Vec<bool>,
     retired_lo: usize,
     retired_hi: usize,
+    /// retired[buckets[b]..] start at or after retired_lo + (b << retired_shift): narrows the
+    /// search for the buffer a stack word points into to one or two buckets
+    retired_buckets: Vec<u32>,
+    retired_shift: u32,
     /// KENNY_GC_VERIFY: a full traversal (by its own visited set) that reports reachable
     /// objects the minor collection left unmarked.
     verify: Option<FxHashSet<usize>>,
@@ -1061,7 +1356,23 @@ struct Marker {
 
 impl Marker {
     fn new(retired: Vec<(usize, usize, usize)>, keep: Vec<bool>, retired_lo: usize, retired_hi: usize) -> Self {
-        Marker { stack: Vec::new(), envs: Vec::new(), marked_envs: FxHashSet::default(), seen_classes: FxHashSet::default(), retired, keep, retired_lo, retired_hi, verify: None, verify_fail: 0, newly_marked: 0, cur: 0, parents: FxHashMap::default(), minor: false, major: false, code: Vec::new(), code_lo: usize::MAX, code_hi: 0, code_hit: Vec::new() }
+        const NB: usize = 1 << 14;
+        let span = retired_hi.saturating_sub(retired_lo) + 1;
+        let retired_shift = (usize::BITS - (span / NB).leading_zeros()).min(63);
+        let mut retired_buckets = Vec::new();
+        if !retired.is_empty() {
+            let nb = (span >> retired_shift) + 2;
+            retired_buckets = vec![0u32; nb];
+            let mut i = 0usize;
+            for (b, slot) in retired_buckets.iter_mut().enumerate() {
+                let start = retired_lo.saturating_add(b << retired_shift);
+                while i < retired.len() && retired[i].0 < start {
+                    i += 1;
+                }
+                *slot = i as u32;
+            }
+        }
+        Marker { stack: Vec::new(), envs: Vec::new(), marked_envs: FxHashSet::default(), seen_classes: FxHashSet::default(), retired, keep, retired_lo, retired_hi, retired_buckets, retired_shift, verify: None, verify_fail: 0, newly_marked: 0, cur: 0, parents: FxHashMap::default(), minor: false, major: false, code: Vec::new(), code_lo: usize::MAX, code_hi: 0, code_hit: Vec::new() }
     }
     #[inline]
     fn value(&mut self, v: V) {
@@ -1124,7 +1435,7 @@ impl Marker {
             if hdr((w - 16) as V).kind == Kind::Env {
                 self.value((w - 16) as V);
             }
-        } else if heap().envs.contains_key(&w) {
+        } else if !heap().envs.is_empty() && heap().envs.contains_key(&w) {
             self.env(w);
         } else if self.major && heap().class_set.contains(&w) {
             self.class(w as *mut Class);
@@ -1137,7 +1448,11 @@ impl Marker {
         if w < self.retired_lo || w > self.retired_hi {
             return;
         }
-        let i = self.retired.partition_point(|r| r.0 <= w);
+        // the last buffer starting at or before w starts in w's bucket or an earlier one
+        let b = (w - self.retired_lo) >> self.retired_shift;
+        let lo = (self.retired_buckets[b] as usize).saturating_sub(1);
+        let hi = (self.retired_buckets[b + 1] as usize).max(lo);
+        let i = lo + self.retired[lo..hi].partition_point(|r| r.0 <= w);
         if i > 0 {
             let (start, bytes, _) = self.retired[i - 1];
             if w <= start + bytes {
@@ -1390,6 +1705,9 @@ fn scan_with_registers(m: &mut Marker) {
             snap.push((ph.regs, ph.saved_sp, ph.stack_base, copy));
         }
     }
+    // with the stopped threads' help when there is enough to scan (not while verifying)
+    let parallel = m.verify.is_none() && crate::mt::multi() && gc_ps().len() > 1;
+    let mut ranges = Vec::new();
     for (i, (regs, sp, base, copy)) in snap.iter().enumerate() {
         m.cur = 30 + i;
         for &w in regs.iter() {
@@ -1400,20 +1718,30 @@ fn scan_with_registers(m: &mut Marker) {
                 m.word(w);
             }
         } else if *base > *sp && *sp != 0 {
-            scan_range(m, *sp, *base);
+            if parallel { ranges.push((*sp, *base)) } else { scan_range(m, *sp, *base) }
         }
     }
     // stacks of suspended threads and fibers
     m.cur = 50;
     if let Some(p) = heap().stack_provider {
         for (lo, hi) in p() {
+            if parallel { ranges.push((lo, hi)) } else { scan_range(m, lo, hi) }
+        }
+    }
+    let words: usize = ranges.iter().map(|r| r.1.saturating_sub(r.0) / 8).sum();
+    if words > 2 * SCAN_CHUNK_WORDS {
+        scan_ranges_parallel(m, &ranges);
+    } else {
+        for (lo, hi) in ranges {
             scan_range(m, lo, hi);
         }
     }
     m.cur = 0;
 }
 
+static SCANNED_WORDS: AtomicUsize = AtomicUsize::new(0);
 fn scan_range(m: &mut Marker, lo: usize, hi: usize) {
+    SCANNED_WORDS.fetch_add(hi.saturating_sub(lo) / 8, Ordering::Relaxed);
     // a stack is never this large: a corrupt bound (scanning it would hang or crash later)
     if hi > lo && hi - lo > (1usize << 31) {
         eprintln!("[gc] bad stack range {lo:#x}..{hi:#x}");
@@ -1441,6 +1769,7 @@ fn collect_locked() {
         return;
     }
     IN_COLLECT.store(true, Ordering::Relaxed);
+    let bg_guard = bg_sweep_pause();
     // roots dropped on another P since the last collection: forget them (and free them)
     for (owner, p) in std::mem::take(&mut *ORPHAN_ROOTS.lock().unwrap_or_else(|e| e.into_inner())) {
         unregister_root(owner as *mut PHeap, p as *const Vec<V>);
@@ -1481,6 +1810,7 @@ fn collect_locked() {
         retired.append(&mut ph.retired);
     }
     retired.sort_unstable();
+    let n_retired = (retired.len(), retired.iter().map(|r| r.1).sum::<usize>() >> 10);
     let keep = vec![false; retired.len()];
     let (retired_lo, retired_hi) = match (retired.first(), retired.iter().map(|r| r.0 + r.1).max()) {
         (Some(f), Some(h)) => (f.0, h),
@@ -1599,11 +1929,15 @@ fn collect_locked() {
         for pg in h.pages.iter_mut() {
             if pg.young {
                 pg.young = false;
-                pg.unswept = true;
+                pg.unswept.store(UNSWEPT, Ordering::Relaxed);
             }
         }
     }
-    {
+    if sweep_pages.is_empty() {
+        // (a minor collection: nothing to sweep now, so don't wake the stopped threads)
+        freed_count = 0;
+        deferred = Vec::new();
+    } else {
         let n = sweep_pages.len();
         *SWEEP_JOB.get() = SweepJob { pages: h.pages.as_mut_ptr(), idx: sweep_pages.as_ptr(), n };
         SWEEP_LIVE.store(0, Ordering::Relaxed);
@@ -1680,7 +2014,9 @@ fn collect_locked() {
     }
     SINCE.store(0, Ordering::Relaxed);
     // with several threads allocating, every collection stops all of them: collect less often
-    let ps = gc_ps().len().clamp(1, 4);
+    // (KENNY_GC_YOUNG_SCALE caps the multiplier: 1 keeps the one-thread young generation, for
+    // the least memory, at the cost of more frequent pauses)
+    let ps = gc_ps().len().clamp(1, env_knob("KENNY_GC_YOUNG_SCALE", 4).max(1));
     let threshold = if generational() {
         // the young generation's size; the old one grows until the next major collection
         min_threshold() * ps
@@ -1700,13 +2036,20 @@ fn collect_locked() {
     MALLOC_LIMIT.store(malloc_limit(), Ordering::Relaxed);
     phase("sweep", &mut lap);
     release_and_refill(h, threshold);
+    if !major && crate::mt::multi() && std::env::var_os("KENNY_GC_LAZY").is_none() {
+        let pages: Vec<usize> = h.pages.iter().filter(|pg| pg.unswept.load(Ordering::Relaxed) == UNSWEPT).map(|pg| &**pg as *const Page as usize).collect();
+        bg_sweep_pages(pages);
+    }
+    drop(bg_guard);
     phase("pages", &mut lap);
     if *STATS_EVERY.get() {
         let txt: Vec<String> = phases.iter().map(|(n, t)| format!("{n}={t:.2}")).collect();
         eprintln!(
-            "[gc] {} phases ms: {} (data_marked={} malloc_envs={}/{} classes={} (freed {}) region_words={} remembered={} promoted={} swept_pages={}/{} freed={} lazily_freed={} helped={}/{})",
+            "[gc] {} phases ms: {} (scanned_words={} retired={:?} (n, KB) data_marked={} malloc_envs={}/{} classes={} (freed {}) region_words={} remembered={} promoted={} swept_pages={}/{} freed={} lazily_freed={} helped={}/{})",
             if major { "major" } else { "minor" },
             txt.join(" "),
+            SCANNED_WORDS.swap(0, Ordering::Relaxed),
+            n_retired,
             DBG_NDATA.load(std::sync::atomic::Ordering::Relaxed),
             n_young_envs,
             h.envs.len(),
@@ -2012,6 +2355,9 @@ fn free_retired(retired: Vec<(usize, usize, usize)>, keep: Vec<bool>) {
 
 /// Minimum allocations between collections. KENNY_GC_MIN overrides it (small values make
 /// a GC stress test).
+fn env_knob(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 fn min_threshold() -> usize {
     static M: G<usize> = G::new(0);
     let m = M.get();
@@ -2037,7 +2383,7 @@ fn growth() -> f64 {
 /// free lists so allocation fills the fullest pages first and emptier pages can drain.
 fn release_and_refill(h: &mut Heap, threshold: usize) {
     let used = |pg: &Page| pg.alloc.iter().map(|w| w.count_ones() as usize).sum::<usize>();
-    let counts: Vec<usize> = h.pages.iter().map(used).collect();
+    let counts: Vec<usize> = h.pages.iter().map(|p| used(p)).collect();
     let capacity: usize = h.pages.iter().map(|p| p.nslots).sum();
     let needed = ((h.live + threshold) as f64 * 1.25) as usize;
     let mut spare = capacity.saturating_sub(needed);
@@ -2057,14 +2403,19 @@ fn release_and_refill(h: &mut Heap, threshold: usize) {
             keep[i - 1]
         });
         h.page_index.clear();
+        h.page_lo = usize::MAX;
+        h.page_hi = 0;
         for (i, pg) in h.pages.iter().enumerate() {
             h.page_index.insert(pg.base, i);
+            h.page_lo = h.page_lo.min(pg.base);
+            h.page_hi = h.page_hi.max(pg.base + PAGE);
         }
+        rebuild_page_table(h);
     }
     // the pool is a stack (pop from the end): emptiest pages first, so allocation fills the
     // fullest pages and emptier ones can drain and be released
     // (unswept pages count as available: their dead objects are freed when taken)
-    let mut order: Vec<(usize, usize)> = h.pages.iter().enumerate().filter(|(_, pg)| used(pg) < pg.nslots || pg.unswept).map(|(i, pg)| (used(pg), i)).collect();
+    let mut order: Vec<(usize, usize)> = h.pages.iter().enumerate().filter(|(_, pg)| used(pg) < pg.nslots || pg.is_unswept()).map(|(i, pg)| (used(pg), i)).collect();
     order.sort_unstable();
     for p in h.pool.iter_mut() {
         p.clear();
