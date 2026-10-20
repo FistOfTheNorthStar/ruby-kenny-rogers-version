@@ -241,7 +241,22 @@ fn cstr(b: &[u8]) -> Result<CString, V> {
 fn osstr(b: &[u8]) -> &OsStr {
     OsStr::from_bytes(b)
 }
+/// The real file for path `p` (crate::vfs: the app's build directory maps to the run directory).
+fn dpath(p: &[u8]) -> Result<CString, V> {
+    cstr(&crate::vfs::disk(p))
+}
+/// Like `dpath`, for a path about to be created, written or removed.
+fn wpath(p: &[u8]) -> Result<CString, V> {
+    crate::vfs::prepare_write(p);
+    dpath(p)
+}
+fn is_write_flags(flags: i32) -> bool {
+    flags & libc::O_ACCMODE != libc::O_RDONLY || flags & (libc::O_CREAT | libc::O_TRUNC) != 0
+}
 fn cwd() -> Vec<u8> {
+    if let Some(d) = crate::vfs::virtual_cwd() {
+        return d;
+    }
     std::env::current_dir().map(|d| d.as_os_str().as_bytes().to_vec()).unwrap_or_else(|_| b"/".to_vec())
 }
 fn set_gvar(name: &str, v: V) {
@@ -270,6 +285,10 @@ pub struct IoState {
     pub binmode: bool,
     /// A copy of STDOUT/STDERR: flush Kenny's stdout buffer before writing.
     pub stdio_copy: bool,
+    /// A file embedded in the binary (crate::vfs), read from memory; `fd` is -1.
+    pub mem: Option<&'static crate::vfs::Entry>,
+    /// read position in `mem`
+    pub mpos: usize,
 }
 
 fn sys_write_all(fd: i32, mut b: &[u8]) -> Result<(), i32> {
@@ -330,6 +349,8 @@ impl IoState {
             autoclose: true,
             binmode: false,
             stdio_copy: false,
+            mem: None,
+            mpos: 0,
         })
     }
     fn detail(&self) -> Vec<u8> {
@@ -429,6 +450,14 @@ impl IoState {
         } else if self.rpos > (1 << 16) {
             self.rbuf.drain(..self.rpos);
             self.rpos = 0;
+        }
+        if let Some(e) = self.mem {
+            let m = crate::vfs::contents(e);
+            let from = self.mpos.min(m.len());
+            let n = (m.len() - from).min(1 << 16);
+            self.rbuf.extend_from_slice(&m[from..from + n]);
+            self.mpos = from + n;
+            return Ok(n);
         }
         if self.std == 0 && self.fd == 0 {
             flush_out();
@@ -622,6 +651,9 @@ impl IoState {
         if self.std != 0 {
             return Ok(0);
         }
+        if self.mem.is_some() {
+            return Ok(self.mpos as i64 - self.avail() as i64);
+        }
         let p = unsafe { libc::lseek(self.fd, 0, libc::SEEK_CUR) };
         if p < 0 {
             return Err(raise_errno(errno(), None, &self.detail()));
@@ -632,6 +664,20 @@ impl IoState {
         self.check_open()?;
         self.flush()?;
         let off = if whence == libc::SEEK_CUR { off - self.avail() as i64 } else { off };
+        if let Some(e) = self.mem {
+            let base = match whence {
+                libc::SEEK_CUR => self.mpos as i64,
+                libc::SEEK_END => e.size as i64,
+                _ => 0,
+            };
+            if base + off < 0 {
+                return Err(raise_errno(libc::EINVAL, None, &self.detail()));
+            }
+            self.rbuf.clear();
+            self.rpos = 0;
+            self.mpos = (base + off) as usize;
+            return Ok(());
+        }
         self.rbuf.clear();
         self.rpos = 0;
         if unsafe { libc::lseek(self.fd, off as libc::off_t, whence) } < 0 {
@@ -655,6 +701,24 @@ impl IoState {
             }
         }
         r.map_err(|e| raise_errno(e, None, &self.detail()))
+    }
+    /// An embedded file that something needs a real descriptor for (`fileno`, `dup`, a
+    /// child's redirection...): continue reading it from a temporary copy.
+    fn materialize(&mut self) -> Result<(), V> {
+        let Some(e) = self.mem else { return Ok(()) };
+        let fd = embedded_fd(self.path.as_deref().unwrap_or_default(), e)?;
+        unsafe { libc::lseek(fd, self.mpos as libc::off_t, libc::SEEK_SET) };
+        self.fd = fd;
+        self.wfd = fd;
+        self.mem = None;
+        Ok(())
+    }
+    /// `fstat` of the open file (an embedded file's own stat).
+    fn fstat(&self) -> Result<libc::stat, i32> {
+        if let Some(e) = self.mem {
+            return Ok(crate::vfs::stat(e));
+        }
+        do_fstat(if self.std != 0 { self.std as i32 } else { self.fd })
     }
     fn close_fds(&mut self) {
         self.closed = true;
@@ -812,7 +876,12 @@ fn parse_mode(m: Option<V>, kw: Option<V>, default: &[u8]) -> Result<Mode, V> {
     Ok(mode)
 }
 fn open_fd(path: &[u8], flags: i32, perm: u32) -> Result<i32, V> {
-    let c = cstr(path)?;
+    if !is_write_flags(flags) {
+        if let Some(e) = crate::vfs::find(path).filter(|e| !e.dir) {
+            return embedded_fd(path, e);
+        }
+    }
+    let c = if is_write_flags(flags) { wpath(path)? } else { dpath(path)? };
     loop {
         let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC, perm as libc::c_uint) };
         if fd >= 0 {
@@ -825,7 +894,35 @@ fn open_fd(path: &[u8], flags: i32, perm: u32) -> Result<i32, V> {
     }
 }
 /// Open a file into a fresh (unregistered) state; used by the path-based class methods.
+/// A descriptor for an embedded file (for code that needs a real fd): an unlinked temporary
+/// file holding its contents.
+fn embedded_fd(path: &[u8], e: &'static crate::vfs::Entry) -> Result<i32, V> {
+    let mut t = tmpdir();
+    t.extend_from_slice(format!("/kenny-embedded-{}-{}", std::process::id(), e.ino).as_bytes());
+    let c = cstr(&t)?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o600) };
+    if fd < 0 {
+        return Err(raise_errno(errno(), Some("rb_sysopen"), path));
+    }
+    unsafe { libc::unlink(c.as_ptr()) };
+    let r = sys_write_all(fd, crate::vfs::contents(e));
+    if let Err(x) = r {
+        unsafe { libc::close(fd) };
+        return Err(raise_errno(x, Some("rb_sysopen"), path));
+    }
+    unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+    Ok(fd)
+}
 fn open_state(path: &[u8], mode: &Mode, perm: u32) -> Result<Box<IoState>, V> {
+    if !is_write_flags(mode.flags) {
+        if let Some(e) = crate::vfs::find(path).filter(|e| !e.dir) {
+            let mut st = IoState::new(-1, true, false);
+            st.mem = Some(e);
+            st.path = Some(path.to_vec());
+            st.binmode = mode.bin;
+            return Ok(st);
+        }
+    }
     let fd = open_fd(path, mode.flags, perm)?;
     let mut st = IoState::new(fd, mode.r, mode.w);
     st.path = Some(path.to_vec());
@@ -919,7 +1016,10 @@ fn readlines_v(s: V, a: &[V]) -> V {
 // ---------- File::Stat ----------
 
 fn do_stat(path: &[u8], follow: bool) -> Result<Result<libc::stat, i32>, V> {
-    let c = cstr(path)?;
+    if let Some(e) = crate::vfs::find(path) {
+        return Ok(Ok(crate::vfs::stat(e)));
+    }
+    let c = dpath(path)?;
     let mut s: libc::stat = unsafe { std::mem::zeroed() };
     let r = unsafe { if follow { libc::stat(c.as_ptr(), &mut s) } else { libc::lstat(c.as_ptr(), &mut s) } };
     Ok(if r == 0 { Ok(s) } else { Err(errno()) })
@@ -931,7 +1031,7 @@ fn do_fstat(fd: i32) -> Result<libc::stat, i32> {
 /// stat for a path-or-IO argument; Ok(None) if it doesn't exist.
 fn stat_arg(v: V, follow: bool) -> Result<Option<libc::stat>, V> {
     if let Some(s) = try_st(v) {
-        return Ok(do_fstat(s.fd).ok());
+        return Ok(s.fstat().ok());
     }
     let p = path_bytes(v)?;
     Ok(do_stat(&p, follow)?.ok())
@@ -940,7 +1040,7 @@ fn stat_or_raise(v: V, follow: bool, func: &str) -> Result<libc::stat, V> {
     if let Some(s) = try_st(v) {
         s.check_open()?;
         let _ = s.flush_raw();
-        return do_fstat(s.fd).map_err(|e| raise_errno(e, Some(func), &s.detail()));
+        return s.fstat().map_err(|e| raise_errno(e, Some(func), &s.detail()));
     }
     let p = path_bytes(v)?;
     do_stat(&p, follow)?.map_err(|e| raise_errno(e, Some(func), &p))
@@ -1490,13 +1590,21 @@ impl Globber<'_> {
         v
     }
     fn exists(&self, path: &[u8]) -> bool {
-        CString::new(self.fs(path)).is_ok_and(|c| {
+        let p = self.fs(path);
+        if crate::vfs::find(&p).is_some() {
+            return true;
+        }
+        CString::new(crate::vfs::disk(&p).into_owned()).is_ok_and(|c| {
             let mut s: libc::stat = unsafe { std::mem::zeroed() };
             unsafe { libc::lstat(c.as_ptr(), &mut s) == 0 }
         })
     }
     fn is_dir(&self, path: &[u8], follow: bool) -> bool {
-        CString::new(self.fs(path)).is_ok_and(|c| {
+        let p = self.fs(path);
+        if let Some(e) = crate::vfs::find(&p) {
+            return e.dir;
+        }
+        CString::new(crate::vfs::disk(&p).into_owned()).is_ok_and(|c| {
             let mut s: libc::stat = unsafe { std::mem::zeroed() };
             let r = unsafe { if follow { libc::stat(c.as_ptr(), &mut s) } else { libc::lstat(c.as_ptr(), &mut s) } };
             r == 0 && is_fmt(s.st_mode as u32, libc::S_IFDIR)
@@ -1542,14 +1650,24 @@ impl Globber<'_> {
             }
             return;
         }
-        let Ok(rd) = std::fs::read_dir(osstr(&self.fs(path))) else { return };
-        let mut ents: Vec<(Vec<u8>, bool)> = rd
-            .filter_map(|e| e.ok())
-            .map(|e| {
-                let d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                (e.file_name().as_bytes().to_vec(), d)
-            })
-            .collect();
+        let dir = self.fs(path);
+        let mut ents: Vec<(Vec<u8>, bool)> = if let Some(names) = crate::vfs::list_dir(&dir) {
+            names
+                .into_iter()
+                .map(|n| {
+                    let d = self.is_dir(&Self::join(path, &n), false);
+                    (n, d)
+                })
+                .collect()
+        } else {
+            let Ok(rd) = std::fs::read_dir(osstr(&crate::vfs::disk(&dir))) else { return };
+            rd.filter_map(|e| e.ok())
+                .map(|e| {
+                    let d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    (e.file_name().as_bytes().to_vec(), d)
+                })
+                .collect()
+        };
         let dotmatch = self.flags & FNM_DOTMATCH != 0;
         if dotmatch && path.is_empty() {
             ents.push((b".".to_vec(), false)); // Ruby 3.1+: "." (never "..") with FNM_DOTMATCH
@@ -1727,6 +1845,7 @@ fn redir_targets(k: V) -> Result<Vec<usize>, V> {
         return Ok(vec![fix(k) as usize]);
     }
     if let Some(s) = try_st(k) {
+        s.materialize()?;
         let fd = if s.std != 0 { s.std as i32 } else { s.fd };
         if (0..=2).contains(&fd) {
             return Ok(vec![fd as usize]);
@@ -1764,6 +1883,7 @@ fn redir_value(v: V, target: usize) -> Result<Redir, V> {
     if let Some(s) = try_st(v) {
         s.check_open()?;
         let _ = s.flush_raw();
+        s.materialize()?;
         return Ok(Redir::Fd(match s.std {
             1 | 2 => s.std as i32,
             _ if target == 0 => s.fd,
@@ -1827,7 +1947,7 @@ fn spawn_spec(args: &[V]) -> Result<SpawnSpec, V> {
             if is_sym(k) {
                 match sym_str(sym_id(k)).as_str() {
                     "chdir" => {
-                        cmd.current_dir(osstr(&path_bytes(v)?));
+                        cmd.current_dir(osstr(&crate::vfs::disk(&path_bytes(v)?)));
                         continue;
                     }
                     "exception" => {
@@ -2172,7 +2292,10 @@ fn io_popen(cls: V, a: &[V], blk: V) -> V {
 // ---------- Dir helpers ----------
 
 fn read_dir_names(p: &[u8], func: &str) -> Result<Vec<Vec<u8>>, V> {
-    match std::fs::read_dir(osstr(p)) {
+    if let Some(names) = crate::vfs::list_dir(p) {
+        return Ok(names);
+    }
+    match std::fs::read_dir(osstr(&crate::vfs::disk(p))) {
         Ok(rd) => Ok(rd.filter_map(|e| e.ok()).map(|e| e.file_name().as_bytes().to_vec()).collect()),
         Err(e) => Err(io_fail(&e, Some(func), p)),
     }
@@ -2492,6 +2615,7 @@ pub fn init() {
     defn(io, "fileno", 0, 0, |s, _, _| {
         let stt = ok!(st(s));
         ok!(stt.check_open());
+        ok!(stt.materialize());
         mkfix(if stt.std != 0 { stt.std as i64 } else { stt.fd as i64 })
     });
     defn(io, "to_i", 0, 0, |s, _, _| send(s, sym("fileno"), &[], QNIL));
@@ -2534,7 +2658,7 @@ pub fn init() {
         let stt = ok!(st(s));
         ok!(stt.check_readable());
         let exc = kw_get(kw, "exception") != Some(QFALSE);
-        if nonblock && stt.avail() == 0 {
+        if nonblock && stt.avail() == 0 && stt.mem.is_none() {
             let mut p = libc::pollfd { fd: stt.fd, events: libc::POLLIN, revents: 0 };
             if unsafe { libc::poll(&mut p, 1, 0) } == 0 {
                 if !exc {
@@ -2727,7 +2851,7 @@ pub fn init() {
         let stt = ok!(st(s));
         ok!(stt.check_open());
         let _ = stt.flush_raw();
-        match do_fstat(if stt.std != 0 { stt.std as i32 } else { stt.fd }) {
+        match stt.fstat() {
             Ok(x) => stat_new(&x),
             Err(e) => raise_errno(e, None, &stt.detail()),
         }
@@ -2739,6 +2863,7 @@ pub fn init() {
             let (nfd, path, r, w) = if let Some(o) = try_st(a[0]) {
                 ok!(o.check_open());
                 let _ = o.flush_raw();
+                ok!(o.materialize());
                 (unsafe { libc::dup(if o.std != 0 { o.std as i32 } else { o.fd }) }, o.path.clone(), o.readable, o.writable)
             } else {
                 let p = ok!(path_bytes(a[0]));
@@ -2764,6 +2889,7 @@ pub fn init() {
         let tfd = if target.std != 0 { target.std as i32 } else { target.fd };
         let (nfd, close_new, path) = if let Some(o) = try_st(a[0]) {
             let _ = o.flush_raw();
+            ok!(o.materialize());
             (if o.std != 0 { o.std as i32 } else { o.fd }, false, o.path.clone())
         } else {
             let p = ok!(path_bytes(a[0]));
@@ -2790,6 +2916,7 @@ pub fn init() {
         let src = ok!(st(s));
         ok!(src.check_open());
         let _ = src.flush_raw();
+        ok!(src.materialize());
         let fd0 = if src.std != 0 { src.std as i32 } else { src.fd };
         let fd = unsafe { libc::fcntl(fd0, libc::F_DUPFD_CLOEXEC, 3) };
         if fd < 0 {
@@ -3000,9 +3127,10 @@ pub fn init() {
             let mut pfds = Vec::new();
             for &x in &rs {
                 let s = ok!(st(x));
-                if s.avail() > 0 {
+                if s.avail() > 0 || s.mem.is_some() {
                     ready_r.push(x);
                 }
+                // an embedded file (fd -1) is always readable; poll skips negative fds
                 pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.fd }, events: libc::POLLIN, revents: 0 });
             }
             for &x in &ws {
@@ -3102,7 +3230,7 @@ pub fn init() {
         let stt = ok!(st(s));
         ok!(stt.check_open());
         ok!(stt.flush());
-        match do_fstat(stt.fd) {
+        match stt.fstat() {
             Ok(x) => mkfix(x.st_size as i64),
             Err(e) => raise_errno(e, None, &stt.detail()),
         }
@@ -3120,6 +3248,9 @@ pub fn init() {
         let stt = ok!(st(s));
         ok!(stt.check_open());
         let op = ok!(int_arg(a[0])) as i32;
+        if stt.mem.is_some() {
+            return mkfix(0); // an embedded file: nobody else writes it
+        }
         loop {
             let r = unsafe { libc::flock(stt.fd, op) };
             if r == 0 {
@@ -3208,7 +3339,15 @@ pub fn init() {
         ($name:expr, $m:expr) => {
             defs(file, $name, 1, 1, |_, a, _| {
                 let p = ok!(path_bytes(a[0]));
-                let c = ok!(cstr(&p));
+                if let Some(e) = crate::vfs::find(&p) {
+                    // embedded files can be read; executable if their mode says so
+                    match $m {
+                        libc::R_OK => return QTRUE,
+                        libc::X_OK => return bool_v(e.dir || e.mode & 0o111 != 0),
+                        _ => {}
+                    }
+                }
+                let c = ok!(dpath(&p));
                 bool_v(unsafe { libc::access(c.as_ptr(), $m) } == 0)
             });
         };
@@ -3331,7 +3470,10 @@ pub fn init() {
                 p = base;
             }
         }
-        match std::fs::canonicalize(osstr(&p)) {
+        if let Some(r) = crate::vfs::realpath(&p) {
+            return sv(r);
+        }
+        match std::fs::canonicalize(osstr(&crate::vfs::disk(&p))) {
             Ok(r) => sv(r.as_os_str().as_bytes().to_vec()),
             Err(e) => io_fail(&e, Some("rb_check_realpath_internal"), &p),
         }
@@ -3346,11 +3488,21 @@ pub fn init() {
                 p = base;
             }
         }
-        if let Ok(r) = std::fs::canonicalize(osstr(&p)) {
+        if let Some(r) = crate::vfs::realpath(&p) {
+            return sv(r);
+        }
+        if let Ok(r) = std::fs::canonicalize(osstr(&crate::vfs::disk(&p))) {
             return sv(r.as_os_str().as_bytes().to_vec());
         }
         let parent = dirname(&p);
-        match std::fs::canonicalize(osstr(&parent)) {
+        if let Some(mut v) = crate::vfs::realpath(&parent) {
+            if !v.ends_with(b"/") {
+                v.push(b'/');
+            }
+            v.extend_from_slice(&basename(&p));
+            return sv(v);
+        }
+        match std::fs::canonicalize(osstr(&crate::vfs::disk(&parent))) {
             Ok(r) => {
                 let mut v = r.as_os_str().as_bytes().to_vec();
                 if !v.ends_with(b"/") {
@@ -3364,7 +3516,10 @@ pub fn init() {
     });
     defs(file, "readlink", 1, 1, |_, a, _| {
         let p = ok!(path_bytes(a[0]));
-        match std::fs::read_link(osstr(&p)) {
+        if crate::vfs::find(&p).is_some() {
+            return raise_errno(libc::EINVAL, Some("rb_readlink"), &p);
+        }
+        match std::fs::read_link(osstr(&crate::vfs::disk(&p))) {
             Ok(r) => sv(r.as_os_str().as_bytes().to_vec()),
             Err(e) => io_fail(&e, Some("rb_readlink"), &p),
         }
@@ -3372,8 +3527,9 @@ pub fn init() {
     fn unlink_all(a: &[V]) -> V {
         for &x in a {
             let p = ok!(path_bytes(x));
-            let c = ok!(cstr(&p));
-            if unsafe { libc::unlink(c.as_ptr()) } != 0 {
+            let embedded = crate::vfs::find(&p).is_some_and(|e| !e.dir);
+            let c = ok!(wpath(&p));
+            if unsafe { libc::unlink(c.as_ptr()) } != 0 && !(embedded && errno() == libc::ENOENT) {
                 return raise_errno(errno(), Some("apply2files"), &p);
             }
         }
@@ -3383,7 +3539,7 @@ pub fn init() {
     defs(file, "unlink", 0, -1, |_, a, _| unlink_all(a));
     defs(file, "rename", 2, 2, |_, a, _| {
         let (x, y) = (ok!(path_bytes(a[0])), ok!(path_bytes(a[1])));
-        let (cx, cy) = (ok!(cstr(&x)), ok!(cstr(&y)));
+        let (cx, cy) = (ok!(wpath(&x)), ok!(wpath(&y)));
         if unsafe { libc::rename(cx.as_ptr(), cy.as_ptr()) } != 0 {
             return raise_errno(errno(), Some("rb_file_s_rename"), format!("({}, {})", bstr(&x), bstr(&y)).as_bytes());
         }
@@ -3391,7 +3547,7 @@ pub fn init() {
     });
     defs(file, "symlink", 2, 2, |_, a, _| {
         let (x, y) = (ok!(path_bytes(a[0])), ok!(path_bytes(a[1])));
-        let (cx, cy) = (ok!(cstr(&x)), ok!(cstr(&y)));
+        let (cx, cy) = (ok!(cstr(&x)), ok!(wpath(&y)));
         if unsafe { libc::symlink(cx.as_ptr(), cy.as_ptr()) } != 0 {
             return raise_errno(errno(), Some("rb_file_s_symlink"), format!("({}, {})", bstr(&x), bstr(&y)).as_bytes());
         }
@@ -3399,7 +3555,7 @@ pub fn init() {
     });
     defs(file, "link", 2, 2, |_, a, _| {
         let (x, y) = (ok!(path_bytes(a[0])), ok!(path_bytes(a[1])));
-        let (cx, cy) = (ok!(cstr(&x)), ok!(cstr(&y)));
+        let (cx, cy) = (ok!(dpath(&x)), ok!(wpath(&y)));
         if unsafe { libc::link(cx.as_ptr(), cy.as_ptr()) } != 0 {
             return raise_errno(errno(), Some("rb_file_s_link"), format!("({}, {})", bstr(&x), bstr(&y)).as_bytes());
         }
@@ -3409,7 +3565,7 @@ pub fn init() {
         let mode = ok!(int_arg(a[0])) as libc::mode_t;
         for &x in &a[1..] {
             let p = ok!(path_bytes(x));
-            let c = ok!(cstr(&p));
+            let c = ok!(wpath(&p));
             let r = unsafe {
                 if follow { libc::chmod(c.as_ptr(), mode) } else { libc::fchmodat(libc::AT_FDCWD, c.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) }
             };
@@ -3425,7 +3581,7 @@ pub fn init() {
         let id = |v: V| if is_fix(v) { fix(v) as u32 } else { u32::MAX };
         for &x in &a[2..] {
             let p = ok!(path_bytes(x));
-            let c = ok!(cstr(&p));
+            let c = ok!(wpath(&p));
             if unsafe { libc::chown(c.as_ptr(), id(a[0]), id(a[1])) } != 0 {
                 return raise_errno(errno(), Some("apply2files"), &p);
             }
@@ -3451,7 +3607,7 @@ pub fn init() {
         let times = [ok!(tv(a[0])), ok!(tv(a[1]))];
         for &x in &a[2..] {
             let p = ok!(path_bytes(x));
-            let c = ok!(cstr(&p));
+            let c = ok!(wpath(&p));
             if unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) } != 0 {
                 return raise_errno(errno(), Some("apply2files"), &p);
             }
@@ -3462,7 +3618,7 @@ pub fn init() {
     defs(file, "lutime", 2, -1, |_, a, _| utime_all(a));
     defs(file, "truncate", 2, 2, |_, a, _| {
         let p = ok!(path_bytes(a[0]));
-        let c = ok!(cstr(&p));
+        let c = ok!(wpath(&p));
         if unsafe { libc::truncate(c.as_ptr(), ok!(int_arg(a[1])) as libc::off_t) } != 0 {
             return raise_errno(errno(), Some("rb_file_s_truncate"), &p);
         }
@@ -3470,7 +3626,7 @@ pub fn init() {
     });
     defs(file, "mkfifo", 1, 2, |_, a, _| {
         let p = ok!(path_bytes(a[0]));
-        let c = ok!(cstr(&p));
+        let c = ok!(wpath(&p));
         let mode = a.get(1).filter(|x| is_fix(**x)).map(|x| fix(*x)).unwrap_or(0o666);
         if unsafe { libc::mkfifo(c.as_ptr(), mode as libc::mode_t) } != 0 {
             return raise_errno(errno(), Some("rb_file_s_mkfifo"), &p);
@@ -3641,19 +3797,22 @@ pub fn init() {
             None => ok!(home_dir(b"")),
         };
         let old = cwd();
-        if let Err(e) = std::env::set_current_dir(osstr(&p)) {
+        if let Err(e) = crate::vfs::chdir(&p) {
             return io_fail(&e, Some("dir_s_chdir"), &p);
         }
         if !is_proc(b) {
             return mkfix(0);
         }
         let r = call_block(b, &[sv(p)]);
-        let _ = std::env::set_current_dir(osstr(&old));
+        let _ = crate::vfs::chdir(&old);
         r
     });
     defs(dir, "mkdir", 1, 2, |_, a, _| {
         let p = ok!(path_bytes(a[0]));
-        let c = ok!(cstr(&p));
+        if crate::vfs::find(&p).is_some() {
+            return raise_errno(libc::EEXIST, Some("dir_s_mkdir"), &p);
+        }
+        let c = ok!(wpath(&p));
         let mode = a.get(1).filter(|x| is_fix(**x)).map(|x| fix(*x)).unwrap_or(0o777);
         if unsafe { libc::mkdir(c.as_ptr(), mode as libc::mode_t) } != 0 {
             return raise_errno(errno(), Some("dir_s_mkdir"), &p);
@@ -3662,7 +3821,7 @@ pub fn init() {
     });
     fn rmdir(a: &[V]) -> V {
         let p = ok!(path_bytes(a[0]));
-        let c = ok!(cstr(&p));
+        let c = ok!(dpath(&p));
         if unsafe { libc::rmdir(c.as_ptr()) } != 0 {
             return raise_errno(errno(), Some("dir_s_rmdir"), &p);
         }
@@ -3674,7 +3833,10 @@ pub fn init() {
     defs(dir, "exist?", 1, 1, |_, a, _| bool_v(ok!(stat_arg(a[0], true)).is_some_and(|s| is_fmt(s.st_mode as u32, libc::S_IFDIR))));
     defs(dir, "empty?", 1, 1, |_, a, _| {
         let p = ok!(path_bytes(a[0]));
-        match std::fs::read_dir(osstr(&p)) {
+        if let Some(names) = crate::vfs::list_dir(&p) {
+            return bool_v(names.is_empty());
+        }
+        match std::fs::read_dir(osstr(&crate::vfs::disk(&p))) {
             Ok(mut rd) => bool_v(rd.next().is_none()),
             Err(_) => QFALSE,
         }

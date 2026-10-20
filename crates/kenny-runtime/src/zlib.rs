@@ -643,7 +643,7 @@ fn gzw_finish(s: V) -> V {
     if is_str(path) {
         let p = String::from_utf8_lossy(&rstr(path).b).into_owned();
         let data = rstr(ivar_get(s, sym("@__fbuf"))).b.clone();
-        if let Err(e) = std::fs::write(&p, data) {
+        if let Err(e) = std::fs::write(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&crate::vfs::write_path(p.as_bytes())), data) {
             return raise(rt().c.io_error, &format!("{p}: {e}"));
         }
     }
@@ -923,8 +923,8 @@ fn init_gzip(z: *mut Class) {
             Ok(p) => String::from_utf8_lossy(&p).into_owned(),
             Err(e) => return e,
         };
-        let src = match std::fs::read(&p) {
-            Ok(x) => x,
+        let src = match crate::vfs::read_file(p.as_bytes()) {
+            Ok(x) => x.into_owned(),
             Err(_) => {
                 let errno = const_lookup(rt().c.object, sym("Errno")).unwrap() as *mut Class;
                 let enoent = const_get_under(errno, sym("ENOENT")).unwrap() as *mut Class;
