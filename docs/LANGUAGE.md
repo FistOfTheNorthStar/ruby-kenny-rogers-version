@@ -42,6 +42,9 @@ which call sites come after it, and only those sites use a refinement-aware look
 - **Metaprogramming is free during boot, slower after.** `define_method`, `class_eval`, `include`,
   `extend` work any time; after boot they invalidate caches and take a slow path.
 - **`$~` / `$1`** are tracked only in methods that reference them.
+- **Objects may move in memory** (the GC compacts sparse pages), but identity is stable:
+  `object_id` and the default `hash` are derived from the address, and an object whose
+  `object_id` or identity hash was ever taken is never moved.
 - **Gems are resolved at build time.** With a `Gemfile.lock`, `kenny build` compiles the locked
   gems of the groups not in `BUNDLE_WITHOUT` (default `development:test`); in the binary,
   `require "bundler/setup"` and `Bundler.require(*groups)` use that build-time resolution.
@@ -65,13 +68,14 @@ No GVL. No new concurrency API. The existing ones become lightweight:
 - **Status:** threads of one process run on all cores at once (M:N): one scheduler per OS
   thread (`KENNY_THREADS`, default one per core; one under `RAILS_ENV`/`RACK_ENV=development`,
   since Rails' classic autoloader counts on a GVL), each with its own run queue, allocator and
-  caches. A thread stays on the OS thread it started on (no migration between cores yet), so
-  load is balanced when threads are created, not afterwards.
-- **All IO is non-blocking automatically.** A built-in network poller (kqueue/epoll/io_uring)
-  parks a thread on IO and runs another — Ruby's `Fiber::Scheduler` behaviour, built in, no gem.
-  *Status:* the built-in HTTP server's sockets already work this way and cooperate with threads;
-  file, subprocess and `socket`-library IO called from Ruby code still blocks the process
-  (next step).
+  caches. A scheduler with nothing to run takes a waiting thread from a busy one (work
+  stealing), so threads move between cores as the load changes.
+- **IO doesn't stop other threads.** A thread waiting on a socket, pipe or `IO.select` yields
+  its core to the other threads; a file read or write, `fsync`, or SQLite query runs as a
+  blocking call, during which the core's waiting threads are handed to an idle core (or a spare
+  one when all are busy) and collections go ahead without waiting for it. Ruby's
+  `Fiber::Scheduler` behaviour, built in, no gem. *Status:* sockets and pipes are polled
+  rather than parked on an event loop (an epoll/kqueue-style poller is the next step).
 - **`Mutex`, `Queue`, `SizedQueue`, `ConditionVariable`, `Monitor`** work as documented, backed by
   the scheduler (parking, not OS blocking).
 - **`Fiber`** keeps its Ruby semantics (`Enumerator#next` etc.).
