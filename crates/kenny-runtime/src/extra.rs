@@ -2190,10 +2190,7 @@ pub fn init() {
         // GC.compact: a full collection that moves objects out of sparsely used pages (when no
         // native frame is active anywhere); returns {moved:, freed_pages:}, or nil if it couldn't
         defs(gc, "compact", 0, 0, |_, _, _| {
-            pst().native_depth -= 1;
-            let r = crate::gc::compact_now();
-            pst().native_depth += 1;
-            match r {
+            match crate::gc::compact_now() {
                 Some((moved, freed)) => {
                     let h = hash_new();
                     rhash(h).m.insert(HKey(mksym(sym("moved"))), mkfix(moved as i64));
@@ -2203,6 +2200,8 @@ pub fn init() {
                 None => QNIL,
             }
         });
+        // (these frames hold no object references: they don't stop the GC from moving objects)
+        gc_transparent(singleton_class(gc as V), &["start", "compact"]);
         defs(gc, "stress", 0, 0, |_, _, _| QFALSE);
         defs(gc, "stress=", 1, 1, |_, a, _| a[0]);
         defs(gc, "latest_gc_info", 0, 1, |_, _, _| hash_new());

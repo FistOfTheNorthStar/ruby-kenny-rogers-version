@@ -1164,10 +1164,7 @@ pub fn init() {
     let gc = new_module("GC");
     set_global_const("GC", gc as V);
     defs(gc, "start", 0, 1, |_, _, _| {
-        // (this frame holds no object references: it doesn't stop the GC from moving objects)
-        pst().native_depth -= 1;
         crate::gc::collect_now();
-        pst().native_depth += 1;
         QNIL
     });
     defs(gc, "enable", 0, 0, |_, _, _| {

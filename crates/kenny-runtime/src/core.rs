@@ -461,10 +461,90 @@ pub fn proc_new_native_rooted(f: NativeBlock, min: i32, max: i32, roots: Vec<V>)
 }
 unsafe extern "C" fn native_block_tramp(p: *mut RProc, self_: V, argc: u64, argv: *const V, blk: V) -> V {
     let args = unsafe { args_slice(argc, argv) };
-    pst().native_depth += 1;
-    let r = unsafe { (*(*p).native)(self_, args, blk) };
-    pst().native_depth -= 1;
+    call_native_block(unsafe { &**(*p).native }, self_, args, blk)
+}
+
+// Native (Rust) methods and blocks may keep object references where the GC can't see or
+// update them (in Rust collections), so the GC moves objects only when no stack has such a
+// frame (gc::compact). Every call into one goes through `call_native`/`call_native_block`
+// (never inlined, never a tail call), so the return address into them marks a native frame
+// on a stack; `native_return_addresses` finds those addresses once. C extension functions
+// are counted instead (C_CALLS: rarer, and reached through a C dispatcher).
+#[inline(never)]
+pub fn call_native(f: NativeFn, recv: V, args: &[V], blk: V) -> V {
+    let r = f(recv, args, blk);
+    not_a_tail_call();
     r
+}
+#[inline(never)]
+fn call_native_block(f: &dyn Fn(V, &[V], V) -> V, recv: V, args: &[V], blk: V) -> V {
+    let r = f(recv, args, blk);
+    not_a_tail_call();
+    r
+}
+/// An empty instruction after the call keeps it from becoming a tail call (which would leave
+/// no frame, and so no return address, behind).
+#[inline(always)]
+fn not_a_tail_call() {
+    unsafe { std::arch::asm!("", options(nomem, nostack, preserves_flags)) };
+}
+/// C extension functions running on any thread (see call_native).
+pub static C_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn call_native_c(f: *const std::ffi::c_void, arity: i32, recv: V, args: &[V]) -> V {
+    C_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let r = crate::capi::call_cfunc(f, arity, recv, args);
+    C_CALLS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    r
+}
+/// The return addresses inside `call_native` and `call_native_block`, found by calling each
+/// with a probe that reads where it returns to (0 where that isn't possible).
+pub fn native_return_addresses() -> [usize; 2] {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RET: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+    static DONE: std::sync::Once = std::sync::Once::new();
+    #[inline(never)]
+    fn not_a_leaf() {
+        std::hint::black_box(());
+    }
+    /// The return address saved in the current function's frame record (it must have one:
+    /// call `not_a_leaf` first).
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[inline(always)]
+    fn own_return_address() -> usize {
+        let fp: usize;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack));
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack));
+        }
+        (unsafe { *((fp + 8) as *const usize) }) & 0x0000_ffff_ffff_ffff
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    fn own_return_address() -> usize {
+        0
+    }
+    fn probe0(_: V, _: &[V], _: V) -> V {
+        not_a_leaf();
+        RET[0].store(own_return_address(), Ordering::Relaxed);
+        QNIL
+    }
+    DONE.call_once(|| {
+        call_native(probe0, QNIL, &[], QNIL);
+        call_native_block(
+            &|_, _, _| {
+                not_a_leaf();
+                RET[1].store(own_return_address(), Ordering::Relaxed);
+                QNIL
+            },
+            QNIL,
+            &[],
+            QNIL,
+        );
+    });
+    [RET[0].load(Ordering::Relaxed), RET[1].load(Ordering::Relaxed)]
 }
 pub unsafe fn args_slice<'a>(argc: u64, argv: *const V) -> &'a [V] {
     if argc == 0 { &[] } else { unsafe { std::slice::from_raw_parts(argv, argc as usize) } }
@@ -627,8 +707,8 @@ pub struct Method {
     /// the body, so aliases and copies keep it.
     pub opt: u8,
     /// A native method audited to keep object references only on the stack (it blocks or
-    /// loops, like `loop`, `sleep`, `Queue#pop`): its frame doesn't count in
-    /// PState::native_depth, so a thread waiting in it doesn't stop the GC from moving objects.
+    /// loops, like `loop`, `sleep`, `Queue#pop`): it is called directly instead of through
+    /// `call_native`, so a thread waiting in it doesn't stop the GC from moving objects.
     pub gc_transparent: bool,
 }
 
@@ -756,10 +836,6 @@ pub struct PState {
     pub thr: crate::thread::PThr,
     /// Direct-mapped method cache in front of `mcache`.
     pub mc: Box<[McEntry; MC_SIZE]>,
-    /// Native (Rust or C) method and block frames active on the running thread. Native code
-    /// may keep object references where the GC can't see or update them (in Rust
-    /// collections), so the GC moves objects only when no thread has any (gc::compact).
-    pub native_depth: u32,
 }
 
 impl PState {
@@ -790,10 +866,51 @@ pub static ALL_PS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new
 pub fn pst() -> &'static mut PState {
     unsafe { &mut *pst_ptr() }
 }
-#[inline(never)]
+#[inline(always)]
 fn pst_ptr() -> *mut PState {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        let key = PST_KEY.load(std::sync::atomic::Ordering::Relaxed);
+        if key != 0 {
+            // the thread's TSD array (TPIDRRO_EL0) indexed by our pthread key: what
+            // pthread_getspecific reads, in two instructions; the asm is volatile, so the read
+            // is never merged with one made before the thread moved to another OS thread
+            let tsd: usize;
+            unsafe { std::arch::asm!("mrs {}, tpidrro_el0", out(reg) tsd, options(nomem, nostack, preserves_flags)) };
+            return unsafe { *((tsd & !7) as *const *mut PState).add(key) };
+        }
+    }
+    pst_ptr_tls()
+}
+#[inline(never)]
+fn pst_ptr_tls() -> *mut PState {
     std::hint::black_box(PST.with(|c| c.get()))
 }
+/// (Apple Silicon) The pthread key holding each P's state, once checked to work (0: not used).
+static PST_KEY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn set_pst_key(p: *mut PState) {
+    use std::sync::atomic::Ordering;
+    static KEY: std::sync::OnceLock<Option<libc::pthread_key_t>> = std::sync::OnceLock::new();
+    let Some(key) = *KEY.get_or_init(|| {
+        let mut k: libc::pthread_key_t = 0;
+        (unsafe { libc::pthread_key_create(&mut k, None) } == 0).then_some(k)
+    }) else {
+        return;
+    };
+    unsafe { libc::pthread_setspecific(key, p as *const std::ffi::c_void) };
+    // use the direct read only if it finds what pthread_getspecific does
+    let tsd: usize;
+    unsafe { std::arch::asm!("mrs {}, tpidrro_el0", out(reg) tsd, options(nomem, nostack, preserves_flags)) };
+    let direct = unsafe { *((tsd & !7) as *const *mut PState).add(key as usize) };
+    if direct == p && key != 0 {
+        PST_KEY.store(key as usize, Ordering::Relaxed);
+    } else {
+        PST_KEY.store(0, Ordering::Relaxed);
+    }
+}
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+fn set_pst_key(_: *mut PState) {}
 /// This OS thread's state, if it runs Ruby code.
 pub fn pst_opt() -> Option<&'static mut PState> {
     let p = pst_ptr();
@@ -814,9 +931,9 @@ pub fn new_pstate() -> *mut PState {
         heap: crate::gc::PHeap::new(),
         thr: crate::thread::PThr::default(),
         mc: new_method_cache(),
-        native_depth: 0,
     }));
     PST.with(|c| c.set(p));
+    set_pst_key(p);
     ALL_PS.lock().unwrap_or_else(|e| e.into_inner()).push(p as usize);
     p
 }
@@ -1237,10 +1354,7 @@ pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
             if m.gc_transparent {
                 return f(recv, args, blk);
             }
-            pst().native_depth += 1;
-            let r = f(recv, args, blk);
-            pst().native_depth -= 1;
-            r
+            call_native(*f, recv, args, blk)
         }
         Body::AttrReader(iv) => {
             if !args.is_empty() {
@@ -1262,9 +1376,7 @@ pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
         }
         Body::CFunc(f, arity) => {
             pst().current_block.push(blk);
-            pst().native_depth += 1;
-            let r = crate::capi::call_cfunc(*f, *arity, recv, args);
-            pst().native_depth -= 1;
+            let r = call_native_c(*f, *arity, recv, args);
             pst().current_block.pop();
             r
         }

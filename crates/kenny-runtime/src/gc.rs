@@ -2457,14 +2457,64 @@ fn compaction_mode(h: &Heap) -> CompactMode {
         _ => CompactMode::Auto,
     }
 }
-/// No thread has native frames that might hold object references the GC can't update.
+/// No thread has a native frame that might hold object references the GC can't update: no C
+/// extension function runs, and no stack (running, stopped, suspended thread or Fiber) holds
+/// a return address into `call_native`/`call_native_block` (see core.rs).
 fn compaction_safe() -> bool {
-    let ok = gc_ps().iter().all(|&p| unsafe { (*(p as *const PState)).native_depth } == 0) && crate::thread::no_suspended_native_frames();
-    if !ok && std::env::var_os("KENNY_GC_COMPACT_STATS").is_some() && heap().compact_request != 0 {
-        let depths: Vec<u32> = gc_ps().iter().map(|&p| unsafe { (*(p as *const PState)).native_depth }).collect();
-        eprintln!("[gc] can't compact now: native frames per P {depths:?}, suspended threads/fibers ok: {}", crate::thread::no_suspended_native_frames());
+    let why = compaction_blocker();
+    if let Some(why) = why {
+        if std::env::var_os("KENNY_GC_COMPACT_STATS").is_some() && heap().compact_request != 0 {
+            eprintln!("[gc] can't compact now: {why}");
+        }
+        return false;
     }
-    ok
+    true
+}
+fn compaction_blocker() -> Option<&'static str> {
+    if crate::core::C_CALLS.load(Ordering::SeqCst) != 0 {
+        return Some("a C extension function is running");
+    }
+    let marks = crate::core::native_return_addresses();
+    if marks.contains(&0) {
+        return Some("native frames can't be recognized on this platform");
+    }
+    let has_mark = |w: usize| {
+        let w = w & 0x0000_ffff_ffff_ffff;
+        w == marks[0] || w == marks[1]
+    };
+    let scan = |lo: usize, hi: usize| {
+        if hi <= lo || hi - lo > (1usize << 31) {
+            return false;
+        }
+        let mut p = (lo + 7) & !7;
+        while p + 8 <= hi {
+            if has_mark(unsafe { *(p as *const usize) }) {
+                return true;
+            }
+            p += 8;
+        }
+        false
+    };
+    // this thread's stack (from here up), the others' (stopped or idle) and their registers
+    if scan(approx_sp_here(), crate::core::pst().heap.stack_base) {
+        return Some("this thread is in a native method");
+    }
+    let me = &crate::core::pst().heap as *const PHeap;
+    for &p in gc_ps().iter() {
+        let ph = unsafe { &(*(p as *const PState)).heap };
+        if std::ptr::eq(ph, me) {
+            continue;
+        }
+        if ph.regs.iter().any(|&w| has_mark(w)) || (ph.saved_sp != 0 && scan(ph.saved_sp, ph.stack_base)) {
+            return Some("another thread is in a native method");
+        }
+    }
+    if let Some(stacks) = heap().stack_provider {
+        if stacks().into_iter().any(|(lo, hi)| scan(lo, hi)) {
+            return Some("a suspended thread or Fiber is in a native method");
+        }
+    }
+    None
 }
 
 #[inline]
