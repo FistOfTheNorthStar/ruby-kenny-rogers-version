@@ -66,6 +66,33 @@ impl<'pr> Visit<'pr> for V {
         }
         visit_forwarding_super_node(self, node);
     }
+    // `...` and anonymous `*` / `**` / `&` arguments read the method's hidden locals: a block
+    // using them captures those (a name the analysed scope doesn't have is ignored)
+    fn visit_forwarding_arguments_node(&mut self, _: &ForwardingArgumentsNode<'pr>) {
+        if self.depth >= 1 {
+            for n in [&b"*"[..], b"**", b"&"] {
+                self.captured.insert(n.to_vec());
+            }
+        }
+    }
+    fn visit_splat_node(&mut self, node: &SplatNode<'pr>) {
+        if node.expression().is_none() && self.depth >= 1 {
+            self.captured.insert(b"*".to_vec());
+        }
+        visit_splat_node(self, node);
+    }
+    fn visit_assoc_splat_node(&mut self, node: &AssocSplatNode<'pr>) {
+        if node.value().is_none() && self.depth >= 1 {
+            self.captured.insert(b"**".to_vec());
+        }
+        visit_assoc_splat_node(self, node);
+    }
+    fn visit_block_argument_node(&mut self, node: &BlockArgumentNode<'pr>) {
+        if node.expression().is_none() && self.depth >= 1 {
+            self.captured.insert(b"&".to_vec());
+        }
+        visit_block_argument_node(self, node);
+    }
     fn visit_local_variable_read_node(&mut self, node: &LocalVariableReadNode<'pr>) {
         self.local(node.name().as_slice(), node.depth());
     }

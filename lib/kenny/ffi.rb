@@ -65,10 +65,32 @@ module FFI
     end
   end
 
+  # the ffi gem's rule: "vips.42" -> "libvips.42.dylib" (".so" on Linux), paths unchanged
   def self.map_library_name(lib)
     lib = lib.to_s
-    return lib if lib.include?("/") || lib.include?(".")
-    "#{Platform::LIBPREFIX}#{lib}.#{Platform::LIBSUFFIX}"
+    lib = "c" if lib == "libc"
+    return lib unless File.basename(lib) == lib
+    lib = "#{Platform::LIBPREFIX}#{lib}" unless lib.start_with?(Platform::LIBPREFIX)
+    suffix = Platform::OS == "darwin" ? /\.#{Platform::LIBSUFFIX}\z/ : /\.so(\z|\.[0-9]+)/
+    lib.match?(suffix) ? lib : "#{lib}.#{Platform::LIBSUFFIX}"
+  end
+
+  LIBRARY_DIRS = %w[/usr/local/lib /opt/homebrew/lib /usr/lib /lib /usr/lib64 /lib64 /opt/local/lib].freeze
+
+  # Whether `name` (a file name or path) names a shared library on this machine, searched
+  # the way dlopen does. System libraries (libc, macOS's /usr/lib and /System ones, which
+  # live in the dyld cache rather than on disk) count as present.
+  def self.library_exists?(name)
+    name = name.to_s
+    base = File.basename(name)
+    return true if base.match?(/\A(lib)?(c|m|dl|pthread|System)(\.|\z)/) || name.start_with?("/usr/lib/", "/System/")
+    return File.exist?(name) if name.include?("/")
+    dirs = %w[LD_LIBRARY_PATH DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH].flat_map { |v| ENV[v].to_s.split(":") }
+    dirs += LIBRARY_DIRS
+    dirs += Dir.glob("/usr/lib/*-linux-gnu") + Dir.glob("/lib/*-linux-gnu")
+    candidates = [name]
+    candidates << "#{Platform::LIBPREFIX}#{name}" unless name.start_with?(Platform::LIBPREFIX)
+    dirs.any? { |d| candidates.any? { |c| File.exist?(File.join(d, c)) } }
   end
 
   # FFI calls into C are not available in a Kenny binary.
@@ -238,8 +260,15 @@ module FFI
     CURRENT_PROCESS = Object.new.freeze
     LIBC = "c"
 
+    # As with the ffi gem, a library that isn't installed raises LoadError here (code such as
+    # Active Storage's vips support rescues it); one that is can be declared against.
     def ffi_lib(*names)
-      @ffi_libs = names.flatten.map { |n| n.equal?(CURRENT_PROCESS) ? n : FFI.map_library_name(n) }
+      libs = names.flatten.map { |n| n.equal?(CURRENT_PROCESS) ? n : FFI.map_library_name(n) }
+      missing = libs.reject { |n| n.equal?(CURRENT_PROCESS) || FFI.library_exists?(n) }
+      unless missing.size < libs.size
+        raise LoadError, missing.map { |n| "Could not open library '#{n}': no such file" }.join(".\n")
+      end
+      @ffi_libs = libs
     end
     def ffi_libraries = @ffi_libs || []
     def ffi_lib_flags(*_flags) = 0

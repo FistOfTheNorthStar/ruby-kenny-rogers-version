@@ -1175,14 +1175,44 @@ fn ancestors_uncached(c: *mut Class) -> Vec<*mut Class> {
         let (pre, part) = own_chain(c, &rest, 0);
         let mut out = pre;
         out.push(c);
-        out.extend(part);
+        out.extend(part.into_iter().map(|e| e.0));
         out.extend(rest.iter().copied());
         out
     }
 }
-/// (prepended chain, included chain) of `k`, leaving out anything already in `below`.
-fn own_chain(k: *mut Class, below: &[*mut Class], depth: u32) -> (Vec<*mut Class>, Vec<*mut Class>) {
-    let mut part: Vec<*mut Class> = Vec::new();
+/// When each runtime `include` happened: (class, module) -> sequence number. Boot-time
+/// includes have none (0: always there).
+static INCLUDE_SEQ: std::sync::Mutex<Option<rustc_hash::FxHashMap<(usize, usize), u64>>> = std::sync::Mutex::new(None);
+static INCLUDE_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Record that `m` was just included into `k`.
+pub fn note_include(k: *mut Class, m: *mut Class) {
+    let t = INCLUDE_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    INCLUDE_SEQ.lock().unwrap().get_or_insert_with(Default::default).insert((k as usize, m as usize), t);
+}
+fn include_seq(k: *mut Class, m: *mut Class) -> u64 {
+    INCLUDE_SEQ.lock().unwrap().as_ref().and_then(|t| t.get(&(k as usize, m as usize)).copied()).unwrap_or(0)
+}
+
+/// When module `x` joined the chain `below` (a superclass's ancestors): the earliest runtime
+/// include of it there, or 0 when it came at boot or through another module.
+fn joined_below(below: &[*mut Class], x: *mut Class) -> u64 {
+    let mut first: Option<u64> = None;
+    for &c in below {
+        if unsafe { (*c).includes.contains(&x) } {
+            let t = include_seq(c, x);
+            first = Some(first.map_or(t, |f| f.min(t)));
+        }
+    }
+    first.unwrap_or(0)
+}
+
+/// (prepended chain, included chain) of `k`, leaving out anything already in `below`. Each
+/// included entry carries when it joined `k`'s chain: a module that two includes bring sits
+/// where it arrived first. (CRuby keeps both copies and finds the first: Rails 8 includes
+/// its to_json module into Hash, then into Enumerable, which Hash already includes.)
+fn own_chain(k: *mut Class, below: &[*mut Class], depth: u32) -> (Vec<*mut Class>, Vec<(*mut Class, u64)>) {
+    let mut part: Vec<(*mut Class, u64)> = Vec::new();
     let mut pre: Vec<*mut Class> = Vec::new();
     if depth > 64 {
         return (pre, part);
@@ -1192,8 +1222,23 @@ fn own_chain(k: *mut Class, below: &[*mut Class], depth: u32) -> (Vec<*mut Class
             if m == k {
                 continue;
             }
-            let chain = module_chain(m, depth + 1);
-            let new: Vec<*mut Class> = chain.into_iter().filter(|x| *x != k && !part.contains(x) && !below.contains(x)).collect();
+            let seq = include_seq(k, m);
+            let mut new: Vec<(*mut Class, u64)> = Vec::new();
+            for (x, t) in module_chain(m, depth + 1) {
+                let t = t.max(seq);
+                // in the superclass chain already when this include happened: skipped
+                if x == k || new.iter().any(|e| e.0 == x) || (below.contains(&x) && joined_below(below, x) <= t) {
+                    continue;
+                }
+                match part.iter().position(|e| e.0 == x) {
+                    Some(i) if part[i].1 > t => {
+                        part.remove(i);
+                    }
+                    Some(_) => continue,
+                    None => {}
+                }
+                new.push((x, t));
+            }
             part.splice(0..0, new);
         }
         for &m in (*k).prepends.iter() {
@@ -1203,17 +1248,19 @@ fn own_chain(k: *mut Class, below: &[*mut Class], depth: u32) -> (Vec<*mut Class
             // unlike include, prepend doesn't skip a module the superclass chain already has
             // (ActiveSupport prepends its to_json module to Object and to String)
             let chain = module_chain(m, depth + 1);
-            let new: Vec<*mut Class> = chain.into_iter().filter(|x| *x != k && !pre.contains(x) && !part.contains(x)).collect();
+            let new: Vec<*mut Class> =
+                chain.into_iter().map(|e| e.0).filter(|x| *x != k && !pre.contains(x) && !part.iter().any(|e| e.0 == *x)).collect();
             pre.splice(0..0, new);
         }
     }
     (pre, part)
 }
-/// A module with what it includes and prepends, in method-resolution order.
-fn module_chain(m: *mut Class, depth: u32) -> Vec<*mut Class> {
+/// A module with what it includes and prepends, in method-resolution order, each with when
+/// it joined the module's chain.
+fn module_chain(m: *mut Class, depth: u32) -> Vec<(*mut Class, u64)> {
     let (pre, part) = own_chain(m, &[], depth);
-    let mut out = pre;
-    out.push(m);
+    let mut out: Vec<(*mut Class, u64)> = pre.into_iter().map(|x| (x, 0)).collect();
+    out.push((m, 0));
     out.extend(part);
     out
 }

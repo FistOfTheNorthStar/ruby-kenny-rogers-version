@@ -4,64 +4,9 @@ use crate::core::*;
 
 pub const FL_BINARY: u32 = 16;
 
-fn enc_obj(name: &str) -> V {
-    let enc = const_lookup(rt().c.object, sym("Encoding")).unwrap() as *mut Class;
-    const_get_under(enc, sym(name)).unwrap_or(QNIL)
-}
-
+/// String#encode / encode! (the Encoding class itself is set up in extra.rs).
 fn init_encoding() {
-    let enc = const_lookup(rt().c.object, sym("Encoding")).unwrap() as *mut Class;
-    let mk = |n: &str| {
-        let o = object_new(enc);
-        ivar_set(o, sym("@__name"), str_from(n));
-        o
-    };
-    let ascii = mk("US-ASCII");
-    const_set(enc, sym("US_ASCII"), ascii);
-    const_set(enc, sym("ASCII"), ascii);
-    const_set(enc, sym("UTF8"), enc_obj("UTF_8"));
-    // Encodings no Kenny string can carry, defined so that code comparing against them
-    // (`file.encoding == Encoding::UTF_16LE`, as the sqlite3 gem does) runs.
-    for (c, n) in [("UTF_16LE", "UTF-16LE"), ("UTF_16BE", "UTF-16BE"), ("UTF_16", "UTF-16"), ("UTF_32LE", "UTF-32LE"), ("UTF_32BE", "UTF-32BE"), ("UTF_32", "UTF-32")] {
-        if const_get_under(enc, sym(c)).is_none() {
-            const_set(enc, sym(c), mk(n));
-        }
-    }
-    for e in ["CompatibilityError", "UndefinedConversionError", "InvalidByteSequenceError", "ConverterNotFoundError"] {
-        let k = new_class("", const_lookup(rt().c.object, sym("EncodingError")).unwrap() as *mut Class);
-        const_set(enc, sym(e), k as V);
-    }
-    defs(enc, "default_external", 0, 0, |_, _, _| enc_obj("UTF_8"));
-    defs(enc, "default_internal", 0, 0, |_, _, _| QNIL);
-    defs(enc, "default_external=", 1, 1, |_, a, _| a[0]);
-    defs(enc, "default_internal=", 1, 1, |_, a, _| a[0]);
-    defs(enc, "find", 1, 1, |_, a, _| {
-        let n = String::from_utf8_lossy(&crate::fmt::to_s(a[0]).unwrap_or_default()).to_ascii_uppercase();
-        match n.as_str() {
-            "UTF-8" | "UTF8" | "LOCALE" | "EXTERNAL" | "FILESYSTEM" => enc_obj("UTF_8"),
-            "ASCII-8BIT" | "BINARY" => enc_obj("BINARY"),
-            "US-ASCII" | "ASCII" => enc_obj("US_ASCII"),
-            // Encoding.default_internal (never set in Kenny)
-            "INTERNAL" => QNIL,
-            _ => arg_error(&format!("unknown encoding name - {n}")),
-        }
-    });
-    defs(enc, "list", 0, 0, |_, _, _| ary_new(vec![enc_obj("UTF_8"), enc_obj("BINARY"), enc_obj("US_ASCII")]));
-    defn(enc, "ascii_compatible?", 0, 0, |_, _, _| QTRUE);
-    defn(enc, "dummy?", 0, 0, |_, _, _| QFALSE);
-    defn(enc, "names", 0, 0, |s, _, _| ary_new(vec![ivar_get(s, sym("@__name"))]));
-    defn(enc, "==", 1, 1, |s, a, _| bool_v(s == a[0]));
     let st = rt().c.string;
-    defn(st, "encoding", 0, 0, |s, _, _| {
-        let f = hdr(s).flags;
-        if f & FL_BINARY != 0 {
-            enc_obj("BINARY")
-        } else if f & (FL_BINARY << 1) != 0 {
-            enc_obj("US_ASCII")
-        } else {
-            enc_obj("UTF_8")
-        }
-    });
     fn set_enc(s: V, e: V) {
         let name = if is_str(e) {
             String::from_utf8_lossy(&rstr(e).b).to_ascii_uppercase()
@@ -77,15 +22,6 @@ fn init_encoding() {
             _ => {}
         }
     }
-    defn(st, "force_encoding", 1, 1, |s, a, _| {
-        set_enc(s, a[0]);
-        s
-    });
-    defn(st, "b", 0, 0, |s, _, _| {
-        let n = str_new(rstr(s).b.clone());
-        hdr(n).flags |= FL_BINARY;
-        n
-    });
     defn(st, "encode", 0, -1, |s, a, _| {
         let n = str_new(rstr(s).b.clone());
         if let Some(&e) = a.first().filter(|x| !is_hash(**x)) {
@@ -242,9 +178,38 @@ fn init_locations() {
         Ok(f) => crate::backtrace::locations(&f),
         Err(e) => e,
     });
+    // Thread.each_caller_location(start = 1, length = nil) { |loc| } (the arguments are Ruby 3.4's)
+    let th = const_lookup(rt().c.object, sym("Thread")).unwrap() as *mut Class;
+    defs(th, "each_caller_location", 0, 2, |_, a, b| {
+        let locs = match frames(a) {
+            Ok(f) => crate::backtrace::locations(&f),
+            Err(e) => return e,
+        };
+        let locs = crate::gc::RVec::from(rary(locs).v.clone());
+        for &l in locs.iter() {
+            crate::tri!(call_block(b, &[l]));
+        }
+        QNIL
+    });
     defn(rt().c.kernel, "caller", 0, 2, |_, a, _| match frames(a) {
         Ok(f) => ary_new(crate::backtrace::lines(&f).iter().map(|l| str_from(l)).collect()),
         Err(e) => e,
+    });
+}
+
+/// Ruby 3.2's Data: the class exists from the start (code reopens it); `Data.define` loads
+/// the rest from the embedded kenny/data.rb.
+fn init_data() {
+    let data = new_class("Data", rt().c.object);
+    set_global_const("Data", data as V);
+    defs(data, "define", 0, -1, |s, a, b| {
+        if crate::compat::require_compiled("kenny/data").is_none() {
+            return raise(rt().c.not_implemented_error, "Data.define: kenny/data was not compiled into this binary");
+        }
+        if pst().pending_is_set() {
+            return UNDEF;
+        }
+        send(s, sym("__kenny_define"), a, b)
     });
 }
 
@@ -421,6 +386,7 @@ pub fn init() {
     init_objectspace();
     init_binding();
     init_monitor();
+    init_data();
     init_encoding();
     init_random();
     init_locations();
@@ -660,14 +626,23 @@ pub fn require_compiled(name: &str) -> Option<V> {
     let key = name.trim_end_matches(".rb");
     let (f, flag, _) = *FILE_TABLE.get().as_ref()?.get(key)?;
     let st = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire);
+    let feature = format!("{key}.rb");
+    let lf = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf));
     if st == 0 {
-        if let Some(&lf) = rt().gvars.get(&sym("$LOADED_FEATURES")) {
-            if is_ary(lf) {
-                rary(lf).v.push(str_from(&format!("{key}.rb")));
+        if let Some(lf) = lf {
+            rary(lf).v.push(str_from(&feature));
+        }
+    }
+    let r = run_file_once(f, flag);
+    if r == UNDEF && st == 0 {
+        if let Some(lf) = lf {
+            let v = &mut rary(lf).v;
+            if let Some(i) = v.iter().rposition(|x| is_str(*x) && rstr(*x).b[..] == *feature.as_bytes()) {
+                v.remove(i);
             }
         }
     }
-    Some(run_file_once(f, flag))
+    Some(r)
 }
 
 /// Run a compiled file unless it already ran: QTRUE if it ran now, QFALSE if it had (or is
@@ -682,7 +657,9 @@ pub fn run_file_once(f: CompiledFn, flag: *mut V) -> V {
         match fl.compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {
                 let r = unsafe { f(rt().main_obj, 0, std::ptr::null(), QNIL) };
-                fl.store(1, Ordering::Release);
+                // as in CRuby, a file that raised isn't loaded: requiring it again runs it again
+                // (and raises again: `rescue LoadError` around an optional dependency works twice)
+                fl.store(if r == UNDEF { 0 } else { 1 }, Ordering::Release);
                 return if r == UNDEF { UNDEF } else { QTRUE };
             }
             Err(1) => return QFALSE,

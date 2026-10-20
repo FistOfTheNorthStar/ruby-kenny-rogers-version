@@ -28,6 +28,13 @@ cargo build --release
 (cd examples/blog && RAILS_ENV=production RAILS_SERVE_STATIC_FILES=1 SECRET_KEY_BASE=$(openssl rand -hex 64) ../../blog)
 ruby examples/blog/compare.rb blog   # the same session against Puma and the binary: identical
 
+# a Rails 8.1 app (Zeitwerk, Solid Cache/Queue/Cable on SQLite, Propshaft, importmap, Turbo),
+# built with Ruby 3.3+ and the app's gems installed; its assets are precompiled with Ruby
+(cd examples/blog8 && RAILS_ENV=production SECRET_KEY_BASE=x bin/rails db:prepare assets:precompile)
+./target/release/kenny build examples/blog8/config.ru -o blog8
+(cd examples/blog8 && RAILS_ENV=production SECRET_KEY_BASE=$(openssl rand -hex 64) ../../blog8)
+ruby examples/blog8/compare.rb blog8   # 45 requests against Puma and the binary: identical
+
 # development mode: code reloading, live Sass/CoffeeScript, Rails' error pages, Action Cable
 (cd examples/blog && bundle exec rails db:migrate)
 BUNDLE_WITHOUT=test ./target/release/kenny build examples/blog/config.ru -o blog-dev
@@ -170,6 +177,13 @@ Working:
   scopes, transactions, eager loading): `examples/rails_api_ar` is a JSON API backed by it.
   Rack 2.2 apps run, and all 1,456 source files of Rails 5.2, ActiveSupport 7.1 and their
   dependencies compile.
+  Rails 8.1 runs too: `examples/blog8` is `rails new` (8.1.4) plus two scaffolds (posts, and
+  comments that belong to them), with Zeitwerk eager loading, Solid Cache, Solid Queue and
+  Solid Cable on SQLite, Propshaft, importmap, Turbo and Stimulus, Active Storage (libvips
+  isn't installed, so it falls back as under Ruby) and jbuilder. `examples/blog8/compare.rb`
+  runs a 45-request session (forms with CSRF tokens, validations, JSON views and a JSON API
+  create, deletes, 404/422 pages, the import map's assets) against Puma and the binary: the
+  responses are identical.
 - **Rails development mode and Action Cable:** a binary built with the development gems
   (`BUNDLE_WITHOUT=test`) and run with `RAILS_ENV=development` reloads code like `rails
   server`: `load` (which the classic autoloader, the routes reloader and initializers use)
@@ -193,7 +207,11 @@ Working:
   call's source line, so a backtrace is a walk of the native stack, taken only when needed.
 - **Bundler, socket, FFI:** Bundler's runtime API on gems resolved at build time;
   `TCPSocket`/`TCPServer`/`Socket` name resolution (blocking); FFI bindings load (their
-  declarations work) but calling a C function through FFI raises NotImplementedError.
+  declarations work) but calling a C function through FFI raises NotImplementedError. As with
+  the ffi gem, `ffi_lib` raises LoadError when the library isn't installed, so optional native
+  dependencies (Active Storage's libvips) are skipped. `require "ripper"` gives Ripper's
+  constants and event tables (enough for gems that load it), but parsing with it raises
+  NotImplementedError.
 - **Built-in HTTP server** for Rack apps: one process serves requests on every core
   (`rack.multithread` is true); `WEB_CONCURRENCY=n` forks n processes instead. `rack.hijack`
   (full and partial) hands the connection's socket to the app.

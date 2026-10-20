@@ -1158,7 +1158,25 @@ pub fn fiber_new(blk: V) -> V {
     });
     ivar_set(o, sym("@__fid"), mkfix(fid as i64));
     ivar_set(o, sym("@__blk"), blk);
+    // a new fiber starts with a copy of its creator's storage (Fiber.new(storage: true))
+    let st = inherited_storage();
+    if st != QNIL {
+        ivar_set(o, sym("@__storage"), st);
+    }
     o
+}
+
+fn current_fiber() -> V {
+    send0(const_lookup(rt().c.object, sym("Fiber")).unwrap(), "current")
+}
+/// Fiber storage (`Fiber[:k]`) of the running fiber: a Hash, or nil while empty.
+fn fiber_storage() -> V {
+    ivar_get(current_fiber(), sym("@__storage"))
+}
+/// A copy of the running fiber's storage for a new fiber or thread, or nil.
+fn inherited_storage() -> V {
+    let st = fiber_storage();
+    if is_hash(st) && !rhash(st).m.is_empty() { crate::kernel::dup(st, false) } else { QNIL }
 }
 
 pub fn fiber_resume(fv: V, args: &[V]) -> V {
@@ -1284,9 +1302,14 @@ pub fn init() {
             return raise(thread_error(), "must be called with a block");
         }
         let args = a.to_vec();
+        // the new thread's root fiber starts with a copy of this fiber's storage
+        let storage = inherited_storage();
         // the block, its arguments and self are reachable from the thread object below
         let tid = spawn_raw(
             Box::new(move |_| {
+                if storage != QNIL {
+                    ivar_set(current_fiber(), sym("@__storage"), storage);
+                }
                 let args = RVec::from(args);
                 call_block(b, &args)
             }),
@@ -1297,6 +1320,7 @@ pub fn init() {
         ivar_set(obj, sym("@__blk"), b);
         ivar_set(obj, sym("@__args"), ary_new(a.to_vec()));
         ivar_set(obj, sym("@__report"), QTRUE);
+        ivar_set(obj, sym("@__inherited_storage"), storage);
         obj
     });
     defs(th, "start", 0, -1, |s, a, b| send(s, sym("new"), a, b));
@@ -1888,6 +1912,47 @@ pub fn init() {
         let o = object_new(sraw().unwrap().fiber_class);
         ivar_set(t, sym("@__root_fiber"), o);
         o
+    });
+
+    // Fiber storage (Ruby 3.2): Fiber[:k], Fiber[:k] = v, Fiber#storage
+    defs(fb, "[]", 1, 1, |_, a, _| {
+        if !is_sym(a[0]) {
+            return type_error(&format!("wrong argument type {} (expected Symbol)", class_name(real_class(a[0]))));
+        }
+        let st = fiber_storage();
+        if is_hash(st) { crate::hash::hget(st, a[0]) } else { QNIL }
+    });
+    defs(fb, "[]=", 2, 2, |_, a, _| {
+        if !is_sym(a[0]) {
+            return type_error(&format!("wrong argument type {} (expected Symbol)", class_name(real_class(a[0]))));
+        }
+        let f = current_fiber();
+        let mut st = ivar_get(f, sym("@__storage"));
+        if !is_hash(st) {
+            if a[1] == QNIL {
+                return QNIL;
+            }
+            st = hash_new();
+            ivar_set(f, sym("@__storage"), st);
+        }
+        if a[1] == QNIL {
+            send(st, sym("delete"), &[a[0]], QNIL);
+        } else {
+            crate::hash::hset(st, a[0], a[1]);
+        }
+        a[1]
+    });
+    defn(fb, "storage", 0, 0, |s, _, _| {
+        let st = ivar_get(s, sym("@__storage"));
+        if is_hash(st) { crate::kernel::dup(st, false) } else { hash_new() }
+    });
+    defn(fb, "storage=", 1, 1, |s, a, _| {
+        if a[0] != QNIL && !is_hash(a[0]) {
+            return type_error("storage must be a hash");
+        }
+        let v = if a[0] == QNIL { QNIL } else { crate::kernel::dup(a[0], false) };
+        ivar_set(s, sym("@__storage"), v);
+        a[0]
     });
 
     // Kernel#sleep becomes thread-aware

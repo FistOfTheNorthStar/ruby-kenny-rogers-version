@@ -22,7 +22,10 @@ impl<M: Module> Compiler<M> {
             Some(a) => a.arguments().iter().collect(),
             None => vec![],
         };
-        let needs_ary = items.iter().any(|n| n.as_splat_node().is_some() || n.as_forwarding_arguments_node().is_some());
+        // `**h` alone passes nothing when h is empty (as in CRuby), so its argument count is
+        // only known at runtime
+        let splat_only_kw = |n: &Node| n.as_keyword_hash_node().is_some_and(|h| h.elements().iter().all(|e| e.as_assoc_splat_node().is_some()));
+        let needs_ary = items.iter().any(|n| n.as_splat_node().is_some() || n.as_forwarding_arguments_node().is_some() || splat_only_kw(n));
         if needs_ary {
             let zero = self.iconst(fx, 0);
             let a = self.call(fx, "kn_ary_new", &[zero, zero]);
@@ -36,6 +39,9 @@ impl<M: Module> Compiler<M> {
                 } else if n.as_forwarding_arguments_node().is_some() {
                     let v = self.forwarded_local(fx, b"*");
                     self.callc(fx, "kn_ary_concat_splat", &[a, v]);
+                } else if splat_only_kw(n) {
+                    let v = self.expr(fx, n);
+                    self.call(fx, "kn_ary_push_kw", &[a, v]);
                 } else {
                     let v = self.expr(fx, n);
                     self.call(fx, "kn_ary_push", &[a, v]);
@@ -233,7 +239,7 @@ impl<M: Module> Compiler<M> {
                             let id = self.sym_val(fx, &sym_name);
                             let f = self.fn_addr(fx, fid);
                             let slot = self.slot_ptr(fx, flag);
-                            return self.call(fx, "kn_autoload", &[s, id, f, slot]);
+                            return self.callc(fx, "kn_autoload", &[s, id, f, slot]);
                         }
                     }
                 }
@@ -328,6 +334,7 @@ impl<M: Module> Compiler<M> {
             && is_fast_op(&name)
             && arg_nodes[0].as_splat_node().is_none()
             && arg_nodes[0].as_keyword_hash_node().is_none()
+            && arg_nodes[0].as_forwarding_arguments_node().is_none()
         {
             let a = self.expr(fx, &arg_nodes[0]);
             self.binop(fx, &name, recv, a)

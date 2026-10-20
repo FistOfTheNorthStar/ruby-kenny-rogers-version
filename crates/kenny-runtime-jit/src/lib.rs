@@ -199,6 +199,7 @@ fn free_dead_units() {
     for id in dead {
         if let Some(u) = units.remove(&id) {
             kenny_runtime::backtrace::unregister_jit(&u.funcs);
+            kenny_runtime::abi::forget_defs(&u.funcs);
             kenny_runtime::gc::unpin_region(u.caches, u.cache_words);
             kenny_runtime::abi::free_owned_caches(u.caches, &u.owned_caches);
             kenny_runtime::gc::unregister_region(u.caches);
