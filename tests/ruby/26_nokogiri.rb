@@ -319,5 +319,12 @@ d.decorators(Nokogiri::XML::Node) << Shout
 d.decorate!
 p d.at("b").shout, d.at("b").class, d.at("i").is_a?(Shout), d.css("i").first.shout
 p d.at("b").singleton_class.include?(Shout), d.at("p").instance_of?(Nokogiri::XML::Element)
+# the decorated-node class is cached: it must survive a full collection with no node using it
+d = nil
+GC.start
+d = Nokogiri::HTML4("<p><b>again</b></p>")
+d.decorators(Nokogiri::XML::Node) << Shout
+d.decorate!
+p d.at("b").shout
 s = Nokogiri::Slop("<html><body><p class='c'>t</p></body></html>")
 p s.html.body.p.text, s.html.body.p["class"]

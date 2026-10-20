@@ -9,7 +9,7 @@ for f in tests/ruby/*.rb; do
   flags=$(sed -n 's/^# kenny-run-flags: //p' "$f" | head -1)
   if [ -n "$flags" ]; then eval "set -- $flags"; else set --; fi
   got=$(./target/release/kenny run "$f" "$@" 2>&1)
-  if [ "$got" = "$(cat "$exp")" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL $f"; echo "$got" | diff "$exp" - | head -20; fi
+  if [ "$got" = "$(cat "$exp")" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL $f"; printf '%s\n' "$got" | diff "$exp" - | head -20; fi
 done
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

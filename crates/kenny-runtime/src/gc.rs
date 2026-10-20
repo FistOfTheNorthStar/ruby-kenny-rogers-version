@@ -2274,8 +2274,10 @@ fn free_dead_singletons(h: &mut Heap, seen: &FxHashSet<usize>) -> usize {
     let class_set = &h.class_set;
     h.classes.retain(|&c| {
         let k = unsafe { &*c };
-        let attached_is_class = class_set.contains(&(k.attached as usize));
-        if k.is_singleton && !attached_is_class && !seen.contains(&(c as usize)) {
+        // only a real object's singleton class (hidden classes flagged singleton with nothing
+        // attached, like nokogiri's decorated-node classes, are cached elsewhere)
+        let attached_is_object = is_heap(k.attached) && !class_set.contains(&(k.attached as usize));
+        if k.is_singleton && attached_is_object && !seen.contains(&(c as usize)) {
             dead.insert(c as usize);
             false
         } else {
