@@ -89,6 +89,61 @@ fn unescape_unicode(pat: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Rewrites every `(group)?` as `(?:(group)|)` and `(group)??` as `(?:|(group))`.
+fn optional_groups_as_alternation(pat: &str) -> String {
+    let cs: Vec<char> = pat.chars().collect();
+    let mut out = String::with_capacity(pat.len() + 16);
+    let mut starts: Vec<usize> = Vec::new();
+    let mut i = 0;
+    let mut class = 0; // nesting depth of [...]
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\\' {
+            out.push(c);
+            if let Some(n) = cs.get(i + 1) {
+                out.push(*n);
+            }
+            i += 2;
+            continue;
+        }
+        if class > 0 {
+            if c == '[' {
+                class += 1;
+            } else if c == ']' {
+                class -= 1;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match c {
+            '[' => class = 1,
+            '(' => starts.push(out.len()),
+            ')' => {
+                if let Some(s) = starts.pop() {
+                    out.push(')');
+                    i += 1;
+                    if cs.get(i) == Some(&'?') && cs.get(i + 1) != Some(&'+') {
+                        let group = out.split_off(s);
+                        if cs.get(i + 1) == Some(&'?') {
+                            out.push_str(&format!("(?:|{group})"));
+                            i += 2;
+                        } else {
+                            out.push_str(&format!("(?:{group}|)"));
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 pub fn regexp_new(src: &[u8], opts: u32) -> V {
     let raw = String::from_utf8_lossy(src);
     let pat = unescape_unicode(&raw).into_owned();
@@ -114,6 +169,11 @@ pub fn regexp_new(src: &[u8], opts: u32) -> V {
             Err(_) if has_high_byte_escape(&pat) => {
                 binary = true;
                 Regex::with_options_and_encoding(onig::EncodedBytes::ascii(pat.as_bytes()), o, Syntax::ruby())
+            }
+            // Oniguruma rejects `?` on a group that can match only an anchor, e.g. `(?:x|$)?`
+            // (uglifier); Onigmo accepts it. `(g)?` is `(?:(g)|)`
+            Err(e) if e.description().contains("target of repeat operator is invalid") => {
+                Regex::with_options(&optional_groups_as_alternation(&pat), o, Syntax::ruby())
             }
             r => r,
         }

@@ -377,6 +377,9 @@ pub fn init() {
                 ivar_set(a[0], sym("@__message"), a[1]);
             }
             a[0]
+        } else if respond_to(a[0], sym("exception")) {
+            // any object with #exception, e.g. a rejected Concurrent::Promise
+            tri!(send(a[0], sym("exception"), &a[1..a.len().min(2)], QNIL))
         } else {
             return type_error("exception class/object expected");
         };
