@@ -461,7 +461,10 @@ pub fn proc_new_native_rooted(f: NativeBlock, min: i32, max: i32, roots: Vec<V>)
 }
 unsafe extern "C" fn native_block_tramp(p: *mut RProc, self_: V, argc: u64, argv: *const V, blk: V) -> V {
     let args = unsafe { args_slice(argc, argv) };
-    unsafe { (*(*p).native)(self_, args, blk) }
+    pst().native_depth += 1;
+    let r = unsafe { (*(*p).native)(self_, args, blk) };
+    pst().native_depth -= 1;
+    r
 }
 pub unsafe fn args_slice<'a>(argc: u64, argv: *const V) -> &'a [V] {
     if argc == 0 { &[] } else { unsafe { std::slice::from_raw_parts(argv, argc as usize) } }
@@ -623,6 +626,10 @@ pub struct Method {
     /// Builtin core method with a specialised call path (`opt::OPT_*`, 0 = none); describes
     /// the body, so aliases and copies keep it.
     pub opt: u8,
+    /// A native method audited to keep object references only on the stack (it blocks or
+    /// loops, like `loop`, `sleep`, `Queue#pop`): its frame doesn't count in
+    /// PState::native_depth, so a thread waiting in it doesn't stop the GC from moving objects.
+    pub gc_transparent: bool,
 }
 
 pub const VIS_PUBLIC: u8 = 0;
@@ -749,6 +756,10 @@ pub struct PState {
     pub thr: crate::thread::PThr,
     /// Direct-mapped method cache in front of `mcache`.
     pub mc: Box<[McEntry; MC_SIZE]>,
+    /// Native (Rust or C) method and block frames active on the running thread. Native code
+    /// may keep object references where the GC can't see or update them (in Rust
+    /// collections), so the GC moves objects only when no thread has any (gc::compact).
+    pub native_depth: u32,
 }
 
 impl PState {
@@ -803,6 +814,7 @@ pub fn new_pstate() -> *mut PState {
         heap: crate::gc::PHeap::new(),
         thr: crate::thread::PThr::default(),
         mc: new_method_cache(),
+        native_depth: 0,
     }));
     PST.with(|c| c.set(p));
     ALL_PS.lock().unwrap_or_else(|e| e.into_inner()).push(p as usize);
@@ -1173,12 +1185,20 @@ fn find_super_method_uncached(klass: *mut Class, owner: *mut Class, mid: u32) ->
 }
 
 pub fn add_method(c: *mut Class, mid: u32, body: Body) -> *const Method {
-    let m = Box::into_raw(Box::new(Method { body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0 })) as *const Method;
+    let m = Box::into_raw(Box::new(Method { body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: false })) as *const Method;
     unsafe {
         (*c).methods.insert(mid, m);
     }
     bump_serial();
     m
+}
+/// Mark native methods as GC-transparent (see Method::gc_transparent).
+pub fn gc_transparent(c: *mut Class, names: &[&str]) {
+    for n in names {
+        if let Some(&m) = unsafe { (*c).methods.get(&sym(n)) } {
+            unsafe { (*(m as *mut Method)).gc_transparent = true };
+        }
+    }
 }
 pub fn defn(c: *mut Class, name: &str, min: i32, max: i32, f: NativeFn) {
     add_method(c, sym(name), Body::Native(f, min, max));
@@ -1216,7 +1236,13 @@ pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
             if n < *min || (*max >= 0 && n > *max) {
                 return arity_error(n, *min, *max);
             }
-            f(recv, args, blk)
+            if m.gc_transparent {
+                return f(recv, args, blk);
+            }
+            pst().native_depth += 1;
+            let r = f(recv, args, blk);
+            pst().native_depth -= 1;
+            r
         }
         Body::AttrReader(iv) => {
             if !args.is_empty() {
@@ -1238,7 +1264,9 @@ pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
         }
         Body::CFunc(f, arity) => {
             pst().current_block.push(blk);
+            pst().native_depth += 1;
             let r = crate::capi::call_cfunc(*f, *arity, recv, args);
+            pst().native_depth -= 1;
             pst().current_block.pop();
             r
         }
@@ -1698,6 +1726,10 @@ pub fn hash_of(v: V) -> u64 {
                 if r == UNDEF {
                     pst().pending = Throw::None;
                 }
+            }
+            if is_heap(v) {
+                // hashed by address (a Hash key, say): the object must never move
+                hdr(v).flags |= crate::gc::FL_ID;
             }
             v.hash(&mut h)
         }

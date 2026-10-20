@@ -212,6 +212,19 @@ impl KMap {
             crate::gc::remember(crate::gc::REM_KMAP, self as *const KMap as usize);
         }
     }
+    /// (GC, every other thread stopped) Rewrite every key and value with `f` (objects the GC
+    /// moved). Hashes stay valid: a key hashed by identity is never moved (gc::FL_ID).
+    pub fn remap(&self, f: impl Fn(V) -> V) {
+        let Some(t) = self.table() else { return };
+        for i in 0..t.used() {
+            let e = t.entry(i);
+            let k = e.key.load(Relaxed);
+            if k != DELETED {
+                e.key.store(f(k), Relaxed);
+                e.val.store(f(e.val.load(Relaxed)), Relaxed);
+            }
+        }
+    }
     pub fn set_old(&self) {
         if self.gc_gen.load(Relaxed) & G_OLD == 0 {
             self.gc_gen.fetch_or(G_OLD, Relaxed);

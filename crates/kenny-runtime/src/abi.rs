@@ -1097,7 +1097,7 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
         return raise(rt().c.name_error, &format!("undefined method '{}' for class '{}'", sym_str(old), class_name(c)));
     }
     let body = crate::kernel::clone_body(unsafe { &(*m).body });
-    let nm = Box::into_raw(Box::new(Method { body, owner: unsafe { (*m).owner }, name: new, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt } }));
+    let nm = Box::into_raw(Box::new(Method { body, owner: unsafe { (*m).owner }, name: new, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent } }));
     unsafe { (*c).methods.insert(new, nm) };
     bump_serial();
     mksym(new)

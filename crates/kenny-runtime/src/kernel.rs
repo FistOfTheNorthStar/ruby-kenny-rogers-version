@@ -158,6 +158,10 @@ pub fn alloc_instance(c: *mut Class) -> V {
 /// `object_id`: Fixnums 2n+1, flonums their bits without the constant tag (all of the
 /// rest matters, including the sign bit), other objects their address / 8.
 fn object_id_of(s: V) -> i64 {
+    if is_heap(s) {
+        // the id is the address: the object must never move
+        hdr(s).flags |= crate::gc::FL_ID;
+    }
     if is_fix(s) {
         fix(s).wrapping_mul(2).wrapping_add(1)
     } else if is_flonum(s) {
@@ -1348,7 +1352,7 @@ fn dup_module(v: V) -> V {
     let k = unsafe { &mut *c };
     for (&id, &m) in src.methods.iter() {
         let mm = unsafe { &*m };
-        let nm = Box::into_raw(Box::new(Method { body: clone_body(&mm.body), owner: c, name: mm.name, params: mm.params, vis: mm.vis, opt: 0 }));
+        let nm = Box::into_raw(Box::new(Method { body: clone_body(&mm.body), owner: c, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent }));
         k.methods.insert(id, nm);
     }
     k.includes.set(src.includes.clone());

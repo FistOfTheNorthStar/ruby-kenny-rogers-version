@@ -134,7 +134,13 @@ pub(crate) unsafe fn call_found(m: *const Method, recv: V, mid: V, args: &[V], e
             if n < *min || (*max >= 0 && n > *max) {
                 return arity_error(n, *min, *max);
             }
-            f(recv, args, QNIL)
+            if mm.gc_transparent {
+                return f(recv, args, QNIL);
+            }
+            pst().native_depth += 1;
+            let r = f(recv, args, QNIL);
+            pst().native_depth -= 1;
+            r
         }
         Body::AttrReader(iv) if args.is_empty() => attr_get(recv, *iv),
         Body::AttrWriter(iv) if args.len() == 1 => ivar_set(recv, *iv, args[0]),

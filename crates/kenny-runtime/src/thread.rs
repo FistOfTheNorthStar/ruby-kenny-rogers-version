@@ -83,6 +83,7 @@ struct GThread {
     current_block: Vec<V>,
     saved_throws: crate::gc::SavedThrows,
     fiber_stack: Vec<usize>,
+    native_depth: u32,
     // set by other threads (under the lock)
     interrupt: Option<Throw>,
     has_interrupt: AtomicBool,
@@ -264,6 +265,20 @@ pub fn static_roots(out: &mut Vec<V>) {
     }
 }
 
+/// Can the GC move objects now (every other thread stopped)? Only if no suspended thread has
+/// a native frame on its stack and no Fiber is suspended mid-run (its stack may hold native
+/// frames too). The running threads' counts are in their Ps' state (gc checks those).
+pub fn no_suspended_native_frames() -> bool {
+    let Some(s) = sraw() else { return true };
+    let ok = s.threads.iter().all(|t| t.state == St::Done || t.state == St::Running || t.native_depth == 0) && s.fibers.iter().all(|f| f.done || !f.started);
+    if !ok && std::env::var_os("KENNY_GC_COMPACT_STATS").is_some() {
+        let t: Vec<(usize, St, u32)> = s.threads.iter().enumerate().filter(|(_, t)| t.state != St::Done && t.state != St::Running && t.native_depth != 0).map(|(i, t)| (i, t.state, t.native_depth)).collect();
+        let f = s.fibers.iter().filter(|f| !f.done && f.started).count();
+        eprintln!("[gc] threads with native frames: {t:?}; fibers suspended mid-run: {f}");
+    }
+    ok
+}
+
 /// (lowest, highest) address of the stack Ruby code is running on (for backtraces).
 pub fn current_stack() -> Option<(usize, usize)> {
     let hi = pst().heap.stack_base;
@@ -287,6 +302,7 @@ fn save_state(t: &mut GThread) {
     t.current_block = std::mem::take(&mut p.current_block);
     t.saved_throws = std::mem::take(&mut p.heap.saved_throws);
     t.fiber_stack = std::mem::take(&mut p.thr.fiber_stack);
+    t.native_depth = std::mem::replace(&mut p.native_depth, 0);
 }
 fn restore_state(t: &mut GThread) {
     let p = pst();
@@ -298,6 +314,7 @@ fn restore_state(t: &mut GThread) {
     p.current_block = std::mem::take(&mut t.current_block);
     p.heap.saved_throws = std::mem::take(&mut t.saved_throws);
     p.thr.fiber_stack = std::mem::take(&mut t.fiber_stack);
+    p.native_depth = t.native_depth;
 }
 
 /// Give control back to this P's loop. The caller has set the thread's state (under the lock).
@@ -421,6 +438,7 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
             pinned: on.is_some(),
             saved_throws: Default::default(),
             fiber_stack: Vec::new(),
+            native_depth: 0,
         }));
         s.ps[p].nthreads += 1;
         P_NTHREADS[p].fetch_add(1, Ordering::Relaxed);
@@ -1853,6 +1871,18 @@ pub fn init() {
         tri!(sleep(secs.map(|s| Duration::from_secs_f64(s.max(0.0)))));
         mkfix(start.elapsed().as_secs_f64().round() as i64)
     });
+
+    // Methods a thread waits in (audited: they keep object references only on the stack):
+    // a thread blocked in one doesn't keep the GC from moving objects.
+    gc_transparent(rt().c.kernel, &["sleep", "loop", "catch"]);
+    gc_transparent(th, &["join", "value"]);
+    gc_transparent(singleton_class(th as V), &["pass", "stop"]);
+    gc_transparent(mx, &["lock", "unlock", "synchronize", "sleep", "try_lock"]);
+    gc_transparent(cv, &["wait", "signal", "broadcast"]);
+    for c in [q, sq] {
+        gc_transparent(c, &["pop", "shift", "deq", "push", "<<", "enq", "close"]);
+    }
+    gc_transparent(mon, &["synchronize", "mon_synchronize", "enter", "exit", "mon_enter", "mon_exit"]);
 }
 
 /// Enumerator#next / peek via a Fiber (works for infinite enumerators).

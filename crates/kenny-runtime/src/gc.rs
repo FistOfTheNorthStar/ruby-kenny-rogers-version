@@ -14,6 +14,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 pub const FL_MARK: u32 = 4;
+/// The object's identity was observed (object_id, identity hash): it never moves.
+pub const FL_ID: u32 = 1 << 24;
+/// (compacting collection) Reached from a root, a stack or other place the GC can't update.
+const FL_PIN: u32 = 1 << 25;
+/// (compacting collection) Moved: the header's class word holds the new address.
+const FL_MOVED: u32 = 1 << 26;
 /// Class header flag: traced by an earlier collection. A minor collection doesn't trace
 /// such a class again: its tables are covered by the class-table write barrier, and the
 /// classes it links to are never freed.
@@ -104,6 +110,10 @@ pub struct Heap {
     pub minors: usize,
     pub major_live: usize,
     pub force_major: bool,
+    /// 0: compact when it pays (and is safe), 2: GC.compact asked for it.
+    pub compact_request: u8,
+    /// What the last compaction did: (objects moved, pages emptied).
+    pub last_compact: Option<(usize, usize)>,
     pub majors: usize,
     pub disabled: u32,
     pub extra_roots: Vec<fn(&mut Vec<V>)>,
@@ -194,6 +204,8 @@ pub fn heap() -> &'static mut Heap {
             minors: 0,
             major_live: 0,
             force_major: true,
+            compact_request: 0,
+            last_compact: None,
             majors: 0,
             disabled: 0,
             extra_roots: Vec::new(),
@@ -261,14 +273,36 @@ fn install_crash_trace() {
     }
 }
 
+/// Memory for a page, straight from the OS (zeroed, PAGE-aligned), so a released page goes
+/// back to the OS at once rather than into an allocator's free lists.
+fn map_page() -> usize {
+    unsafe {
+        let len = 2 * PAGE;
+        let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0);
+        if p == libc::MAP_FAILED {
+            std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(PAGE, PAGE).unwrap());
+        }
+        let p = p as usize;
+        let base = (p + PAGE - 1) & !(PAGE - 1);
+        // trim to the aligned page
+        if base > p {
+            libc::munmap(p as *mut libc::c_void, base - p);
+        }
+        let end = p + len;
+        if end > base + PAGE {
+            libc::munmap((base + PAGE) as *mut libc::c_void, end - base - PAGE);
+        }
+        base
+    }
+}
+fn unmap_page(base: usize) {
+    unsafe { libc::munmap(base as *mut libc::c_void, PAGE) };
+}
+
 /// A new empty page (heap lock held); returns its index.
 fn new_page(h: &mut Heap, ci: usize) -> usize {
     let slot = SIZE_CLASSES[ci];
-    let layout = std::alloc::Layout::from_size_align(PAGE, PAGE).unwrap();
-    let base = unsafe { std::alloc::alloc_zeroed(layout) } as usize;
-    if base == 0 {
-        std::alloc::handle_alloc_error(layout);
-    }
+    let base = map_page();
     let nslots = PAGE / slot;
     let idx = h.pages.len();
     h.pages.push(Box::new(Page { base, slot, nslots, alloc: vec![0; nslots.div_ceil(64)], class_idx: ci, young: true, unswept: AtomicU8::new(SWEPT) }));
@@ -350,6 +384,26 @@ fn refill(ph: &mut PHeap, ci: usize) -> usize {
         }
     }
 }
+/// The allocated object whose slot contains `w` (an interior pointer), if any (collector).
+fn slot_containing(w: usize) -> Option<usize> {
+    let h = heap();
+    if w < h.page_lo || w >= h.page_hi {
+        return None;
+    }
+    let base = w & !(PAGE - 1);
+    let pi = if h.page_table.is_empty() {
+        *h.page_index.get(&base)?
+    } else {
+        match h.page_table[(base - h.page_lo) / PAGE] {
+            0 => return None,
+            i => i as usize - 1,
+        }
+    };
+    let pg = &h.pages[pi];
+    let i = (w - base) / pg.slot;
+    (i < pg.nslots && pg.alloc[i / 64] & (1 << (i % 64)) != 0).then_some(base + i * pg.slot)
+}
+
 /// Rebuild the flat page table after the heap's span changed (heap lock held, or collecting).
 fn rebuild_page_table(h: &mut Heap) {
     // up to 4M entries (16 MB) covers a 256 GB span; beyond that use the hash map
@@ -763,6 +817,56 @@ pub extern "C" fn kn_safepoint() -> V {
 }
 
 /// GC.start: collect now (with several threads, stopping the others first).
+/// Give the allocator's free memory back to the OS (an idle server).
+pub fn release_malloc_memory() {
+    unsafe extern "C" {
+        fn mi_collect(force: bool);
+        #[cfg(target_os = "macos")]
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    if use_system() {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    } else {
+        unsafe { mi_collect(true) };
+    }
+}
+
+/// Collections since the last idle compaction, below which an idle server leaves the heap.
+const IDLE_COMPACT_AFTER: usize = 8;
+static IDLE_COMPACTED_AT: AtomicUsize = AtomicUsize::new(0);
+/// Is a tidy-up worth it when the server goes idle (enough collections since the last one)?
+pub fn idle_compaction_wanted() -> bool {
+    compaction_mode(heap()) != CompactMode::Off && heap().collections >= IDLE_COMPACTED_AT.load(Ordering::Relaxed) + IDLE_COMPACT_AFTER
+}
+/// The server has been idle: a major collection that compacts if it frees enough pages
+/// (every P is waiting for the network, so no native frame holds hidden references).
+pub fn idle_compact() {
+    if !idle_compaction_wanted() {
+        return;
+    }
+    let r = compact_now_mode(1);
+    IDLE_COMPACTED_AT.store(heap().collections, Ordering::Relaxed);
+    release_malloc_memory();
+    if std::env::var_os("KENNY_GC_COMPACT_STATS").is_some() {
+        eprintln!("[gc] idle tidy-up: {r:?}");
+    }
+}
+
+/// GC.compact: a major collection that moves objects if it is safe now. (moved, pages emptied)
+pub fn compact_now() -> Option<(usize, usize)> {
+    compact_now_mode(2)
+}
+fn compact_now_mode(request: u8) -> Option<(usize, usize)> {
+    heap().compact_request = request;
+    heap().last_compact = None;
+    collect_now();
+    heap().compact_request = 0;
+    heap().last_compact.take()
+}
+
 pub fn collect_now() {
     heap().force_major = true;
     if crate::mt::multi() {
@@ -1352,6 +1456,11 @@ struct Marker {
     code_lo: usize,
     code_hi: usize,
     code_hit: Vec<bool>,
+    /// A major collection that may move objects: objects reached through anything but an
+    /// object field the compactor rewrites get FL_PIN (`pinning` says which kind of reference
+    /// is being followed).
+    compacting: bool,
+    pinning: bool,
 }
 
 impl Marker {
@@ -1372,7 +1481,7 @@ impl Marker {
                 *slot = i as u32;
             }
         }
-        Marker { stack: Vec::new(), envs: Vec::new(), marked_envs: FxHashSet::default(), seen_classes: FxHashSet::default(), retired, keep, retired_lo, retired_hi, retired_buckets, retired_shift, verify: None, verify_fail: 0, newly_marked: 0, cur: 0, parents: FxHashMap::default(), minor: false, major: false, code: Vec::new(), code_lo: usize::MAX, code_hi: 0, code_hit: Vec::new() }
+        Marker { stack: Vec::new(), envs: Vec::new(), marked_envs: FxHashSet::default(), seen_classes: FxHashSet::default(), retired, keep, retired_lo, retired_hi, retired_buckets, retired_shift, verify: None, verify_fail: 0, newly_marked: 0, cur: 0, parents: FxHashMap::default(), minor: false, major: false, code: Vec::new(), code_lo: usize::MAX, code_hi: 0, code_hit: Vec::new(), compacting: false, pinning: true }
     }
     #[inline]
     fn value(&mut self, v: V) {
@@ -1407,6 +1516,9 @@ impl Marker {
                 return;
             }
             let hd = hdr(v);
+            if self.compacting && self.pinning {
+                hd.flags |= FL_PIN;
+            }
             if hd.flags & FL_MARK == 0 {
                 hd.flags |= FL_MARK;
                 self.newly_marked += 1;
@@ -1439,6 +1551,11 @@ impl Marker {
             self.env(w);
         } else if self.major && heap().class_set.contains(&w) {
             self.class(w as *mut Class);
+        } else if self.compacting {
+            // a pointer into an object (a Rust reference to one of its fields): pin it
+            if let Some(p) = slot_containing(w) {
+                self.value(p as V);
+            }
         }
     }
     /// A stack word pointing into (or just past) a retired buffer keeps it: a Rust frame may
@@ -1490,6 +1607,11 @@ impl Marker {
         if c.is_null() || !self.seen_classes.insert(c as usize) {
             return;
         }
+        let pinning = std::mem::replace(&mut self.pinning, true);
+        self.class_tables(c);
+        self.pinning = pinning;
+    }
+    fn class_tables(&mut self, c: *mut Class) {
         let k = unsafe { &mut *c };
         if self.verify.is_none() {
             if self.minor && k.h.flags & FL_CLASS_TRACED != 0 {
@@ -1532,6 +1654,7 @@ impl Marker {
                 continue;
             }
             if let Some(e) = self.envs.pop() {
+                self.pinning = true;
                 self.cur = 2; // an environment
                 let n = heap().envs[&e] as usize;
                 let words = unsafe { std::slice::from_raw_parts(e as *const usize, 2 + n) };
@@ -1544,7 +1667,14 @@ impl Marker {
             break;
         }
     }
+    /// Mark what `v` references. The fields the compactor rewrites (see `compact`) are
+    /// followed with pinning off; everything else pins what it reaches.
     fn trace(&mut self, v: V) {
+        self.pinning = true;
+        self.trace_fields(v);
+        self.pinning = true;
+    }
+    fn trace_fields(&mut self, v: V) {
         if hdr(v).kind == Kind::Env {
             // [header (klass = slot count)][parent, blk, slots...]
             let n = hdr(v).klass as usize;
@@ -1565,34 +1695,42 @@ impl Marker {
                 if promote {
                     obj(v).ivars.set_old();
                 }
+                self.pinning = false;
                 for &x in &obj(v).ivars {
                     self.value(x);
                 }
+                self.pinning = true;
             }
             Kind::Array => {
                 if promote {
                     rary(v).v.set_old();
                 }
+                self.pinning = false;
                 for &x in &rary(v).v {
                     self.value(x);
                 }
+                self.pinning = true;
             }
             Kind::Hash => {
                 let h = rhash(v);
                 if promote {
                     h.m.set_old();
                 }
+                self.pinning = false;
                 for (k, x) in h.m.iter() {
                     self.value(k.0);
                     self.value(*x);
                 }
                 self.value(h.default);
                 self.value(h.default_proc);
+                self.pinning = true;
             }
             Kind::Range => {
                 let r = rrange(v);
+                self.pinning = false;
                 self.value(r.lo);
                 self.value(r.hi);
+                self.pinning = true;
             }
             Kind::Proc => {
                 let p = rproc(v);
@@ -1601,7 +1739,10 @@ impl Marker {
                     self.code_word(f);
                 }
                 self.env(p.env as usize);
+                self.pinning = false;
                 self.value(p.self_);
+                self.pinning = true;
+                // (a native closure may hold copies of these: pinned)
                 for &x in &p.roots {
                     self.value(x);
                 }
@@ -1706,7 +1847,9 @@ fn scan_with_registers(m: &mut Marker) {
         }
     }
     // with the stopped threads' help when there is enough to scan (not while verifying)
-    let parallel = m.verify.is_none() && crate::mt::multi() && gc_ps().len() > 1;
+    static PAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let par_ok = *PAR.get_or_init(|| std::env::var("KENNY_GC_PARALLEL_SCAN").map_or(true, |v| v != "0"));
+    let parallel = par_ok && m.verify.is_none() && crate::mt::multi() && gc_ps().len() > 1;
     let mut ranges = Vec::new();
     for (i, (regs, sp, base, copy)) in snap.iter().enumerate() {
         m.cur = 30 + i;
@@ -1826,6 +1969,7 @@ fn collect_locked() {
     };
     m.minor = !major;
     m.major = major;
+    m.compacting = major && compaction_mode(h) != CompactMode::Off && compaction_safe();
     let orphans = if major { std::mem::take(&mut *ORPHANS.raw()) } else { Vec::new() };
     if !orphans.is_empty() {
         for (u, o) in orphans.iter().enumerate() {
@@ -1972,6 +2116,16 @@ fn collect_locked() {
         unsafe { free_obj(p) };
     }
     let freed_classes = if major { free_dead_singletons(h, &m.seen_classes) } else { 0 };
+    if m.compacting {
+        let forced = compaction_mode(h) == CompactMode::Forced;
+        let r = compact(h, forced);
+        if *STATS_EVERY.get() || std::env::var_os("KENNY_GC_COMPACT_STATS").is_some() {
+            eprintln!("[gc] compaction: moved {} objects, emptied {} pages", r.0, r.1);
+        }
+        h.last_compact = Some(r);
+    } else if major && h.compact_request == 2 {
+        h.last_compact = None;
+    }
     if !orphans.is_empty() {
         free_dead_units(h, &mut m, orphans);
     }
@@ -2035,7 +2189,9 @@ fn collect_locked() {
     MALLOC_SINCE.store(0, Ordering::Relaxed);
     MALLOC_LIMIT.store(malloc_limit(), Ordering::Relaxed);
     phase("sweep", &mut lap);
-    release_and_refill(h, threshold);
+    // an idle server's tidy-up keeps room for one P's young generation only (pages come back
+    // when the load does)
+    release_and_refill(h, if h.compact_request == 1 { min_threshold() } else { threshold });
     if !major && crate::mt::multi() && std::env::var_os("KENNY_GC_LAZY").is_none() {
         let pages: Vec<usize> = h.pages.iter().filter(|pg| pg.unswept.load(Ordering::Relaxed) == UNSWEPT).map(|pg| &**pg as *const Page as usize).collect();
         bg_sweep_pages(pages);
@@ -2201,6 +2357,243 @@ fn mark_roots(m: &mut Marker, h: &mut Heap, all_classes: bool) {
             scan_range(m, p, p + n * 8);
         }
     }
+}
+
+// ---------- compaction ----------
+//
+// A major collection can move objects out of sparsely used pages into the free slots of
+// fuller ones, so the emptied pages can be returned. It moves only plain objects, strings,
+// arrays, hashes, ranges, floats and bignums that nothing pins: an object stays put if it was
+// reached from a root, a stack (also through a pointer into it), a C extension's mark
+// function, a native closure's captured values, a closure environment or generic ivars, if it
+// has a singleton class, or if its identity was observed (object_id, identity hash: FL_ID).
+// After moving, the fields that may refer to moved objects (instance variables, array
+// elements, hash keys and values, range ends, a proc's self) are rewritten.
+//
+// Native code may keep object references in Rust collections (a copy of an array's elements
+// while it calls a block, say), which the collector can neither see nor rewrite. So objects
+// move only when no thread is running a native method or block (PState::native_depth) and no
+// Fiber is suspended mid-run: compiled Ruby code and the runtime's call glue keep references
+// only on the stack or in registered roots.
+
+#[derive(PartialEq, Clone, Copy)]
+enum CompactMode {
+    Off,
+    Auto,
+    Forced,
+}
+/// KENNY_GC_COMPACT=0 never moves objects, =always tries at every major collection;
+/// otherwise when it frees enough pages (and GC.compact asks).
+fn compaction_mode(h: &Heap) -> CompactMode {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let m = *M.get_or_init(|| match std::env::var("KENNY_GC_COMPACT").as_deref() {
+        Ok("0") => 0,
+        Ok("always") => 2,
+        _ => 1,
+    });
+    match (m, h.compact_request) {
+        (0, _) => CompactMode::Off,
+        (2, _) | (_, 2) => CompactMode::Forced,
+        _ => CompactMode::Auto,
+    }
+}
+/// No thread has native frames that might hold object references the GC can't update.
+fn compaction_safe() -> bool {
+    let ok = gc_ps().iter().all(|&p| unsafe { (*(p as *const PState)).native_depth } == 0) && crate::thread::no_suspended_native_frames();
+    if !ok && std::env::var_os("KENNY_GC_COMPACT_STATS").is_some() && heap().compact_request != 0 {
+        let depths: Vec<u32> = gc_ps().iter().map(|&p| unsafe { (*(p as *const PState)).native_depth }).collect();
+        eprintln!("[gc] can't compact now: native frames per P {depths:?}, suspended threads/fibers ok: {}", crate::thread::no_suspended_native_frames());
+    }
+    ok
+}
+
+#[inline]
+fn movable(p: usize) -> bool {
+    let hd = hdr(p as V);
+    if hd.flags & (FL_ID | FL_PIN | FL_MOVED) != 0 || hd.flags & FL_MARK == 0 {
+        return false;
+    }
+    if !matches!(hd.kind, Kind::Object | Kind::String | Kind::Array | Kind::Hash | Kind::Range | Kind::Float | Kind::Bignum) {
+        return false;
+    }
+    if !hd.klass.is_null() && unsafe { (*hd.klass).is_singleton } {
+        return false;
+    }
+    // (instance variables of other kinds are keyed by address)
+    !crate::core::GENERIC_IVARS.raw().as_ref().is_some_and(|t| t.contains_key(&p))
+}
+
+/// The new address of a moved object, else `v` itself.
+#[inline]
+fn forwarded(v: V) -> V {
+    if v & 15 != 0 || !is_object(v as usize) {
+        return v;
+    }
+    let hd = hdr(v);
+    if hd.flags & FL_MOVED != 0 { hd.klass as V } else { v }
+}
+
+/// Move objects out of sparse pages (after a major collection's sweep, every other thread
+/// stopped). `forced`: even if few pages empty. Returns (objects moved, pages emptied).
+fn compact(h: &mut Heap, forced: bool) -> (usize, usize) {
+    let used = |pg: &Page| pg.alloc.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+    // plan: per size class, the emptiest pages whose live objects fit in the others' free slots
+    let mut sources: Vec<usize> = Vec::new();
+    for ci in 0..SIZE_CLASSES.len() {
+        let mut pages: Vec<(usize, usize)> = h.pages.iter().enumerate().filter(|(_, pg)| pg.class_idx == ci).map(|(i, pg)| (used(pg), i)).filter(|(u, _)| *u > 0).collect();
+        pages.sort_unstable();
+        let nslots = SIZE_CLASSES.get(ci).map(|s| PAGE / s).unwrap_or(1);
+        let mut free_after: usize = pages.iter().map(|(u, _)| nslots - u).sum();
+        let mut k = 0;
+        let mut moving = 0;
+        while k < pages.len() {
+            let (u, _) = pages[k];
+            // a source gives up its free slots as a target and needs room for its objects
+            if u > nslots / 2 || moving + u > free_after - (nslots - u) {
+                break;
+            }
+            free_after -= nslots - u;
+            moving += u;
+            k += 1;
+        }
+        let min_pages = if forced { 1 } else { 16 };
+        if k >= min_pages {
+            sources.extend(pages[..k].iter().map(|(_, i)| *i));
+        }
+    }
+    let mut moved = Vec::new();
+    if !sources.is_empty() {
+        let is_source: FxHashSet<usize> = sources.iter().copied().collect();
+        for ci in 0..SIZE_CLASSES.len() {
+            // targets: the fullest pages of this class first
+            let mut targets: Vec<(usize, usize)> = h.pages.iter().enumerate().filter(|(i, pg)| pg.class_idx == ci && !is_source.contains(i)).map(|(i, pg)| (used(pg), i)).filter(|(u, i)| *u < h.pages[*i].nslots).collect();
+            targets.sort_unstable_by(|a, b| b.cmp(a));
+            let mut ti = 0;
+            let mut tw = 0;
+            let class_sources: Vec<usize> = sources.iter().copied().filter(|&i| h.pages[i].class_idx == ci).collect();
+            for si in class_sources {
+                let (sbase, slot, nslots) = (h.pages[si].base, h.pages[si].slot, h.pages[si].nslots);
+                for s in 0..nslots {
+                    if h.pages[si].alloc[s / 64] & (1 << (s % 64)) == 0 {
+                        continue;
+                    }
+                    let p = sbase + s * slot;
+                    if !movable(p) {
+                        continue;
+                    }
+                    // the next free slot among the targets
+                    let dst = loop {
+                        let Some(&(_, t)) = targets.get(ti) else { break None };
+                        let pg = &mut h.pages[t];
+                        let mut found = None;
+                        while tw < pg.alloc.len() {
+                            let valid = (pg.nslots - tw * 64).min(64);
+                            let mask = if valid == 64 { u64::MAX } else { (1u64 << valid) - 1 };
+                            let free = !pg.alloc[tw] & mask;
+                            if free != 0 {
+                                let b = free.trailing_zeros() as usize;
+                                pg.alloc[tw] |= 1 << b;
+                                found = Some(pg.base + (tw * 64 + b) * pg.slot);
+                                break;
+                            }
+                            tw += 1;
+                        }
+                        if found.is_some() {
+                            break found;
+                        }
+                        ti += 1;
+                        tw = 0;
+                    };
+                    let Some(dst) = dst else { break };
+                    unsafe { std::ptr::copy_nonoverlapping(p as *const u8, dst as *mut u8, slot) };
+                    let hd = hdr(p as V);
+                    hd.klass = dst as *mut Class;
+                    hd.flags |= FL_MOVED;
+                    moved.push((si, s, p));
+                }
+            }
+        }
+    }
+    // rewrite references to moved objects (and drop this collection's pins)
+    if !moved.is_empty() {
+        crate::mt::LAZY_SWEEP.with(|l| l.set(true));
+    }
+    for pg in h.pages.iter() {
+        for wi in 0..pg.alloc.len() {
+            let mut bits = pg.alloc[wi];
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let p = pg.base + (wi * 64 + b) * pg.slot;
+                let hd = hdr(p as V);
+                if hd.flags & FL_MOVED != 0 {
+                    continue;
+                }
+                hd.flags &= !FL_PIN;
+                if moved.is_empty() {
+                    continue;
+                }
+                let v = p as V;
+                match hd.kind {
+                    Kind::Object => {
+                        let iv = &mut obj(v).ivars;
+                        for i in 0..iv.len() {
+                            let x = iv[i];
+                            let y = forwarded(x);
+                            if y != x {
+                                iv[i] = y;
+                            }
+                        }
+                    }
+                    Kind::Array => {
+                        let a = &mut rary(v).v;
+                        for i in 0..a.len() {
+                            let x = a[i];
+                            let y = forwarded(x);
+                            if y != x {
+                                a[i] = y;
+                            }
+                        }
+                    }
+                    Kind::Hash => {
+                        let hh = rhash(v);
+                        hh.m.remap(forwarded);
+                        hh.default = forwarded(hh.default);
+                        hh.default_proc = forwarded(hh.default_proc);
+                    }
+                    Kind::Range => {
+                        let r = rrange(v);
+                        r.lo = forwarded(r.lo);
+                        r.hi = forwarded(r.hi);
+                    }
+                    Kind::Proc => {
+                        let pr = rproc(v);
+                        pr.self_ = forwarded(pr.self_);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if !moved.is_empty() {
+        crate::mt::LAZY_SWEEP.with(|l| l.set(false));
+    }
+    // the old slots are free now (their contents live on at the new address)
+    let mut touched: FxHashSet<usize> = FxHashSet::default();
+    for &(si, s, p) in &moved {
+        let pg = &mut h.pages[si];
+        pg.alloc[s / 64] &= !(1u64 << (s % 64));
+        let hd = hdr(p as V);
+        hd.flags = 0;
+        hd.klass = std::ptr::null_mut();
+        touched.insert(si);
+    }
+    let emptied = touched.iter().filter(|&&i| used(&h.pages[i]) == 0).count();
+    if !moved.is_empty() {
+        // (constant caches may hold a moved value)
+        crate::core::bump_const_serial();
+    }
+    (moved.len(), emptied)
 }
 
 /// Classes that running class bodies define into and that running `define_method` methods
@@ -2389,13 +2782,12 @@ fn release_and_refill(h: &mut Heap, threshold: usize) {
     let capacity: usize = h.pages.iter().map(|p| p.nslots).sum();
     let needed = ((h.live + threshold) as f64 * 1.25) as usize;
     let mut spare = capacity.saturating_sub(needed);
-    let layout = std::alloc::Layout::from_size_align(PAGE, PAGE).unwrap();
     let mut keep = vec![true; h.pages.len()];
     for (i, pg) in h.pages.iter().enumerate() {
         if counts[i] == 0 && pg.nslots <= spare {
             spare -= pg.nslots;
             keep[i] = false;
-            unsafe { std::alloc::dealloc(pg.base as *mut u8, layout) };
+            unmap_page(pg.base);
         }
     }
     if keep.iter().any(|k| !k) {

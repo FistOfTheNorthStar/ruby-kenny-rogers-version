@@ -15,6 +15,37 @@ use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 
 static APP: G<Option<V>> = G::new(None);
+
+/// After this long without any request on any P, P 0's loop runs a full collection that may
+/// move objects to empty sparse pages and return memory (gc::idle_compact).
+const IDLE_TIDY: std::time::Duration = std::time::Duration::from_secs(1);
+/// When some P last had network activity (ms since process start).
+static LAST_ACTIVITY: AtomicStamp = AtomicStamp::new(0);
+struct Stamp;
+impl Stamp {
+    fn now() -> u64 {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    }
+}
+struct AtomicStamp(std::sync::atomic::AtomicU64);
+impl AtomicStamp {
+    const fn new(v: u64) -> Self {
+        AtomicStamp(std::sync::atomic::AtomicU64::new(v))
+    }
+    fn load(&self, o: std::sync::atomic::Ordering) -> StampVal {
+        StampVal(self.0.load(o))
+    }
+    fn store(&self, v: u64, o: std::sync::atomic::Ordering) {
+        self.0.store(v, o)
+    }
+}
+struct StampVal(u64);
+impl StampVal {
+    fn elapsed_ms(&self) -> u64 {
+        Stamp::now().saturating_sub(self.0)
+    }
+}
 static MIDDLEWARE: G<Vec<(V, Vec<V>, V)>> = G::new(Vec::new());
 
 pub fn static_roots() -> Vec<V> {
@@ -313,8 +344,13 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
     let mut next = 1usize;
     let mut events = Events::with_capacity(1024);
     let port = std_listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    // the loop on P 0 tidies the heap once the server has been idle for a second
+    let tidier = crate::core::pst().thr.idx == 0;
     loop {
-        let timeout = crate::thread::idle_timeout();
+        let mut timeout = crate::thread::idle_timeout();
+        if tidier && crate::gc::idle_compaction_wanted() {
+            timeout = Some(timeout.map_or(IDLE_TIDY, |t| t.min(IDLE_TIDY)));
+        }
         // waiting for the network doesn't hold up a collection on another thread
         if let Err(e) = crate::gc::blocking(|| poll.poll(&mut events, timeout)) {
             if e.kind() == ErrorKind::Interrupted {
@@ -322,6 +358,13 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
             }
             err_out(format!("kenny: poll: {e}\n").as_bytes());
             return 1;
+        }
+        if events.is_empty() {
+            if tidier && LAST_ACTIVITY.load(std::sync::atomic::Ordering::Relaxed).elapsed_ms() >= IDLE_TIDY.as_millis() as u64 {
+                crate::gc::idle_compact();
+            }
+        } else {
+            LAST_ACTIVITY.store(Stamp::now(), std::sync::atomic::Ordering::Relaxed);
         }
         for ev in events.iter() {
             if ev.token() == LISTENER {

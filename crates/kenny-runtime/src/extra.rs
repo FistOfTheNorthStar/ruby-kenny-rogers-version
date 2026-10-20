@@ -2187,7 +2187,22 @@ pub fn init() {
     // ===== GC =====
     if let Some(gc) = const_lookup(c.object, sym("GC")) {
         let gc = gc as *mut Class;
-        defs(gc, "compact", 0, 0, |_, _, _| QNIL);
+        // GC.compact: a full collection that moves objects out of sparsely used pages (when no
+        // native frame is active anywhere); returns {moved:, freed_pages:}, or nil if it couldn't
+        defs(gc, "compact", 0, 0, |_, _, _| {
+            pst().native_depth -= 1;
+            let r = crate::gc::compact_now();
+            pst().native_depth += 1;
+            match r {
+                Some((moved, freed)) => {
+                    let h = hash_new();
+                    rhash(h).m.insert(HKey(mksym(sym("moved"))), mkfix(moved as i64));
+                    rhash(h).m.insert(HKey(mksym(sym("freed_pages"))), mkfix(freed as i64));
+                    h
+                }
+                None => QNIL,
+            }
+        });
         defs(gc, "stress", 0, 0, |_, _, _| QFALSE);
         defs(gc, "stress=", 1, 1, |_, a, _| a[0]);
         defs(gc, "latest_gc_info", 0, 1, |_, _, _| hash_new());
