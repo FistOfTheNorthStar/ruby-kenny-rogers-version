@@ -1,0 +1,14 @@
+"Kenny"
+"k@example.com"
+3
+true
+[:age, :age=, :age?, :email]
+7
+60
+"hello eval"
+"SECRET!"
+6
+"HEY!!"
+42
+99
+SyntaxError

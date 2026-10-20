@@ -1,0 +1,46 @@
+["zero", "small", "big", "text", "text", "small"]
+10
+-2
+400
+[1, 4, 9]
+7
+4
+2.0
+no error
+ensure 4
+error: zero! (RuntimeError)
+ensure 0
+arg error: negative!
+ensure -1
+succeeded after 3
+"custom default"
+MyError
+true
+-1
+20
+:none
+ensure ran
+:from_body
+:no_block
+14
+[1, 2, [], 3, 4, {}, nil]
+[1, 9, [8, 7], 3, 5, {e: 6}, :blk]
+3
+7
+11
+16
+0
+[1, 4]
+3
+[11, 12, 13]
+[1, 6]
+[[1, 0], [2, 1], [3, 2]]
+"big"
+"yes"
+"local-variable"
+nil
+"method"
+"constant"
+false
+true
+FrozenError: can't modify frozen String: "frozen"

@@ -1,0 +1,100 @@
+# Kenny Ruby — language profile
+
+Kenny compiles Ruby ahead of time to a single native binary, like Go.
+
+## Rule 1: a strict subset of Ruby
+
+- **No new syntax, keywords or core APIs.** Every valid Kenny program is a valid Ruby program
+  and behaves the same under CRuby (except where noted below).
+- Features we drop are **compile errors with a clear message** in your code, never silent
+  differences. In dependencies (files found via `-I` load paths, gems, the stdlib) they are build
+  warnings instead, and raise `NotImplementedError` only if that code path actually runs — so a
+  gem whose debug page uses `binding` still compiles.
+- Syntax is parsed by Prism, Ruby's official parser, so the grammar is exactly Ruby's.
+
+## Rule 2: drop runtime powers that tax every program
+
+| Dropped | Reason |
+|---|---|
+| Local variables seen through a `Binding` (`local_variable_get/set`, `eval("x", binding)` reading locals) | Locals must be able to live in registers. `binding` itself works but captures `self` only, so `ERB#result(binding)` and `eval(src, binding)` with methods/ivars work |
+| Redefining Integer and Float operators (`Integer#+`, `Float#<`, `Integer#&`, ...: `+ - * / % < <= > >= == != & \| ^`) | Lets arithmetic and comparisons compile inline, on unboxed values, with no guards |
+| `ObjectSpace.each_object` (except for `Class`/`Module`), `ObjectSpace._id2ref` | Heap doesn't need to be walkable; GC can move objects. Classes are tracked anyway, so `each_object(Class)` works |
+| `TracePoint`, `set_trace_func` | No hooks on every call/line (a debug build flag replaces them) |
+| String encodings other than UTF-8, ASCII-8BIT (binary), US-ASCII | Strings skip per-operation encoding checks |
+| `require` / `load` / `autoload` of files not known at build time | Whole program is compiled together |
+| Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in with `--ext`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError` |
+| `Thread#raise` / `Thread#kill` landing at arbitrary instructions | Delivered only at safe points (calls, loop back-edges, IO) |
+| `RubyVM::*`, `Ractor`, `$;`, `$,`, `callcc`, flip-flop, `BEGIN`/`END` | CRuby internals, superseded, or deprecated |
+
+Other core methods (`Array#[]`, `Hash#[]=`, `String#==`, `Integer#times`, `Array#each`, ...) can
+still be redefined, subclassed or refined: their specialised paths check through the call site's
+inline cache that the builtin method is the one being called, and otherwise make a normal call.
+Floats can't get singleton methods or instance variables (as in CRuby, they are immediate values
+or frozen).
+
+Refinements were on this list at first, but real gems (Rack among them) use them, so they are
+supported in a way that costs nothing elsewhere: `using` is lexical, so the compiler knows exactly
+which call sites come after it, and only those sites use a refinement-aware lookup.
+
+## Rule 3: defaults that differ from CRuby
+
+- **Frozen string literals by default** (Ruby is heading here already).
+- **Metaprogramming is free during boot, slower after.** `define_method`, `class_eval`, `include`,
+  `extend` work any time; after boot they invalidate caches and take a slow path.
+- **`$~` / `$1`** are tracked only in methods that reference them.
+- **Gems are resolved at build time.** With a `Gemfile.lock`, `kenny build` compiles the locked
+  gems of the groups not in `BUNDLE_WITHOUT` (default `development:test`); in the binary,
+  `require "bundler/setup"` and `Bundler.require(*groups)` use that build-time resolution.
+  Application servers in the Gemfile (Puma, Unicorn, ...) are left out: the binary is the
+  server. `require "bootsnap/setup"` does nothing (there is nothing to cache).
+- **`YAML.load` follows the psych of the Ruby the program is built against** (or of a psych
+  gem in the lock file): with psych 3 (Ruby ≤ 3.0) it is a full load that accepts aliases and
+  any class, as Rails 5.2 expects; with psych 4+ it is a safe load.
+- **Ruby 2 keyword arguments in dependencies.** Methods and blocks defined in files found via
+  load paths (gems, the stdlib) and in `eval`'d strings take a trailing positional Hash with
+  Symbol keys as their keywords, as Ruby 2.x did — gems such as Rails 5.2 rely on it. The app's
+  own code keeps Ruby 3 semantics (except that a Hash which would otherwise be one positional
+  argument too many is taken as keywords instead of raising ArgumentError).
+
+## Rule 4: concurrency is fixed with the APIs Ruby already has
+
+No GVL. No new concurrency API. The existing ones become lightweight:
+
+- **`Thread.new` is a lightweight task**, like a goroutine: its own small stack, cheap to create,
+  switched by a scheduler when it blocks and every 10ms for fairness.
+- **Status:** threads of one process run on all cores at once (M:N): one scheduler per OS
+  thread (`KENNY_THREADS`, default one per core), each with its own run queue, allocator and
+  caches. A thread stays on the OS thread it started on (no migration between cores yet), so
+  load is balanced when threads are created, not afterwards.
+- **All IO is non-blocking automatically.** A built-in network poller (kqueue/epoll/io_uring)
+  parks a thread on IO and runs another — Ruby's `Fiber::Scheduler` behaviour, built in, no gem.
+  *Status:* the built-in HTTP server's sockets already work this way and cooperate with threads;
+  file, subprocess and `socket`-library IO called from Ruby code still blocks the process
+  (next step).
+- **`Mutex`, `Queue`, `SizedQueue`, `ConditionVariable`, `Monitor`** work as documented, backed by
+  the scheduler (parking, not OS blocking).
+- **`Fiber`** keeps its Ruby semantics (`Enumerator#next` etc.).
+- **Memory safety under races:** a data race in Ruby code can give wrong answers but never crash
+  the process. Readers of Arrays, Hashes, Strings, instance variables and class tables never
+  lock; writers take a per-object spin lock, only once more than one OS thread runs Ruby code.
+  A buffer that grows is replaced, never freed under a reader: the old one is freed by the GC
+  once no stack points into it. Racy unsynchronized writes (two threads doing `@n += 1` or
+  `h[k] = v` on the same object) can lose an update, as on JRuby; use a `Mutex` as there.
+- **Compatibility bar:** Ruby code that is correct on JRuby / TruffleRuby (no GVL) is correct here.
+  Rails is thread-safe and already tested that way.
+
+## Rule 5: the server is part of the binary
+
+Like Go's `net/http`, the runtime contains an HTTP/1.1 + HTTP/2 server written in Rust.
+No Puma, no Unicorn, no new API: a standard Rack `config.ru` (`run MyApp`) is the entry point,
+each request runs on its own lightweight `Thread`, and `./app` starts serving.
+
+```
+kenny build config.ru -o app
+./app            # listens on $PORT (default 3000)
+```
+
+## Compatibility target
+
+Measured, not claimed: pass rate on `ruby/spec` for the kept features, then the test suites of
+Rack, Sinatra, and Rails' default gem set.

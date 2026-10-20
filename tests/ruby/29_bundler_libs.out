@@ -1,0 +1,15 @@
+"constant"
+true
+true
+true
+true
+true
+"AF_INET"
+true
+6
+nil
+16
+8
+"do_it"
+true
+{"adapter" => "sqlite3", "pool" => 5, "database" => "db/p.sqlite3"}

@@ -1,0 +1,1753 @@
+//! Values, heap objects, classes, symbols, method dispatch and the pending-throw state.
+//!
+//! Value tagging (64-bit, CRuby-compatible layout so a C-API shim stays possible):
+//!   ...xxx1  Fixnum (62-bit signed, value << 1 | 1)
+//!   0x00     false
+//!   0x08     nil
+//!   0x14     true
+//!   0x34     UNDEF  (never visible to Ruby; a function returning it means "a throw is pending")
+//!   id<<8|0x0c  Symbol
+//!   ...xx10  Flonum: a Float stored in the value itself (CRuby's encoding: the double's bits
+//!            rotated left by 3 with the low 2 bits replaced by 0b10). Covers doubles whose
+//!            exponent is within about 2^-255..2^256, plus +0.0 (0x8000000000000002); -0.0,
+//!            NaN, Infinity and very large/small values stay heap `RFloat`s. The compiler
+//!            emits the same encode/decode inline, and include/ruby.h mirrors it.
+//!   8-aligned pointer  heap object (starts with `Header`)
+//!
+//! v0 is single-threaded and never frees memory (no GC yet).
+
+pub use crate::svec::SVec;
+pub use crate::cmap::CMap;
+use num_bigint::BigInt;
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
+pub type V = u64;
+
+pub const QFALSE: V = 0x00;
+pub const QNIL: V = 0x08;
+pub const QTRUE: V = 0x14;
+pub const UNDEF: V = 0x34;
+pub const SYM_TAG: V = 0x0c;
+
+pub const FIX_MAX: i64 = (1i64 << 62) - 1;
+pub const FIX_MIN: i64 = -(1i64 << 62);
+
+pub struct G<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for G<T> {}
+impl<T> G<T> {
+    pub const fn new(v: T) -> Self {
+        G(UnsafeCell::new(v))
+    }
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub fn get(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+// ---------- immediates ----------
+
+#[inline(always)]
+pub fn is_fix(v: V) -> bool {
+    v & 1 == 1
+}
+#[inline(always)]
+pub fn fix(v: V) -> i64 {
+    (v as i64) >> 1
+}
+#[inline(always)]
+pub fn mkfix(i: i64) -> V {
+    ((i << 1) | 1) as u64
+}
+#[inline(always)]
+pub fn truthy(v: V) -> bool {
+    v & !QNIL != 0
+}
+#[inline(always)]
+pub fn bool_v(b: bool) -> V {
+    if b { QTRUE } else { QFALSE }
+}
+#[inline(always)]
+pub fn is_sym(v: V) -> bool {
+    v & 0xff == SYM_TAG
+}
+#[inline(always)]
+pub fn sym_id(v: V) -> u32 {
+    (v >> 8) as u32
+}
+#[inline(always)]
+pub fn mksym(id: u32) -> V {
+    ((id as u64) << 8) | SYM_TAG
+}
+#[inline(always)]
+pub fn is_heap(v: V) -> bool {
+    v & 7 == 0 && v != QFALSE && v != QNIL
+}
+
+// ---------- flonums (immediate Floats) ----------
+
+pub const FLONUM_MASK: V = 3;
+pub const FLONUM_FLAG: V = 2;
+/// The flonum encoding of +0.0.
+pub const FLONUM_ZERO: V = 0x8000_0000_0000_0002;
+
+#[inline(always)]
+pub fn is_flonum(v: V) -> bool {
+    v & FLONUM_MASK == FLONUM_FLAG
+}
+#[inline(always)]
+pub fn flonum_to_f64(v: V) -> f64 {
+    if v == FLONUM_ZERO {
+        return 0.0;
+    }
+    let b63 = v >> 63;
+    f64::from_bits(((2 - b63) | (v & !FLONUM_MASK)).rotate_right(3))
+}
+/// The flonum for `d`, if it has one (else the Float must live on the heap).
+#[inline(always)]
+pub fn f64_to_flonum(d: f64) -> Option<V> {
+    let t = d.to_bits();
+    let bits = ((t >> 60) & 7) as i64;
+    if t != 0x3000_0000_0000_0000 && (bits - 3) & !1 == 0 {
+        Some((t.rotate_left(3) & !1) | FLONUM_FLAG)
+    } else if t == 0 {
+        Some(FLONUM_ZERO)
+    } else {
+        None
+    }
+}
+/// The f64 of a Float value (flonum or heap); the caller has checked `is_float`.
+#[inline(always)]
+pub fn float_val(v: V) -> f64 {
+    if is_flonum(v) { flonum_to_f64(v) } else { rfloat(v).f }
+}
+
+// ---------- heap objects ----------
+
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Object,
+    String,
+    Array,
+    Hash,
+    Float,
+    Bignum,
+    Proc,
+    Class,
+    Range,
+    /// Opaque C-extension data (TypedData / Data_Wrap_Struct)
+    Data,
+    /// A closure environment (see `Env`): never a Ruby value. The header's `klass` field holds
+    /// its slot count, and compiled code points at the words after the header.
+    Env,
+}
+
+pub const FL_FROZEN: u32 = 1;
+pub const FL_KWHASH: u32 = 2;
+/// String flag: ASCII-8BIT (binary) encoding. (4 is gc::FL_MARK; 16 matches compat::FL_BINARY upstream.)
+pub const FL_BINARY: u32 = 16;
+/// Proc flag: the block declares keyword parameters (a trailing keyword hash is not positional).
+pub const FL_PROC_KW: u32 = 256;
+
+#[repr(C)]
+pub struct Header {
+    pub klass: *mut Class,
+    pub kind: Kind,
+    pub flags: u32,
+}
+
+#[repr(C)]
+pub struct RObject {
+    pub h: Header,
+    pub shape: *mut Class,
+    pub ivars: SVec<V>,
+}
+#[repr(C)]
+pub struct RString {
+    pub h: Header,
+    pub b: SVec<u8>,
+    pub iv: GenIv,
+}
+#[repr(C)]
+pub struct RArray {
+    pub h: Header,
+    pub v: SVec<V>,
+    pub iv: GenIv,
+}
+pub type FxBuild = std::hash::BuildHasherDefault<rustc_hash::FxHasher>;
+pub type HMap = crate::khash::KMap;
+
+#[repr(C)]
+pub struct RHash {
+    pub h: Header,
+    pub m: HMap,
+    pub default: V,
+    pub default_proc: V,
+    pub iv: GenIv,
+}
+
+/// Instance variables of a String, Array or Hash (e.g. ActiveSupport::SafeBuffer's
+/// `@html_safe`), created on first use.
+#[derive(Default)]
+pub struct GenIv(std::sync::atomic::AtomicPtr<CMap<u32, V>>);
+impl GenIv {
+    pub const fn new() -> Self {
+        GenIv(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+    pub fn map(&self) -> Option<&'static mut CMap<u32, V>> {
+        let p = self.0.load(std::sync::atomic::Ordering::Acquire);
+        if p.is_null() { None } else { Some(unsafe { &mut *p }) }
+    }
+    pub fn map_or_create(&self) -> &'static mut CMap<u32, V> {
+        if let Some(m) = self.map() {
+            return m;
+        }
+        let n = Box::into_raw(Box::new(CMap::new()));
+        match self.0.compare_exchange(std::ptr::null_mut(), n, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
+            Ok(_) => unsafe { &mut *n },
+            Err(cur) => {
+                drop(unsafe { Box::from_raw(n) });
+                unsafe { &mut *cur }
+            }
+        }
+    }
+}
+impl Drop for GenIv {
+    fn drop(&mut self) {
+        let p = *self.0.get_mut();
+        if !p.is_null() {
+            drop(unsafe { Box::from_raw(p) });
+        }
+    }
+}
+#[repr(C)]
+pub struct RFloat {
+    pub h: Header,
+    pub f: f64,
+}
+#[repr(C)]
+pub struct RBignum {
+    pub h: Header,
+    pub n: BigInt,
+}
+#[repr(C)]
+pub struct RRange {
+    pub h: Header,
+    pub lo: V,
+    pub hi: V,
+    pub excl: bool,
+}
+
+pub type BlockFn = unsafe extern "C" fn(*mut RProc, V, u64, *const V, V) -> V;
+pub type NativeBlock = Box<dyn Fn(V, &[V], V) -> V>;
+
+/// Closure environment: captured locals live here. Layout is read by compiled code:
+/// [parent, method_block, slot0, slot1, ...]
+#[repr(C)]
+pub struct Env {
+    pub parent: *mut Env,
+    pub blk: V,
+    pub slots: [V; 0],
+}
+
+#[repr(C)]
+pub struct RProc {
+    pub h: Header,
+    pub func: BlockFn,
+    pub env: *mut Env,
+    pub self_: V,
+    pub min: i32,
+    pub max: i32, // -1 = unlimited
+    pub autosplat: bool,
+    pub lambda: bool,
+    pub native: *mut NativeBlock,
+    /// Values captured by a native closure (kept alive by the GC).
+    pub roots: Vec<V>,
+}
+
+#[repr(C)]
+pub struct RData {
+    pub h: Header,
+    pub data: *mut std::ffi::c_void,
+    pub dmark: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    pub dfree: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    pub roots: Vec<V>,
+}
+
+#[repr(C)]
+pub struct Class {
+    pub h: Header,
+    pub name: String,
+    pub superclass: *mut Class,
+    pub methods: CMap<u32, *const Method>,
+    pub includes: SVec<*mut Class>,
+    pub consts: CMap<u32, V>,
+    pub ivar_index: CMap<u32, u32>,
+    pub ivar_names: SVec<u32>,
+    pub civars: CMap<u32, V>,
+    pub cvars: CMap<u32, V>,
+    pub is_module: bool,
+    pub is_singleton: bool,
+    pub attached: V,
+    pub lexical_parent: *mut Class,
+    pub alloc: Kind,
+    pub struct_members: SVec<u32>,
+    pub module_function: bool,
+    /// Modules prepended to this class/module (looked up before its own methods).
+    pub prepends: SVec<*mut Class>,
+    /// Visibility for methods defined next in a class body (`private` with no arguments).
+    pub default_vis: u8,
+}
+
+#[inline(always)]
+pub fn hdr(v: V) -> &'static mut Header {
+    unsafe { &mut *(v as *mut Header) }
+}
+#[inline(always)]
+pub fn kind(v: V) -> Option<Kind> {
+    // flonums report Kind::Float too, so `kind`-based dispatch treats both Float forms alike;
+    // anything that touches the header must check `is_heap` (not `kind(..).is_some()`)
+    if is_heap(v) {
+        Some(hdr(v).kind)
+    } else if is_flonum(v) {
+        Some(Kind::Float)
+    } else {
+        None
+    }
+}
+macro_rules! caster {
+    ($name:ident, $t:ty) => {
+        #[inline(always)]
+        pub fn $name(v: V) -> &'static mut $t {
+            unsafe { &mut *(v as *mut $t) }
+        }
+    };
+}
+caster!(obj, RObject);
+caster!(rstr, RString);
+caster!(rary, RArray);
+caster!(rhash, RHash);
+caster!(rfloat, RFloat);
+caster!(rbig, RBignum);
+caster!(rrange, RRange);
+caster!(rproc, RProc);
+caster!(rclass, Class);
+
+pub fn is_kind(v: V, k: Kind) -> bool {
+    kind(v) == Some(k)
+}
+pub fn is_str(v: V) -> bool {
+    is_kind(v, Kind::String)
+}
+pub fn is_ary(v: V) -> bool {
+    is_kind(v, Kind::Array)
+}
+pub fn is_hash(v: V) -> bool {
+    is_kind(v, Kind::Hash)
+}
+pub fn is_float(v: V) -> bool {
+    is_kind(v, Kind::Float)
+}
+pub fn is_big(v: V) -> bool {
+    is_kind(v, Kind::Bignum)
+}
+pub fn is_int(v: V) -> bool {
+    is_fix(v) || is_big(v)
+}
+pub fn is_class(v: V) -> bool {
+    is_kind(v, Kind::Class)
+}
+pub fn is_proc(v: V) -> bool {
+    is_kind(v, Kind::Proc)
+}
+pub fn is_range(v: V) -> bool {
+    is_kind(v, Kind::Range)
+}
+
+pub fn alloc<T>(t: T) -> V {
+    debug_assert!(std::mem::align_of::<T>() <= 16);
+    let p = crate::gc::alloc_slot(std::mem::size_of::<T>());
+    unsafe { std::ptr::write(p as *mut T, t) };
+    p as V
+}
+fn header(klass: *mut Class, kind: Kind) -> Header {
+    Header { klass, kind, flags: 0 }
+}
+
+pub fn str_new(b: Vec<u8>) -> V {
+    alloc(RString { h: header(rt().c.string, Kind::String), b: SVec::from(b), iv: GenIv::new() })
+}
+pub fn str_from(s: &str) -> V {
+    str_new(s.as_bytes().to_vec())
+}
+pub fn ary_new(v: Vec<V>) -> V {
+    alloc(RArray { h: header(rt().c.array, Kind::Array), v: SVec::from(v), iv: GenIv::new() })
+}
+pub fn hash_new() -> V {
+    alloc(RHash { h: header(rt().c.hash, Kind::Hash), m: HMap::new(), default: QNIL, default_proc: QNIL, iv: GenIv::new() })
+}
+pub fn float_new(f: f64) -> V {
+    match f64_to_flonum(f) {
+        Some(v) => v,
+        None => float_new_heap(f),
+    }
+}
+/// A heap Float (Floats are always frozen, like CRuby's).
+pub fn float_new_heap(f: f64) -> V {
+    let v = alloc(RFloat { h: header(rt().c.float, Kind::Float), f });
+    hdr(v).flags |= FL_FROZEN;
+    v
+}
+pub fn range_new(lo: V, hi: V, excl: bool) -> V {
+    let r = alloc(RRange { h: header(rt().c.range, Kind::Range), lo, hi, excl });
+    hdr(r).flags |= FL_FROZEN;
+    r
+}
+pub fn object_new(klass: *mut Class) -> V {
+    // instances usually get the same ivars as earlier ones: size the buffer for them up front
+    let n = if klass.is_null() { 0 } else { unsafe { (*klass).ivar_names.len() } };
+    alloc(RObject { h: header(klass, Kind::Object), shape: klass, ivars: SVec::with_capacity(n) })
+}
+pub fn int_from_big(n: BigInt) -> V {
+    use num_traits::ToPrimitive;
+    if let Some(i) = n.to_i64() {
+        if (FIX_MIN..=FIX_MAX).contains(&i) {
+            return mkfix(i);
+        }
+    }
+    let v = alloc(RBignum { h: header(rt().c.integer, Kind::Bignum), n });
+    hdr(v).flags |= FL_FROZEN;
+    v
+}
+pub fn int_from_i128(i: i128) -> V {
+    if i >= FIX_MIN as i128 && i <= FIX_MAX as i128 { mkfix(i as i64) } else { int_from_big(BigInt::from(i)) }
+}
+
+pub fn proc_new_compiled(func: BlockFn, env: *mut Env, self_: V, min: i32, max: i32, autosplat: bool, lambda: bool) -> V {
+    alloc(RProc {
+        h: header(rt().c.proc_, Kind::Proc),
+        func,
+        env,
+        self_,
+        min,
+        max,
+        autosplat,
+        lambda,
+        native: std::ptr::null_mut(),
+        roots: Vec::new(),
+    })
+}
+pub fn proc_new_native(f: NativeBlock, min: i32, max: i32) -> V {
+    proc_new_native_rooted(f, min, max, Vec::new())
+}
+/// A native proc whose closure captures Ruby values: list them in `roots`.
+pub fn proc_new_native_rooted(f: NativeBlock, min: i32, max: i32, roots: Vec<V>) -> V {
+    let p = alloc(RProc {
+        h: header(rt().c.proc_, Kind::Proc),
+        func: native_block_tramp,
+        env: std::ptr::null_mut(),
+        self_: QNIL,
+        min,
+        max,
+        autosplat: max != 1 && min != 1,
+        lambda: false,
+        native: Box::into_raw(Box::new(f)),
+        roots,
+    });
+    p
+}
+unsafe extern "C" fn native_block_tramp(p: *mut RProc, self_: V, argc: u64, argv: *const V, blk: V) -> V {
+    let args = unsafe { args_slice(argc, argv) };
+    unsafe { (*(*p).native)(self_, args, blk) }
+}
+pub unsafe fn args_slice<'a>(argc: u64, argv: *const V) -> &'a [V] {
+    if argc == 0 { &[] } else { unsafe { std::slice::from_raw_parts(argv, argc as usize) } }
+}
+
+pub fn is_frozen(v: V) -> bool {
+    !is_heap(v) || hdr(v).flags & FL_FROZEN != 0
+}
+pub fn check_frozen(v: V) -> V {
+    if is_frozen(v) {
+        let msg = format!("can't modify frozen {}: {}", class_name(class_of(v)), crate::fmt::inspect_lossy(v));
+        return raise(rt().c.frozen_error, &msg);
+    }
+    QNIL
+}
+
+// ---------- symbols ----------
+
+// Names live in chunks that never move (lock-free `sym_name`); lookup is a lock-free
+// open-addressing table that only grows (a new table is published whole). Adding a symbol
+// takes SYM_LOCK.
+const SYM_CHUNK: usize = 4096;
+struct SymName {
+    ptr: std::sync::atomic::AtomicPtr<u8>,
+    len: std::sync::atomic::AtomicUsize,
+}
+static SYM_CHUNKS: [std::sync::atomic::AtomicPtr<SymName>; 4096] = [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 4096];
+static SYM_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static SYM_TABLE: std::sync::atomic::AtomicPtr<SymTable> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static SYM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+struct SymTable {
+    mask: usize,
+    slots: Box<[std::sync::atomic::AtomicU32]>,
+}
+
+#[inline]
+fn sym_hash(b: &[u8]) -> u64 {
+    let mut h = rustc_hash::FxHasher::default();
+    h.write(b);
+    h.write_usize(b.len());
+    h.finish()
+}
+fn sym_probe(t: &SymTable, h: u64, name: &[u8]) -> Result<u32, usize> {
+    use std::sync::atomic::Ordering;
+    let mut i = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & t.mask;
+    loop {
+        let e = t.slots[i].load(Ordering::Acquire);
+        if e == 0 {
+            return Err(i);
+        }
+        if sym_name(e - 1) == name {
+            return Ok(e - 1);
+        }
+        i = (i + 1) & t.mask;
+    }
+}
+pub fn intern(name: &[u8]) -> u32 {
+    use std::sync::atomic::Ordering;
+    let h = sym_hash(name);
+    let t = SYM_TABLE.load(Ordering::Acquire);
+    if !t.is_null() {
+        if let Ok(id) = sym_probe(unsafe { &*t }, h, name) {
+            return id;
+        }
+    }
+    let _g = SYM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut t = SYM_TABLE.load(Ordering::Acquire);
+    if !t.is_null() {
+        if let Ok(id) = sym_probe(unsafe { &*t }, h, name) {
+            return id;
+        }
+    }
+    let id = SYM_COUNT.load(Ordering::Relaxed);
+    // the name
+    let ci = id as usize / SYM_CHUNK;
+    let mut chunk = SYM_CHUNKS[ci].load(Ordering::Acquire);
+    if chunk.is_null() {
+        let v: Vec<SymName> = (0..SYM_CHUNK).map(|_| SymName { ptr: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), len: std::sync::atomic::AtomicUsize::new(0) }).collect();
+        chunk = Box::leak(v.into_boxed_slice()).as_mut_ptr();
+        SYM_CHUNKS[ci].store(chunk, Ordering::Release);
+    }
+    let leaked: &'static mut [u8] = Box::leak(name.to_vec().into_boxed_slice());
+    let e = unsafe { &*chunk.add(id as usize % SYM_CHUNK) };
+    e.len.store(leaked.len(), Ordering::Relaxed);
+    e.ptr.store(if leaked.is_empty() { std::ptr::NonNull::dangling().as_ptr() } else { leaked.as_mut_ptr() }, Ordering::Release);
+    SYM_COUNT.store(id + 1, Ordering::Release);
+    // the lookup table (grown at half full; the old one stays readable until the next GC)
+    let n = id as usize + 1;
+    if t.is_null() || n * 2 > unsafe { (*t).mask } + 1 {
+        let size = (n * 4).next_power_of_two().max(1024);
+        let nt = Box::into_raw(Box::new(SymTable { mask: size - 1, slots: (0..size).map(|_| std::sync::atomic::AtomicU32::new(0)).collect() }));
+        for i in 0..n as u32 {
+            let nm = sym_name(i);
+            if let Err(slot) = sym_probe(unsafe { &*nt }, sym_hash(nm), nm) {
+                unsafe { (*nt).slots[slot].store(i + 1, Ordering::Release) };
+            }
+        }
+        // the old table is leaked: lock-free readers may still be probing it, and tables
+        // double in size, so all old ones together are smaller than the current one
+        SYM_TABLE.store(nt, Ordering::Release);
+        t = nt;
+    } else if let Err(slot) = sym_probe(unsafe { &*t }, h, name) {
+        unsafe { (*t).slots[slot].store(id + 1, Ordering::Release) };
+    }
+    let _ = t;
+    id
+}
+pub fn sym(name: &str) -> u32 {
+    intern(name.as_bytes())
+}
+pub fn sym_count() -> u32 {
+    SYM_COUNT.load(std::sync::atomic::Ordering::Acquire)
+}
+#[inline]
+pub fn sym_name(id: u32) -> &'static [u8] {
+    use std::sync::atomic::Ordering;
+    let chunk = SYM_CHUNKS[id as usize / SYM_CHUNK].load(Ordering::Acquire);
+    if !chunk.is_null() {
+        let e = unsafe { &*chunk.add(id as usize % SYM_CHUNK) };
+        let p = e.ptr.load(Ordering::Acquire);
+        if !p.is_null() {
+            return unsafe { std::slice::from_raw_parts(p, e.len.load(Ordering::Relaxed)) };
+        }
+    }
+    // an id handed over without synchronisation: wait for its name under the lock
+    let _g = SYM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let chunk = SYM_CHUNKS[id as usize / SYM_CHUNK].load(Ordering::Acquire);
+    assert!(!chunk.is_null(), "unknown symbol id {id}");
+    let e = unsafe { &*chunk.add(id as usize % SYM_CHUNK) };
+    unsafe { std::slice::from_raw_parts(e.ptr.load(Ordering::Acquire), e.len.load(Ordering::Relaxed)) }
+}
+pub fn sym_str(id: u32) -> String {
+    String::from_utf8_lossy(sym_name(id)).into_owned()
+}
+
+// ---------- methods ----------
+
+pub type CompiledFn = unsafe extern "C" fn(V, u64, *const V, V) -> V;
+pub type NativeFn = fn(V, &[V], V) -> V;
+
+pub enum Body {
+    Compiled(CompiledFn),
+    Native(NativeFn, i32, i32),
+    AttrReader(u32),
+    AttrWriter(u32),
+    Proc(V),
+    /// C extension function and its arity (-1 = argc/argv, 0..15 = fixed).
+    CFunc(*const std::ffi::c_void, i32),
+    Undefined,
+}
+pub struct Method {
+    pub body: Body,
+    pub owner: *mut Class,
+    pub name: u32,
+    /// Compiled methods: NUL-terminated parameter list "req:a,opt:b,rest:c,key:d,block:e".
+    pub params: *const u8,
+    /// 0 = public, 1 = private, 2 = protected
+    pub vis: u8,
+    /// Builtin core method with a specialised call path (`opt::OPT_*`, 0 = none); describes
+    /// the body, so aliases and copies keep it.
+    pub opt: u8,
+}
+
+pub const VIS_PUBLIC: u8 = 0;
+pub const VIS_PRIVATE: u8 = 1;
+pub const VIS_PROTECTED: u8 = 2;
+
+/// Methods Ruby always makes private.
+pub fn always_private(mid: u32) -> bool {
+    matches!(sym_name(mid), b"initialize" | b"initialize_copy" | b"initialize_dup" | b"initialize_clone" | b"respond_to_missing?")
+}
+
+/// A call site's inline cache (3 words reserved by the compiler). The lookup result lives in
+/// an immutable entry behind one atomic pointer, so a thread never sees one site's class
+/// paired with another's method. With one OS thread the entry is updated in place.
+#[repr(C)]
+pub struct CallCache {
+    pub entry: std::sync::atomic::AtomicPtr<CacheEntry>,
+    /// Misses after several threads started; past a limit the site stops caching (megamorphic).
+    pub misses: u64,
+    pub _spare: u64,
+}
+/// Up to `IC_WAYS` receiver classes and their methods (a polymorphic inline cache), valid
+/// while the method serial is unchanged.
+pub const IC_WAYS: usize = 4;
+pub struct CacheEntry {
+    pub serial: u64,
+    pub n: usize,
+    pub klass: [*mut Class; IC_WAYS],
+    pub method: [*const Method; IC_WAYS],
+}
+
+// ---------- pending throws (exceptions and non-local control flow) ----------
+
+#[derive(Clone, Copy, Debug)]
+pub enum Throw {
+    None,
+    Raise(V),
+    Break { tag: u64, val: V },
+    Return { tag: u64, val: V },
+    Throw { tag: V, val: V },
+    StopLoop(V),
+    /// Thread#kill: unwinds the thread, running ensure clauses; never rescued.
+    Kill,
+}
+
+// ---------- the runtime ----------
+
+#[derive(Default, Clone, Copy)]
+pub struct Core {
+    pub basic_object: *mut Class,
+    pub object: *mut Class,
+    pub module: *mut Class,
+    pub class: *mut Class,
+    pub kernel: *mut Class,
+    pub comparable: *mut Class,
+    pub enumerable: *mut Class,
+    pub nil: *mut Class,
+    pub true_: *mut Class,
+    pub false_: *mut Class,
+    pub numeric: *mut Class,
+    pub integer: *mut Class,
+    pub float: *mut Class,
+    pub string: *mut Class,
+    pub symbol: *mut Class,
+    pub array: *mut Class,
+    pub hash: *mut Class,
+    pub range: *mut Class,
+    pub proc_: *mut Class,
+    pub enumerator: *mut Class,
+    pub exception: *mut Class,
+    pub script_error: *mut Class,
+    pub not_implemented_error: *mut Class,
+    pub standard_error: *mut Class,
+    pub runtime_error: *mut Class,
+    pub frozen_error: *mut Class,
+    pub argument_error: *mut Class,
+    pub name_error: *mut Class,
+    pub no_method_error: *mut Class,
+    pub type_error: *mut Class,
+    pub zero_div_error: *mut Class,
+    pub index_error: *mut Class,
+    pub key_error: *mut Class,
+    pub stop_iteration: *mut Class,
+    pub range_error: *mut Class,
+    pub float_domain_error: *mut Class,
+    pub local_jump_error: *mut Class,
+    pub io_error: *mut Class,
+    pub system_stack_error: *mut Class,
+    pub uncaught_throw_error: *mut Class,
+    pub struct_: *mut Class,
+    pub time: *mut Class,
+    pub io: *mut Class,
+    pub mutex: *mut Class,
+}
+
+pub struct Runtime {
+    pub c: Core,
+    pub gvars: CMap<u32, V>,
+    pub main_obj: V,
+    /// Buffered $stdout output (shared by all threads, like the real stdout).
+    pub out: crate::mt::L<Vec<u8>>,
+    pub rng: u64,
+    pub script_name: String,
+}
+
+/// Interpreter state of one OS thread running Ruby code (a "P"). Green threads running on it
+/// swap the first few fields in and out (thread.rs).
+pub struct PState {
+    pub pending: Throw,
+    pub errinfo: V,
+    pub last_match: V,
+    pub stack_limit: usize,
+    /// `class`/`module` bodies and `class_eval` blocks being run (the default definee).
+    pub definee: Vec<*mut Class>,
+    /// Methods defined with define_method that are running (for `super` inside them).
+    pub dm_stack: Vec<*const Method>,
+    /// Blocks passed to running C-extension functions (rb_block_given_p / rb_yield).
+    pub current_block: Vec<V>,
+    pub mcache: HashMap<(usize, u32), *const Method, FxBuild>,
+    pub mcache_serial: u64,
+    /// Allocation, GC roots and stop-the-world state of this thread.
+    pub heap: crate::gc::PHeap,
+    /// This P's scheduler state.
+    pub thr: crate::thread::PThr,
+    /// Direct-mapped method cache in front of `mcache`.
+    pub mc: Box<[McEntry; MC_SIZE]>,
+}
+
+impl PState {
+    pub fn pending_is_set(&self) -> bool {
+        !matches!(self.pending, Throw::None)
+    }
+}
+
+static RT: G<*mut Runtime> = G::new(std::ptr::null_mut());
+
+#[inline(always)]
+pub fn rt() -> &'static mut Runtime {
+    unsafe { &mut **RT.get() }
+}
+
+thread_local! {
+    static PST: std::cell::Cell<*mut PState> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+/// Every P's state (for the GC). A collection holds this lock from start to end, so a P
+/// that is starting up waits instead of joining the list halfway through one.
+pub static ALL_PS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+#[inline(always)]
+pub fn pst() -> &'static mut PState {
+    unsafe { &mut *PST.with(|c| c.get()) }
+}
+/// This OS thread's state, if it runs Ruby code.
+pub fn pst_opt() -> Option<&'static mut PState> {
+    let p = PST.with(|c| c.get());
+    if p.is_null() { None } else { Some(unsafe { &mut *p }) }
+}
+/// Set up interpreter state for the calling OS thread.
+pub fn new_pstate() -> *mut PState {
+    let p = Box::into_raw(Box::new(PState {
+        pending: Throw::None,
+        errinfo: QNIL,
+        last_match: QNIL,
+        stack_limit: 0,
+        definee: Vec::new(),
+        dm_stack: Vec::new(),
+        current_block: Vec::new(),
+        mcache: HashMap::default(),
+        mcache_serial: 0,
+        heap: crate::gc::PHeap::new(),
+        thr: crate::thread::PThr::default(),
+        mc: new_method_cache(),
+    }));
+    PST.with(|c| c.set(p));
+    ALL_PS.lock().unwrap_or_else(|e| e.into_inner()).push(p as usize);
+    p
+}
+
+/// Method-table version: bumped whenever method lookup could change; call caches compare it.
+pub static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[inline(always)]
+pub fn serial() -> u64 {
+    SERIAL.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub fn init_runtime() {
+    let x = 0u8;
+    init_runtime_at(std::hint::black_box(&x) as *const u8 as usize + 256);
+}
+/// Boot the runtime on the calling thread; `stack_base` is the top of its stack (for the GC).
+pub fn init_runtime_at(stack_base: usize) {
+    let r = Box::new(Runtime {
+        c: Core::default(),
+        gvars: CMap::new(),
+        main_obj: QNIL,
+        out: crate::mt::L::new(Vec::with_capacity(1 << 16)),
+        rng: 0x2545F4914F6CDD1D,
+        script_name: String::new(),
+    });
+    *RT.get() = Box::into_raw(r);
+    new_pstate();
+    pst().heap.stack_base = stack_base;
+    crate::mt::SPIN_HOOK.store(crate::gc::park_if_stopping as fn() as *mut (), std::sync::atomic::Ordering::Release);
+    crate::boot::boot();
+}
+
+// ---------- classes ----------
+
+pub fn new_class_raw(name: &str, superclass: *mut Class, is_module: bool) -> *mut Class {
+    let alloc_kind = if superclass.is_null() { Kind::Object } else { unsafe { (*superclass).alloc } };
+    let c = Box::into_raw(Box::new(Class {
+        h: header(std::ptr::null_mut(), Kind::Class),
+        name: name.to_string(),
+        superclass,
+        methods: CMap::new(),
+        includes: SVec::new(),
+        consts: CMap::new(),
+        ivar_index: CMap::new(),
+        ivar_names: SVec::new(),
+        civars: CMap::new(),
+        cvars: CMap::new(),
+        is_module,
+        is_singleton: false,
+        attached: QNIL,
+        lexical_parent: std::ptr::null_mut(),
+        alloc: alloc_kind,
+        struct_members: SVec::new(),
+        module_function: false,
+        prepends: SVec::new(),
+        default_vis: 0,
+    }));
+    crate::gc::register_class(c);
+    c
+}
+
+/// Create a class with its metaclass (class methods are inherited through metaclasses).
+pub fn new_class(name: &str, superclass: *mut Class) -> *mut Class {
+    let c = new_class_raw(name, superclass, false);
+    let r = rt();
+    if !r.c.class.is_null() {
+        let meta_super = if superclass.is_null() { r.c.class } else { singleton_of_class(superclass) };
+        let meta = new_class_raw("", meta_super, false);
+        unsafe {
+            (*meta).is_singleton = true;
+            (*meta).attached = c as V;
+            (*meta).h.klass = r.c.class;
+            (*c).h.klass = meta;
+        }
+    }
+    if !superclass.is_null() {
+        unsafe {
+            (*c).struct_members.set((*superclass).struct_members.clone());
+        }
+    }
+    // no cache invalidation: method caches are keyed by class, and a new class has none
+    c
+}
+pub fn new_module(name: &str) -> *mut Class {
+    let m = new_class_raw(name, std::ptr::null_mut(), true);
+    unsafe {
+        (*m).h.klass = rt().c.module;
+    }
+    m
+}
+fn singleton_of_class(c: *mut Class) -> *mut Class {
+    unsafe {
+        let k = (*c).h.klass;
+        if !k.is_null() && (*k).is_singleton { k } else { singleton_class(c as V) }
+    }
+}
+
+pub fn singleton_class(v: V) -> *mut Class {
+    if !is_heap(v) {
+        // nil/true/false/numbers/symbols: methods go on the class itself
+        return class_of(v);
+    }
+    let h = hdr(v);
+    unsafe {
+        if !h.klass.is_null() && (*h.klass).is_singleton && (*h.klass).attached == v {
+            return h.klass;
+        }
+        let sup = if is_class(v) && !(*(v as *mut Class)).is_module {
+            let s = (*(v as *mut Class)).superclass;
+            if s.is_null() { rt().c.class } else { singleton_of_class(s) }
+        } else {
+            h.klass
+        };
+        let meta = new_class_raw("", sup, false);
+        (*meta).is_singleton = true;
+        (*meta).attached = v;
+        (*meta).h.klass = rt().c.class;
+        (*meta).alloc = (*sup).alloc;
+        h.klass = meta;
+
+        // no global cache invalidation: the object's class pointer changed, so its call
+        // sites miss their caches anyway (`extend` / `define_singleton_method` on objects
+        // at request time must not flush every method cache)
+        meta
+    }
+}
+
+#[inline(always)]
+pub fn class_of(v: V) -> *mut Class {
+    let c = &rt().c;
+    if is_fix(v) {
+        c.integer
+    } else if is_heap(v) {
+        hdr(v).klass
+    } else if v == QNIL {
+        c.nil
+    } else if v == QTRUE {
+        c.true_
+    } else if v == QFALSE {
+        c.false_
+    } else if is_sym(v) {
+        c.symbol
+    } else if is_flonum(v) {
+        c.float
+    } else {
+        c.object
+    }
+}
+/// The class ignoring singleton classes.
+pub fn real_class(v: V) -> *mut Class {
+    let mut k = class_of(v);
+    unsafe {
+        while !k.is_null() && (*k).is_singleton {
+            k = (*k).superclass;
+        }
+    }
+    k
+}
+pub fn class_name(c: *mut Class) -> String {
+    unsafe {
+        if c.is_null() {
+            return "?".into();
+        }
+        if (*c).is_singleton {
+            return format!("#<Class:{}>", crate::fmt::inspect_lossy((*c).attached));
+        }
+        if (*c).name.is_empty() { format!("#<Class:0x{:016x}>", c as usize) } else { (*c).name.clone() }
+    }
+}
+
+pub fn bump_serial() {
+    SERIAL.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    bump_const_serial(); // include/prepend change constant lookup too
+}
+
+/// Bumped whenever a constant lookup could change (constant set/removed, autoload
+/// registered, ancestry changed); per-site constant caches compare against it.
+pub static CONST_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[inline(always)]
+pub fn const_serial() -> u64 {
+    CONST_SERIAL.load(std::sync::atomic::Ordering::Acquire)
+}
+pub fn bump_const_serial() {
+    CONST_SERIAL.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Ancestors in method-resolution order (a copy; see `ancestors_rc`).
+pub fn ancestors(c: *mut Class) -> Vec<*mut Class> {
+    ancestors_rc(c).to_vec()
+}
+
+struct AncestorCache {
+    serial: u64,
+    map: rustc_hash::FxHashMap<usize, std::rc::Rc<[*mut Class]>>,
+    supers: rustc_hash::FxHashMap<(usize, usize, u32), *const Method>,
+}
+
+fn ancestor_cache() -> &'static mut AncestorCache {
+    // per OS thread (Rc values, and no locking on the hot path)
+    thread_local!(static ANC: std::cell::Cell<*mut AncestorCache> = const { std::cell::Cell::new(std::ptr::null_mut()) });
+    let serial = serial();
+    let p = ANC.with(|a| {
+        if a.get().is_null() {
+            a.set(Box::into_raw(Box::new(AncestorCache { serial, map: Default::default(), supers: Default::default() })));
+        }
+        a.get()
+    });
+    let c = unsafe { &mut *p };
+    // the method serial changes with every include/prepend (and method definition)
+    if c.serial != serial {
+        c.map.clear();
+        c.supers.clear();
+        c.serial = serial;
+    }
+    c
+}
+
+/// Ancestors in method-resolution order, cached per class until the hierarchy changes.
+pub fn ancestors_rc(c: *mut Class) -> std::rc::Rc<[*mut Class]> {
+    let cache = ancestor_cache();
+    if let Some(a) = cache.map.get(&(c as usize)) {
+        return a.clone();
+    }
+    let a: std::rc::Rc<[*mut Class]> = ancestors_uncached(c).into();
+    cache.map.insert(c as usize, a.clone());
+    a
+}
+
+fn ancestors_uncached(c: *mut Class) -> Vec<*mut Class> {
+    let mut out = Vec::new();
+    let mut k = c;
+    unsafe {
+        while !k.is_null() {
+            for &p in (*k).prepends.iter().rev() {
+                if !out.contains(&p) {
+                    out.push(p);
+                    push_includes(p, &mut out);
+                }
+            }
+            out.push(k);
+            push_includes(k, &mut out);
+            k = (*k).superclass;
+        }
+    }
+    out
+}
+fn push_includes(k: *mut Class, out: &mut Vec<*mut Class>) {
+    unsafe {
+        for &m in (*k).includes.iter().rev() {
+            if !out.contains(&m) {
+                out.push(m);
+                push_includes(m, out);
+            }
+        }
+    }
+}
+
+/// First level of the global method cache: direct-mapped, so a call site whose inline cache
+/// misses (a polymorphic site) usually costs one probe instead of a hash-map lookup.
+#[derive(Clone, Copy)]
+pub struct McEntry {
+    klass: usize,
+    mid: u32,
+    serial: u64,
+    m: *const Method,
+}
+const MC_SIZE: usize = 4096;
+/// A fresh per-thread method cache (each P has its own: entries are several words).
+pub fn new_method_cache() -> Box<[McEntry; MC_SIZE]> {
+    Box::new([McEntry { klass: 0, mid: 0, serial: 0, m: std::ptr::null() }; MC_SIZE])
+}
+
+#[inline(always)]
+pub fn find_method(c: *mut Class, mid: u32) -> *const Method {
+    let slot = ((c as usize >> 4) ^ (mid as usize).wrapping_mul(0x9E37_79B9)) & (MC_SIZE - 1);
+    let e = &pst().mc[slot];
+    if e.klass == c as usize && e.mid == mid && e.serial == serial() {
+        return e.m;
+    }
+    find_method_slow(c, mid, slot)
+}
+#[inline(never)]
+fn find_method_slow(c: *mut Class, mid: u32, slot: usize) -> *const Method {
+    let r = pst();
+    let serial = serial();
+    if r.mcache_serial != serial {
+        r.mcache.clear();
+        r.mcache_serial = serial;
+    }
+    let m = match r.mcache.get(&(c as usize, mid)) {
+        Some(&m) => m,
+        None => {
+            let m = find_method_uncached(c, mid);
+            r.mcache.insert((c as usize, mid), m);
+            m
+        }
+    };
+    r.mc[slot] = McEntry { klass: c as usize, mid, serial, m };
+    m
+}
+fn find_method_uncached(c: *mut Class, mid: u32) -> *const Method {
+    let mut k = c;
+    unsafe {
+        while !k.is_null() {
+            for &p in (*k).prepends.iter().rev() {
+                if let Some(&m) = (*p).methods.get(&mid) {
+                    return if matches!((*m).body, Body::Undefined) { std::ptr::null() } else { m };
+                }
+                if let Some(m) = find_in_includes(p, mid) {
+                    return if matches!((*m).body, Body::Undefined) { std::ptr::null() } else { m };
+                }
+            }
+            if let Some(&m) = (*k).methods.get(&mid) {
+                return if matches!((*m).body, Body::Undefined) { std::ptr::null() } else { m };
+            }
+            if let Some(m) = find_in_includes(k, mid) {
+                return if matches!((*m).body, Body::Undefined) { std::ptr::null() } else { m };
+            }
+            k = (*k).superclass;
+        }
+    }
+    std::ptr::null()
+}
+fn find_in_includes(k: *mut Class, mid: u32) -> Option<*const Method> {
+    unsafe {
+        for &m in (*k).includes.iter().rev() {
+            if let Some(&meth) = (*m).methods.get(&mid) {
+                return Some(meth);
+            }
+            if let Some(x) = find_in_includes(m, mid) {
+                return Some(x);
+            }
+        }
+    }
+    None
+}
+pub fn find_super_method(self_: V, owner: *mut Class, mid: u32) -> *const Method {
+    let k = class_of(self_);
+    let key = (k as usize, owner as usize, mid);
+    if let Some(&m) = ancestor_cache().supers.get(&key) {
+        return m;
+    }
+    let m = find_super_method_uncached(k, owner, mid);
+    ancestor_cache().supers.insert(key, m);
+    m
+}
+fn find_super_method_uncached(klass: *mut Class, owner: *mut Class, mid: u32) -> *const Method {
+    let anc = ancestors_rc(klass);
+    if !anc.contains(&owner) {
+        // `super` from a refinement method: the refined class's own method
+        return find_method(klass, mid);
+    }
+    let mut found = false;
+    for &k in anc.iter() {
+        if found {
+            if let Some(&m) = unsafe { (*k).methods.get(&mid) } {
+                return m;
+            }
+        } else if k == owner {
+            found = true;
+        }
+    }
+    std::ptr::null()
+}
+
+pub fn add_method(c: *mut Class, mid: u32, body: Body) -> *const Method {
+    let m = Box::into_raw(Box::new(Method { body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0 })) as *const Method;
+    unsafe {
+        (*c).methods.insert(mid, m);
+    }
+    bump_serial();
+    m
+}
+pub fn defn(c: *mut Class, name: &str, min: i32, max: i32, f: NativeFn) {
+    add_method(c, sym(name), Body::Native(f, min, max));
+}
+pub fn defs(c: *mut Class, name: &str, min: i32, max: i32, f: NativeFn) {
+    let meta = singleton_class(c as V);
+    add_method(meta, sym(name), Body::Native(f, min, max));
+}
+pub fn respond_to(v: V, mid: u32) -> bool {
+    !find_method(class_of(v), mid).is_null()
+}
+
+// ---------- calling ----------
+
+#[inline(always)]
+fn approx_sp() -> usize {
+    let x = 0u8;
+    &x as *const u8 as usize
+}
+
+pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
+    if crate::gc::safepoint() {
+        return UNDEF;
+    }
+    let m = unsafe { &*m };
+    match &m.body {
+        Body::Compiled(f) => {
+            if approx_sp() < pst().stack_limit {
+                return raise(rt().c.system_stack_error, "stack level too deep");
+            }
+            unsafe { f(recv, args.len() as u64, args.as_ptr(), blk) }
+        }
+        Body::Native(f, min, max) => {
+            let n = args.len() as i32;
+            if n < *min || (*max >= 0 && n > *max) {
+                return arity_error(n, *min, *max);
+            }
+            f(recv, args, blk)
+        }
+        Body::AttrReader(iv) => {
+            if !args.is_empty() {
+                return arity_error(args.len() as i32, 0, 0);
+            }
+            ivar_get(recv, *iv)
+        }
+        Body::AttrWriter(iv) => {
+            if args.len() != 1 {
+                return arity_error(args.len() as i32, 1, 1);
+            }
+            ivar_set(recv, *iv, args[0])
+        }
+        Body::Proc(p) => {
+            pst().dm_stack.push(m as *const Method);
+            let r = call_proc_with_self(*p, recv, args, blk, true);
+            pst().dm_stack.pop();
+            r
+        }
+        Body::CFunc(f, arity) => {
+            pst().current_block.push(blk);
+            let r = crate::capi::call_cfunc(*f, *arity, recv, args);
+            pst().current_block.pop();
+            r
+        }
+        Body::Undefined => QNIL,
+    }
+}
+
+
+pub fn arity_error(given: i32, min: i32, max: i32) -> V {
+    let expected = if max < 0 {
+        format!("{min}+")
+    } else if min == max {
+        format!("{min}")
+    } else {
+        format!("{min}..{max}")
+    };
+    raise(rt().c.argument_error, &format!("wrong number of arguments (given {given}, expected {expected})"))
+}
+
+pub fn send(recv: V, mid: u32, args: &[V], blk: V) -> V {
+    let m = find_method(class_of(recv), mid);
+    if m.is_null() {
+        return method_missing(recv, mid, args, blk, false);
+    }
+    invoke(m, recv, args, blk)
+}
+pub fn send0(recv: V, name: &str) -> V {
+    send(recv, sym(name), &[], QNIL)
+}
+pub fn send1(recv: V, name: &str, a: V) -> V {
+    send(recv, sym(name), &[a], QNIL)
+}
+
+pub fn method_missing(recv: V, mid: u32, args: &[V], blk: V, vcall: bool) -> V {
+    let mm = sym("method_missing");
+    let m = find_method(class_of(recv), mm);
+    if !m.is_null() && !matches!(unsafe { &(*m).body }, Body::Native(..)) {
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(mksym(mid));
+        a.extend_from_slice(args);
+        return invoke(m, recv, &a, blk);
+    }
+    no_method_error(recv, mid, vcall)
+}
+pub fn no_method_error(recv: V, mid: u32, vcall: bool) -> V {
+    let name = sym_str(mid);
+    if vcall {
+        return raise(
+            rt().c.name_error,
+            &format!("undefined local variable or method '{}' for {}", name, describe_recv(recv)),
+        );
+    }
+    raise(rt().c.no_method_error, &format!("undefined method '{}' for {}", name, describe_recv(recv)))
+}
+fn describe_recv(v: V) -> String {
+    if v == QNIL {
+        "nil".into()
+    } else if v == QTRUE {
+        "true".into()
+    } else if v == QFALSE {
+        "false".into()
+    } else if v == rt().main_obj {
+        "main:Object".into()
+    } else if is_class(v) {
+        let c = rclass(v);
+        if c.is_module { format!("module {}", c.name) } else { format!("class {}", class_name(v as *mut Class)) }
+    } else {
+        format!("an instance of {}", class_name(real_class(v)))
+    }
+}
+
+/// Call a block/proc with Ruby block-argument semantics.
+pub fn call_block(blk: V, args: &[V]) -> V {
+    if !is_proc(blk) {
+        return raise(rt().c.local_jump_error, "no block given (yield)");
+    }
+    let p = rproc(blk);
+    call_proc_with_self(blk, p.self_, args, QNIL, false)
+}
+pub fn call_block_with_blk(blk: V, args: &[V], blkarg: V) -> V {
+    if !is_proc(blk) {
+        return raise(rt().c.local_jump_error, "no block given (yield)");
+    }
+    let p = rproc(blk);
+    call_proc_with_self(blk, p.self_, args, blkarg, false)
+}
+pub fn call_proc_with_self(pv: V, self_: V, args: &[V], blk: V, as_method: bool) -> V {
+    if crate::gc::safepoint() {
+        return UNDEF;
+    }
+    let p = rproc(pv);
+    if p.lambda || as_method {
+        let mut n = args.len() as i32;
+        if hdr(pv).flags & FL_PROC_KW != 0 && args.last().is_some_and(|&h| is_hash(h) && hdr(h).flags & FL_KWHASH != 0) {
+            n -= 1;
+        }
+        if n < p.min || (p.max >= 0 && n > p.max) {
+            return arity_error(n, p.min, p.max);
+        }
+    } else if p.autosplat && args.len() == 1 && is_ary(args[0]) {
+        let v = rary(args[0]).v.clone();
+        return unsafe { (p.func)(pv as *mut RProc, self_, v.len() as u64, v.as_ptr(), blk) };
+    }
+    unsafe { (p.func)(pv as *mut RProc, self_, args.len() as u64, args.as_ptr(), blk) }
+}
+
+// ---------- instance variables ----------
+
+pub fn ivar_get(v: V, id: u32) -> V {
+    match kind(v) {
+        Some(Kind::Object) => {
+            let o = obj(v);
+            let shape = unsafe { &*o.shape };
+            match shape_index(shape, id) {
+                // UNDEF marks an ivar removed by remove_instance_variable
+                Some(i) => o.ivars.get(i as usize).copied().filter(|x| *x != UNDEF).unwrap_or(QNIL),
+                None => QNIL,
+            }
+        }
+        Some(Kind::Class) => rclass(v).civars.get(&id).copied().unwrap_or(QNIL),
+        _ => gen_ivar_get(v, id).unwrap_or(QNIL),
+    }
+}
+pub fn ivar_defined(v: V, id: u32) -> bool {
+    match kind(v) {
+        Some(Kind::Object) => {
+            let o = obj(v);
+            let shape = unsafe { &*o.shape };
+            matches!(shape_index(shape, id), Some(i) if (i as usize) < o.ivars.len() && o.ivars[i as usize] != UNDEF)
+        }
+        Some(Kind::Class) => rclass(v).civars.contains_key(&id),
+        _ => gen_ivar_get(v, id).is_some(),
+    }
+}
+/// Slot of ivar `id` in objects of `shape`, if it has one. Small shapes (the common case)
+/// are searched linearly, which beats hashing.
+#[inline]
+pub fn shape_index(shape: &Class, id: u32) -> Option<u32> {
+    if shape.ivar_names.len() <= 16 {
+        return shape.ivar_names.iter().position(|&n| n == id).map(|i| i as u32);
+    }
+    shape.ivar_index.get(&id).copied()
+}
+pub fn ivar_index_for(shape: *mut Class, id: u32) -> u32 {
+    let s = unsafe { &mut *shape };
+    if let Some(i) = shape_index(s, id) {
+        return i;
+    }
+    // two threads adding different ivars to one class must not get the same slot
+    let g = crate::cmap::write_lock();
+    if let Some(&i) = s.ivar_index.get(&id) {
+        return i;
+    }
+    let i = s.ivar_names.len() as u32;
+    s.ivar_names.push(id);
+    s.ivar_index.insert_locked(id, i);
+    drop(g);
+    i
+}
+pub fn ivar_set(v: V, id: u32, val: V) -> V {
+    if is_frozen(v) {
+        let r = check_frozen(v);
+        if r == UNDEF {
+            return UNDEF;
+        }
+    }
+    match kind(v) {
+        Some(Kind::Object) => {
+            let o = obj(v);
+            let i = ivar_index_for(o.shape, id) as usize;
+            if o.ivars.len() <= i {
+                o.ivars.resize(i + 1, QNIL);
+            }
+            o.ivars[i] = val;
+        }
+        Some(Kind::Class) => {
+            rclass(v).civars.insert(id, val);
+        }
+        _ => gen_ivar_set(v, id, val),
+    }
+    val
+}
+pub fn ivar_list(v: V) -> Vec<(u32, V)> {
+    match kind(v) {
+        Some(Kind::Object) => {
+            let o = obj(v);
+            let shape = unsafe { &*o.shape };
+            o.ivars
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i < shape.ivar_names.len())
+                .map(|(i, &x)| (shape.ivar_names[i], x))
+                .filter(|(n, x)| *x != UNDEF && !sym_name(*n).starts_with(b"@__"))
+                .collect()
+        }
+        Some(Kind::Class) => rclass(v).civars.iter().map(|(&k, &v)| (k, v)).collect(),
+        _ => gen_ivar_list(v),
+    }
+}
+
+// Instance variables of objects other than plain Objects and classes: on the object for
+// String/Array/Hash, otherwise in a global table keyed by address.
+pub static GENERIC_IVARS: crate::mt::L<Option<HashMap<usize, CMap<u32, V>, FxBuild>>> = crate::mt::L::new(None);
+fn gen_slot(v: V) -> Option<&'static GenIv> {
+    match kind(v) {
+        Some(Kind::String) => Some(&rstr(v).iv),
+        Some(Kind::Array) => Some(&rary(v).iv),
+        Some(Kind::Hash) => Some(&rhash(v).iv),
+        _ => None,
+    }
+}
+pub fn gen_ivar_get(v: V, id: u32) -> Option<V> {
+    match gen_slot(v) {
+        Some(g) => g.map().and_then(|m| m.get(&id).copied()),
+        None => GENERIC_IVARS.get().as_ref().and_then(|t| t.get(&(v as usize))).and_then(|m| m.get(&id).copied()),
+    }
+}
+pub fn gen_ivar_set(v: V, id: u32, val: V) {
+    crate::gc::wb_obj(v);
+    match gen_slot(v) {
+        // (wb_obj above is the barrier for these tables)
+        Some(g) => {
+            g.map_or_create().insert_untracked(id, val);
+        }
+        None => {
+            GENERIC_IVARS.get().get_or_insert_with(HashMap::default).entry(v as usize).or_default().insert_untracked(id, val);
+        }
+    }
+}
+pub fn gen_ivar_remove(v: V, id: u32) -> Option<V> {
+    match gen_slot(v) {
+        Some(g) => g.map().and_then(|m| m.remove(&id)),
+        None => GENERIC_IVARS.get().as_mut().and_then(|t| t.get_mut(&(v as usize))).and_then(|m| m.remove(&id)),
+    }
+}
+pub fn gen_ivar_list(v: V) -> Vec<(u32, V)> {
+    match gen_slot(v) {
+        Some(g) => g.map().map(|m| m.iter().map(|(&k, &v)| (k, v)).collect()).unwrap_or_default(),
+        None => GENERIC_IVARS.get().as_ref().and_then(|t| t.get(&(v as usize))).map(|m| m.iter().map(|(&k, &v)| (k, v)).collect()).unwrap_or_default(),
+    }
+}
+/// Copy `from`'s generic ivars to `to` (dup/clone).
+pub fn gen_ivar_copy(from: V, to: V) {
+    for (k, x) in gen_ivar_list(from) {
+        gen_ivar_set(to, k, x);
+    }
+}
+/// For the GC: every value held as a generic ivar of `v`.
+pub fn gen_ivar_values(v: V, out: &mut Vec<V>) {
+    match gen_slot(v) {
+        Some(g) => {
+            if let Some(m) = g.map() {
+                out.extend(m.values().copied());
+            }
+        }
+        None => {
+            if let Some(m) = GENERIC_IVARS.raw().as_ref().and_then(|t| t.get(&(v as usize))) {
+                out.extend(m.values().copied());
+            }
+        }
+    }
+}
+
+// ---------- constants ----------
+
+pub fn const_lookup(cref: *mut Class, id: u32) -> Option<V> {
+    unsafe {
+        // lexical scopes first, but not the top level: Ruby checks the ancestors of
+        // the innermost class before Object (so an included `Nodes::Symbol` beats `::Symbol`)
+        let object = rt().c.object;
+        let mut k = cref;
+        while !k.is_null() && k != object {
+            if let Some(&v) = (*k).consts.get(&id) {
+                return Some(v);
+            }
+            // a pending autoload here wins over outer/top-level constants (caller triggers it)
+            if crate::abi::has_autoload(k, id) {
+                return None;
+            }
+            k = (*k).lexical_parent;
+        }
+        if !cref.is_null() {
+            for &a in ancestors_rc(cref).iter() {
+                if let Some(&v) = (*a).consts.get(&id) {
+                    return Some(v);
+                }
+                // an autoload in an earlier ancestor wins over a constant in a later one
+                if crate::abi::has_autoload(a, id) {
+                    return None;
+                }
+            }
+        }
+        (*rt().c.object).consts.get(&id).copied()
+    }
+}
+pub fn const_get_under(c: *mut Class, id: u32) -> Option<V> {
+    for &a in ancestors_rc(c).iter() {
+        if let Some(&v) = unsafe { (*a).consts.get(&id) } {
+            return Some(v);
+        }
+        // `Engine::Configuration` with `autoload :Configuration` in Engine must load it rather
+        // than find the superclass's `Railtie::Configuration` (the caller triggers the autoload)
+        if crate::abi::has_autoload(a, id) {
+            return None;
+        }
+    }
+    None
+}
+pub fn const_set(c: *mut Class, id: u32, v: V) {
+    unsafe {
+        if is_class(v) {
+            let k = rclass(v);
+            if k.name.is_empty() && !k.is_singleton {
+                k.name = if c == rt().c.object || c.is_null() {
+                    sym_str(id)
+                } else {
+                    format!("{}::{}", (*c).name, sym_str(id))
+                };
+            }
+        }
+        (*c).consts.insert(id, v);
+    }
+    bump_const_serial();
+}
+pub fn set_global_const(name: &str, v: V) {
+    const_set(rt().c.object, sym(name), v);
+}
+
+// ---------- raising ----------
+
+/// "file:line" of the innermost Ruby call on the current stack (see pcmap.rs).
+pub fn current_loc() -> Option<String> {
+    let a = crate::backtrace::capture();
+    let (file, line, _) = crate::backtrace::symbolize(*a.first()?)?;
+    Some(format!("{file}:{line}"))
+}
+
+pub fn exc_new(cls: *mut Class, msg: &str) -> V {
+    let e = object_new(cls);
+    ivar_set(e, sym("@__message"), str_from(msg));
+    e
+}
+pub fn raise(cls: *mut Class, msg: &str) -> V {
+    raise_exc(exc_new(cls, msg))
+}
+pub fn raise_exc(e: V) -> V {
+    // KENNY_DEBUG_RAISE=1: log every raise (class, message, last call site) to stderr,
+    // which helps find the original error behind a rescue/ensure chain.
+    static DEBUG_RAISE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DEBUG_RAISE.get_or_init(|| std::env::var_os("KENNY_DEBUG_RAISE").is_some()) && is_heap(e) {
+        let m = ivar_get(e, sym("@__message"));
+        let msg = if is_str(m) { String::from_utf8_lossy(&rstr(m).b).into_owned() } else { String::new() };
+        eprintln!("[raise] {}: {} (at {})", class_name(real_class(e)), msg, current_loc().unwrap_or_default());
+    }
+    if is_heap(e) && !ivar_defined(e, sym("@__backtrace")) && !ivar_defined(e, sym("@__bt_raw")) {
+        // the return addresses now; "file:line:in 'label'" strings only if `backtrace` is asked
+        let addrs = crate::backtrace::capture();
+        if !addrs.is_empty() {
+            ivar_set(e, sym("@__bt_raw"), crate::backtrace::pack(&addrs));
+        } else if let Some(loc) = current_loc() {
+            ivar_set(e, sym("@__backtrace"), ary_new(vec![str_from(&loc)]));
+        }
+    }
+    pst().pending = Throw::Raise(e);
+    UNDEF
+}
+/// Integers, Floats and Symbols can't have singleton methods (TypeError, as in CRuby).
+pub fn check_singleton_ok(v: V) -> V {
+    if is_int(v) || is_float(v) || is_sym(v) {
+        return type_error("can't define singleton");
+    }
+    QNIL
+}
+pub fn type_error(msg: &str) -> V {
+    raise(rt().c.type_error, msg)
+}
+pub fn arg_error(msg: &str) -> V {
+    raise(rt().c.argument_error, msg)
+}
+
+#[macro_export]
+macro_rules! tri {
+    ($e:expr) => {{
+        let v = $e;
+        if v == $crate::core::UNDEF {
+            return $crate::core::UNDEF;
+        }
+        v
+    }};
+}
+
+pub fn is_a(v: V, c: *mut Class) -> bool {
+    // the same answer as `ancestors(class_of(v)).contains(&c)`, without building the list
+    fn in_mods(list: &[*mut Class], c: *mut Class) -> bool {
+        list.iter().any(|&m| m == c || in_mods(unsafe { &(*m).includes }, c))
+    }
+    let is_mod = unsafe { (*c).is_module };
+    let mut k = class_of(v);
+    while !k.is_null() {
+        if k == c {
+            return true;
+        }
+        if is_mod && unsafe { in_mods(&(*k).prepends, c) || in_mods(&(*k).includes, c) } {
+            return true;
+        }
+        k = unsafe { (*k).superclass };
+    }
+    false
+}
+
+// ---------- hash keys ----------
+
+#[repr(transparent)]
+pub struct HKey(pub V);
+
+/// `hash` / `eql?` defined by the object's class (Ruby or native, e.g. Struct, Date),
+/// as opposed to the identity defaults from Kernel/Object.
+fn own_method(v: V, name: &str) -> Option<*const Method> {
+    let m = find_method(class_of(v), sym(name));
+    if m.is_null() {
+        return None;
+    }
+    let owner = unsafe { (*m).owner };
+    let c = &rt().c;
+    if owner == c.kernel || owner == c.object || owner == c.basic_object {
+        return None;
+    }
+    Some(m)
+}
+
+pub fn hash_of(v: V) -> u64 {
+    let mut h = rustc_hash::FxHasher::default();
+    match kind(v) {
+        None => v.hash(&mut h),
+        Some(Kind::String) => rstr(v).b.hash(&mut h),
+        // same hash for 0.0 and -0.0, which are eql?
+        Some(Kind::Float) => {
+            let f = float_val(v);
+            (if f == 0.0 { 0.0f64 } else { f }).to_bits().hash(&mut h)
+        }
+        Some(Kind::Bignum) => rbig(v).n.hash(&mut h),
+        Some(Kind::Array) => {
+            for &x in &rary(v).v {
+                hash_of(x).hash(&mut h);
+            }
+        }
+        Some(Kind::Range) => {
+            hash_of(rrange(v).lo).hash(&mut h);
+            hash_of(rrange(v).hi).hash(&mut h);
+        }
+        _ => {
+            if let Some(m) = own_method(v, "hash") {
+                let r = invoke(m, v, &[], QNIL);
+                if is_fix(r) {
+                    return r;
+                }
+                if r == UNDEF {
+                    pst().pending = Throw::None;
+                }
+            }
+            v.hash(&mut h)
+        }
+    }
+    h.finish()
+}
+pub fn eql(a: V, b: V) -> bool {
+    if a == b {
+        return true;
+    }
+    match (kind(a), kind(b)) {
+        (Some(Kind::String), Some(Kind::String)) => rstr(a).b == rstr(b).b,
+        (Some(Kind::Float), Some(Kind::Float)) => float_val(a) == float_val(b),
+        (Some(Kind::Bignum), Some(Kind::Bignum)) => rbig(a).n == rbig(b).n,
+        (Some(Kind::Array), Some(Kind::Array)) => {
+            let (x, y) = (&rary(a).v, &rary(b).v);
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| eql(*p, *q))
+        }
+        (Some(Kind::Range), Some(Kind::Range)) => {
+            let (x, y) = (rrange(a), rrange(b));
+            x.excl == y.excl && eql(x.lo, y.lo) && eql(x.hi, y.hi)
+        }
+        (Some(ka), Some(kb)) if ka == kb && !matches!(ka, Kind::String | Kind::Float | Kind::Bignum | Kind::Array | Kind::Range) => {
+            match own_method(a, "eql?") {
+                Some(m) => {
+                    let r = invoke(m, a, &[b], QNIL);
+                    if r == UNDEF {
+                        pst().pending = Throw::None;
+                        return false;
+                    }
+                    truthy(r)
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+impl Hash for HKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(hash_of(self.0));
+    }
+}
+impl PartialEq for HKey {
+    fn eq(&self, o: &Self) -> bool {
+        eql(self.0, o.0)
+    }
+}
+impl Eq for HKey {}
+
+/// Ruby `==` with fast paths for core types (CRuby's rb_equal: the same object is always
+/// equal, even a NaN; `nan == nan` itself goes to Float#==).
+pub fn equal(a: V, b: V) -> V {
+    if a == b {
+        return QTRUE;
+    }
+    match (kind(a), kind(b)) {
+        (Some(Kind::Float), Some(Kind::Float)) => bool_v(float_val(a) == float_val(b)),
+        (None, None) => QFALSE,
+        (Some(Kind::String), Some(Kind::String)) => bool_v(rstr(a).b == rstr(b).b),
+        _ => send(a, sym("=="), &[b], QNIL),
+    }
+}

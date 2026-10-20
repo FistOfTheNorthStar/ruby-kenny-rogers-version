@@ -1,0 +1,153 @@
+"Kenny"
+["a", "b"]
+1.5
+12345678901234567890
+true
+nil
+"é😀"
+[1, {"y" => 0}]
+{"name":"Kenny","tags":["a","b"],"n":1.5,"big":12345678901234567890,"ok":true,"none":null,"u":"é😀","nested":{"x":[1,{"y":0}]}}
+{"q":"quote\" back\\ slash/ nl\n ctl\u001f tab\t","sym":"val","3":null}
+{
+  "a": [
+    1,
+    2,
+    {
+      "b": null
+    }
+  ],
+  "c": {},
+  "d": []
+}
+1
+[1,"two",null,true,2.5]
+"hé"
+"sym"
+42
+null
+"[\"\\u00e9\",\"\\u2028\"]"
+"[\"<\\/x>\"]"
+true
+[{"x":1,"y":2},"plain!","\u003cb>"]
+{
+  "pts": [
+    {
+      "x": 3,
+      "y": [
+        4
+      ]
+    }
+  ]
+}
+ParserError: [1,]
+ParserError: {"a"}
+ParserError: [01]
+ParserError: tru
+ParserError: {"a":1,}
+ParserError: [1 2]
+ParserError: 
+ParserError: nul
+NaN not allowed in JSON
+true
+"{\"a\":[1,null]}"
+[1, 2]
+nil
+[3]
+"[3]"
+"\t"
+JSON::ParserError
+JSON::JSONError
+true
+[[:num, "3.14", ".14"], [:op, "+"], [:id, "foo_bar", "foo_bar"], [:op, "*"], [:op, "("], [:id, "x1", "x1"], [:op, "-"], [:num, "2", nil], [:op, ")"]]
+"test"
+4
+"test"
+""
+" string here"
+4
+" "
+4
+" str"
+"test "
+8
+"ing"
+"ing here"
+8
+7
+false
+15
+8
+"#<StringScanner 8/16 \"...t str\" @ \"ing h...\">"
+true
+"#<StringScanner fin>"
+"#<StringScanner 5/16 \"test \" @ \"strin...\">"
+false
+"string here more"
+"key: value"
+["key", "value"]
+["key: value", "value"]
+3
+"value"
+"hé"
+3
+2
+"l"
+"l"
+nil
+3
+"o w"
+"b"
+"c"
+"ab"
+StringScanner::Error
+"5d41402abc4b2a76b9719d911017c592"
+"aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
+"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+"59e1748777448c69de6b800d7a33bbfb"
+"cf83e1357eefb8bdf1542850d66d8007"
+"XUFAKrxLKna5cZ2REBfFkg=="
+true
+true
+"2cf24dba5fb0a30e"
+"ce06092fb948d9ff"
+"2cf24dba5fb0a30e"
+"e3b0c44298fc1c14"
+64
+32
+128
+32
+"01ff"
+true
+Digest::MD5
+"#<Digest::MD5: d41d8cd98f00b204e9800998ecf8427e>"
+Digest::Base
+Digest::Class
+907060870
+103547413
+0
+1
+true
+true
+true
+""
+true
+[31, 139, 8, 0]
+true
+"abcdefghi\n"
+"abcdefghi\n"
+"abcdefghi\n"
+nil
+""
+true
+"wrapped"
+"streamed data"
+true
+Zlib::DataError
+"incorrect header check"
+Zlib::GzipFile::Error
+"not in gzip format"
+true
+true
+"auto"
+9
+-1

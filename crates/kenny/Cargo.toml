@@ -1,0 +1,8 @@
+[package]
+name = "kenny"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kenny-compiler = { version = "0.1.0", path = "../kenny-compiler" }
+ruby-prism = "1.9.0"

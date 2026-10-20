@@ -1,0 +1,46 @@
+9
+"2024"
+"The year "
+["2024", "1999", "1234"]
+[["555", "1234"]]
+"The year 3135 and 2000 were good; call 666-2345."
+"year The 2024 and 1999 were good; call 555-1234."
+"The year 2024 and 1999 were g00d; call 555-1234."
+["a", "b", "c"]
+["one", "two", "three"]
+"555"
+"1234"
+["555", "1234"]
+{"num" => "555", "rest" => "1234"}
+39
+"kenny"
+"example"
+"kenny"
+"example"
+" now"
+true
+true
+0
+[:error, "disk full"]
+"The Quick Brown Fox"
+"camel_case_string"
+{"x" => "1", "y" => "2"}
+"h(.)llo"
+"/h(.)llo/i"
+0
+"a\\.b\\*c"
+3
+5
+5
+"42"
+"val"
+["a", "b", "c", "d"]
+1
+"foo-bar-baz"
+"aBc"
+true
+6
+["a", "c"]
+[2024, 10, 19]
+"111"
+["h", "e", "l"]

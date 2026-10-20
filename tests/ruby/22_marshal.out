@@ -1,0 +1,220 @@
+== hex (matches CRuby)
+NilClass: 040830
+TrueClass: 040854
+FalseClass: 040846
+Integer: 04086900
+Integer: 04086906
+Integer: 040869fa
+Integer: 0408697f
+Integer: 040869017b
+Integer: 04086980
+Integer: 040869ff84
+Integer: 04086901ff
+Integer: 040869020001
+Integer: 040869ff00
+Integer: 040869fefffe
+Integer: 04086902ffff
+Integer: 04086903000001
+Integer: 0408690400000001
+Integer: 04086904ffffff3f
+Integer: 04086c2b0700000040
+Integer: 040869fc000000c0
+Integer: 04086c2d0701000040
+Integer: 04086c2b0700000080
+Integer: 04086c2b090000000000000040
+Integer: 04086c2b0a00000000000000000100
+Integer: 04086c2d0a00000000000000000100
+Integer: 04086c2b0c0000000000000000000000001000
+Float: 04086608312e35
+Float: 0408660630
+Float: 040866072d30
+Float: 04086608696e66
+Float: 040866092d696e66
+Float: 04086608302e31
+Float: 0408660a3165313030
+Float: 0408660931652d35
+Float: 040866123132333435363738392e313233
+Float: 0408660931653136
+Float: 0408660631
+Float: 0408660d322e35652d333030
+Float: 04086608316532
+Float: 0408660a302e303031
+Float: 04086617302e33333333333333333333333333333333
+Float: 0408660d2d312e35652d3130
+Float: 0408660b313233343536
+Float: 0408660931653135
+Float: 0408661a312e32333435363738393031323334353637653139
+Float: 0408661b312e3739373639333133343836323331353765333038
+Float: 0408660b35652d333234
+String: 0408492200063a064554
+String: 0408492208616263063a064554
+String: 04082208616263
+String: 0408492207c3bc063a064554
+String: 040849220678063a064546
+Symbol: 04083a0873796d
+Symbol: 0408493a07c3bc063a064554
+Symbol: 04083a08612062
+Array: 04085b083a06613b003a0662
+Array: 04085b00
+Array: 04085b0769065b0769075b066908
+Hash: 04087b00
+Hash: 04087b073a0661690649220662063a0645545b066907
+Hash: 04087d0669066907690a
+Array: 04085b076608312e354006
+Array: 04085b086c2b080000000000016c2b0800000000000149220661063a064554
+Point: 0408533a0a506f696e74073a067869063a067949220678063a064554
+Foo: 04086f3a08466f6f073a07406169063a07406249220673063a064554
+UM: 0408553a07554d5b06690c
+MyStr: 040849433a0a4d79537472220671063a064554
+MyArr: 0408433a0a4d794172725b066906
+Class: 0408630b537472696e67
+Module: 04086d0b4b65726e656c
+Module: 04086d0f436f6d70617261626c65
+Regexp: 0408492f0961622b6301063a064546
+Regexp: 0408492f067806063a064546
+Regexp: 0408492f07c3bc10063a064554
+Range: 04086f3a0a52616e6765083a096578636c463a0a626567696e69063a08656e646907
+Range: 04086f3a0a52616e6765083a096578636c543a0a626567696e69063a08656e646908
+Range: 04086f3a0a52616e6765083a096578636c463a0a626567696e49220661063a0645543a08656e6449220662063b0854
+Range: 04086f3a0a52616e6765083a096578636c463a0a626567696e69063a08656e6430
+Rational: 0408553a0d526174696f6e616c5b0769066908
+Complex: 0408553a0c436f6d706c65785b0769066907
+RuntimeError: 04086f3a1152756e74696d654572726f72073a096d657367492209626f6f6d063a0645543a07627430
+Object: 0408653a084578746f3a0b4f626a65637400
+Class: 0408630b537472756374
+Class: 0408630a506f696e74
+Set: 04086f3a08536574063a0a40686173687d0769065469075446
+Date: 0408553a09446174655b0b69006903e38425690069006900660c32323939313631
+DateTime: 0408553a0d4461746554696d655b0b69006903e384256902151d69006902100e660c32323939313631
+Time: 040849753a0954696d650dd6e91ec040e24135093a0d6e616e6f5f6e756d690215033a0d6e616e6f5f64656e69063a0d7375626d6963726f220778903a097a6f6e65492208555443063a064546
+Time: 040849753a0954696d650d208011c000000000063a097a6f6e65492208555443063a064546
+04085b07492208647570063a0645544006
+04085b064000
+04085b07660a31653330304006
+04085b086c2b080000000000014922067a063a0645544007
+0408653a0f456e756d657261626c65653a0f436f6d70617261626c656f3a0b4f626a65637400
+040849220678073a0645543a0940666f6f6906
+0408495b066906063a0940666f6f6907
+04085b09630b537472696e6740063a064549220665063b0054
+== round trips
+true
+{name: "kenny", list: [1, 2.5, nil, true, :sym, 1208925819614629174706176, -7], nested: {"deep" => [[1], {x: [2]}]}, r: 1..10}
+#<struct Point x=3, y=[4]>
+true
+Foo
+10
+["a", {b: 2}]
+UD
+42
+UM
+[1, "x"]
+true
+MyStr
+MyArr
+MyHash
+1..5
+1...5
+"a".."c"
+1..
+..5
+false
+true
+(3/4)
+(1-2i)
+(0/1)
+Err
+"bad"
+nil
+String
+Comparable
+Struct
+#<Set: {1, 2, 3}>
+true
+#<Date: 2021-03-04 ((2459278j,0s,0n),+0s,2299161j)>
+#<DateTime: 2021-03-04T05:06:07+02:00 ((2459278j,11167s,0n),+7200s,2299161j)>
+2023-11-14 22:13:20.123456789 UTC
+true
+123456789
+true
+2023-11-15 03:43:20.000005 +0530
+19800
+5
+[#<Encoding:UTF-8>, #<Encoding:ASCII-8BIT>, #<Encoding:US-ASCII>]
+:ü
+[:a, :b, :a]
+/ab+c/ix
+"ü"
+true
+true
+[{1 => 2}, 5]
+[0.0, -0.0, Infinity, -Infinity, 1.0e+300, 5.0e-324]
+true
+18446744073709551616
+-18446744073709551616
+4611686018427387904
+-4611686018427387904
+1073741824
+-1073741825
+== identity and cycles
+["shared", "shared", ["shared"]]
+true
+true
+true
+1
+true
+1
+2
+true
+true
+true
+== IO and options
+{a: [1, 2]}
+"second"
+[1, "s", [:k]]
+[1, true, "s", :k, [:k], [1, "s", [:k]]]
+["A", :b]
+true
+true
+true
+true
+true
+:ok
+4
+8
+"\x04\bi\x06"
+"\x04\b[\x06[\x06i\x06"
+#<Encoding:ASCII-8BIT>
+== errors
+TypeError: no _dump_data is defined for class Proc
+TypeError: no _dump_data is defined for class Method
+TypeError: no _dump_data is defined for class Thread
+TypeError: can't dump IO
+TypeError: can't dump anonymous class #<Class:0x...>
+TypeError: can't dump anonymous class #<Class:0x...>
+TypeError: singleton class can't be dumped
+TypeError: can't dump hash with default proc
+TypeError: can't dump anonymous class #<Class:0x...>
+TypeError: singleton can't be dumped
+ArgumentError: exceed depth limit
+ArgumentError: marshal data too short
+ArgumentError: marshal data too short
+TypeError: incompatible marshal file format (can't be read)
+	format version 4.8 required; 4.9 given
+TypeError: incompatible marshal file format (can't be read)
+	format version 4.8 required; 3.0 given
+ArgumentError: undefined class/module Zzz
+ArgumentError: undefined class/module Zzz
+ArgumentError: dump format error(0x58)
+ArgumentError: marshal data too short
+ArgumentError: dump format error (unlinked)
+ArgumentError: Kernel does not refer to class
+ArgumentError: String does not refer to module
+ArgumentError: Kernel does not refer to class
+TypeError: instance of Object needs to have method `marshal_load'
+TypeError: class Object needs to have method `_load'
+ArgumentError: undefined class/module Foo::Bar
+ArgumentError: undefined class/module Point::Q
+== ActiveSupport-style prepend
+autoloading Zzz
+1
+[1, "two", :three]

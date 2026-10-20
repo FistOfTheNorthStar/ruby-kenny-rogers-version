@@ -1,0 +1,82 @@
+rowid=6 changes=1 total=6
+[1, "a", 1.5, nil]
+[2, "b", 2.0, nil]
+[3, "c", 3.0, "\x00\x01"]
+[4, "d", nil, nil]
+[5, "e", 1000000000000.0, nil]
+[6, "f", 7.0, nil]
+[[3, "c", "\x00\x01"]]
+#<Encoding:ASCII-8BIT>
+#<Encoding:UTF-8>
+[[9223372036854775807, -9223372036854775808, 4611686018427387904, 0.25, "é", "\xFF\x00", nil]]
+[9223372036854775807, -4611686018427387904, 1.8446744073709552e+19]
+[["id", 6], ["name", "f"]]
+"f"
+6
+[["id", 5], ["name", "e"]]
+"e"
+5
+[6, 1000000000000.0]
+"d"
+nil
+[["a", "b"], [1, "x"]]
+["a"]
+["b"]
+["c"]
+["e"]
+["f"]
+["name"]
+["text"]
+1
+1
+true
+["a"]
+["b"]
+[["c"], ["e"], ["f"]]
+true
+SQLite3::Exception
+"cannot use a closed statement"
+[1]
+SQLite3::ResultSet::ArrayWithTypesAndFields
+["id"]
+SQLite3::ConstraintException
+"UNIQUE constraint failed: t.name"
+19
+SQLite3::SQLException
+"no such table: nope"
+1
+SQLite3::SQLException
+"near \"selec\": syntax error"
+"no such bind parameter"
+"can't prepare Obje"
+"boom"
+["a", "b", "c", "d", "e", "f", "x"]
+false
+true
+7
+[[3.0], [4.0], [6.0], [2000000000000.0], [14.0]]
+5
+28
+"a|b|c|d|e|f|x"
+ArgumentError
+"inner"
+["x", "f", "e"]
+[["1", "a"], ["2", "b"]]
+0
+false
+true
+false
+"1.7.3"
+true
+true
+false
+#<Encoding:UTF-8>
+1
+true
+[["one", 1], ["two", 2.5]]
+true
+SQLite3::ReadOnlyException
+"attempt to write a readonly database"
+true
+ArgumentError
+"prepare called on a closed database"

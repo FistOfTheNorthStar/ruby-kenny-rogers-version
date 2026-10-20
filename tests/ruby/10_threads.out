@@ -1,0 +1,32 @@
+[0, 10, 20, 30, 40]
+[1, 4, 9, 16]
+4000
+true
+:woke
+[:joined, "boom in thread"]
+"rescued: wake up"
+false
+"worker"
+nil
+true
+["a0", "a1", "a2", "b0", "b1", "b2"]
+6
+[0, 1, 2, 3, 4, 5]
+[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+10
+101
+false
+1
+2
+3
+:stop
+[0, 1, 2, 3, 4]
+0
+1
+[0, 2, 4]
+1
+2
+3
+3
+fatal
+"No live threads left. Deadlock?"

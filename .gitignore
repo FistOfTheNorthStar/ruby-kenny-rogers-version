@@ -1,0 +1,4 @@
+target/
+*.kenny.o
+/*.out
+.DS_Store

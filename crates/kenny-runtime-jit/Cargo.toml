@@ -1,0 +1,11 @@
+[package]
+name = "kenny-runtime-jit"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+kenny-runtime = { path = "../kenny-runtime" }
+kenny-compiler = { path = "../kenny-compiler", features = ["jit"] }

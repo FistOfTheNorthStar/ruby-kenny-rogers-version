@@ -1,0 +1,20 @@
+[1, 2]
+[0, 3]
+[1]
+[1, 2]
+[2]
+[1, 5]
+true
+"no implicit conversion of Integer into Array"
+[1, 2, 3]
+[]
+["a"]
+[[:a, 1]]
+[:s]
+[1]
+nil
+"definitely/not/here"
+"class variable"
+nil
+"a/b/c"
+"ABC"

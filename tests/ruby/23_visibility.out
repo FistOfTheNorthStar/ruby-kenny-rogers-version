@@ -1,0 +1,33 @@
+"s5/s5"
+1
+6
+2
+private method 'secret' called for an instance of Acct
+private method 'bal=' called for an instance of Acct
+false
+true
+"s6"
+1
+private method 'helper' called for an instance of Acct
+[:bal=, :helper, :initialize, :secret]
+[:>, :bal, :bump, :cmp, :open, :show]
+[:prot]
+true
+false
+true
+4
+"s6"
+private method 'open' called for an instance of Acct
+8
+10
+private method 'twice' called for an instance of UsesUtil
+:top
+private method 'top_helper' called for an instance of Integer
+"007"
+true
+"mm:ghost"
+"mm:hidden"
+true
+false
+Single
+private method 'new' called for class Single

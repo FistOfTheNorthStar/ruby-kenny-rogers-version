@@ -1,0 +1,338 @@
+== version
+"1.15.7"
+"1.15.7"
+true
+true
+nil
+true
+== HTML4 fragments
+"<div>\n<p>a</p>\n<p>b</p>\n</div>"
+"<div>\n<p>a</p>\n<p>b</p>\n</div>"
+1
+"div"
+"<div>\n<span>a</span><span>b</span>\n</div><table><tr><td>1</td></tr></table>"
+"<a href='a%20b\"c&amp;d&lt;&gt;'>x</a><img src=\"x%20y\"><input checked disabled value=\"a&amp;b&lt;c&gt;\"><br>"
+"<p>é   &lt;&gt;&amp;\"'</p>"
+"<script>if (a < b && c) {}</script><style>a > b {}</style><!-- c -->"
+[Nokogiri::XML::Text, Nokogiri::XML::Element, Nokogiri::XML::Text]
+"<section><article>x</article></section><custom-el a=\"1\">y</custom-el>"
+"<ul><li></ul><p></p><div></div>"
+"<div>\n<!-- c --><p>x</p>\n</div>"
+"<div>t<p>x</p>u</div>"
+"\n<p>x</p>\n<p>y</p>\n"
+"<a href=\"x%20y%20\">z</a>"
+== HTML4 documents
+"<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\" \"http://www.w3.org/TR/REC-html40/loose.dtd\">\n<html><body><p>hi</p></body></html>\n"
+"UTF-8"
+true
+false
+13
+"html"
+true
+"<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\" \"http://www.w3.org/TR/REC-html40/loose.dtd\">\n<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\">\n<title>T</title>\n</head>\n<body>\n<div>\n<p>a</p>\n<p>b</p>\n</div>\n<ul>\n<li>x</li>\n<li>y</li>\n</ul>\n</body>\n</html>\n"
+"T"
+"<!DOCTYPE html>\n<html><body><p>x</p></body></html>\n"
+"html"
+"<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\" \"http://www.w3.org/TR/REC-html40/loose.dtd\">\n\n"
+"<div>a</div>\n"
+"<body>\n<div>a</div>\n<div>b</div>\n<span>c</span>\n</body>"
+"<html>\n  <body>\n    <div>a</div>\n    <div>b</div>\n    <span>c</span>\n  </body>\n</html>"
+"<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\" \"http://www.w3.org/TR/REC-html40/loose.dtd\">\n<html>\n  <body>\n    <div>a</div>\n    <div>b</div>\n    <span>c</span>\n  </body>\n</html>\n"
+== traversal
+"div"
+"div"
+1
+true
+false
+"main"
+"a b"
+"main"
+nil
+true
+false
+["id", "class"]
+"a b"
+["id", "class"]
+["main", "a b"]
+[["id", "main", Nokogiri::XML::Attr], ["class", "a b", Nokogiri::XML::Attr]]
+["p", "comment", "p", "text"]
+["p", "p"]
+2
+"p"
+"one"
+"two three"
+true
+"c"
+true
+"tail"
+"comment"
+"two three"
+"p"
+"onetwo threetail"
+"onetwo threetail"
+"onetwo threetail"
+"<p class=\"x\">one</p>\n<!--c--><p>two <b>three</b></p>tail"
+"body"
+["body", "html", "document"]
+"/html/body/div/p[2]/b"
+"html > body > div"
+true
+true
+["a", "b"]
+["x"]
+true
+["text", "p", "comment", "text", "text", "b", "p", "text", "div"]
+true
+false
+== search
+["1", "2", "3"]
+3
+["1"]
+"y"
+["1"]
+["3"]
+["2"]
+["1", "3"]
+["B"]
+["A"]
+["B"]
+1
+1
+3
+["A", "B", "s1"]
+["2", "3"]
+["2", "3"]
+["p"]
+["2", "3"]
+"s1"
+nil
+10
+0
+1
+3
+["2"]
+"1"
+"3"
+"2"
+["2", "3"]
+3.0
+"2"
+false
+7.0
+["/a", "http://b.example/"]
+Nokogiri::XML::Attr
+"3"
+1
+["1", "2", "3"]
+["li", "li", "li", "a", "a"]
+"p"
+0
+"2"
+"3"
+"ul"
+"html"
+"bcd"
+"ABc"
+"abc"
+5.0
+6.0
+2.0
+3.0
+3.0
+["2", "3"]
+["1", "2"]
+["html", "body", "p"]
+["p"]
+3
+3
+3
+["a", "a", "li"]
+"A"
+["1", "2", "3"]
+3
+["2"]
+"1,2,3"
+["2", "3"]
+["2", "3"]
+Nokogiri::XML::XPath::SyntaxError
+Nokogiri::CSS::SyntaxError
+== mutation
+"<b class=\"x\">bold</b>"
+"<div>\n<p>one</p>\n<b class=\"x\">bold</b>\n</div>"
+"<div>\n<p>one</p>\n<b class=\"x\">bold</b><i>it</i>\n</div>"
+"<div>before <p>one</p>\n<span>after</span><b class=\"x\">bold</b><i>it</i>\n</div>"
+"<div>before <p>one</p>\n<em>rep</em><b class=\"x\">bold</b><i>it</i>\n</div>"
+"<div>before <p>one</p>txt<b class=\"x\">bold</b><i>it</i>\n</div>"
+"<div>before <p>one</p>txt<b class=\"x\">bold</b>\n</div>"
+nil
+"<div>before <p>one</p>txt</div>"
+"<div>before <hr>\n<p>one</p>\n<br>txt</div>"
+"section"
+"<div>before <hr>\n<section><p>one</p></section><br>txt</div>"
+"<p data-k=\"v\" title=\"t\">one</p>"
+"<p title=\"t\">one</p>"
+"<p title=\"changed\">one</p>"
+"<p>one</p>"
+"<p>&lt;new &amp; content&gt;</p>"
+"<new & content>"
+"<p><b>x</b><i>y</i></p>"
+"<p>plain</p>"
+"<div>before <hr>\n<section><h1>plain</h1></section><br>txt</div>"
+"big red"
+"red"
+["red"]
+"red big"
+2
+"<div>before <section><h1 class=\"red big\">plain</h1></section>txt</div>"
+"<div>before <section><!--note--><h1 class=\"red big\">plain</h1></section>txt</div>"
+"<section><!--note--><h1 class=\"red big\">plain</h1></section>"
+nil
+true
+"<section></section>"
+== cross-document moves
+"<div><li>a</li></div>"
+"<ul><li>b</li></ul>"
+true
+42
+"div"
+"<div>\n<li>a</li>\n<ul><li>b</li></ul>\n</div>"
+0
+== text merging
+3
+["a", "b", "c"]
+"<p>abc</p>"
+== node sets
+Nokogiri::XML::NodeSet
+3
+3
+"1"
+"3"
+"2"
+"3"
+["1", "2"]
+["2", "3"]
+"1"
+["1", "2"]
+Array
+["1", "2", "3"]
+["2", "3"]
+4
+["p", "p", "p", "div"]
+3
+["4"]
+3
+true
+false
+2
+false
+true
+"123"
+"123"
+"<p>1</p>\n<p>2</p>\n<p>3</p>\n"
+"<p>1</p>\n<p>2</p>\n<p>3</p>\n"
+["c", "c", "c"]
+[nil, nil, nil]
+["3", "2", "1"]
+3
+[]
+3
+0
+"<body><div>4</div></body>"
+2
+["div", "body"]
+"body"
+1
+"div"
+0
+false
+3
+true
+== XML
+Nokogiri::XML::Document
+nil
+"1.0"
+"root"
+true
+false
+9
+"<?xml version=\"1.0\"?>\n<root>\n  <a x=\"1\">t</a>\n  <b>\n    <c/>\n    <d>q</d>\n  </b>\n  <!-- c -->\n  <?pi data?>\n  <e><![CDATA[x<y]]></e>\n</root>\n"
+"<root>\n  <a x=\"1\">t</a>\n  <b>\n    <c/>\n    <d>q</d>\n  </b>\n  <!-- c -->\n  <?pi data?>\n  <e><![CDATA[x<y]]></e>\n</root>"
+"<b>\n  <c/>\n  <d>q</d>\n</b>"
+"1"
+"q"
+Nokogiri::XML::CDATA
+"x<y"
+["a", "b", "e"]
+["q"]
+" c "
+"pi"
+"UTF-8"
+"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<r a=\"é &lt; &quot; t\">é &gt; AB</r>\n"
+"é < \" t"
+"é > AB"
+"<?xml version=\"1.0\"?>\n<r>&#xE9;</r>\n"
+"<?xml version=\"1.0\"?>\n<r xmlns=\"urn:x\" xmlns:p=\"urn:p\">\n  <p:a p:b=\"1\">x</p:a>\n  <c/>\n</r>\n"
+"urn:x"
+nil
+"a"
+1
+[["xmlns", "urn:x"], ["xmlns:p", "urn:p"]]
+[["xmlns", "urn:x"], ["xmlns:p", "urn:p"]]
+"p"
+[["b", "p"]]
+"1"
+[nil, "p"]
+[]
+"<?xml version=\"1.0\"?>\n<r>  <a>  </a>\n</r>\n"
+true
+"<?xml version=\"1.0\"?>\n"
+"<?xml version=\"1.0\"?>\n<r>\n  <a/>\n  <b>t</b>\n  <c>d</c>\n</r>\n"
+Nokogiri::XML::SyntaxError
+["a", "b"]
+"<a>1</a><b>2</b>"
+"<r><a>1</a></r>"
+== builder
+"<?xml version=\"1.0\"?>\n<root>\n  <item id=\"1\">one</item>\n  <item id=\"2\">two</item>\n  <empty/>\n</root>\n"
+"<div class=\"x\"><span>hi</span></div>"
+== HTML5
+Nokogiri::HTML5::Document
+"<!DOCTYPE html><html><head></head><body><p>x<br>y</p></body></html>"
+"UTF-8"
+"<p>a<br>b</p><template><b>x</b></template>"
+"<p title=\"a&amp;b&quot;&nbsp;\">&lt;&nbsp;&amp;</p><script>a<b</script>"
+"<html><head></head><body><svg viewBox=\"0 0 1 1\"><path xlink:href=\"#a\"></path></svg><p>x</p></body></html>"
+"http://www.w3.org/2000/svg"
+nil
+[["href", "xlink"]]
+"tbody"
+["a", "b"]
+== misc
+160
+169
+true
+true
+"&lt;a &amp; &quot;b&quot;&gt;"
+true
+1
+-1
+1
+Array
+false
+true
+"b"
+"<i>z</i>"
+["em"]
+"t"
+"<!--c-->"
+"<![CDATA[x<y]]>"
+"<p>x</p>"
+"<p>x</p>"
+== decorators
+"B"
+Nokogiri::XML::Element
+true
+"I"
+true
+true
+"t"
+"c"

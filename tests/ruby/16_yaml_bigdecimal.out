@@ -1,0 +1,167 @@
+== scalars
+["plain string", "single quoted", "double \"quoted\"\tescape", 42, -17, 31, "0o17", 15, 1000000, 3.25, 6.02e+23, Infinity, -Infinity, true, false, true, false, true, false, nil, nil, nil, "123", "true", "1e3", 45000, "2024-10-19 x"]
+true
+== symbols
+[:name, ":quoted", :"with space"]
+Psych::DisallowedClass: Tried to load unspecified class: Symbol
+[:a, 1]
+[[:c, 2]]
+== database.yml
+"default":
+  "adapter" = "postgresql"
+  "encoding" = "unicode"
+  "pool" = 5
+  "timeout" = 5000
+  "host" = "localhost"
+"development":
+  "adapter" = "postgresql"
+  "encoding" = "unicode"
+  "pool" = 5
+  "timeout" = 5000
+  "host" = "localhost"
+  "database" = "app_development"
+"test":
+  "adapter" = "postgresql"
+  "encoding" = "unicode"
+  "pool" = 2
+  "timeout" = 5000
+  "host" = "localhost"
+  "database" = "app_test"
+"production":
+  "adapter" = "postgresql"
+  "encoding" = "unicode"
+  "pool" = 5
+  "timeout" = 5000
+  "host" = "db.example.com"
+  "database" = "app_production"
+  "variables":
+    "statement_timeout" = "5s"
+2
+BadAlias raised: true
+[["z", 3], ["x", 1], ["y", 9]]
+[[1, 2], [1, 2]]
+true
+== collections and blocks
+"flow_seq" = ["a", "b", ["c", "d"]]
+"flow_map":
+  "k" = "v"
+  "n" = 1
+"nested" = [{"name" => "first", "tags" => ["x", "y"]}, {"name" => "second", "tags" => []}]
+"literal" = "line one\n  indented\nline three\n"
+"folded" = "folded text\nnew paragraph\n"
+"strip" = "no newline"
+"keep" = "kept\n\n"
+"empty_map":
+"quoted key" = "value"
+"complex key" = "complex value"
+[1, [2], [["three", 3]]]
+nil
+nil
+== errors
+Psych::SyntaxError (true) file=nil
+Tried to load unspecified class: Object
+== dump
+---
+name: Kenny
+version: 1
+ratio: 0.5
+big: 1180591620717411303424
+enabled: true
+nothing:
+:sym_key: :sym_value
+list:
+- 1
+- two
+- 3.0
+- - 4
+  - 5
+- six: 6
+empty_list: []
+empty_hash: {}
+nested:
+  a:
+    b:
+      c: deep
+strings:
+- 'true'
+- '123'
+- '1.5'
+- ''
+- " padded "
+- 'colon: here'
+- "#hash"
+- "- dash"
+- it's
+- say "hi"
+- "tab\there"
+- |
+  multi
+  line
+- 'trailing
+
+  '
+- 'null'
+- "~"
+- café
+- !!str '<<'
+---
+- 1
+- - 2
+  - - 3
+--- plain
+---
+---
+a: 1
+---
+- 2
+---
+long: 'word word word word word word word word word word word word word word word
+  word word word word word word word word word word '
+true
+--- !ruby/object:Point
+x: 3
+y:
+- 4
+- five
+[Point, 3, [4, "five"]]
+[4, "five"]
+---
+a: &1
+- 1
+- 2
+b: *1
+== BigDecimal
+0.123456e3
+0.1e-3
+-0.5e0
+0.1e21
+0.42e2
+0.7e1
+0.1e0
+0.100025e4
+[0.1234561e3, 0.1234559e3, 0.123456e-1, 0.30864e2, -0.123456e3, 0.123456e3]
+[true, false]
+["0.123456e3", "123.456", "1 234 567.891", "100.0", "0.1e-3", "0.0001"]
+[123, 123.456, 123, 123, 123, 124, 123]
+[0.12346e3, 120, 0.1235e3, 0.2e1, 0.3e1, -3]
+[0.1234e3, 0.1235e3, 0.12345e3, 0.12e1, 0.13e1]
+[6, 3, 3, 2, 2, 1, [1, "123456", 10, 3]]
+[false, true, false, true, true, true]
+[Infinity, -Infinity, NaN, 1, -1, nil, true, false]
+[Infinity, NaN, NaN, 0.0]
+[0.33333333333333333333e0, 0.6666666667e0, 3, 0.15e1, [-4.0, 0.5]]
+[0.225e1, 0.25e0, 0.12e1, 0.23e1]
+[1, true, true, true, true, true, true, true, true]
+[0.124456e3, 0.124456e3, 0.2e-3, 0.15e1, [0.2e1, 0.123456e3], [1, 2.5, 0.3e1], 0.123456e3]
+[0.3e1, 0.25e0, 0.3e0, 0.15e1, 0.12e2, 0.0, 0.0, true, "1.5"]
+"x"
+1
+"1.23"
+"0.314e1"
+invalid value for BigDecimal(): "12abc"
+nil
+can't convert nil into BigDecimal
+Computation results in 'Infinity'
+[3, 7, -2, 1000000000]
+[true, true, true]
+[0.5997e2, "59.97", "64.77"]

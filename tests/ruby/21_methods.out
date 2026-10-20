@@ -1,0 +1,16 @@
+42
+1
+Calc
+:double
+[[:req, :x]]
+[2, 4]
+[[:req, :a], [:opt, :b], [:rest, :rest], [:keyreq, :k], [:key, :opt], [:keyrest, :kw], [:block, :blk]]
+-3
+10
+12
+"#<UnboundMethod: Calc#double>"
+"#<Calc:"
+1
+-1
+7
+Kernel

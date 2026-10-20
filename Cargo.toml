@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/kenny-runtime", "crates/kenny-runtime-jit", "crates/kenny-compiler", "crates/kenny"]
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"
+codegen-units = 1
+lto = "thin"
+
+[profile.dev]
+panic = "abort"

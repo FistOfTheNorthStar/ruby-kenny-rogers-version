@@ -1,0 +1,416 @@
+//! Control flow: if/unless, loops, case/when, begin/rescue/ensure, return/break/next.
+
+use crate::*;
+use cranelift_codegen::ir::{condcodes::IntCC, types::I64, InstBuilder};
+use ruby_prism::*;
+
+impl<M: Module> Compiler<M> {
+    pub(crate) fn if_node(&mut self, fx: &mut Fx, n: &IfNode) -> Value {
+        let c = self.expr(fx, &n.predicate());
+        let t = self.truthy(fx, c);
+        let then_b = fx.b.create_block();
+        let else_b = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.ins().brif(t, then_b, &[], else_b, &[]);
+        fx.b.switch_to_block(then_b);
+        let v = self.stmts(fx, n.statements());
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(else_b);
+        let v = match n.subsequent() {
+            Some(s) => self.expr(fx, &s),
+            None => self.nil(fx),
+        };
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    pub(crate) fn unless_node(&mut self, fx: &mut Fx, n: &UnlessNode) -> Value {
+        let c = self.expr(fx, &n.predicate());
+        let t = self.truthy(fx, c);
+        let then_b = fx.b.create_block();
+        let else_b = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.ins().brif(t, else_b, &[], then_b, &[]);
+        fx.b.switch_to_block(then_b);
+        let v = self.stmts(fx, n.statements());
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(else_b);
+        let v = match n.else_clause() {
+            Some(e) => self.stmts(fx, e.statements()),
+            None => self.nil(fx),
+        };
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    pub(crate) fn while_loop(&mut self, fx: &mut Fx, pred: &Node, body: Option<StatementsNode>, until: bool, do_while: bool) -> Value {
+        let header = fx.b.create_block();
+        let body_b = fx.b.create_block();
+        let exit = fx.b.create_block();
+        fx.b.append_block_param(exit, I64);
+        fx.b.ins().jump(if do_while { body_b } else { header }, &[]);
+        fx.b.switch_to_block(header);
+        let c = self.expr(fx, pred);
+        let t = self.truthy(fx, c);
+        let nil = self.nil(fx);
+        if until {
+            fx.b.ins().brif(t, exit, &[nil.into()], body_b, &[]);
+        } else {
+            fx.b.ins().brif(t, body_b, &[], exit, &[nil.into()]);
+        }
+        fx.b.switch_to_block(body_b);
+        fx.loops.push(LoopCtx { next: header, exit, redo: body_b, next_val: false });
+        self.stmts_void(fx, body);
+        fx.loops.pop();
+        self.safepoint(fx);
+        fx.b.ins().jump(header, &[]);
+        fx.b.switch_to_block(exit);
+        fx.b.block_params(exit)[0]
+    }
+
+    pub(crate) fn for_loop(&mut self, fx: &mut Fx, f: &ForNode) -> Value {
+        let coll = self.expr(fx, &f.collection());
+        let ary = self.callc(fx, "kn_splat_to_ary", &[coll]);
+        let i = fx.b.declare_var(I64);
+        let zero = self.iconst(fx, 0);
+        fx.b.def_var(i, zero);
+        let header = fx.b.create_block();
+        let body_b = fx.b.create_block();
+        let incr = fx.b.create_block();
+        let exit = fx.b.create_block();
+        fx.b.append_block_param(exit, I64);
+        fx.b.ins().jump(header, &[]);
+        fx.b.switch_to_block(header);
+        let iv = fx.b.use_var(i);
+        let len = self.call(fx, "kn_ary_len", &[ary]);
+        let c = fx.b.ins().icmp(IntCC::SignedLessThan, iv, len);
+        fx.b.ins().brif(c, body_b, &[], exit, &[coll.into()]);
+        fx.b.switch_to_block(body_b);
+        let iv = fx.b.use_var(i);
+        let x = self.call(fx, "kn_ary_ref", &[ary, iv]);
+        self.assign_target(fx, &f.index(), x);
+        let body_start = fx.b.create_block();
+        fx.b.ins().jump(body_start, &[]);
+        fx.b.switch_to_block(body_start);
+        fx.loops.push(LoopCtx { next: incr, exit, redo: body_start, next_val: false });
+        self.stmts_void(fx, f.statements());
+        fx.loops.pop();
+        fx.b.ins().jump(incr, &[]);
+        fx.b.switch_to_block(incr);
+        let iv = fx.b.use_var(i);
+        let n = fx.b.ins().iadd_imm_s(iv, 1);
+        fx.b.def_var(i, n);
+        self.safepoint(fx);
+        fx.b.ins().jump(header, &[]);
+        fx.b.switch_to_block(exit);
+        fx.b.block_params(exit)[0]
+    }
+
+    pub(crate) fn case_node(&mut self, fx: &mut Fx, n: &CaseNode) -> Value {
+        let subj = n.predicate().map(|p| self.expr(fx, &p));
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        for w in n.conditions().iter() {
+            let Some(w) = w.as_when_node() else { continue };
+            let body_b = fx.b.create_block();
+            for cond in w.conditions().iter() {
+                let at = cond.location().start_offset();
+                let t = if let Some(sp) = cond.as_splat_node() {
+                    // when *list  ->  list.any? { |x| x === subj }
+                    let list = match sp.expression() {
+                        Some(e) => self.expr(fx, &e),
+                        None => self.nil(fx),
+                    };
+                    let ary = self.callc(fx, "kn_splat_to_ary", &[list]);
+                    let s = match subj {
+                        Some(s) => s,
+                        None => {
+                            self.error_at(at, "splat in `when` without a case subject");
+                            self.nil(fx)
+                        }
+                    };
+                    let r = self.send(fx, ary, b"__kn_case_any", &[s], None);
+                    self.truthy(fx, r)
+                } else {
+                    match subj {
+                        Some(s) => {
+                            if cond.as_symbol_node().is_some() {
+                                let cv = self.expr(fx, &cond);
+                                fx.b.ins().icmp(IntCC::Equal, cv, s)
+                            } else {
+                                let cv = self.expr(fx, &cond);
+                                let r = self.send(fx, cv, b"===", &[s], None);
+                                self.truthy(fx, r)
+                            }
+                        }
+                        None => {
+                            let cv = self.expr(fx, &cond);
+                            self.truthy(fx, cv)
+                        }
+                    }
+                };
+                let next = fx.b.create_block();
+                fx.b.ins().brif(t, body_b, &[], next, &[]);
+                fx.b.switch_to_block(next);
+            }
+            let fallthrough = fx.b.current_block().unwrap();
+            fx.b.switch_to_block(body_b);
+            let v = self.stmts(fx, w.statements());
+            fx.b.ins().jump(done, &[v.into()]);
+            fx.b.switch_to_block(fallthrough);
+        }
+        let v = match n.else_clause() {
+            Some(e) => self.stmts(fx, e.statements()),
+            None => self.nil(fx),
+        };
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    /// Exception classes of a rescue clause (default StandardError).
+    fn rescue_classes(&mut self, fx: &mut Fx, r: &RescueNode) -> Vec<Value> {
+        let ex: Vec<Node> = r.exceptions().iter().collect();
+        if ex.is_empty() {
+            let cref = self.cref(fx);
+            let s = self.sym_val(fx, b"StandardError");
+            return vec![self.callc(fx, "kn_const_get", &[cref, s])];
+        }
+        ex.iter()
+            .map(|e| {
+                if let Some(sp) = e.as_splat_node() {
+                    let v = match sp.expression() {
+                        Some(x) => self.expr(fx, &x),
+                        None => self.nil(fx),
+                    };
+                    self.callc(fx, "kn_splat_to_ary", &[v])
+                } else {
+                    self.expr(fx, e)
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn begin_node(&mut self, fx: &mut Fx, n: &BeginNode) -> Value {
+        let rescue = n.rescue_clause();
+        let ensure = n.ensure_clause();
+        if rescue.is_none() && ensure.is_none() {
+            let v = self.stmts(fx, n.statements());
+            return match n.else_clause() {
+                Some(e) => self.stmts(fx, e.statements()),
+                None => v,
+            };
+        }
+        let after = fx.b.create_block();
+        fx.b.append_block_param(after, I64);
+        let ens_unwind = ensure.as_ref().map(|_| fx.b.create_block());
+        if let Some(eu) = ens_unwind {
+            fx.unwind.push(eu);
+            fx.ensure_depth += 1;
+        }
+
+        let v = match rescue {
+            Some(first) => {
+                let body_start = fx.b.create_block();
+                let normal = fx.b.create_block();
+                fx.b.append_block_param(normal, I64);
+                fx.b.ins().jump(body_start, &[]);
+                fx.b.switch_to_block(body_start);
+                let resc_bb = fx.b.create_block();
+                fx.unwind.push(resc_bb);
+                let v = self.stmts(fx, n.statements());
+                fx.unwind.pop();
+                let v = match n.else_clause() {
+                    Some(e) => self.stmts(fx, e.statements()),
+                    None => v,
+                };
+                fx.b.ins().jump(normal, &[v.into()]);
+
+                fx.b.switch_to_block(resc_bb);
+                let exc = self.call(fx, "kn_pending_exc", &[]);
+                let is_nil = fx.b.ins().icmp_imm_s(IntCC::Equal, exc, QNIL);
+                let check_bb = fx.b.create_block();
+                let outer = *fx.unwind.last().unwrap();
+                fx.b.ins().brif(is_nil, outer, &[], check_bb, &[]);
+                fx.b.switch_to_block(check_bb);
+                // matching rescue clauses in order
+                let mut clause = Some(first);
+                while let Some(r) = clause {
+                    let classes = self.rescue_classes(fx, &r);
+                    let body_bb = fx.b.create_block();
+                    for cls in classes {
+                        let m = self.callc(fx, "kn_exc_match", &[exc, cls]);
+                        let t = self.truthy(fx, m);
+                        let next = fx.b.create_block();
+                        fx.b.ins().brif(t, body_bb, &[], next, &[]);
+                        fx.b.switch_to_block(next);
+                    }
+                    let nomatch = fx.b.current_block().unwrap();
+                    fx.b.switch_to_block(body_bb);
+                    let prev = self.call(fx, "kn_errinfo", &[]);
+                    self.call(fx, "kn_rescued", &[exc]);
+                    if let Some(reference) = r.reference() {
+                        self.assign_target(fx, &reference, exc);
+                    }
+                    fx.retry.push(body_start);
+                    let rv = self.stmts(fx, r.statements());
+                    fx.retry.pop();
+                    self.call(fx, "kn_errinfo_restore", &[prev]);
+                    fx.b.ins().jump(normal, &[rv.into()]);
+                    fx.b.switch_to_block(nomatch);
+                    clause = r.subsequent();
+                }
+                let outer = *fx.unwind.last().unwrap();
+                fx.b.ins().jump(outer, &[]);
+                fx.b.switch_to_block(normal);
+                fx.b.block_params(normal)[0]
+            }
+            None => self.stmts(fx, n.statements()),
+        };
+
+        match (ensure, ens_unwind) {
+            (Some(e), Some(eu)) => {
+                fx.unwind.pop();
+                fx.ensure_depth -= 1;
+                self.stmts(fx, e.statements());
+                fx.b.ins().jump(after, &[v.into()]);
+                // unwinding path: run ensure, then keep unwinding
+                fx.b.switch_to_block(eu);
+                let h = self.call(fx, "kn_save_pending", &[]);
+                self.stmts(fx, e.statements());
+                let again = self.call(fx, "kn_restore_pending", &[h]);
+                let outer = *fx.unwind.last().unwrap();
+                let nil = self.nil(fx);
+                fx.b.ins().brif(again, outer, &[], after, &[nil.into()]);
+            }
+            _ => {
+                fx.b.ins().jump(after, &[v.into()]);
+            }
+        }
+        fx.b.switch_to_block(after);
+        fx.b.block_params(after)[0]
+    }
+
+    pub(crate) fn rescue_modifier(&mut self, fx: &mut Fx, n: &RescueModifierNode) -> Value {
+        let normal = fx.b.create_block();
+        fx.b.append_block_param(normal, I64);
+        let resc_bb = fx.b.create_block();
+        fx.unwind.push(resc_bb);
+        let v = self.expr(fx, &n.expression());
+        fx.unwind.pop();
+        fx.b.ins().jump(normal, &[v.into()]);
+        fx.b.switch_to_block(resc_bb);
+        let exc = self.call(fx, "kn_pending_exc", &[]);
+        let is_nil = fx.b.ins().icmp_imm_s(IntCC::Equal, exc, QNIL);
+        let check_bb = fx.b.create_block();
+        let outer = *fx.unwind.last().unwrap();
+        fx.b.ins().brif(is_nil, outer, &[], check_bb, &[]);
+        fx.b.switch_to_block(check_bb);
+        let cref = self.cref(fx);
+        let s = self.sym_val(fx, b"StandardError");
+        let cls = self.callc(fx, "kn_const_get", &[cref, s]);
+        let m = self.callc(fx, "kn_exc_match", &[exc, cls]);
+        let t = self.truthy(fx, m);
+        let body_bb = fx.b.create_block();
+        let outer = *fx.unwind.last().unwrap();
+        fx.b.ins().brif(t, body_bb, &[], outer, &[]);
+        fx.b.switch_to_block(body_bb);
+        let prev = self.call(fx, "kn_errinfo", &[]);
+        self.call(fx, "kn_rescued", &[exc]);
+        let rv = self.expr(fx, &n.rescue_expression());
+        self.call(fx, "kn_errinfo_restore", &[prev]);
+        fx.b.ins().jump(normal, &[rv.into()]);
+        fx.b.switch_to_block(normal);
+        fx.b.block_params(normal)[0]
+    }
+
+    fn jump_value(&mut self, fx: &mut Fx, args: Option<ArgumentsNode>) -> Value {
+        let items: Vec<Node> = match &args {
+            Some(a) => a.arguments().iter().collect(),
+            None => vec![],
+        };
+        if items.len() == 1 && items[0].as_splat_node().is_none() {
+            return self.expr(fx, &items[0]);
+        }
+        if items.is_empty() {
+            return self.nil(fx);
+        }
+        let a = self.eval_args(fx, args);
+        match a.splat {
+            Some(ary) => ary,
+            None => {
+                let n = self.iconst(fx, a.vals.len() as i64);
+                let buf = self.args_buf(fx, &a.vals);
+                self.call(fx, "kn_ary_new", &[n, buf])
+            }
+        }
+    }
+
+    pub(crate) fn return_node(&mut self, fx: &mut Fx, args: Option<ArgumentsNode>) -> Value {
+        let v = self.jump_value(fx, args);
+        match fx.kind {
+            ScopeKind::Method if fx.ensure_depth > 0 => {
+                let tag = fx.b.use_var(fx.tag_v);
+                self.call(fx, "kn_throw_return", &[tag, v]);
+                self.jump_unwind(fx);
+            }
+            ScopeKind::Block if !fx.lambda => {
+                let tag = match self.method_env(fx) {
+                    Some(e) => e,
+                    None => self.iconst(fx, 0),
+                };
+                self.call(fx, "kn_throw_return", &[tag, v]);
+                self.jump_unwind(fx);
+            }
+            _ => {
+                fx.b.ins().return_(&[v]);
+                self.dead_block(fx);
+            }
+        }
+        self.nil(fx)
+    }
+
+    pub(crate) fn break_node(&mut self, fx: &mut Fx, args: Option<ArgumentsNode>, at: usize) -> Value {
+        let v = self.jump_value(fx, args);
+        if let Some(l) = fx.loops.last() {
+            let exit = l.exit;
+            fx.b.ins().jump(exit, &[v.into()]);
+            self.dead_block(fx);
+        } else if fx.kind == ScopeKind::Block {
+            if fx.lambda {
+                fx.b.ins().return_(&[v]);
+                self.dead_block(fx);
+            } else {
+                let p = fx.b.use_var(fx.proc_v.unwrap());
+                self.call(fx, "kn_throw_break", &[p, v]);
+                self.jump_unwind(fx);
+            }
+        } else {
+            self.error_at(at, "break outside of a loop or block");
+        }
+        self.nil(fx)
+    }
+
+    pub(crate) fn next_node(&mut self, fx: &mut Fx, args: Option<ArgumentsNode>, at: usize) -> Value {
+        let v = self.jump_value(fx, args);
+        if let Some(l) = fx.loops.last() {
+            let next = l.next;
+            if l.next_val {
+                fx.b.ins().jump(next, &[v.into()]);
+            } else {
+                fx.b.ins().jump(next, &[]);
+            }
+            self.dead_block(fx);
+        } else if fx.kind == ScopeKind::Block {
+            fx.b.ins().return_(&[v]);
+            self.dead_block(fx);
+        } else {
+            self.error_at(at, "next outside of a loop or block");
+        }
+        self.nil(fx)
+    }
+}

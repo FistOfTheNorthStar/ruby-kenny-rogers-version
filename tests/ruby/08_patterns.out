@@ -1,0 +1,22 @@
+big int 500
+number 7
+number 2.5
+string hi
+empty string
+empty array
+starts with 1, rest [2, 3]
+pair 4,5
+found needle, then [:b, :c]
+adult Ann
+person Kid with [:age, :city]
+circle r=2
+nil!
+something else: :sym
+struct as array 1,2
+struct as hash 3,4
+pinned match
+admin@5432
+true
+false
+NoMatchingPatternError: 42
+10

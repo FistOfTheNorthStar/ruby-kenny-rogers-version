@@ -1,0 +1,34 @@
+[3, 9, 1]
+[["28_rails_boot.rb", 8, "inner"], ["28_rails_boot.rb", 9, "outer"], ["28_rails_boot.rb", 10, "<main>"]]
+["28_rails_boot.rb:11:in 'boom'", "28_rails_boot.rb:13:in '<main>'"]
+true
+:engine_root
+:mgmt
+"rails0"
+nil
+"AttrAcc::Struct"
+nil
+true
+true
+[1, 2, 3]
+:dup
+:clone
+Coll
+:no_super
+true
+false
+(2/5)
+(1/3)
+(0/1)
+"[\\xC2-\\xDF][\\x80-\\xBF]"
+"[^ A-Za-z0-9!.^_`|~-]"
+{b: 2, a: 1}
+true
+true
+SignalException
+Exception
+StandardError
+true
+true
+false
+1

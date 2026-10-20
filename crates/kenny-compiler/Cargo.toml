@@ -1,0 +1,18 @@
+[package]
+name = "kenny-compiler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cranelift-codegen = "0.136.4"
+cranelift-frontend = "0.136.4"
+cranelift-jit = { version = "0.136.4", optional = true }
+cranelift-module = "0.136.4"
+cranelift-object = "0.136.4"
+indexmap = "2.14.2"
+libc = { version = "0.2.191", optional = true }
+ruby-prism = "1.9.0"
+target-lexicon = "0.13.5"
+
+[features]
+jit = ["dep:cranelift-jit", "dep:libc"]

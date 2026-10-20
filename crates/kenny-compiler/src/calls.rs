@@ -1,0 +1,614 @@
+//! Method calls, operators (with inline Integer fast paths), blocks, super and yield.
+
+use crate::*;
+use crate::fastpath::is_fast_op;
+use cranelift_codegen::ir::{condcodes::IntCC, types::I64, InstBuilder};
+use ruby_prism::*;
+
+pub(crate) struct Args {
+    pub vals: Vec<Value>,
+    /// When any argument is a splat, all arguments are collected into this array instead.
+    pub splat: Option<Value>,
+}
+
+const DROPPED_CALLS: &[(&str, &str)] = &[
+    ("set_trace_func", "set_trace_func is not supported by Kenny (see docs/LANGUAGE.md)"),
+    ("callcc", "callcc is not supported by Kenny"),
+];
+
+impl<M: Module> Compiler<M> {
+    pub(crate) fn eval_args(&mut self, fx: &mut Fx, args: Option<ArgumentsNode>) -> Args {
+        let items: Vec<Node> = match args {
+            Some(a) => a.arguments().iter().collect(),
+            None => vec![],
+        };
+        let needs_ary = items.iter().any(|n| n.as_splat_node().is_some() || n.as_forwarding_arguments_node().is_some());
+        if needs_ary {
+            let zero = self.iconst(fx, 0);
+            let a = self.call(fx, "kn_ary_new", &[zero, zero]);
+            for n in &items {
+                if let Some(s) = n.as_splat_node() {
+                    let v = match s.expression() {
+                        Some(e) => self.expr(fx, &e),
+                        None => self.forwarded_local(fx, b"*"),
+                    };
+                    self.callc(fx, "kn_ary_concat_splat", &[a, v]);
+                } else if n.as_forwarding_arguments_node().is_some() {
+                    let v = self.forwarded_local(fx, b"*");
+                    self.callc(fx, "kn_ary_concat_splat", &[a, v]);
+                } else {
+                    let v = self.expr(fx, n);
+                    self.call(fx, "kn_ary_push", &[a, v]);
+                }
+            }
+            return Args { vals: vec![], splat: Some(a) };
+        }
+        let vals = items.iter().map(|n| self.expr(fx, n)).collect();
+        Args { vals, splat: None }
+    }
+
+    /// A hidden local of the enclosing method for anonymous forwarding (`*`, `**`, `&`, `...`).
+    pub(crate) fn forwarded_local(&mut self, fx: &mut Fx, name: &[u8]) -> Value {
+        let depth = match (fx.kind, &fx.method) {
+            (ScopeKind::Block, Some(m)) => (fx.scope - m.scope) as u32,
+            _ => 0,
+        };
+        let depth = depth + fx.inline_levels.len() as u32;
+        self.local_get(fx, name, depth)
+    }
+
+    /// `blk` None: the call passes no block at all.
+    fn send_raw(&mut self, fx: &mut Fx, recv: Value, name: &[u8], args: &Args, blk: Option<Value>, explicit: bool) -> Value {
+        self.mark_loc(fx);
+        let cache = self.cache_ptr(fx, 3);
+        let mid = self.sym_val(fx, name);
+        if blk.is_none() && args.splat.is_none() && args.vals.len() <= 2 && self.refine_scope.is_none() {
+            return self.send_simple(fx, cache, recv, mid, &args.vals, explicit);
+        }
+        let blk = match blk {
+            Some(b) => b,
+            None => self.nil(fx),
+        };
+        if let Some(scope) = self.refine_scope {
+            // call sites after `using`: refinement-aware lookup (other sites pay nothing)
+            let sc = self.iconst(fx, scope as i64);
+            let (n, buf) = match args.splat {
+                Some(a) => {
+                    let n = self.call(fx, "kn_ary_len", &[a]);
+                    let p = self.call(fx, "kn_ary_ptr", &[a]);
+                    (n, p)
+                }
+                None => (self.iconst(fx, args.vals.len() as i64), self.args_buf(fx, &args.vals)),
+            };
+            return self.call(fx, "kn_send_refined", &[cache, sc, recv, mid, n, buf, blk]);
+        }
+        match args.splat {
+            Some(a) => self.call(fx, "kn_send_splat", &[cache, recv, mid, a, blk]),
+            None => {
+                let n = self.iconst(fx, args.vals.len() as i64);
+                let buf = self.args_buf(fx, &args.vals);
+                // `obj.foo` must not reach a private method; `foo` / `self.foo` may
+                self.call(fx, if explicit { "kn_send_pub" } else { "kn_send" }, &[cache, recv, mid, n, buf, blk])
+            }
+        }
+    }
+    /// Send with unwinding on exceptions.
+    pub(crate) fn send(&mut self, fx: &mut Fx, recv: Value, name: &[u8], args: &[Value], blk: Option<Value>) -> Value {
+        let a = Args { vals: args.to_vec(), splat: None };
+        let r = self.send_raw(fx, recv, name, &a, blk, false);
+        self.check(fx, r);
+        r
+    }
+
+    /// `recv.name(arg) { literal block }` as a normal call (the fallback of an inlined block).
+    pub(crate) fn send_with_block(&mut self, fx: &mut Fx, recv: Value, name: &[u8], arg: Option<Value>, p: Value) -> Value {
+        let args = Args { vals: arg.into_iter().collect(), splat: None };
+        let r = self.send_raw(fx, recv, name, &args, Some(p), true);
+        self.catch_break(fx, r, p)
+    }
+
+    /// After calling with a literal block: a `break` inside that block lands here.
+    fn catch_break(&mut self, fx: &mut Fx, r: Value, proc_v: Value) -> Value {
+        let is_undef = fx.b.ins().icmp_imm_s(IntCC::Equal, r, UNDEF);
+        let handler = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.ins().brif(is_undef, handler, &[], done, &[r.into()]);
+        fx.b.switch_to_block(handler);
+        let r2 = self.call(fx, "kn_catch_break", &[proc_v]);
+        let still = fx.b.ins().icmp_imm_s(IntCC::Equal, r2, UNDEF);
+        let target = *fx.unwind.last().unwrap();
+        fx.b.ins().brif(still, target, &[], done, &[r2.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    /// The block argument of a call: (value, literal proc for break handling).
+    fn block_arg(&mut self, fx: &mut Fx, block: Option<Node>, lambda: bool) -> (Value, Option<Value>) {
+        match block {
+            None => (self.nil(fx), None),
+            Some(b) => {
+                if let Some(ba) = b.as_block_argument_node() {
+                    let v = match ba.expression() {
+                        Some(e) => {
+                            let v = self.expr(fx, &e);
+                            self.callc(fx, "kn_to_proc", &[v])
+                        }
+                        None => self.method_block(fx),
+                    };
+                    (v, None)
+                } else if let Some(bn) = b.as_block_node() {
+                    let locals = bn.locals().iter().map(|c| c.as_slice().to_vec()).collect();
+                    let p = self.block_proc(fx, bn.parameters(), bn.body(), locals, lambda);
+                    (p, Some(p))
+                } else {
+                    (self.nil(fx), None)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn call_node(&mut self, fx: &mut Fx, c: &CallNode) -> Value {
+        let name = c.name().as_slice().to_vec();
+        let at = c.location().start_offset();
+        let at_loc = c.message_loc().map(|l| l.start_offset()).unwrap_or(at);
+        let recv_node = c.receiver();
+        let arg_nodes: Vec<Node> = match c.arguments() {
+            Some(a) => a.arguments().iter().collect(),
+            None => vec![],
+        };
+        let block = c.block();
+
+        // `Kernel.block_given?` / `::Kernel.block_given?` (BasicObject subclasses such as
+        // Jbuilder write it so): like the bare call, it asks about the current method's block
+        if matches!(name.as_slice(), b"block_given?" | b"iterator?") && arg_nodes.is_empty() && block.is_none() {
+            let kernel_recv = recv_node.as_ref().is_some_and(|r| {
+                r.as_constant_read_node().is_some_and(|k| k.name().as_slice() == b"Kernel")
+                    || r.as_constant_path_node().is_some_and(|k| k.parent().is_none() && k.name().is_some_and(|n| n.as_slice() == b"Kernel"))
+            });
+            if kernel_recv {
+                let b = self.method_block(fx);
+                let c = fx.b.ins().icmp_imm_s(IntCC::NotEqual, b, QNIL);
+                return self.bool_v(fx, c);
+            }
+        }
+
+        if recv_node.is_none() {
+            let sname = String::from_utf8_lossy(&name).into_owned();
+            if let Some((_, msg)) = DROPPED_CALLS.iter().find(|(n, _)| *n == sname) {
+                if arg_nodes.is_empty() || sname != "binding" {
+                    return self.unsupported(fx, at, msg);
+                }
+            }
+            match name.as_slice() {
+                b"block_given?" | b"iterator?" if arg_nodes.is_empty() && block.is_none() => {
+                    let b = self.method_block(fx);
+                    let c = fx.b.ins().icmp_imm_s(IntCC::NotEqual, b, QNIL);
+                    return self.bool_v(fx, c);
+                }
+                b"__method__" if arg_nodes.is_empty() => {
+                    return match fx.method.clone() {
+                        Some(m) => self.sym_val(fx, &m.name),
+                        None => self.nil(fx),
+                    };
+                }
+                b"__dir__" if arg_nodes.is_empty() => {
+                    let abs = self.file.canonicalize().unwrap_or(self.file.clone());
+                    let d = abs.parent().map(|p| p.display().to_string()).unwrap_or_default();
+                    return self.str_lit(fx, d.as_bytes());
+                }
+                b"require_relative" if arg_nodes.len() == 1 && arg_nodes[0].as_string_node().is_some() => {
+                    return self.require_relative(fx, &arg_nodes[0], at);
+                }
+                b"using" if arg_nodes.len() == 1 => {
+                    let m = self.expr(fx, &arg_nodes[0]);
+                    self.refine_counter += 1;
+                    let id = (self.fn_counter as u64) << 20 | self.refine_counter;
+                    let parent = self.refine_scope.unwrap_or(0);
+                    let idv = self.iconst(fx, id as i64);
+                    let pv = self.iconst(fx, parent as i64);
+                    self.callc(fx, "kn_using", &[idv, m, pv]);
+                    self.refine_scope = Some(id);
+                    return self.self_val(fx);
+                }
+                b"autoload"
+                    if arg_nodes.len() == 2 && arg_nodes[0].as_symbol_node().is_some() && arg_nodes[1].as_string_node().is_some() =>
+                {
+                    let name = String::from_utf8_lossy(arg_nodes[1].as_string_node().unwrap().unescaped()).into_owned();
+                    let mut dirs = self.load_paths.clone();
+                    if let Some(d) = self.file.parent() {
+                        dirs.push(d.to_path_buf());
+                    }
+                    let found = dirs.iter().map(|d| {
+                        let mut p = d.join(&name);
+                        if p.extension().is_none() {
+                            p.set_extension("rb");
+                        }
+                        p
+                    }).find(|p| p.is_file());
+                    if let Some(p) = found {
+                        if let Some((fid, flag)) = self.require_file(p, at) {
+                            let s = self.self_val(fx);
+                            let sym_name = arg_nodes[0].as_symbol_node().unwrap().unescaped().to_vec();
+                            let id = self.sym_val(fx, &sym_name);
+                            let f = self.fn_addr(fx, fid);
+                            let slot = self.slot_ptr(fx, flag);
+                            return self.call(fx, "kn_autoload", &[s, id, f, slot]);
+                        }
+                    }
+                }
+                b"load" if arg_nodes.len() == 1 && arg_nodes[0].as_string_node().is_some() => {
+                    let name = String::from_utf8_lossy(arg_nodes[0].as_string_node().unwrap().unescaped()).into_owned();
+                    let mut dirs: Vec<PathBuf> = self.file.parent().map(|d| vec![d.to_path_buf()]).unwrap_or_default();
+                    dirs.extend(self.load_paths.clone());
+                    if let Some(p) = dirs.iter().map(|d| d.join(&name)).find(|p| p.is_file()) {
+                        return self.require_path(fx, p, at);
+                    }
+                }
+                b"require" if arg_nodes.len() == 1 && arg_nodes[0].as_string_node().is_some() => {
+                    let name = String::from_utf8_lossy(arg_nodes[0].as_string_node().unwrap().unescaped()).into_owned();
+                    // only Ruby sources are compiled in (.so/.bundle/.jar stay runtime requires)
+                    let found = if name.ends_with(".so") || name.ends_with(".bundle") || name.ends_with(".jar") || name.ends_with(".dll") {
+                        // a Ruby file standing in for a C extension (Kenny's overlay), never a real binary
+                        self.load_paths.iter().map(|d| d.join(&name)).find(|p| {
+                            p.is_file()
+                                && std::fs::read(p).is_ok_and(|b| {
+                                    let head = &b[..b.len().min(4)];
+                                    !(head == [0xcf, 0xfa, 0xed, 0xfe] || head == [0x7f, b'E', b'L', b'F'] || head == [0xca, 0xfe, 0xba, 0xbe] || head.starts_with(b"PK"))
+                                })
+                        })
+                    } else {
+                        self.load_paths.iter().map(|d| d.join(format!("{name}.rb"))).chain(
+                            self.load_paths.iter().map(|d| d.join(&name)).filter(|p| p.extension().is_some_and(|e| e == "rb")),
+                        ).find(|p| p.is_file())
+                    };
+                    if let Some(p) = found {
+                        return self.require_path(fx, p, at);
+                    }
+                }
+                b"binding" if arg_nodes.is_empty() && block.is_none() => {
+                    // captures self only; eval through it needs the runtime compiler
+                    self.needs_jit = true;
+                    let s = self.self_val(fx);
+                    return self.call(fx, "kn_binding_new", &[s]);
+                }
+                b"lambda" if arg_nodes.is_empty() && block.as_ref().is_some_and(|b| b.as_block_node().is_some()) => {
+                    let (p, _) = self.block_arg(fx, block, true);
+                    return p;
+                }
+                _ => {}
+            }
+        }
+
+        // `!x` / `not x`
+        if name == b"!" && arg_nodes.is_empty() && block.is_none() {
+            if let Some(r) = &recv_node {
+                let v = self.expr(fx, r);
+                let t = self.truthy(fx, v);
+                let tr = self.iconst(fx, QTRUE);
+                let fa = self.iconst(fx, QFALSE);
+                return fx.b.ins().select(t, fa, tr);
+            }
+        }
+
+        if matches!(name.as_slice(), b"eval" | b"class_eval" | b"module_eval" | b"instance_eval") && !arg_nodes.is_empty() {
+            self.needs_jit = true;
+        }
+
+        let recv = match &recv_node {
+            Some(r) => self.expr(fx, r),
+            None => self.self_val(fx),
+        };
+
+        // safe navigation: recv&.foo
+        let safe = c.is_safe_navigation();
+        let (safe_done, safe_cont) = if safe {
+            let done = fx.b.create_block();
+            fx.b.append_block_param(done, I64);
+            let cont = fx.b.create_block();
+            let is_nil = fx.b.ins().icmp_imm_s(IntCC::Equal, recv, QNIL);
+            let nil = self.nil(fx);
+            fx.b.ins().brif(is_nil, done, &[nil.into()], cont, &[]);
+            fx.b.switch_to_block(cont);
+            (Some(done), Some(cont))
+        } else {
+            (None, None)
+        };
+        let _ = safe_cont;
+
+        self.cur_offset = at_loc;
+        let result = if recv_node.is_some()
+            && arg_nodes.len() == 1
+            && block.is_none()
+            && is_fast_op(&name)
+            && arg_nodes[0].as_splat_node().is_none()
+            && arg_nodes[0].as_keyword_hash_node().is_none()
+        {
+            let a = self.expr(fx, &arg_nodes[0]);
+            self.binop(fx, &name, recv, a)
+        } else if c.is_variable_call() {
+            self.mark_loc(fx);
+            let cache = self.cache_ptr(fx, 3);
+            let mid = self.sym_val(fx, &name);
+            self.callc(fx, "kn_vcall", &[cache, recv, mid])
+        } else if let Some(v) = match &recv_node {
+            Some(r) if r.as_self_node().is_none() => self.inline_block_call(fx, c, recv),
+            _ => None,
+        } {
+            v
+        } else {
+            let args = self.eval_args(fx, c.arguments());
+            let forwards = arg_nodes.iter().any(|n| n.as_forwarding_arguments_node().is_some());
+            let no_block = block.is_none() && !forwards;
+            let (blk, literal) = if forwards && block.is_none() {
+                (self.forwarded_local(fx, b"&"), None)
+            } else {
+                self.block_arg(fx, block, false)
+            };
+            self.cur_offset = at_loc;
+            let explicit = recv_node.as_ref().is_some_and(|r| r.as_self_node().is_none());
+            let r = self.send_raw(fx, recv, &name, &args, if no_block { None } else { Some(blk) }, explicit);
+            let r = match literal {
+                Some(p) => self.catch_break(fx, r, p),
+                None => {
+                    self.check(fx, r);
+                    r
+                }
+            };
+            if c.is_attribute_write() && args.splat.is_none() {
+                *args.vals.last().unwrap_or(&r)
+            } else {
+                r
+            }
+        };
+        match safe_done {
+            Some(done) => {
+                fx.b.ins().jump(done, &[result.into()]);
+                fx.b.switch_to_block(done);
+                fx.b.block_params(done)[0]
+            }
+            None => result,
+        }
+    }
+
+    fn require_relative(&mut self, fx: &mut Fx, arg: &Node, at: usize) -> Value {
+        let rel = String::from_utf8_lossy(arg.as_string_node().unwrap().unescaped()).into_owned();
+        let base = self.file.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let mut full = base.join(&rel);
+        if full.extension().is_none() {
+            full.set_extension("rb");
+        }
+        self.require_path(fx, full, at)
+    }
+
+    fn require_path(&mut self, fx: &mut Fx, full: PathBuf, at: usize) -> Value {
+        let Some((fid, flag)) = self.require_file(full, at) else {
+            return self.iconst(fx, QFALSE);
+        };
+        // flag: 0 = not loaded, 1 = loaded, otherwise the thread loading it right now
+        // (kn_require_file waits for that thread, like CRuby's require)
+        let flagp = self.slot_ptr(fx, flag);
+        let st = fx.b.ins().load(I64, mem(), flagp, 0);
+        let loaded = fx.b.ins().icmp_imm_s(IntCC::Equal, st, 1);
+        let run = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        let f = self.iconst(fx, QFALSE);
+        fx.b.ins().brif(loaded, done, &[f.into()], run, &[]);
+        fx.b.switch_to_block(run);
+        let fa = self.fn_addr(fx, fid);
+        let r = self.call(fx, "kn_require_file", &[flagp, fa]);
+        self.check(fx, r);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    // ---------- compound assignment on calls ----------
+
+    fn recv_or_self(&mut self, fx: &mut Fx, r: Option<Node>) -> Value {
+        match r {
+            Some(n) => self.expr(fx, &n),
+            None => self.self_val(fx),
+        }
+    }
+    pub(crate) fn call_op_write(&mut self, fx: &mut Fx, n: &CallOperatorWriteNode) -> Value {
+        let recv = self.recv_or_self(fx, n.receiver());
+        let cur = self.send(fx, recv, n.read_name().as_slice(), &[], None);
+        let rhs = self.num_expr(fx, &n.value(), true);
+        let v = self.binop_rhs(fx, n.binary_operator().as_slice(), cur, rhs);
+        self.send(fx, recv, n.write_name().as_slice(), &[v], None);
+        v
+    }
+    pub(crate) fn call_or_write(&mut self, fx: &mut Fx, n: &CallOrWriteNode, _or: bool) -> Value {
+        let recv = self.recv_or_self(fx, n.receiver());
+        let cur = self.send(fx, recv, n.read_name().as_slice(), &[], None);
+        let value = n.value();
+        let wn = n.write_name().as_slice().to_vec();
+        self.or_assign(fx, cur, |c, fx| {
+            let v = c.expr(fx, &value);
+            c.send(fx, recv, &wn, &[v], None);
+            v
+        })
+    }
+    pub(crate) fn call_and_write(&mut self, fx: &mut Fx, n: &CallAndWriteNode) -> Value {
+        let recv = self.recv_or_self(fx, n.receiver());
+        let cur = self.send(fx, recv, n.read_name().as_slice(), &[], None);
+        let value = n.value();
+        let wn = n.write_name().as_slice().to_vec();
+        self.and_assign(fx, cur, |c, fx| {
+            let v = c.expr(fx, &value);
+            c.send(fx, recv, &wn, &[v], None);
+            v
+        })
+    }
+    fn index_args(&mut self, fx: &mut Fx, a: Option<ArgumentsNode>) -> Vec<Value> {
+        match a {
+            Some(a) => a.arguments().iter().map(|n| self.expr(fx, &n)).collect(),
+            None => vec![],
+        }
+    }
+    pub(crate) fn index_op_write(&mut self, fx: &mut Fx, n: &IndexOperatorWriteNode) -> Value {
+        let recv = self.recv_or_self(fx, n.receiver());
+        let mut args = self.index_args(fx, n.arguments());
+        let cur = self.send(fx, recv, b"[]", &args, None);
+        let rhs = self.num_expr(fx, &n.value(), true);
+        let v = self.binop_rhs(fx, n.binary_operator().as_slice(), cur, rhs);
+        args.push(v);
+        self.send(fx, recv, b"[]=", &args, None);
+        v
+    }
+    pub(crate) fn index_or_write(&mut self, fx: &mut Fx, n: &IndexOrWriteNode) -> Value {
+        let recv = self.recv_or_self(fx, n.receiver());
+        let args = self.index_args(fx, n.arguments());
+        let cur = self.send(fx, recv, b"[]", &args, None);
+        let value = n.value();
+        self.or_assign(fx, cur, |c, fx| {
+            let v = c.expr(fx, &value);
+            let mut a = args.clone();
+            a.push(v);
+            c.send(fx, recv, b"[]=", &a, None);
+            v
+        })
+    }
+    pub(crate) fn index_and_write(&mut self, fx: &mut Fx, n: &IndexAndWriteNode) -> Value {
+        let recv = self.recv_or_self(fx, n.receiver());
+        let args = self.index_args(fx, n.arguments());
+        let cur = self.send(fx, recv, b"[]", &args, None);
+        let value = n.value();
+        self.and_assign(fx, cur, |c, fx| {
+            let v = c.expr(fx, &value);
+            let mut a = args.clone();
+            a.push(v);
+            c.send(fx, recv, b"[]=", &a, None);
+            v
+        })
+    }
+
+    // ---------- super / yield ----------
+
+    fn do_super(&mut self, fx: &mut Fx, args: Args, blk: Value, at: usize) -> Value {
+        let _ = at;
+        let Some(m) = fx.method.clone() else {
+            // e.g. inside define_method { super(...) }: resolved at runtime
+            let s = self.self_val(fx);
+            let ary = match args.splat {
+                Some(a) => a,
+                None => {
+                    let n = self.iconst(fx, args.vals.len() as i64);
+                    let buf = self.args_buf(fx, &args.vals);
+                    self.call(fx, "kn_ary_new", &[n, buf])
+                }
+            };
+            return self.callc(fx, "kn_super_dyn", &[s, ary, blk]);
+        };
+        let slot = self.slot_ptr(fx, m.owner_slot);
+        let s = self.self_val(fx);
+        let mid = self.sym_val(fx, &m.name);
+        if let Some(pv) = fx.proc_v {
+            // `super` in a block inside a method: if that block has become a method body
+            // (`define_method(:x) { super(v) }` in a method), it means the new method's super
+            let ary = match args.splat {
+                Some(a) => a,
+                None => {
+                    let n = self.iconst(fx, args.vals.len() as i64);
+                    let buf = self.args_buf(fx, &args.vals);
+                    self.call(fx, "kn_ary_new", &[n, buf])
+                }
+            };
+            let p = fx.b.use_var(pv);
+            return self.callc(fx, "kn_super_blk", &[p, slot, s, mid, ary, blk]);
+        }
+        match args.splat {
+            Some(a) => self.callc(fx, "kn_super_splat", &[slot, s, mid, a, blk]),
+            None => {
+                let n = self.iconst(fx, args.vals.len() as i64);
+                let buf = self.args_buf(fx, &args.vals);
+                self.callc(fx, "kn_super", &[slot, s, mid, n, buf, blk])
+            }
+        }
+    }
+    pub(crate) fn super_node(&mut self, fx: &mut Fx, s: &SuperNode) -> Value {
+        let at = s.location().start_offset();
+        let args = self.eval_args(fx, s.arguments());
+        let blk = match s.block() {
+            Some(b) => self.block_arg(fx, Some(b), false).0,
+            None => self.method_block(fx),
+        };
+        self.do_super(fx, args, blk, at)
+    }
+    pub(crate) fn zsuper_node(&mut self, fx: &mut Fx, s: &ForwardingSuperNode) -> Value {
+        let at = s.location().start_offset();
+        let (params, depth) = if fx.kind == ScopeKind::Method {
+            (fx.zsuper.clone(), 0u32)
+        } else {
+            match fx.method.clone() {
+                Some(m) => (m.params, (fx.scope - m.scope) as u32),
+                None => return self.unsupported(fx, at, "super called outside of a method"),
+            }
+        };
+        let zero = self.iconst(fx, 0);
+        let ary = self.call(fx, "kn_ary_new", &[zero, zero]);
+        let mut kw: Option<Value> = None;
+        for (name, kind) in &params {
+            let v = self.local_get(fx, name, depth);
+            match kind {
+                0 => {
+                    self.call(fx, "kn_ary_push", &[ary, v]);
+                }
+                1 => {
+                    self.callc(fx, "kn_ary_concat_splat", &[ary, v]);
+                }
+                2 => {
+                    let h = match kw {
+                        Some(h) => h,
+                        None => {
+                            let one = self.iconst(fx, 1);
+                            let h = self.call(fx, "kn_hash_new", &[zero, zero, one]);
+                            kw = Some(h);
+                            h
+                        }
+                    };
+                    let key = self.sym_val(fx, name);
+                    let two = self.iconst(fx, 2);
+                    let buf = self.args_buf(fx, &[key, v]);
+                    let pair = self.call(fx, "kn_hash_new", &[two, buf, zero]);
+                    self.callc(fx, "kn_hash_merge_splat", &[h, pair]);
+                }
+                _ => {
+                    let h = match kw {
+                        Some(h) => h,
+                        None => {
+                            let one = self.iconst(fx, 1);
+                            let h = self.call(fx, "kn_hash_new", &[zero, zero, one]);
+                            kw = Some(h);
+                            h
+                        }
+                    };
+                    self.callc(fx, "kn_hash_merge_splat", &[h, v]);
+                }
+            }
+        }
+        if let Some(h) = kw {
+            self.call(fx, "kn_ary_push", &[ary, h]);
+        }
+        let blk = match s.block() {
+            Some(b) => self.block_arg(fx, Some(b.as_node()), false).0,
+            None => self.method_block(fx),
+        };
+        self.do_super(fx, Args { vals: vec![], splat: Some(ary) }, blk, at)
+    }
+
+    pub(crate) fn yield_node(&mut self, fx: &mut Fx, y: &YieldNode) -> Value {
+        let blk = self.method_block(fx);
+        let args = self.eval_args(fx, y.arguments());
+        match args.splat {
+            Some(a) => self.callc(fx, "kn_yield_splat", &[blk, a]),
+            None => {
+                let n = self.iconst(fx, args.vals.len() as i64);
+                let buf = self.args_buf(fx, &args.vals);
+                self.callc(fx, "kn_yield", &[blk, n, buf])
+            }
+        }
+    }
+}

@@ -1,0 +1,422 @@
+-- pack
+"\x01\x02\xFF"
+"\xFF\xFF\xFF\xFF"
+"\x00\x00\x00\x01\x02\x00\x00\x00"
+"\x00\x01\x02\x00"
+"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFE\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+10
+8
+8
+"abc\x00\x00"
+"abc  "
+"abc\x00"
+"abc"
+"AB"
+"AB"
+"A@"
+"A"
+"hé😀"
+"\x82,\x00"
+"\x00\x00\xC0?"
+"?\xF8\x00\x00\x00\x00\x00\x00"
+8
+"\x01\x00\x02"
+"\x01\x03"
+"\x01\x00\x00"
+"aGVsbG8gd29ybGQ=\n"
+"aGVsbG8gd29ybGQ="
+"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4\neHh4eHh4eHh4eHh4eHh4eHh4eHg=\n"
+"caf=C3=A9 =3D 1\tok=\n"
+"#86)C\n"
+"head:AB"
+"too few arguments"
+"no implicit conversion of String into Integer"
+-- unpack
+[1, 2, 3, 4]
+[513, 1027]
+[16909060]
+[-1]
+[65534]
+[18446744073709551615, nil]
+["abc"]
+["ab", "cd"]
+["ab", "ef"]
+["b"]
+["4142"]
+["1424"]
+["0100000101000010"]
+["1000001001000010"]
+["0100"]
+[104, 233, 108, 108, 111]
+[300, 0]
+"hello world"
+"hi"
+"= caf\xC3\xA9 ok"
+["abc"]
+1.5
+[3.25, -1.0]
+[3]
+[nil]
+#<Encoding:ASCII-8BIT>
+#<Encoding:ASCII-8BIT>
+#<Encoding:UTF-8>
+"invalid base64"
+-- base64
+"aGVsbG8gd29ybGQ="
+"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4\neHh4eHh4eHh4eHh4eHh4\n"
+"hello world"
+"__79Pj8="
+"YWI"
+"\xFF\xFE\xFD>?"
+"round trip é"
+-- inspect/encoding
+"\u0000\u0001\e\u007F"
+"\a\b\v\f"
+"\xFF\xFE"
+"café\xFF"
+#<Encoding:ASCII-8BIT>
+#<Encoding:UTF-8>
+#<Encoding:ASCII-8BIT>
+#<Encoding:US-ASCII>
+#<Encoding:UTF-8>
+#<Encoding:UTF-8>
+-- Kernel
+via Kernel.puts
+"003.1"
+31
+2.5
+"kernel raise"
+0
+nil
+-1
+{}
+{}
+{a: 1}
+{1 => 2}
+true
+true
+2
+[:@x, :@z]
+nil
+"instance variable @nope not defined"
+42
+42
+true
+true
+"nil"
+true
+7
+6
+-- Math
+4.0
+3.0
+5.0
+0.0
+0.0
+0.5493061443
+0.0
+1.0
+24.0
+1.7724538509
+[0.6931471805599454, 1]
+[0.6025390625, 11]
+1234.0
+"Numerical argument is out of domain - \"atanh\""
+-- Array
+2
+nil
+[2, :b]
+nil
+[[1, 1], [1, 2], [1, 3], [2, 2], [2, 3], [3, 3]]
+[[0, 0], [0, 1], [1, 0], [1, 1]]
+[[]]
+[4, 1, 2, 3]
+[4, 1, 2, 3]
+[4, 1, 2, 3]
+[1]
+nil
+[1, 2.0]
+["APPLE", "CAT"]
+[1, 3]
+[[true, [3, 1]], [false, [4]], [true, [1, 5, 9]], [false, [2, 6]]]
+[[1, 2, 6, 7, 8], [10]]
+[[1, 2], [3, 4]]
+[["a", "b"], ["#", "c", "d"], ["#", "e"]]
+[[1], [2, 3]]
+[[[1], 0]]
+-- Enumerable/Enumerator
+[[true, [1]], [true, [3]], [true, [5]]]
+[3, 4, 5]
+[10, 40]
+[1, 2, 3, 4, 5]
+[1, 2, 3]
+[1, 2, 4, 8, 16, 32]
+[0, 1, 1, 2, 3]
+[3, 2, 1, 0]
+[1]
+[2]
+[1, 4, 9]
+-- numbers
+true
+1.0
+true
+3.5
+0
+3.141592653589793
+0
+3.141592653589793
+3
+4
+3
+1
+true
+false
+true
+[6, 36]
+9
+6.25
+true
+0
+[3, 3.141592653589793]
+[5, 0]
+-- Hash
+true
+true
+false
+true
+false
+{a: 1}
+nil
+false
+true
+"abab"
+{ab: "abab"}
+[:a, [1, 2], :b, 3]
+[:a, 1, [2]]
+:b
+[:a, 1]
+nil
+true
+[1, 2, nil]
+true
+nil
+-- Module
+-1
+1
+nil
+1
+0
+[:@@cv]
+1
+[]
+5
+false
+true
+false
+false
+[]
+true
+nil
+-- nil/true/Proc
+true
+false
+nil
+true
+true
+false
+true
+4
+5
+true
+-- Range
+8
+2.5
+1001
+[1, 10]
+[1.0, 1.25, 1.5, 1.75, 2.0]
+["a", "e"]
+-- Regexp/MatchData
+#<Encoding:US-ASCII>
+#<Encoding:UTF-8>
+false
+/x/
+nil
+true
+true
+true
+false
+-- String
+"hé"
+"é"
+nil
+"a"
+"é"
+[104, 233, 33]
+[97, 98]
+["é", "a", "🇫🇷", "\r\n"]
+["a", "b"]
+"heo"
+"heo"
+nil
+"bo"
+nil
+"bo"
+"bo"
+"bb"
+"bb"
+"bb"
+"hippo"
+"hippo"
+nil
+"xdd"
+"hero"
+"AB"
+"xb"
+"xb"
+65
+"Abc"
+"hello "
+"w"
+"o"
+"w"
+"rl"
+"w"
+"d"
+"w"
+nil
+true
+"x"
+"x"
+"x"
+"a\nbé"
+"A\\101"
+"\"caf\\u00E9\\n\""
+"café\n"
+"s"
+nil
+-- Struct
+20
+nil
+1
+3
+3
+[[:x, 1], [:y, {k: [10, 20]}], [:z, nil]]
+[1]
+[nil]
+[1, nil]
+-- Symbol
+true
+0
+true
+nil
+#<Encoding:US-ASCII>
+#<Encoding:UTF-8>
+:ba
+"ell"
+:hEllO
+true
+-- Thread
+true
+false
+false
+1
+:dflt
+"blk missing"
+"key not found: :missing"
+[:tv]
+:handled
+true
+false
+false
+-- Fiber
+"created"
+"suspended"
+"terminated"
+-- Time
+2000-01-02 03:04:05.5 UTC
+"2000-01-02 03:04:05 UTC"
+2000
+1
+2
+3
+4
+5
+500000
+500000000
+0.5
+true
+false
+0
+2
+true
+true
+0
+"UTC"
+false
+[5, 4, 3, 2, 1, 2000, 0, 2, false, "UTC"]
+"Sun Jan  2 03:04:05 2000"
+"Sun Jan  2 03:04:05 2000"
+"2000-01-02T03:04:05Z"
+"2000-01-02T03:04:05.500Z"
+"2000-01-02T03:04:05.500+00:00"
+2000-01-02 03:04:05.75 UTC
+2000-01-02 03:04:05 UTC
+3
+11045.5
+6
+2000-01-02 03:04:06 UTC
+2000-01-02 03:04:05 UTC
+2000-01-02 03:04:06 UTC
+123000000
+true
+true
+true
+-1
+"2000-02-29 00:00:00 UTC"
+946684799
+2024-05-06 07:08:09 +0900
+32400
+nil
+7
+"2024-05-05 22:08:09 UTC"
+true
+false
+"-0530 -05:30 -05:30:00"
+true
+"1970-01-01 00:00:00 UTC"
+"1970-01-01 00:00:01.5 UTC"
+"1970-01-01 01:00:00.5 +0100"
+123456789
+5
+"2000-01-01 02:00:00 +0200"
+23
+"2001-02-03 04:05:06.75 +0000"
+"2001-02-03 04:05:06 UTC"
+2020
+6
+15
+12
+true
+true
+true
+"mon out of range"
+-- Random/SecureRandom
+true
+42
+5
+#<Encoding:ASCII-8BIT>
+true
+true
+true
+true
+4
+true
+true
+true
+8
+true
+true
+true
+3
+"invalid argument - -1"
+[[[1], []]]

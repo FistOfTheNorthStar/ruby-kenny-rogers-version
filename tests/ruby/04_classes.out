@@ -1,0 +1,42 @@
+Rex the beagle says Woof
+Dog(Rex)
+1
+"yip"
+[Puppy, Loud, Dog, Animal]
+Animal
+true
+#<UnboundMethod: Dog#speak>
+Amy
+["Amy", "Zed"]
+true
+false
+(4, 6)
+true
+#<Point 14,6>
+true
+false
+"got thing"
+true
+true
+NoMethodError: undefined method 'unknown' for an instance of Meta
+#<struct S a=1, b=2>
+3
+[1, 2]
+true
+10
+[1, 2, 3]
+[6, 2, 4]
+true
+3
+3
+[3, 1, 2]
+hello you
+>> hi from Person
+>>
+1
+Counter
+true
+true
+false
+"singleton!"
+[:special]
