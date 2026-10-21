@@ -14,6 +14,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 pub const FL_MARK: u32 = 4;
+/// An old object already in the remembered set (cleared when a collection consumes it), so
+/// repeated stores into it are recorded once.
+pub const FL_REMEMBERED: u32 = 1 << 21;
 /// The object's identity was observed (object_id, identity hash): it never moves.
 pub const FL_ID: u32 = 1 << 24;
 /// (compacting collection) Reached from a root, a stack or other place the GC can't update.
@@ -747,8 +750,12 @@ pub fn remember(kind: u8, p: usize) {
 /// instance variables): an old object is rescanned by the next minor collection.
 #[inline]
 pub fn wb_obj(v: V) {
-    if is_heap(v) && hdr(v).flags & FL_MARK != 0 {
-        remember(REM_OBJ, v as usize);
+    if is_heap(v) && hdr(v).flags & (FL_MARK | FL_REMEMBERED) == FL_MARK {
+        // (atomic: another OS thread may be setting other bits of the same header)
+        let f = unsafe { std::sync::atomic::AtomicU32::from_ptr(&mut hdr(v).flags) };
+        if f.fetch_or(FL_REMEMBERED, Ordering::Relaxed) & FL_REMEMBERED == 0 {
+            remember(REM_OBJ, v as usize);
+        }
     }
 }
 /// C-extension data objects (their mark functions see values the barrier can't): scanned by
@@ -2083,7 +2090,12 @@ fn collect_locked() {
                         }
                     }
                 }
-                _ => m.trace(p as V),
+                _ => {
+                    if kind == REM_OBJ {
+                        hdr(p as V).flags &= !FL_REMEMBERED;
+                    }
+                    m.trace(p as V)
+                }
             }
         }
         phase("remembered", &mut lap);
@@ -2103,6 +2115,7 @@ fn collect_locked() {
                 REM_KMAP => unsafe { &*(p as *const crate::khash::KMap) }.clear_remembered(),
                 REM_CMAP_VALUES => unsafe { &*(p as *const CMap<u32, V>) }.clear_remembered(),
                 REM_CMAP_METHODS => unsafe { &*(p as *const CMap<u32, *const Method>) }.clear_remembered(),
+                REM_OBJ => hdr(p as V).flags &= !FL_REMEMBERED,
                 _ => {}
             }
         }

@@ -341,5 +341,6 @@ pub fn compile(src: &[u8], mode: EvalMode, file: &str, symbols: &[(&'static str,
 pub fn required_symbols() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = RUNTIME.iter().map(|(n, _, _)| *n).filter(|n| !n.starts_with("kn_start")).collect();
     v.push("KN_GC_PENDING");
+    v.push("KN_DIRECT");
     v
 }

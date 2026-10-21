@@ -21,6 +21,8 @@ pub fn multi() -> bool {
 }
 pub fn set_multi() {
     MULTI.store(true, Ordering::SeqCst);
+    // direct calls from compiled code check one global stack limit: only for one P
+    crate::core::KN_DIRECT.call_limit.store(usize::MAX, Ordering::SeqCst);
 }
 pub fn set_in_sweep(b: bool) {
     IN_SWEEP.store(b, Ordering::Relaxed);

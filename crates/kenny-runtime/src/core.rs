@@ -407,9 +407,10 @@ pub fn range_new(lo: V, hi: V, excl: bool) -> V {
     r
 }
 pub fn object_new(klass: *mut Class) -> V {
-    // instances usually get the same ivars as earlier ones: size the buffer for them up front
+    // instances usually get the same ivars as earlier ones: make room for them up front,
+    // as unset slots (UNDEF), so setting one is a plain store (also from compiled code)
     let n = if klass.is_null() { 0 } else { unsafe { (*klass).ivar_names.len() } };
-    alloc(RObject { h: header(klass, Kind::Object), shape: klass, ivars: SVec::with_capacity(n) })
+    alloc(RObject { h: header(klass, Kind::Object), shape: klass, ivars: SVec::from(vec![UNDEF; n]) })
 }
 pub fn int_from_big(n: BigInt) -> V {
     use num_traits::ToPrimitive;
@@ -710,6 +711,9 @@ pub struct Method {
     /// loops, like `loop`, `sleep`, `Queue#pop`): it is called directly instead of through
     /// `call_native`, so a thread waiting in it doesn't stop the GC from moving objects.
     pub gc_transparent: bool,
+    /// attr_reader/attr_writer: (receiver class << 16) | the ivar's slot index for the last
+    /// two classes it ran on (0 = none), so a call needn't look the slot up by name.
+    pub attr_slot: [std::sync::atomic::AtomicU64; 2],
 }
 
 pub const VIS_PUBLIC: u8 = 0;
@@ -729,16 +733,70 @@ pub struct CallCache {
     pub entry: std::sync::atomic::AtomicPtr<CacheEntry>,
     /// Misses after several threads started; past a limit the site stops caching (megamorphic).
     pub misses: u64,
-    pub _spare: u64,
+    /// For compiled code's inline attribute access in loops: (receiver class << 16) | ivar
+    /// index once this site has reached an attr_reader/attr_writer it may use, else 0.
+    /// Cleared whenever the method serial changes (see `opt::kn_attr_get`).
+    pub attr: std::sync::atomic::AtomicU64,
 }
 /// Up to `IC_WAYS` receiver classes and their methods (a polymorphic inline cache), valid
 /// while the method serial is unchanged.
 pub const IC_WAYS: usize = 4;
+/// (`repr(C)`: compiled code reads `serial`, `klass` and `direct`; kenny-compiler
+/// fastpath.rs `direct_call`.)
+#[repr(C)]
 pub struct CacheEntry {
     pub serial: u64,
     pub n: usize,
     pub klass: [*mut Class; IC_WAYS],
     pub method: [*const Method; IC_WAYS],
+    /// For each way: the compiled function of a `Body::Compiled` method, with the low bit
+    /// set for a private one; 0 for anything else. Compiled code calls it directly.
+    pub direct: [usize; IC_WAYS],
+    /// For each way: an attr_reader/attr_writer's ivar slot in the class's objects, as
+    /// `slot << 8 | 4 | writer << 1 | private`; 0 for anything else (see `attr_of`).
+    pub attr: [u64; IC_WAYS],
+}
+/// `CacheEntry::attr` for method `m` found for receivers of class `k`: for plain classes
+/// only (an object's slot table is the class it was allocated from, which compiled code
+/// checks is its class), and for a reader only once the class has the ivar.
+pub fn attr_of(k: *mut Class, m: *const Method) -> u64 {
+    if m.is_null() || k.is_null() || unsafe { (*k).is_singleton } {
+        return 0;
+    }
+    let private = (unsafe { (*m).vis } == VIS_PRIVATE) as u64;
+    let (slot, writer) = match unsafe { &(*m).body } {
+        Body::AttrReader(iv) => match shape_index(unsafe { &*k }, *iv) {
+            Some(i) => (i as u64, 0),
+            None => return 0,
+        },
+        Body::AttrWriter(iv) => (ivar_index_for(k, *iv) as u64, 2),
+        // builtin nil? / is_a? (kind_of?): answered by the direct-call stub
+        Body::Native(..) => {
+            return match unsafe { (*m).opt } {
+                crate::opt::OPT_NIL_P => ATTR_NIL_P | private,
+                crate::opt::OPT_IS_A => ATTR_IS_A | private,
+                _ => 0,
+            };
+        }
+        _ => return 0,
+    };
+    if slot >= 1 << 48 {
+        return 0;
+    }
+    slot << 8 | 4 | writer | private
+}
+/// `CacheEntry::attr` tags of builtin methods compiled code answers itself.
+pub const ATTR_NIL_P: u64 = 8;
+pub const ATTR_IS_A: u64 = 16;
+/// `CacheEntry::direct` for method `m`.
+pub fn direct_of(m: *const Method) -> usize {
+    if m.is_null() {
+        return 0;
+    }
+    match unsafe { &(*m).body } {
+        Body::Compiled(f) if *f as usize & 1 == 0 => *f as usize | (unsafe { (*m).vis } == VIS_PRIVATE) as usize,
+        _ => 0,
+    }
 }
 
 // ---------- pending throws (exceptions and non-local control flow) ----------
@@ -940,6 +998,83 @@ pub fn new_pstate() -> *mut PState {
 
 /// Method-table version: bumped whenever method lookup could change; call caches compare it.
 pub static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// What compiled code checks before calling a method directly (kenny-compiler fastpath.rs
+/// `direct_call`): a copy of `SERIAL`, and the stack limit while only one OS thread runs
+/// Ruby code (then it is this P's `stack_limit`; usize::MAX otherwise, which sends every
+/// call through the runtime, where `pst()` gives the right limit).
+#[repr(C)]
+pub struct KnDirect {
+    pub serial: std::sync::atomic::AtomicU64,
+    pub call_limit: std::sync::atomic::AtomicUsize,
+    /// Core methods compiled code may skip calling while they are the builtin ones:
+    /// `DIRECT_SYM_EQ` (Symbol#==), `DIRECT_NIL_P` (nil? of every class of immediate
+    /// values), `DIRECT_IS_A` (is_a? and kind_of? of those classes).
+    pub flags: std::sync::atomic::AtomicU64,
+    /// A copy of `CONST_SERIAL` (constant caches, abi.rs `ConstEntry`).
+    pub const_serial: std::sync::atomic::AtomicU64,
+}
+#[unsafe(no_mangle)]
+pub static KN_DIRECT: KnDirect = KnDirect {
+    serial: std::sync::atomic::AtomicU64::new(1),
+    call_limit: std::sync::atomic::AtomicUsize::new(usize::MAX),
+    flags: std::sync::atomic::AtomicU64::new(0),
+    const_serial: std::sync::atomic::AtomicU64::new(1),
+};
+pub const DIRECT_SYM_EQ: u64 = 1;
+pub const DIRECT_NIL_P: u64 = 2;
+pub const DIRECT_IS_A: u64 = 4;
+/// Set once the builtin methods are tagged (opt.rs `init`).
+pub static DIRECT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `KN_DIRECT.flags` is 0 until recomputed (methods changed): on the next inline cache
+/// miss (`abi::dispatch_miss`, a Ruby thread with a method cache, not inside a collection).
+pub static DIRECT_FLAGS_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Methods changed: no core method may be skipped until `update_direct_flags` checks again.
+pub fn invalidate_direct_flags() {
+    use std::sync::atomic::Ordering::SeqCst;
+    KN_DIRECT.flags.store(0, SeqCst);
+    DIRECT_FLAGS_DIRTY.store(true, SeqCst);
+}
+#[inline(never)]
+pub fn update_direct_flags() {
+    use std::sync::atomic::Ordering::SeqCst;
+    if !DIRECT_READY.load(SeqCst) {
+        return;
+    }
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    DIRECT_FLAGS_DIRTY.store(false, SeqCst);
+    static IDS: std::sync::OnceLock<[u32; 4]> = std::sync::OnceLock::new();
+    let [eq, nil_p, is_a, kind_of] = *IDS.get_or_init(|| [sym("=="), sym("nil?"), sym("is_a?"), sym("kind_of?")]);
+    let c = rt().c;
+    let is = |k: *mut Class, mid: u32, opt: u8| {
+        let m = find_method(k, mid);
+        !m.is_null() && unsafe { (*m).opt } == opt
+    };
+    let imm = [c.integer, c.float, c.symbol, c.nil, c.true_, c.false_];
+    let mut flags = 0;
+    if is(c.symbol, eq, crate::opt::OPT_IDENTITY_EQ) {
+        flags |= DIRECT_SYM_EQ;
+    }
+    if imm.iter().all(|&k| is(k, nil_p, crate::opt::OPT_NIL_P)) {
+        flags |= DIRECT_NIL_P;
+    }
+    if imm.iter().all(|&k| is(k, is_a, crate::opt::OPT_IS_A) && is(k, kind_of, crate::opt::OPT_IS_A)) {
+        flags |= DIRECT_IS_A;
+    }
+    KN_DIRECT.flags.store(flags, SeqCst);
+    // changed again meanwhile: what we found may be stale
+    if DIRECT_FLAGS_DIRTY.load(SeqCst) {
+        KN_DIRECT.flags.store(0, SeqCst);
+    }
+}
+
+/// Set the running stack's limit (`PState::stack_limit`), for direct calls too.
+pub fn set_stack_limit(limit: usize) {
+    pst().stack_limit = limit;
+    let l = if crate::mt::multi() { usize::MAX } else { limit };
+    KN_DIRECT.call_limit.store(l, std::sync::atomic::Ordering::SeqCst);
+}
 #[inline(always)]
 pub fn serial() -> u64 {
     SERIAL.load(std::sync::atomic::Ordering::Acquire)
@@ -1105,7 +1240,10 @@ pub fn class_name(c: *mut Class) -> String {
 }
 
 pub fn bump_serial() {
-    SERIAL.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let s = SERIAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    KN_DIRECT.serial.store(s, std::sync::atomic::Ordering::SeqCst);
+    crate::opt::clear_attr_sites();
+    invalidate_direct_flags();
     bump_const_serial(); // include/prepend change constant lookup too
 }
 
@@ -1117,7 +1255,8 @@ pub fn const_serial() -> u64 {
     CONST_SERIAL.load(std::sync::atomic::Ordering::Acquire)
 }
 pub fn bump_const_serial() {
-    CONST_SERIAL.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let s = CONST_SERIAL.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+    KN_DIRECT.const_serial.store(s, std::sync::atomic::Ordering::Release);
 }
 
 /// Ancestors in method-resolution order (a copy; see `ancestors_rc`).
@@ -1347,7 +1486,7 @@ fn find_super_method_uncached(klass: *mut Class, owner: *mut Class, mid: u32) ->
 }
 
 pub fn add_method(c: *mut Class, mid: u32, body: Body) -> *const Method {
-    let m = Box::into_raw(Box::new(Method { body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: false })) as *const Method;
+    let m = Box::into_raw(Box::new(Method { body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: false, attr_slot: Default::default() })) as *const Method;
     unsafe {
         (*c).methods.insert(mid, m);
     }

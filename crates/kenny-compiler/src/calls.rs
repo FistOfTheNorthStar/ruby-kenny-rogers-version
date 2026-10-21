@@ -69,7 +69,7 @@ impl<M: Module> Compiler<M> {
         let cache = self.owned_cache_ptr(fx, OWNED_CALL);
         let mid = self.sym_val(fx, name);
         if blk.is_none() && args.splat.is_none() && args.vals.len() <= 2 && self.refine_scope.is_none() {
-            return self.send_simple(fx, cache, recv, mid, &args.vals, explicit);
+            return self.send_simple(fx, cache, recv, name, mid, &args.vals, explicit);
         }
         let blk = match blk {
             Some(b) => b,
@@ -342,7 +342,26 @@ impl<M: Module> Compiler<M> {
             self.mark_loc(fx);
             let cache = self.owned_cache_ptr(fx, OWNED_CALL);
             let mid = self.sym_val(fx, &name);
-            self.callc(fx, "kn_vcall", &[cache, recv, mid])
+            let (inline, stub) = crate::fastpath::direct_plan(&name, !fx.loops.is_empty());
+            let plain = move |c: &mut Self, fx: &mut Fx, rt: &'static str, args: &[Value]| -> Value {
+                if inline && rt == "kn_vcall" {
+                    c.direct_call(fx, cache, recv, &[], false, |c, fx| c.call(fx, rt, args))
+                } else if (inline || stub) && rt == "kn_attr_get" {
+                    c.call_stub(fx, crate::fastpath::STUB_ATTR_GET, args)
+                } else if stub && rt == "kn_vcall" {
+                    c.call_stub(fx, crate::fastpath::STUB_VCALL, args)
+                } else {
+                    c.call(fx, rt, args)
+                }
+            };
+            let r = if !fx.loops.is_empty() && crate::fastpath::attr_name(&name) {
+                let mode = self.iconst(fx, 2);
+                self.attr_fast(fx, cache, recv, None, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, mode]))
+            } else {
+                plain(self, fx, "kn_vcall", &[cache, recv, mid])
+            };
+            self.check(fx, r);
+            r
         } else if let Some(v) = match &recv_node {
             Some(r) if r.as_self_node().is_none() => self.inline_block_call(fx, c, recv),
             _ => None,

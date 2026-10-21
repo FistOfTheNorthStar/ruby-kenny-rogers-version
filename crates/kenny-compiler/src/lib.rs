@@ -118,6 +118,10 @@ pub(crate) struct Fx<'a> {
     /// Unboxed shadows of register locals assigned from arithmetic: (raw f64, kind) with
     /// kind 0 = the tagged variable is current, 1 = only the raw f64 is, 2 = both.
     pub num_locals: HashMap<Vec<u8>, (Variable, Variable)>,
+    /// Locals that only ever get Integers (analysis::int_locals), and values read from
+    /// them or computed from such values: a hint that a Float path is the unlikely one.
+    pub int_locals: HashSet<Vec<u8>>,
+    pub int_vals: HashSet<Value>,
 }
 
 pub struct Compiler<M: Module> {
@@ -134,6 +138,10 @@ pub struct Compiler<M: Module> {
     pub(crate) syms_id: DataId,
     pub(crate) strs_id: DataId,
     pub(crate) gc_flag_id: DataId,
+    /// kenny-runtime core.rs `KN_DIRECT` (method serial copy, direct-call stack limit).
+    pub(crate) direct_id: DataId,
+    /// This module's direct-call stubs (fastpath.rs `direct_stub`), by kind.
+    pub(crate) direct_stubs: HashMap<u8, FuncId>,
     /// Source offset of the node being compiled (for call-site locations).
     pub(crate) cur_offset: usize,
     pub(crate) fn_counter: usize,
@@ -301,6 +309,10 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_send0", &[I64, I64, I64, I64], &[I64]),
     ("kn_send1", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_send2", &[I64, I64, I64, I64, I64, I64], &[I64]),
+    ("kn_attr_get", &[I64, I64, I64, I64], &[I64]),
+    ("kn_is_a", &[I64, I64], &[I64]),
+    ("kn_is_a_fill", &[I64, I64, I64], &[I64]),
+    ("kn_attr_set", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_opt_check", &[I64, I64, I64, I64], &[I64]),
     ("kn_ary_at", &[I64, I64], &[I64]),
     ("kn_autosplat", &[I64], &[I64]),
@@ -387,6 +399,7 @@ impl<M: Module> Compiler<M> {
         let syms_id = module.declare_data("__kn_syms", Linkage::Local, true, false).map_err(|e| e.to_string())?;
         let strs_id = module.declare_data("__kn_strs", Linkage::Local, false, false).map_err(|e| e.to_string())?;
         let gc_flag_id = module.declare_data("KN_GC_PENDING", Linkage::Import, true, false).map_err(|e| e.to_string())?;
+        let direct_id = module.declare_data("KN_DIRECT", Linkage::Import, true, false).map_err(|e| e.to_string())?;
         Ok(Compiler {
             module,
             rt,
@@ -399,6 +412,8 @@ impl<M: Module> Compiler<M> {
             syms_id,
             strs_id,
             gc_flag_id,
+            direct_id,
+            direct_stubs: HashMap::new(),
             cur_offset: 0,
             fn_counter: 0,
             scopes: Vec::new(),

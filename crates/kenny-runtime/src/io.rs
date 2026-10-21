@@ -3759,7 +3759,7 @@ pub fn init() {
     fn ivar_list_all(v: V) -> Vec<(u32, V)> {
         let o = obj(v);
         let shape = unsafe { &*o.shape };
-        o.ivars.iter().enumerate().filter(|(i, _)| *i < shape.ivar_names.len()).map(|(i, &x)| (shape.ivar_names[i], x)).collect()
+        o.ivars.iter().enumerate().filter(|&(i, &x)| i < shape.ivar_names.len() && x != UNDEF).map(|(i, &x)| (shape.ivar_names[i], x)).collect()
     }
     macro_rules! stat_int {
         ($name:expr, $k:expr) => {

@@ -81,7 +81,7 @@ pub unsafe extern "C" fn kn_start(
             crate::gc::heap().extra_roots.push(static_roots);
             crate::gc::register_region(caches, cache_words as usize);
             let r = rt();
-            pst().stack_limit = (&x as *const u8 as usize).saturating_sub(STACK_SIZE - (4 << 20));
+            set_stack_limit((&x as *const u8 as usize).saturating_sub(STACK_SIZE - (4 << 20)));
             r.script_name = script.clone();
             // intern compiled-in symbols in order
             let mut p = symnames as *const u8;
@@ -190,11 +190,40 @@ pub(crate) unsafe fn dispatch(cache: *mut CallCache, recv: V, mid: V) -> *const 
     }
     unsafe { dispatch_miss(c, e, k, serial, mid) }
 }
+/// `dispatch` for callers that still need `cache` afterwards (`opt::kn_attr_get`): the miss
+/// path hands it back, so the common path needn't keep it in a saved register.
+#[inline(always)]
+pub(crate) unsafe fn dispatch_keep(cache: *mut CallCache, recv: V, mid: V) -> (*const Method, *mut CallCache) {
+    let k = class_of(recv);
+    let c = unsafe { &mut *cache };
+    let serial = serial();
+    let e = c.entry.load(std::sync::atomic::Ordering::Acquire);
+    if !e.is_null() {
+        let e = unsafe { &*e };
+        if e.serial == serial {
+            if e.klass[0] == k {
+                return (e.method[0], cache);
+            }
+            for i in 1..e.n.min(IC_WAYS) {
+                if e.klass[i] == k {
+                    return (e.method[i], cache);
+                }
+            }
+        }
+    }
+    unsafe { dispatch_miss_keep(cache, e, k, serial, mid) }
+}
+#[inline(never)]
+unsafe fn dispatch_miss_keep(cache: *mut CallCache, e: *mut CacheEntry, k: *mut Class, serial: u64, mid: V) -> (*const Method, *mut CallCache) {
+    (unsafe { dispatch_miss(&mut *cache, e, k, serial, mid) }, cache)
+}
+
 /// Free the entries that an eval unit's call-site and constant caches point to (the unit is
 /// being freed: nothing can run its code). `owned` lists (word offset, kind): 1 = CallCache,
 /// 2 = ConstCache (kenny_compiler::OWNED_CALL / OWNED_CONST).
 pub fn free_owned_caches(caches: usize, owned: &[(u32, u8)]) {
     use std::sync::atomic::Ordering;
+    crate::opt::forget_attr_sites(owned.iter().filter(|(_, k)| *k == 1).map(|(off, _)| caches + *off as usize * 8));
     for &(off, kind) in owned {
         let p = caches + off as usize * 8;
         match kind {
@@ -217,7 +246,7 @@ pub fn free_owned_caches(caches: usize, owned: &[(u32, u8)]) {
 
 /// The entry `old` (if still current) with (k, m) added; a full entry drops its oldest class.
 fn ic_with(old: *mut CacheEntry, serial: u64, k: *mut Class, m: *const Method) -> CacheEntry {
-    let mut e = CacheEntry { serial, n: 0, klass: [std::ptr::null_mut(); IC_WAYS], method: [std::ptr::null(); IC_WAYS] };
+    let mut e = CacheEntry { serial, n: 0, klass: [std::ptr::null_mut(); IC_WAYS], method: [std::ptr::null(); IC_WAYS], direct: [0; IC_WAYS], attr: [0; IC_WAYS] };
     if !old.is_null() {
         let o = unsafe { &*old };
         if o.serial == serial {
@@ -226,6 +255,8 @@ fn ic_with(old: *mut CacheEntry, serial: u64, k: *mut Class, m: *const Method) -
             for i in 0..keep {
                 e.klass[i + 1] = o.klass[i];
                 e.method[i + 1] = o.method[i];
+                e.direct[i + 1] = o.direct[i];
+                e.attr[i + 1] = o.attr[i];
             }
             e.n = keep + 1;
         }
@@ -235,10 +266,15 @@ fn ic_with(old: *mut CacheEntry, serial: u64, k: *mut Class, m: *const Method) -
     }
     e.klass[0] = k;
     e.method[0] = m;
+    e.direct[0] = direct_of(m);
+    e.attr[0] = attr_of(k, m);
     e
 }
 #[inline(never)]
 unsafe fn dispatch_miss(c: &mut CallCache, e: *mut CacheEntry, k: *mut Class, serial: u64, mid: V) -> *const Method {
+    if DIRECT_FLAGS_DIRTY.load(std::sync::atomic::Ordering::Relaxed) {
+        update_direct_flags();
+    }
     let m = find_method(k, sym_id(mid));
     if !crate::mt::multi() {
         let ne = ic_with(e, serial, k, m);
@@ -524,6 +560,32 @@ pub extern "C" fn kn_env_new(parent: *mut Env, blk: V, nslots: u64) -> *mut Env 
         crate::gc::register_env(d as usize, nslots as u32);
         d as *mut Env
     }
+}
+/// `v.is_a?(c)` for the builtin is_a?/kind_of? (compiled code checked that it is).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_is_a(v: V, c: V) -> V {
+    bool_v(is_class(c) && is_a(v, c as *mut Class))
+}
+/// `kn_is_a` for a heap receiver at a call site whose cache entry has the builtin is_a? for
+/// the receiver's class: also records the answer for `c` in that way's `attr` word
+/// (`c << 16 | answer << 5 | ATTR_IS_A | private`), which the stub then uses. (Only while
+/// one OS thread runs Ruby code: entries are changed in place.)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_is_a_fill(cache: *mut CallCache, v: V, c: V) -> V {
+    let r = is_class(c) && is_a(v, c as *mut Class);
+    if is_class(c) && (c as u64) < 1 << 47 && !crate::mt::multi() {
+        let e = unsafe { (*cache).entry.load(std::sync::atomic::Ordering::Acquire) };
+        if !e.is_null() {
+            let e = unsafe { &mut *e };
+            let k = hdr(v).klass;
+            for w in 0..e.n.min(IC_WAYS) {
+                if e.klass[w] == k && e.attr[w] & 0x1e == ATTR_IS_A {
+                    e.attr[w] = (c as u64) << 16 | (r as u64) << 5 | ATTR_IS_A | (e.attr[w] & 1);
+                }
+            }
+        }
+    }
+    bool_v(r)
 }
 /// Write barrier after compiled code stores into an old (GC-heap) environment.
 #[unsafe(no_mangle)]
@@ -1021,6 +1083,8 @@ pub struct ConstCache {
     entry: std::sync::atomic::AtomicPtr<ConstEntry>,
     _spare: [u64; 2],
 }
+/// (compiled code reads it: expr.rs `ConstantReadNode`)
+#[repr(C)]
 struct ConstEntry {
     serial: u64,
     cref: V,
@@ -1327,7 +1391,7 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
         return raise(rt().c.name_error, &format!("undefined method '{}' for class '{}'", sym_str(old), class_name(c)));
     }
     let body = crate::kernel::clone_body(unsafe { &(*m).body });
-    let nm = Box::into_raw(Box::new(Method { body, owner: unsafe { (*m).owner }, name: new, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent } }));
+    let nm = Box::into_raw(Box::new(Method { body, owner: unsafe { (*m).owner }, name: new, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
     unsafe { (*c).methods.insert(new, nm) };
     bump_serial();
     mksym(new)

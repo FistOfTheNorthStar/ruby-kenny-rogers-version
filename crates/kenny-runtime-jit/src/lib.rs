@@ -123,6 +123,10 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_send0", kenny_runtime::opt::kn_send0 as *const u8),
         ("kn_send1", kenny_runtime::opt::kn_send1 as *const u8),
         ("kn_send2", kenny_runtime::opt::kn_send2 as *const u8),
+        ("kn_attr_get", kenny_runtime::opt::kn_attr_get as *const u8),
+        ("kn_is_a", kenny_runtime::abi::kn_is_a as *const u8),
+        ("kn_is_a_fill", kenny_runtime::abi::kn_is_a_fill as *const u8),
+        ("kn_attr_set", kenny_runtime::opt::kn_attr_set as *const u8),
         ("kn_opt_check", kenny_runtime::opt::kn_opt_check as *const u8),
         ("kn_ary_at", kenny_runtime::opt::kn_ary_at as *const u8),
         ("kn_autosplat", kenny_runtime::opt::kn_autosplat as *const u8),
@@ -130,6 +134,7 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_range_last", kenny_runtime::opt::kn_range_last as *const u8),
         ("kn_float_box", kenny_runtime::opt::kn_float_box as *const u8),
         ("KN_GC_PENDING", &kenny_runtime::gc::KN_GC_PENDING as *const _ as *const u8),
+        ("KN_DIRECT", &kenny_runtime::core::KN_DIRECT as *const _ as *const u8),
     ]
 }
 

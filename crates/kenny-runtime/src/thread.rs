@@ -238,7 +238,7 @@ fn enter_ctx(c: usize) {
     });
     pt().running_ctx = Some(c);
     pst().heap.stack_base = base;
-    pst().stack_limit = limit + STACK_MARGIN;
+    crate::core::set_stack_limit(limit + STACK_MARGIN);
 }
 /// Mark ctx `c` as suspended at the current stack position.
 fn leave_ctx(c: usize) {
@@ -1211,7 +1211,7 @@ pub fn fiber_resume(fv: V, args: &[V]) -> V {
     // Back on the resumer's stack: say so before anything that can stop for a collection
     // (taking a lock can): the GC scans this P's stack from here up to `stack_base`.
     pst().heap.stack_base = outer_base;
-    pst().stack_limit = outer_limit;
+    crate::core::set_stack_limit(outer_limit);
     pt().running_ctx = Some(outer);
     pt().fiber_stack.pop();
     let f = unsafe { &mut *fiber_ptr(fid) };
