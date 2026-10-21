@@ -254,6 +254,7 @@ Web (the machine was also running other work, so treat these as rough; `ab -c 10
 | Rails 5.2 HTML page with layout and partials (`examples/rails_html`) | 10.4k req/s, 42 MB | 23.1k req/s, 83 MB | 4.5k req/s, 44 MB (1 thread) |
 | Rails 5.2 + ActiveRecord/SQLite read (`examples/rails_api_ar`) | 5.7k req/s, 51 MB | 16.7k req/s, 100 MB | 3.0k req/s, 44 MB (1 thread) |
 | Whole Rails 5.2 app (`examples/blog`), scaffold index | 2.7k req/s, 83 MB | 8.7k req/s, 144 MB (125 MB once idle) | 1.5k req/s, 108 MB (1 thread); 4.1k req/s, 1,058 MB (12 workers) |
+| Whole Rails 8.1 app (`examples/blog8`, SQLite, Solid Cache/Queue), scaffold index | 1.9k req/s, 113 MB | 7.7k req/s, 187 MB | 1.1k req/s (1 thread, Ruby 3.3); 4.9k req/s, about 1.1 GB (12 workers) |
 
 Run them yourself: `bench/run.sh`. Tests: `tests/run.sh`. Compile-check a file without linking: `kenny check file.rb`.
 
