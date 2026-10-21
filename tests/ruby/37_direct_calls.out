@@ -1,0 +1,77 @@
+[[1, 2, 11, 4, 1], [102, 204, 12, 5, 2], [3, 6, 13, 6, 3], [4, 8, 14, 7, 4]]
+[[1, 2, 11, 4, 1], [102, 204, 12, 5, 2], [3, 6, 13, 6, 3], [4, 8, 14, 7, 4]]
+[[1, 2, 11, 4, 1], [102, 204, 12, 5, 2], [3, 6, 13, 6, 3], [4, 8, 14, 7, 4]]
+:hidden
+:hidden
+:hidden
+"private method 'secret'"
+"private method 'secret'"
+"private method 'secret'"
+[14, 14, 14, NoMethodError, :changed]
+14
+8
+:single
+9
+10000
+SystemStackError
+1000
+SystemStackError
+1000
+46368
+500
+[[1, 10], [2, 20], [3, 30]]
+FrozenError
+2
+nil
+[]
+["v3-0", "v3-1"]
+true
+[50000, 70000, 90000, 110000]
+[2, 204, 6, 8]
+[:@a]
+false
+false
+[:@a, :@b]
+[:@a]
+[[true, true, false, false], [false, false, true, true], [false, false, true, true], [false, false, true, true], [false, false, true, true], [true, false, false, true]]
+[:redef, :redef, false, :redef]
+[true, true, false, false]
+"s4-1999"
+["s4-1999"]
+20
+"s4-1500"
+[[true, false, false, false, false, true], [false, false, false, true, true, true], [false, false, false, false, true, true], [false, false, false, false, true, true], [false, false, false, false, false, true], [false, false, false, false, false, true], [false, false, false, false, true, true], [false, false, false, false, false, true], [false, true, false, false, false, true], [false, true, true, false, false, true], [:custom, :custom, false, :custom, :custom, :custom]]
+[[true, false, false, false, false, true], [false, false, false, true, true, true], [false, false, false, false, true, true], [false, false, false, false, true, true], [false, false, false, false, false, true], [false, false, false, false, false, true], [false, false, false, false, true, true], [false, false, false, false, false, true], [false, true, false, false, false, true], [false, true, true, false, false, true], [:custom, :custom, false, :custom, :custom, :custom]]
+[[true, false, false, false, false, true], [false, false, false, true, true, true], [false, false, false, false, true, true], [false, false, false, false, true, true], [false, false, false, false, false, true], [false, false, false, false, false, true], [false, false, false, false, true, true], [false, false, false, false, false, true], [false, true, false, false, false, true], [false, true, true, false, false, true], [:custom, :custom, false, :custom, :custom, :custom]]
+NoMethodError
+NoMethodError
+NoMethodError
+[false, true]
+[false, true]
+[false, true]
+[:single, true]
+[:int_nil, [:int_nil, false], true]
+[false, [false, false]]
+[:nil_is_a, [true, :nil_is_a]]
+[true, [true, false]]
+[:kernel_kind_of, :kernel_kind_of]
+[true, true]
+[[false, true, false], [false, true, false]]
+[[false, true, false], [false, true, false]]
+[[false, true, false], [false, true, false]]
+[[false, true, false], [true, true, false]]
+[true, true, false]
+[false, true, false]
+[false, true, false]
+[false, true, false]
+[false, true, false]
+[[true, true], [false, true], [false, true], [false, false]]
+[:nil_v, :false_v, :int_v]
+[[1, [1, 2]], [2, [2, 4]], [:overridden, [:overridden, 6]], [4, [4, 8]]]
+[[1, [1, 2]], [2, [2, 4]], [:overridden, [:overridden, 6]], [4, [4, 8]]]
+[[1, [1, 2]], [2, [2, 4]], [:overridden, [:overridden, 6]], [4, [4, 8]]]
+:private_v
+nil
+:single_v
+7
+[:redefined, :redefined, :overridden, :redefined]

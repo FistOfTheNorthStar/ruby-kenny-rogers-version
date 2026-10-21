@@ -330,6 +330,8 @@ impl<M: Module> Compiler<M> {
                 redo_block: None,
                 inline_levels: Vec::new(),
                 num_locals,
+                int_locals: analysis::int_locals(&spec.analysis),
+                int_vals: HashSet::new(),
             };
             let v = body(self, &mut fx);
             fx.b.ins().return_(&[v]);
@@ -477,10 +479,12 @@ impl<M: Module> Compiler<M> {
         }
     }
     /// Generational GC: storing into an old environment (its header's mark bit, 4 bytes
-    /// before the environment) tells the runtime, so the next minor collection rescans it.
+    /// before the environment) tells the runtime, so the next minor collection rescans it
+    /// (once: kenny-runtime gc.rs `FL_REMEMBERED`, 1 << 21, set while it is recorded).
     fn env_write_barrier(&mut self, fx: &mut Fx, e: Value) {
         let flags = fx.b.ins().load(ir::types::I32, mem(), e, -4);
-        let old = fx.b.ins().band_imm_u(flags, 4);
+        let bits = fx.b.ins().band_imm_u(flags, 4 | (1 << 21));
+        let old = fx.b.ins().icmp_imm_u(IntCC::Equal, bits, 4);
         let slow = fx.b.create_block();
         let done = fx.b.create_block();
         fx.b.set_cold_block(slow);
@@ -523,7 +527,11 @@ impl<M: Module> Compiler<M> {
                 return crate::fastpath::Num::Lazy { boxed, raw, kind, lit: false };
             }
         }
-        crate::fastpath::Num::Boxed(self.local_get(fx, name, depth))
+        let v = self.local_get(fx, name, depth);
+        if depth == fx.inline_levels.len() as u32 && fx.int_locals.contains(name) {
+            fx.int_vals.insert(v);
+        }
+        crate::fastpath::Num::Boxed(v)
     }
     /// Assign a numeric result to a local without boxing it (when it has a shadow).
     pub(crate) fn local_set_num(&mut self, fx: &mut Fx, name: &[u8], depth: u32, n: crate::fastpath::Num) {

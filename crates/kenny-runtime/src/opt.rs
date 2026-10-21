@@ -45,6 +45,7 @@ pub const OPT_ARY_EACH_INDEX: u8 = 26;
 pub const OPT_ARY_ANY: u8 = 27;
 pub const OPT_ARY_ALL: u8 = 28;
 pub const OPT_STR_APPEND: u8 = 29;
+pub const OPT_IS_A: u8 = 30;
 
 fn tag(c: *mut Class, name: &str, t: u8) {
     let m = unsafe { (*c).methods.get(&sym(name)).copied() };
@@ -94,10 +95,14 @@ pub fn init() {
     tag(c.basic_object, "==", OPT_IDENTITY_EQ);
     tag(c.symbol, "==", OPT_IDENTITY_EQ);
     tag(c.kernel, "nil?", OPT_NIL_P);
+    tag(c.kernel, "is_a?", OPT_IS_A);
+    tag(c.kernel, "kind_of?", OPT_IS_A);
     tag(c.integer, "times", OPT_INT_TIMES);
     tag(c.integer, "upto", OPT_INT_UPTO);
     tag(c.integer, "downto", OPT_INT_DOWNTO);
     tag(c.range, "each", OPT_RANGE_EACH);
+    crate::core::DIRECT_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::core::update_direct_flags();
 }
 
 use crate::abi::{dispatch, dispatch_keep};
@@ -154,13 +159,19 @@ fn attr_index(m: *const Method, recv: V, iv: u32) -> Option<usize> {
     use std::sync::atomic::Ordering::Relaxed;
     let shape = obj(recv).shape;
     let cache = unsafe { &(*m).attr_slot };
-    let w = cache.load(Relaxed);
+    let w = cache[0].load(Relaxed);
     if w != 0 && w >> 16 == shape as u64 {
         return Some((w & 0xFFFF) as usize);
     }
+    let w1 = cache[1].load(Relaxed);
+    if w1 != 0 && w1 >> 16 == shape as u64 {
+        return Some((w1 & 0xFFFF) as usize);
+    }
     let i = shape_index(unsafe { &*shape }, iv)?;
     if i <= 0xFFFF && (shape as u64) >> 48 == 0 {
-        cache.store(((shape as u64) << 16) | i as u64, Relaxed);
+        // the newest first (each word on its own is consistent)
+        cache[1].store(w, Relaxed);
+        cache[0].store(((shape as u64) << 16) | i as u64, Relaxed);
     }
     Some(i as usize)
 }
@@ -257,6 +268,7 @@ unsafe fn send1_found(m: *const Method, recv: V, mid: V, a: V, explicit: u64) ->
             return recv;
         }
         OPT_IDENTITY_EQ => return bool_v(recv == a),
+        OPT_IS_A => return bool_v(is_class(a) && is_a(recv, a as *mut Class)),
         _ => {}
     }
     unsafe { call_found(m, recv, mid, &[a], explicit) }

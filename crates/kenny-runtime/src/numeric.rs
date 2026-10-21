@@ -62,7 +62,33 @@ pub enum Op {
     Pow,
 }
 
+/// An Integer that fits in an i128 (Fixnums, small Bignums), without copying a Bignum.
+#[inline]
+fn int128(v: V) -> Option<i128> {
+    if is_fix(v) {
+        Some(fix(v) as i128)
+    } else if is_big(v) {
+        rbig(v).n.to_i128()
+    } else {
+        None
+    }
+}
+
 pub fn arith(op: Op, a: V, b: V) -> V {
+    // Integers within i128 (the usual Bignums): no BigInt copies unless the result needs one
+    if let (Some(p), Some(q)) = (int128(a), int128(b)) {
+        let r = match op {
+            Op::Add => p.checked_add(q),
+            Op::Sub => p.checked_sub(q),
+            Op::Mul => p.checked_mul(q),
+            Op::Div if q != 0 && !(p == i128::MIN && q == -1) => Some(num_integer::Integer::div_floor(&p, &q)),
+            Op::Mod if q != 0 && !(p == i128::MIN && q == -1) => Some(p.mod_floor(&q)),
+            _ => None,
+        };
+        if let Some(r) = r {
+            return int_from_i128(r);
+        }
+    }
     let (Some(x), Some(y)) = (num(a), num(b)) else {
         if num(a).is_some() && is_heap(b) && respond_to(b, sym("coerce")) {
             let pair = tri!(send1(b, "coerce", a));
@@ -162,6 +188,9 @@ fn int_pow(base: BigInt, e: i128) -> V {
 
 /// <=> for numbers; None if not comparable.
 pub fn num_cmp(a: V, b: V) -> Option<std::cmp::Ordering> {
+    if let (Some(p), Some(q)) = (int128(a), int128(b)) {
+        return Some(p.cmp(&q));
+    }
     let (x, y) = (num(a)?, num(b)?);
     match (&x, &y) {
         (N::I(p), N::I(q)) => Some(p.cmp(q)),

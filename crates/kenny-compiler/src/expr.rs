@@ -497,7 +497,11 @@ impl<M: Module> Compiler<M> {
                 let crefp = self.slot_ptr(fx, fx.cref_slot);
                 let s = self.sym_val(fx, n.name().as_slice());
                 let cache = self.owned_cache_ptr(fx, OWNED_CONST);
-                self.callc(fx, "kn_const_get_l", &[cache, crefp, s])
+                if fx.loops.is_empty() {
+                    self.callc(fx, "kn_const_get_l", &[cache, crefp, s])
+                } else {
+                    self.const_cached(fx, cache, crefp, s)
+                }
             }
             Node::ConstantPathNode { .. } => {
                 let n = node.as_constant_path_node().unwrap();
@@ -779,13 +783,24 @@ impl<M: Module> Compiler<M> {
         let s = self.self_val(fx);
         let id = self.sym_val(fx, name);
         let cache = self.cache_ptr(fx, 2);
+        if self.inline_ivars(fx) {
+            return self.ivar_fast(fx, cache, s, None, |c, fx| c.call(fx, "kn_ivar_get", &[s, id, cache]));
+        }
         self.call(fx, "kn_ivar_get", &[s, id, cache])
     }
     pub(crate) fn ivar_set(&mut self, fx: &mut Fx, name: &[u8], v: Value) -> Value {
         let s = self.self_val(fx);
         let id = self.sym_val(fx, name);
         let cache = self.cache_ptr(fx, 2);
+        if self.inline_ivars(fx) {
+            return self.ivar_fast(fx, cache, s, Some(v), |c, fx| c.callc(fx, "kn_ivar_set", &[s, id, v, cache]));
+        }
         self.callc(fx, "kn_ivar_set", &[s, id, v, cache])
+    }
+    /// Instance variables are read/written inline in loops; elsewhere the call is most of
+    /// the cost and inlining every access would grow a Rails binary's code by ~9%.
+    fn inline_ivars(&self, fx: &Fx) -> bool {
+        !fx.loops.is_empty()
     }
 
     fn interpolate(&mut self, fx: &mut Fx, parts: &NodeList) -> Value {

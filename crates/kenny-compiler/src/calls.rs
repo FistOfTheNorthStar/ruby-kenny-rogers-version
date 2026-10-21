@@ -342,11 +342,23 @@ impl<M: Module> Compiler<M> {
             self.mark_loc(fx);
             let cache = self.owned_cache_ptr(fx, OWNED_CALL);
             let mid = self.sym_val(fx, &name);
+            let (inline, stub) = crate::fastpath::direct_plan(&name, !fx.loops.is_empty());
+            let plain = move |c: &mut Self, fx: &mut Fx, rt: &'static str, args: &[Value]| -> Value {
+                if inline && rt == "kn_vcall" {
+                    c.direct_call(fx, cache, recv, &[], false, |c, fx| c.call(fx, rt, args))
+                } else if (inline || stub) && rt == "kn_attr_get" {
+                    c.call_stub(fx, crate::fastpath::STUB_ATTR_GET, args)
+                } else if stub && rt == "kn_vcall" {
+                    c.call_stub(fx, crate::fastpath::STUB_VCALL, args)
+                } else {
+                    c.call(fx, rt, args)
+                }
+            };
             let r = if !fx.loops.is_empty() && crate::fastpath::attr_name(&name) {
                 let mode = self.iconst(fx, 2);
-                self.attr_fast(fx, cache, recv, None, |c, fx| c.call(fx, "kn_attr_get", &[cache, recv, mid, mode]))
+                self.attr_fast(fx, cache, recv, None, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, mode]))
             } else {
-                self.call(fx, "kn_vcall", &[cache, recv, mid])
+                plain(self, fx, "kn_vcall", &[cache, recv, mid])
             };
             self.check(fx, r);
             r
