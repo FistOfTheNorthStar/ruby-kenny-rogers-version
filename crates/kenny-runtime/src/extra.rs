@@ -1035,17 +1035,21 @@ static THREAD_ABORT: G<V> = G::new(QFALSE);
 /// String encodings: UTF-8 unless flagged binary (ASCII-8BIT), plus the Encoding class API.
 fn init_encoding(st: *mut Class, enc: *mut Class) {
     defn(st, "b", 0, 0, |s, _, _| crate::pack::bin_str(rstr(s).b.clone()));
-    defn(st, "encoding", 0, 0, |s, _, _| encoding(if is_bin(s) { "BINARY" } else { "UTF-8" }));
+    // FL_BINARY marks ASCII-8BIT strings, the next bit US-ASCII ones; others are UTF-8
+    const FL_ASCII: u32 = FL_BINARY << 1;
+    defn(st, "encoding", 0, 0, |s, _, _| {
+        let f = hdr(s).flags;
+        encoding(if f & FL_BINARY != 0 { "BINARY" } else if f & FL_ASCII != 0 { "US-ASCII" } else { "UTF-8" })
+    });
     defn(st, "force_encoding", 1, 1, |s, a, _| {
         let Some(n) = enc_name_of(a[0]) else { return no_conv(a[0], "String") };
-        // Lenient on frozen strings: Kenny freezes literals that CRuby code expects to be mutable.
-        if is_frozen(s) {
-            return s;
-        }
-        if n == "ASCII-8BIT" || n == "BINARY" {
-            hdr(s).flags |= FL_BINARY;
-        } else {
-            hdr(s).flags &= !FL_BINARY;
+        // applies to frozen strings too: Kenny freezes literals that CRuby code expects to be mutable
+        let h = hdr(s);
+        h.flags &= !(FL_BINARY | FL_ASCII);
+        match n.to_ascii_uppercase().as_str() {
+            "ASCII-8BIT" | "BINARY" => h.flags |= FL_BINARY,
+            "US-ASCII" | "ASCII" => h.flags |= FL_ASCII,
+            _ => {}
         }
         s
     });
@@ -1054,25 +1058,95 @@ fn init_encoding(st: *mut Class, enc: *mut Class) {
     ivar_set(us, sym("@__name"), str_from("US-ASCII"));
     const_set(enc, sym("US_ASCII"), us);
     const_set(enc, sym("ASCII"), us);
-    defn(enc, "ascii_compatible?", 0, 0, |_, _, _| QTRUE);
-    defn(enc, "dummy?", 0, 0, |_, _, _| QFALSE);
+    const_set(enc, sym("ANSI_X3_4_1968"), us);
+    const_set(enc, sym("UTF8"), encoding("UTF-8"));
+    const_set(enc, sym("CP65001"), encoding("UTF-8"));
+    // the other encodings: placeholders no string carries, for comparisons and lookups
+    let mut list = vec![encoding("BINARY"), encoding("UTF-8"), us];
+    for (name, _, consts, dummy, ascii) in crate::enc_table::ENCODINGS {
+        let o = object_new(enc);
+        ivar_set(o, sym("@__name"), str_from(name));
+        if *dummy {
+            ivar_set(o, sym("@__dummy"), QTRUE);
+        }
+        if !*ascii {
+            ivar_set(o, sym("@__non_ascii"), QTRUE);
+        }
+        for c in *consts {
+            const_set(enc, sym(c), o);
+        }
+        list.push(o);
+    }
+    let list = ary_new(list);
+    hdr(list).flags |= FL_FROZEN;
+    rt().gvars.insert(sym("$__kenny_encodings"), list);
+    defn(enc, "ascii_compatible?", 0, 0, |s, _, _| bool_v(!ivar_defined(s, sym("@__non_ascii"))));
+    defn(enc, "==", 1, 1, |s, a, _| bool_v(s == a[0]));
+    defn(enc, "dummy?", 0, 0, |s, _, _| bool_v(ivar_defined(s, sym("@__dummy"))));
+    fn aliases_of(name: &str) -> &'static [&'static str] {
+        match name {
+            "ASCII-8BIT" => &["BINARY"],
+            "UTF-8" => &["CP65001"],
+            "US-ASCII" => &["ASCII", "ANSI_X3.4-1968", "646"],
+            _ => crate::enc_table::ENCODINGS.iter().find(|e| e.0 == name).map_or(&[], |e| e.1),
+        }
+    }
     defn(enc, "names", 0, 0, |s, _, _| {
         let n = ivar_get(s, sym("@__name"));
-        if is_str(n) && rstr(n).b == b"ASCII-8BIT" { ary_new(vec![str_from("ASCII-8BIT"), str_from("BINARY")]) } else { ary_new(vec![n]) }
+        let mut v = vec![n];
+        v.extend(aliases_of(&s_of(n)).iter().map(|a| str_from(a)));
+        ary_new(v)
     });
     defs(enc, "default_external", 0, 0, |_, _, _| encoding("UTF-8"));
     defs(enc, "default_internal", 0, 0, |_, _, _| QNIL);
     defs(enc, "default_external=", 1, 1, |_, a, _| a[0]);
     defs(enc, "default_internal=", 1, 1, |_, a, _| a[0]);
     defs(enc, "find", 1, 1, |_, a, _| {
+        if is_heap(a[0]) && real_class(a[0]) == const_lookup(rt().c.object, sym("Encoding")).unwrap() as *mut Class {
+            return a[0];
+        }
         let Some(n) = enc_name_of(a[0]) else { return no_conv(a[0], "String") };
         match n.as_str() {
-            "UTF-8" | "UTF8" | "ASCII-8BIT" | "BINARY" | "US-ASCII" | "ASCII" | "LOCALE" | "EXTERNAL" | "FILESYSTEM" => encoding(&n),
-            _ => arg_error(&format!("unknown encoding name - {}", s_of(a[0]))),
+            "UTF-8" | "UTF8" | "CP65001" | "ASCII-8BIT" | "BINARY" | "US-ASCII" | "ASCII" | "ANSI_X3.4-1968" | "646" | "LOCALE" | "EXTERNAL" | "FILESYSTEM" => encoding(&n),
+            "INTERNAL" => QNIL,
+            _ => {
+                let hit = crate::enc_table::ENCODINGS
+                    .iter()
+                    .find(|(name, aliases, ..)| name.eq_ignore_ascii_case(&n) || aliases.iter().any(|x| x.eq_ignore_ascii_case(&n)));
+                match hit {
+                    Some((_, _, consts, ..)) => {
+                        let enc = const_lookup(rt().c.object, sym("Encoding")).unwrap() as *mut Class;
+                        const_get_under(enc, sym(consts[0])).unwrap_or(QNIL)
+                    }
+                    None => arg_error(&format!("unknown encoding name - {}", s_of(a[0]))),
+                }
+            }
         }
     });
-    defs(enc, "list", 0, 0, |_, _, _| ary_new(vec![encoding("BINARY"), encoding("UTF-8"), encoding("US-ASCII")]));
-    defs(enc, "name_list", 0, 0, |_, _, _| ary_new(["ASCII-8BIT", "UTF-8", "US-ASCII", "BINARY", "ASCII"].iter().map(|n| str_from(n)).collect()));
+    defs(enc, "list", 0, 0, |_, _, _| {
+        let l = rt().gvars.get(&sym("$__kenny_encodings")).copied().unwrap_or(QNIL);
+        ary_new(rary(l).v.to_vec())
+    });
+    defs(enc, "name_list", 0, 0, |_, _, _| {
+        let mut v: Vec<V> = ["ASCII-8BIT", "UTF-8", "US-ASCII", "BINARY", "ASCII", "CP65001"].iter().map(|n| str_from(n)).collect();
+        for (name, aliases, ..) in crate::enc_table::ENCODINGS {
+            v.push(str_from(name));
+            v.extend(aliases.iter().map(|a| str_from(a)));
+        }
+        ary_new(v)
+    });
+    defs(enc, "aliases", 0, 0, |_, _, _| {
+        let h = hash_new();
+        for (n, a) in [("BINARY", "ASCII-8BIT"), ("CP65001", "UTF-8"), ("ASCII", "US-ASCII"), ("ANSI_X3.4-1968", "US-ASCII"), ("646", "US-ASCII")] {
+            crate::hash::hset(h, str_from(n), str_from(a));
+        }
+        for (name, aliases, ..) in crate::enc_table::ENCODINGS {
+            for a in *aliases {
+                crate::hash::hset(h, str_from(a), str_from(name));
+            }
+        }
+        h
+    });
     defs(enc, "compatible?", 2, 2, |_, _, _| encoding("UTF-8"));
 }
 
@@ -1979,11 +2053,9 @@ pub fn init() {
             QNIL
         }
     });
-    // Encoding (skipped when another module already set it up, e.g. upstream compat.rs)
+    // Encoding and the String encoding methods (String#encode is in compat.rs)
     let enc = const_lookup(c.object, sym("Encoding")).unwrap() as *mut Class;
-    if const_get_under(enc, sym("US_ASCII")).is_none() {
-        init_encoding(st, enc);
-    }
+    init_encoding(st, enc);
 
     // ===== Struct =====
     let sc = c.struct_;

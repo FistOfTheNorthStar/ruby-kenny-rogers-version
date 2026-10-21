@@ -44,6 +44,11 @@ struct Db {
     /// handler blocks). Until then a query is plain C: it runs as a blocking call (gc::blocking),
     /// so a slow query holds up neither a collection nor the other threads of this P.
     ruby_cb: bool,
+    /// statement_timeout= in ms (0: none) and the running statement's deadline (see `stmt_timeout_cb`)
+    stmt_timeout_ms: i64,
+    stmt_deadline: Option<std::time::Instant>,
+    /// closed by `discard` (a forked child's inherited connection)
+    discarded: bool,
 }
 
 struct Stmt {
@@ -93,7 +98,7 @@ fn db_of(v: V) -> &'static mut Db {
     if let Some(d) = data_of::<Db>(v, "@__db") {
         return d;
     }
-    ivar_set(v, sym("@__db"), wrap(Db { db: std::ptr::null_mut(), self_v: v, exc: false, busy_ms: 0, busy_since: None, ruby_cb: false }, free_db));
+    ivar_set(v, sym("@__db"), wrap(Db { db: std::ptr::null_mut(), self_v: v, exc: false, busy_ms: 0, busy_since: None, ruby_cb: false, stmt_timeout_ms: 0, stmt_deadline: None, discarded: false }, free_db));
     data_of::<Db>(v, "@__db").unwrap()
 }
 fn stmt_of(v: V) -> &'static mut Stmt {
@@ -520,6 +525,20 @@ struct CollData {
     db: *mut Db,
     cmp: V,
 }
+/// Progress handler for `statement_timeout=`: interrupts a statement running past its deadline.
+/// Pure Rust (no Ruby), so it may run inside a blocking call.
+unsafe extern "C" fn stmt_timeout_cb(p: *mut c_void) -> c_int {
+    let d = unsafe { &mut *(p as *mut Db) };
+    let now = std::time::Instant::now();
+    match d.stmt_deadline {
+        None => {
+            d.stmt_deadline = Some(now + std::time::Duration::from_millis(d.stmt_timeout_ms.max(0) as u64));
+            0
+        }
+        Some(t) => (now > t) as c_int,
+    }
+}
+
 unsafe extern "C" fn coll_cb(p: *mut c_void, alen: c_int, a: *const c_void, blen: c_int, b: *const c_void) -> c_int {
     unsafe {
         let cd = &*(p as *const CollData);
@@ -752,6 +771,34 @@ fn init_database(m: *mut Class) {
         }
     };
 
+    defn(c, "statement_timeout=", 1, 1, |s, a, _| {
+        let d = db_of(s);
+        let ms = match num2int(a[0]) {
+            Ok(i) => i,
+            Err(e) => return e,
+        };
+        d.stmt_timeout_ms = ms;
+        if !d.db.is_null() {
+            let n = if ms == 0 { -1 } else { 1000 };
+            unsafe { ffi::sqlite3_progress_handler(d.db, n, Some(stmt_timeout_cb), d as *mut Db as *mut c_void) };
+        }
+        s
+    });
+    // ForkSafety: a forked child drops its inherited connection without touching the parent's
+    // files' locks (sqlite3_close would); Kenny never forks with live connections, so this closes.
+    defn(c, "discard", 0, 0, |s, _, _| {
+        let d = db_of(s);
+        if !d.db.is_null() {
+            unsafe { ffi::sqlite3_db_release_memory(d.db) };
+            unsafe { sqlite3_close_v2(d.db) };
+            d.db = std::ptr::null_mut();
+        }
+        d.discarded = true;
+        s
+    });
+    defn(c, "load_extension_internal", 1, 1, |_, _, _| {
+        raise(rt().c.not_implemented_error, "loading SQLite extensions is not supported by Kenny (a Kenny binary doesn't load shared libraries)")
+    });
     defn(c, "open_v2", 3, 3, |s, a, _| open_v2(s, a));
     defn(c, "open16", 1, 1, |s, a, _| {
         // Kenny strings are UTF-8 (or binary); open the path as given.
@@ -927,7 +974,7 @@ fn init_database(m: *mut Class) {
         s
     });
     defn(c, "encoding", 0, 0, |s, _, _| db_encoding(s));
-    for p in ["open_v2", "open16", "define_aggregator2", "disable_quirk_mode", "exec_batch", "db_filename"] {
+    for p in ["open_v2", "open16", "define_aggregator2", "disable_quirk_mode", "exec_batch", "db_filename", "discard", "load_extension_internal"] {
         private(p);
     }
 }
@@ -943,6 +990,7 @@ fn stmt_initialize(s: V, db: V, sql: V) -> V {
     if d.db.is_null() {
         return arg_error("prepare called on a closed database");
     }
+    d.stmt_deadline = None;
     let st = stmt_of(s);
     let bytes = str_bytes(sql);
     let (dbp, sql_p, sql_n) = (d.db as usize, bytes.as_ptr() as usize, bytes.len() as c_int);
@@ -981,6 +1029,9 @@ fn stmt_step(s: V) -> V {
     }
     let conn = ivar_get(s, sym("@connection"));
     let stmt = st.st;
+    if is_heap(conn) && unsafe { ffi::sqlite3_stmt_busy(stmt) } == 0 {
+        db_of(conn).stmt_deadline = None;
+    }
     let quiet = is_heap(conn) && !db_of(conn).ruby_cb;
     let value = if quiet {
         let p = stmt as usize;
@@ -1105,6 +1156,90 @@ fn init_statement(m: *mut Class) {
         st.done = false;
         s
     });
+    // sqlite3 2.x: Statement#initialize is Ruby and calls this; returns the unparsed remainder
+    defn(c, "prepare", 2, 2, |s, a, _| {
+        tri!(stmt_initialize(s, a[0], a[1]));
+        ivar_get(s, sym("@remainder"))
+    });
+
+    defn(c, "sql", 0, 0, |s, _, _| {
+        let st = open_stmt!(s);
+        let v = cstr_bytes(unsafe { ffi::sqlite3_sql(st.st) }).map(str_new).unwrap_or(QNIL);
+        if is_heap(v) {
+            hdr(v).flags |= FL_FROZEN;
+        }
+        v
+    });
+    defn(c, "expanded_sql", 0, 0, |s, _, _| {
+        let st = open_stmt!(s);
+        let p = unsafe { ffi::sqlite3_expanded_sql(st.st) };
+        let v = cstr_bytes(p).map(str_new).unwrap_or(QNIL);
+        unsafe { ffi::sqlite3_free(p as *mut c_void) };
+        if is_heap(v) {
+            hdr(v).flags |= FL_FROZEN;
+        }
+        v
+    });
+    defn(c, "named_params", 0, 0, |s, _, _| {
+        let st = open_stmt!(s);
+        let n = unsafe { ffi::sqlite3_bind_parameter_count(st.st) };
+        let mut out = Vec::new();
+        for i in 1..=n {
+            if let Some(name) = cstr_bytes(unsafe { ffi::sqlite3_bind_parameter_name(st.st, i) }) {
+                if name.first().is_some_and(|&c| c != b'?') {
+                    out.push(str_new(name[1..].to_vec()));
+                }
+            }
+        }
+        let a = ary_new(out);
+        hdr(a).flags |= FL_FROZEN;
+        a
+    });
+    defn(c, "memused", 0, 0, |s, _, _| {
+        let st = open_stmt!(s);
+        mkfix(unsafe { ffi::sqlite3_stmt_status(st.st, ffi::SQLITE_STMTSTATUS_MEMUSED, 0) } as i64)
+    });
+    const STATS: [(&str, c_int); 8] = [
+        ("fullscan_steps", ffi::SQLITE_STMTSTATUS_FULLSCAN_STEP),
+        ("sorts", ffi::SQLITE_STMTSTATUS_SORT),
+        ("autoindexes", ffi::SQLITE_STMTSTATUS_AUTOINDEX),
+        ("vm_steps", ffi::SQLITE_STMTSTATUS_VM_STEP),
+        ("reprepares", ffi::SQLITE_STMTSTATUS_REPREPARE),
+        ("runs", ffi::SQLITE_STMTSTATUS_RUN),
+        ("filter_misses", ffi::SQLITE_STMTSTATUS_FILTER_MISS),
+        ("filter_hits", ffi::SQLITE_STMTSTATUS_FILTER_HIT),
+    ];
+    defn(c, "stat_for", 1, 1, |s, a, _| {
+        let st = open_stmt!(s);
+        if !is_sym(a[0]) {
+            return type_error("non-symbol given");
+        }
+        let name = sym_name(sym_id(a[0]));
+        let op = STATS.iter().find(|(n, _)| n.as_bytes() == &name[..]).map(|(_, op)| *op);
+        mkfix(op.map_or(0, |op| unsafe { ffi::sqlite3_stmt_status(st.st, op, 0) }) as i64)
+    });
+    defn(c, "stats_as_hash", 0, 0, |s, _, _| {
+        let st = open_stmt!(s);
+        let h = hash_new();
+        for (n, op) in STATS {
+            crate::hash::hset(h, mksym(sym(n)), mkfix(unsafe { ffi::sqlite3_stmt_status(st.st, op, 0) } as i64));
+        }
+        h
+    });
+    defn(c, "column_decltype_downcased", 1, 1, |s, a, _| {
+        let st = open_stmt!(s);
+        let i = match num2int(a[0]) {
+            Ok(i) => i as c_int,
+            Err(e) => return e,
+        };
+        cstr_bytes(unsafe { ffi::sqlite3_column_decltype(st.st, i) }).map(|b| str_new(b.to_ascii_lowercase())).unwrap_or(QNIL)
+    });
+    for p in ["prepare", "stat_for", "stats_as_hash", "column_decltype_downcased"] {
+        let mm = unsafe { (*c).methods.get(&sym(p)).copied() };
+        if let Some(mm) = mm {
+            unsafe { (*(mm as *mut Method)).vis = VIS_PRIVATE };
+        }
+    }
     defn(c, "step", 0, 0, |s, _, _| stmt_step(s));
     defn(c, "done?", 0, 0, |s, _, _| bool_v(stmt_of(s).done));
     defn(c, "column_count", 0, 0, |s, _, _| {
@@ -1248,6 +1383,22 @@ fn init_sqlite3_native() {
     init_statement(m);
     init_backup(m);
 
+    defs(m, "status", 1, 2, |_, a, _| {
+        let op = match num2int(a[0]) {
+            Ok(i) => i as c_int,
+            Err(e) => return e,
+        };
+        let reset = a.get(1).is_some_and(|v| truthy(*v)) as c_int;
+        let (mut cur, mut high): (c_int, c_int) = (0, 0);
+        unsafe { ffi::sqlite3_status(op, &mut cur, &mut high, reset) };
+        let h = hash_new();
+        crate::hash::hset(h, mksym(sym("current")), mkfix(cur as i64));
+        crate::hash::hset(h, mksym(sym("highwater")), mkfix(high as i64));
+        h
+    });
+    // the SQLite library is compiled into the runtime, as with the gem's precompiled builds
+    const_set(m, sym("SQLITE_PACKAGED_LIBRARIES"), QTRUE);
+    const_set(m, sym("SQLITE_PRECOMPILED_LIBRARIES"), QTRUE);
     defs(m, "sqlcipher?", 0, 0, |_, _, _| QFALSE);
     defs(m, "libversion", 0, 0, |_, _, _| mkfix(unsafe { ffi::sqlite3_libversion_number() } as i64));
     defs(m, "threadsafe", 0, 0, |_, _, _| mkfix(unsafe { ffi::sqlite3_threadsafe() } as i64));

@@ -514,7 +514,7 @@ impl<M: Module> Compiler<M> {
                 let v = self.expr(fx, &n.value());
                 let cref = self.cref(fx);
                 let s = self.sym_val(fx, n.name().as_slice());
-                self.call(fx, "kn_const_set", &[cref, s, v])
+                self.callc(fx, "kn_const_set", &[cref, s, v])
             }
             Node::ConstantPathWriteNode { .. } => {
                 let n = node.as_constant_path_write_node().unwrap();
@@ -526,7 +526,7 @@ impl<M: Module> Compiler<M> {
                 let v = self.expr(fx, &n.value());
                 let name = t.name().map(|x| x.as_slice().to_vec()).unwrap_or_default();
                 let s = self.sym_val(fx, &name);
-                self.call(fx, "kn_const_set", &[parent, s, v])
+                self.callc(fx, "kn_const_set", &[parent, s, v])
             }
             Node::ConstantOrWriteNode { .. } => {
                 let n = node.as_constant_or_write_node().unwrap();
@@ -543,7 +543,7 @@ impl<M: Module> Compiler<M> {
                 fx.b.ins().jump(done, &[cur.into()]);
                 fx.b.switch_to_block(no);
                 let v = self.expr(fx, &n.value());
-                self.call(fx, "kn_const_set", &[cref, s, v]);
+                self.callc(fx, "kn_const_set", &[cref, s, v]);
                 fx.b.ins().jump(done, &[v.into()]);
                 fx.b.switch_to_block(done);
                 fx.b.block_params(done)[0]
@@ -551,14 +551,17 @@ impl<M: Module> Compiler<M> {
             Node::MultiWriteNode { .. } => {
                 let m = node.as_multi_write_node().unwrap();
                 let value = m.value();
-                let rhs = if let Some(a) = value.as_array_node() {
-                    self.array_literal(fx, &a.elements())
+                // the expression's value is the right-hand side as written (`while (a, b = q.shift)`
+                // stops at nil), not the array it was converted to
+                let (rhs, result) = if let Some(a) = value.as_array_node() {
+                    let r = self.array_literal(fx, &a.elements());
+                    (r, r)
                 } else {
                     let v = self.expr(fx, &value);
-                    self.callc(fx, "kn_masgn_ary", &[v])
+                    (self.callc(fx, "kn_masgn_ary", &[v]), v)
                 };
                 self.destructure(fx, &m.lefts(), m.rest(), &m.rights(), rhs);
-                rhs
+                result
             }
 
             // ---- definitions ----
@@ -890,7 +893,7 @@ impl<M: Module> Compiler<M> {
         } else if let Some(t) = target.as_constant_target_node() {
             let cref = self.cref(fx);
             let s = self.sym_val(fx, t.name().as_slice());
-            self.call(fx, "kn_const_set", &[cref, s, v]);
+            self.callc(fx, "kn_const_set", &[cref, s, v]);
         } else if let Some(t) = target.as_index_target_node() {
             let recv = self.expr(fx, &t.receiver());
             let mut args: Vec<Value> = match t.arguments() {

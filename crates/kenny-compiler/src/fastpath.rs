@@ -73,7 +73,7 @@ pub(crate) fn numeric_call<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<(ruby_p
     }
     let recv = c.receiver()?;
     let args: Vec<ruby_prism::Node> = c.arguments()?.arguments().iter().collect();
-    if args.len() != 1 || args[0].as_splat_node().is_some() || args[0].as_keyword_hash_node().is_some() || args[0].as_block_argument_node().is_some() {
+    if args.len() != 1 || args[0].as_splat_node().is_some() || args[0].as_keyword_hash_node().is_some() || args[0].as_block_argument_node().is_some() || args[0].as_forwarding_arguments_node().is_some() {
         return None;
     }
     Some((recv, args.into_iter().next().unwrap()))

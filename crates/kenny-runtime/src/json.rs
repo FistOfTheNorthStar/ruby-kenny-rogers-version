@@ -215,7 +215,14 @@ fn indent(out: &mut Vec<u8>, o: &Opts, depth: i64) {
 }
 
 fn is_builtin_to_json(v: V) -> bool {
-    let m = find_method(class_of(v), sym("to_json"));
+    // as in the json gem's C generator: instances of the core classes themselves are always
+    // generated natively, whatever `to_json` they have (ActiveSupport adds one to each)
+    let c = class_of(v);
+    let k = &rt().c;
+    if v == QNIL || v == QTRUE || v == QFALSE || [k.hash, k.array, k.string, k.integer, k.float].contains(&c) {
+        return true;
+    }
+    let m = find_method(c, sym("to_json"));
     m.is_null() || BUILTIN_TO_JSON.get().contains(&m)
 }
 
@@ -1088,10 +1095,28 @@ fn init_json() {
         }
     });
 
+    // as in the json gem, the core classes' to_json comes from included modules, so a module
+    // included later (ActiveSupport's ToJsonWithActiveSupportEncoder in Rails 8) overrides it
+    // and reaches it through `super`
     let to_json = sym("to_json");
     let mut builtin = Vec::new();
-    for c in [r.c.object, r.c.hash, r.c.array, r.c.string, r.c.integer, r.c.float, r.c.nil, r.c.true_, r.c.false_, r.c.symbol] {
-        builtin.push(add_method(c, to_json, Body::Native(to_json_native, 0, -1)));
+    let gm = new_module("JSON::Ext::Generator::GeneratorMethods");
+    const_set(genm, sym("GeneratorMethods"), gm as V);
+    for (name, c) in [
+        ("Object", r.c.object),
+        ("Hash", r.c.hash),
+        ("Array", r.c.array),
+        ("String", r.c.string),
+        ("Integer", r.c.integer),
+        ("Float", r.c.float),
+        ("NilClass", r.c.nil),
+        ("TrueClass", r.c.true_),
+        ("FalseClass", r.c.false_),
+    ] {
+        let m = new_module(&format!("JSON::Ext::Generator::GeneratorMethods::{name}"));
+        const_set(gm, sym(name), m as V);
+        builtin.push(add_method(m, to_json, Body::Native(to_json_native, 0, -1)));
+        crate::kernel::do_include(c, m as V);
     }
     *BUILTIN_TO_JSON.get() = builtin;
 }

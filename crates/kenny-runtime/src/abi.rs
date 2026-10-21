@@ -284,9 +284,56 @@ pub unsafe extern "C" fn kn_send_splat(cache: *mut CallCache, recv: V, mid: V, a
     unsafe { kn_send(cache, recv, mid, a.len() as u64, a.as_ptr(), blk) }
 }
 
+/// A `def`'s owner slot (where `super` starts looking) once one definition site has defined
+/// methods in more than one class (a `def` run in a loop or a `Module.new` block, or a method
+/// copied by `Module#dup`): the owner is then found from the running method's code.
+pub const SHARED_OWNER: V = 1;
+
+/// The compiled function of each `def` site's owner slot, and back (see `super_owner`).
+static SLOT_FNS: crate::mt::L<std::collections::HashMap<usize, usize, FxBuild>> = crate::mt::L::new(std::collections::HashMap::with_hasher(FxBuild::new()));
+static FN_SLOTS: crate::mt::L<std::collections::HashMap<usize, usize, FxBuild>> = crate::mt::L::new(std::collections::HashMap::with_hasher(FxBuild::new()));
+
+/// `Module#dup` copied a compiled method: its `super` can no longer use the slot's owner.
+pub fn share_owner_of(f: CompiledFn) {
+    if let Some(&slot) = FN_SLOTS.get().get(&(f as usize)) {
+        unsafe { *(slot as *mut V) = SHARED_OWNER };
+    }
+}
+
+/// A freed eval unit's functions: drop their owner-slot entries.
+pub fn forget_defs(funcs: &[usize]) {
+    let mut fs = FN_SLOTS.get();
+    let mut ss = SLOT_FNS.get();
+    for f in funcs {
+        if let Some(slot) = fs.remove(f) {
+            if ss.get(&slot) == Some(f) {
+                ss.remove(&slot);
+            }
+        }
+    }
+}
+
+/// The class whose method is running a `super` (where the lookup continues from).
+fn super_owner(owner_slot: *const V, self_: V, mid: u32) -> *mut Class {
+    let owner = unsafe { *owner_slot };
+    if owner != SHARED_OWNER {
+        return owner as *mut Class;
+    }
+    if let Some(f) = SLOT_FNS.get().get(&(owner_slot as usize)).copied() {
+        for &k in ancestors_rc(class_of(self_)).iter() {
+            if let Some(&m) = unsafe { (*k).methods.get(&mid) } {
+                if matches!(unsafe { &(*m).body }, Body::Compiled(g) if *g as usize == f) {
+                    return k;
+                }
+            }
+        }
+    }
+    std::ptr::null_mut()
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_super(owner_slot: *const V, self_: V, mid: V, argc: u64, argv: *const V, blk: V) -> V {
-    let owner = unsafe { *owner_slot } as *mut Class;
+    let owner = super_owner(owner_slot, self_, sym_id(mid));
     let args = unsafe { args_slice(argc, argv) };
     let m = find_super_method(self_, owner, sym_id(mid));
     if m.is_null() {
@@ -313,7 +360,7 @@ pub unsafe extern "C" fn kn_super(owner_slot: *const V, self_: V, mid: V, argc: 
 /// `defined?(super)`: 1 if a superclass method exists.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_super_defined(owner_slot: *const V, self_: V, mid: V) -> u64 {
-    let owner = unsafe { *owner_slot } as *mut Class;
+    let owner = super_owner(owner_slot, self_, sym_id(mid));
     (!find_super_method(self_, owner, sym_id(mid)).is_null()) as u64
 }
 
@@ -853,13 +900,23 @@ pub fn const_missing(c: *mut Class, id: u32) -> V {
 
 /// `owner`: where a pending autoload for `id` was found in the lexical scope, if known.
 fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
-    // `Gem` (RubyGems' API) is loaded on first use from the embedded kenny/gem.rb
-    if id == sym("Gem") && find_autoload(c)(id).is_none() && crate::compat::require_compiled("kenny/gem").is_some() {
-        if pst().pending_is_set() {
-            return UNDEF;
-        }
-        if let Some(v) = const_get_under(rt().c.object, id) {
-            return v;
+    // Constants CRuby has without a require are loaded on first use: `Gem` (RubyGems' API)
+    // from the embedded kenny/gem.rb, `Set` from the stdlib's set.rb (Ruby 3.2+ autoloads it)
+    let implicit = if id == sym("Gem") {
+        Some("kenny/gem")
+    } else if id == sym("Set") {
+        Some("set")
+    } else {
+        None
+    };
+    if let Some(file) = implicit {
+        if find_autoload(c)(id).is_none() && crate::compat::require_compiled(file).is_some() {
+            if pst().pending_is_set() {
+                return UNDEF;
+            }
+            if let Some(v) = const_get_under(rt().c.object, id) {
+                return v;
+            }
         }
     }
     if let Some(owner) = owner.or_else(|| find_autoload(c)(id)) {
@@ -878,6 +935,20 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
             Some(f) => {
                 LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 let r = crate::compat::run_file_once(f, a.flag);
+                LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                autoloads().remove(&(owner as usize, id));
+                if r == UNDEF {
+                    return UNDEF;
+                }
+                if let Some(v) = after_autoload(owner, c, id) {
+                    return v;
+                }
+            }
+            // CRuby's autoload calls `require` as a method, so an override sees it: Zeitwerk's
+            // turns an autoload of a directory into a module and runs callbacks after files
+            None if require_overridden() => {
+                LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let r = send(rt().main_obj, sym("require"), &[str_from(&a.path)], QNIL);
                 LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 autoloads().remove(&(owner as usize, id));
                 if r == UNDEF {
@@ -913,6 +984,12 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
     send(c as V, sym("const_missing"), &[mksym(id)], QNIL)
 }
 
+/// Whether Ruby code redefined `Kernel#require` (the builtin is native).
+fn require_overridden() -> bool {
+    let m = find_method(class_of(rt().main_obj), sym("require"));
+    !m.is_null() && !matches!(unsafe { &(*m).body }, Body::Native(..))
+}
+
 /// After an autoload ran: the constant where it was registered, or else (like CRuby, whose
 /// lookup ends with the cref class) wherever the loaded file defined it for `c`.
 fn after_autoload(owner: *mut Class, c: *mut Class, id: u32) -> Option<V> {
@@ -923,6 +1000,9 @@ fn after_autoload(owner: *mut Class, c: *mut Class, id: u32) -> Option<V> {
 pub extern "C" fn kn_autoload(target: V, id: V, loader: CompiledFn, flag: *mut V) -> V {
     let owner = if is_class(target) { target as *mut Class } else { rt().c.object };
     register_autoload(owner, sym_id(id), sym_str(sym_id(id)), Some(loader), flag);
+    if !const_added(owner, sym_id(id)) {
+        return UNDEF;
+    }
     QNIL
 }
 #[unsafe(no_mangle)]
@@ -1034,9 +1114,28 @@ pub extern "C" fn kn_const_defined_under(parent: V, id: V) -> u64 {
     let object = rt().c.object;
     ancestors(c).into_iter().take_while(|&a| a != object || c == object).any(|a| has_autoload(a, id)) as u64
 }
+/// Ruby's `Module#const_added(name)` hook, run after Ruby code defines a constant (class and
+/// module definitions, assignments, `const_set`, `autoload`) when a program overrides it, as
+/// Zeitwerk does to set up the autoloads of a namespace once it is defined. Returns false if
+/// the hook raised.
+pub fn const_added(c: *mut Class, id: u32) -> bool {
+    if c.is_null() {
+        return true;
+    }
+    let hook = find_method(class_of(c as V), sym("const_added"));
+    if hook.is_null() || matches!(unsafe { &(*hook).body }, Body::Native(..)) {
+        return true;
+    }
+    invoke(hook, c as V, &[mksym(id)], QNIL) != UNDEF
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_const_set(cref: V, id: V, v: V) -> V {
-    const_set(cref_class(cref), sym_id(id), v);
+    let c = cref_class(cref);
+    const_set(c, sym_id(id), v);
+    if !const_added(c, sym_id(id)) {
+        return UNDEF;
+    }
     v
 }
 #[unsafe(no_mangle)]
@@ -1098,6 +1197,9 @@ pub extern "C" fn kn_define_class(cref: V, id: V, sup: V) -> V {
     let c = new_class("", sup as *mut Class);
     unsafe { (*c).lexical_parent = outer };
     const_set(outer, sym_id(id), c as V);
+    if !const_added(outer, sym_id(id)) {
+        return UNDEF;
+    }
     tri!(send(sup, sym("inherited"), &[c as V], QNIL));
     c as V
 }
@@ -1116,6 +1218,9 @@ pub extern "C" fn kn_define_module(cref: V, id: V) -> V {
     let m = new_module("");
     unsafe { (*m).lexical_parent = outer };
     const_set(outer, sym_id(id), m as V);
+    if !const_added(outer, sym_id(id)) {
+        return UNDEF;
+    }
     m as V
 }
 #[unsafe(no_mangle)]
@@ -1159,7 +1264,16 @@ pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owne
             &format!("Kenny does not allow redefining {}#{} (see docs/LANGUAGE.md)", class_name(cls), name),
         );
     }
-    unsafe { *owner_slot = cls as V };
+    unsafe {
+        let prev = *owner_slot;
+        if prev == 0 {
+            *owner_slot = cls as V;
+            SLOT_FNS.get().insert(owner_slot as usize, f as usize);
+            FN_SLOTS.get().insert(f as usize, owner_slot as usize);
+        } else if prev != cls as V {
+            *owner_slot = SHARED_OWNER;
+        }
+    }
     let m = add_method(cls, sym_id(id), Body::Compiled(f));
     unsafe {
         let mm = &mut *(m as *mut Method);
@@ -1255,6 +1369,14 @@ pub unsafe extern "C" fn kn_args_rest(argc: u64, argv: *const V, start: u64, pos
     let end = (a.len() as u64).saturating_sub(posts) as usize;
     let start = (start as usize).min(end);
     ary_new(a[start..end].to_vec())
+}
+/// Append a `**h` keyword argument unless it is empty (`f(*a, **{})` passes only `*a`).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_ary_push_kw(a: V, h: V) -> V {
+    if !(is_hash(h) && rhash(h).m.is_empty()) {
+        rary(a).v.push(h);
+    }
+    a
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_is_kwhash(v: V) -> u64 {

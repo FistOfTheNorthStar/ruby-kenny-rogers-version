@@ -11,6 +11,7 @@ pub mod assets;
 pub mod backtrace;
 pub mod array;
 pub mod bigdecimal;
+pub mod enc_table;
 pub mod boot;
 pub mod capi;
 pub mod cmap;

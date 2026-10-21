@@ -195,6 +195,7 @@ pub fn do_include(target: *mut Class, m: V) -> V {
     }
     if !ancestors(target).contains(&(m as *mut Class)) {
         unsafe { (*target).includes.push(m as *mut Class) };
+        note_include(target, m as *mut Class);
         bump_serial();
     }
     QNIL
@@ -1053,6 +1054,9 @@ pub fn init() {
     defn(md, "const_set", 2, 2, |s, a, _| match sym_arg(a[0]) {
         Ok(id) => {
             const_set(s as *mut Class, id, a[1]);
+            if !crate::abi::const_added(s as *mut Class, id) {
+                return UNDEF;
+            }
             a[1]
         }
         Err(e) => e,
@@ -1136,6 +1140,9 @@ pub fn init() {
                 return QNIL;
             }
             crate::abi::register_autoload(s as *mut Class, id, String::from_utf8_lossy(&p).into_owned(), None, std::ptr::null_mut());
+            if !crate::abi::const_added(s as *mut Class, id) {
+                return UNDEF;
+            }
             QNIL
         }
         (Err(e), _) => e,
@@ -1394,6 +1401,9 @@ fn dup_module(v: V) -> V {
     let k = unsafe { &mut *c };
     for (&id, &m) in src.methods.iter() {
         let mm = unsafe { &*m };
+        if let Body::Compiled(f) = mm.body {
+            crate::abi::share_owner_of(f);
+        }
         let nm = Box::into_raw(Box::new(Method { body: clone_body(&mm.body), owner: c, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent }));
         k.methods.insert(id, nm);
     }
@@ -1406,6 +1416,24 @@ fn dup_module(v: V) -> V {
     k.alloc = src.alloc;
     k.lexical_parent = src.lexical_parent;
     k.struct_members.set(src.struct_members.clone());
+    // like CRuby: the copy has the original's instance variables and singleton methods
+    // (`def self.included`, `extend`ed modules)
+    k.civars = src.civars.clone();
+    let meta = src.h.klass;
+    if !meta.is_null() && unsafe { (*meta).is_singleton && (*meta).attached == v } {
+        let dm = singleton_class(c as V);
+        let (sm, dk) = unsafe { (&*meta, &mut *dm) };
+        for (&id, &m) in sm.methods.iter() {
+            let mm = unsafe { &*m };
+            if let Body::Compiled(f) = mm.body {
+                crate::abi::share_owner_of(f);
+            }
+            let nm = Box::into_raw(Box::new(Method { body: clone_body(&mm.body), owner: dm, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent }));
+            dk.methods.insert(id, nm);
+        }
+        dk.includes.set(sm.includes.clone());
+        dk.prepends.set(sm.prepends.clone());
+    }
     bump_serial();
     c as V
 }

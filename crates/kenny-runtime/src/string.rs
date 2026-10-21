@@ -232,17 +232,27 @@ fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
     let mut out = Vec::with_capacity(src.len());
     let mut start = 0;
     let mut changed = false;
+    // a String replacement: converted once; `\\0`, `\\&`, `\\\\` etc. are expanded as with a Regexp
+    let rep_str = match a.get(1) {
+        Some(&r) if !is_hash(r) => Some(want_str(r)?),
+        _ => None,
+    };
     while let Some(i) = find(&src, &pat, start) {
         out.extend_from_slice(&src[start..i]);
-        let matched = str_new(pat.clone());
-        let rep: Vec<u8> = if a.len() > 1 {
-            if is_hash(a[1]) {
-                let v = rhash(a[1]).m.get(&HKey(matched)).copied().unwrap_or(QNIL);
-                to_s(v).map_err(|_| UNDEF)?
+        let rep: Vec<u8> = if let Some(rb) = &rep_str {
+            if rb.contains(&b'\\') {
+                crate::regex::expand(rb, &src, &[i as i64, (i + pat.len()) as i64], QNIL)
             } else {
-                want_str(a[1])?
+                rb.clone()
             }
+        } else if a.len() > 1 {
+            let v = crate::hash::hget(a[1], str_new(pat.clone()));
+            if v == UNDEF {
+                return Err(UNDEF);
+            }
+            to_s(v).map_err(|_| UNDEF)?
         } else if is_proc(blk) {
+            let matched = str_new(pat.clone());
             let v = call_block(blk, &[matched]);
             if v == UNDEF {
                 return Err(UNDEF);
@@ -409,7 +419,9 @@ pub fn init() {
             Ok(r) => r,
             Err(e) => return e,
         };
-        send(re, sym("match?"), &[s], QNIL)
+        let mut args = vec![s];
+        args.extend(a.get(1).copied());
+        send(re, sym("match?"), &args, QNIL)
     });
     defn(c, "+", 1, 1, |s, a, _| {
         let o = match want_str(a[0]) {

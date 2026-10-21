@@ -20,9 +20,9 @@ Kenny compiles Ruby ahead of time to a single native binary, like Go.
 | Redefining Integer and Float operators (`Integer#+`, `Float#<`, `Integer#&`, ...: `+ - * / % < <= > >= == != & \| ^`) | Lets arithmetic and comparisons compile inline, on unboxed values, with no guards |
 | `ObjectSpace.each_object` (except for `Class`/`Module`), `ObjectSpace._id2ref` | Heap doesn't need to be walkable; GC can move objects. Classes are tracked anyway, so `each_object(Class)` works |
 | `TracePoint`, `set_trace_func` | No hooks on every call/line (a debug build flag replaces them) |
-| String encodings other than UTF-8, ASCII-8BIT (binary), US-ASCII | Strings skip per-operation encoding checks |
+| String encodings other than UTF-8, ASCII-8BIT (binary), US-ASCII | Strings skip per-operation encoding checks. CRuby's other encodings exist as `Encoding` objects (every constant, `Encoding.find`, `list`, `aliases`, `dummy?`) so code that compares against them or looks them up runs, but no string carries one |
 | `require` / `autoload` of a library by name (searched on `$LOAD_PATH`) that wasn't compiled in | Whole program is compiled together. `load` of a file, and `require` of an absolute path, that is new or changed since the build are compiled at runtime by the embedded JIT (Rails' code reloading in development) |
-| Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in with `--ext`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError`. The `sassc` gem (libsass through FFI) is replaced by a native Sass compiler |
+| Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in with `--ext`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError`. As with the ffi gem, `ffi_lib` raises `LoadError` when the library isn't installed. The `sassc` gem (libsass through FFI) is replaced by a native Sass compiler |
 | `Thread#raise` / `Thread#kill` landing at arbitrary instructions | Delivered only at safe points (calls, loop back-edges, IO) |
 | `RubyVM::*`, `Ractor`, `$;`, `$,`, `callcc`, flip-flop, `BEGIN`/`END` | CRuby internals, superseded, or deprecated |
 

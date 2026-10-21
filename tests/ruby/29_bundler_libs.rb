@@ -13,9 +13,14 @@ p srv.addr[0], srv.addr[1] > 0
 srv.close
 
 require "ffi"
+begin
+  Module.new { extend FFI::Library; ffi_lib "nosuchlib" }
+rescue LoadError => e
+  p e.message[/\ACould not open library .libnosuchlib/] # as with the ffi gem: optional native dependencies rescue LoadError
+end
 module Lib
   extend FFI::Library
-  ffi_lib "nosuchlib"
+  ffi_lib FFI::Library::LIBC
   typedef :pointer, :handle
   Color = enum(:red, :green, 5, :blue)
   attach_function :do_it, [:handle, :int], :int

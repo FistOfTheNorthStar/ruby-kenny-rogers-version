@@ -67,6 +67,16 @@ fn bstr(b: &[u8]) -> String {
 fn sv(b: Vec<u8>) -> V {
     str_new(b)
 }
+/// A binary (ASCII-8BIT) string: what CRuby's read(n), readpartial and binmode reads return.
+fn bin_v(b: Vec<u8>) -> V {
+    let v = str_new(b);
+    hdr(v).flags |= crate::compat::FL_BINARY;
+    v
+}
+fn set_binary(buf: V, b: Vec<u8>) {
+    rstr(buf).b.set(b);
+    hdr(buf).flags |= crate::compat::FL_BINARY;
+}
 
 // ---------- SystemCallError / Errno ----------
 
@@ -2713,6 +2723,7 @@ pub fn init() {
     });
     defn(io, "read", 0, 2, |s, a, _| {
         let stt = ok!(st(s));
+        let binary = stt.binmode || a.first().is_some_and(|&n| n != QNIL);
         let r = match a.first() {
             Some(&n) if n != QNIL => {
                 let n = ok!(int_arg(n));
@@ -2728,10 +2739,14 @@ pub fn init() {
             _ => ok!(stt.read_all()),
         };
         if let Some(&buf) = a.get(1).filter(|x| is_str(**x)) {
-            rstr(buf).b.set(r);
+            if binary {
+                set_binary(buf, r);
+            } else {
+                rstr(buf).b.set(r);
+            }
             return buf;
         }
-        sv(r)
+        if binary { bin_v(r) } else { sv(r) }
     });
     fn readpartial(s: V, a: &[V], nonblock: bool) -> V {
         let (a, kw) = split_kw(a);
@@ -2756,10 +2771,10 @@ pub fn init() {
             return eof_error();
         }
         if let Some(&buf) = a.get(1).filter(|x| is_str(**x)) {
-            rstr(buf).b.set(b);
+            set_binary(buf, b);
             return buf;
         }
-        sv(b)
+        bin_v(b)
     }
     defn(io, "readpartial", 1, 2, |s, a, _| readpartial(s, a, false));
     defn(io, "sysread", 1, 2, |s, a, _| readpartial(s, a, false));
@@ -3060,6 +3075,8 @@ pub fn init() {
             }
         });
         match ok!(r) {
+            // binread, a "rb" mode, or a length (as IO#read(n)): a binary string
+            Some(b) if m.bin || len.is_some() => bin_v(b),
             Some(b) => sv(b),
             None => QNIL,
         }

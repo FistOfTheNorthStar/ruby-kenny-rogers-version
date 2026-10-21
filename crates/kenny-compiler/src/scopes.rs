@@ -224,9 +224,11 @@ impl<M: Module> Compiler<M> {
             }
             // a bare `super` inside a block also passes the method's anonymous `*` / `**`
             // (`def render(*) = logger.silence { super }`), which aren't in the locals list
-            if caps.zsuper_in_block && spec.kind == ScopeKind::Method {
-                for n in [&b"*"[..], b"**"] {
-                    if !env_slots.contains_key(n) {
+            // and so do `...` and anonymous `*` / `**` / `&` arguments used in a block
+            if spec.kind == ScopeKind::Method {
+                for n in [&b"*"[..], b"**", b"&"] {
+                    let used = (caps.zsuper_in_block && n != b"&") || caps.captured.contains(n);
+                    if used && !env_slots.contains_key(n) {
                         let i = env_slots.len();
                         env_slots.insert(n.to_vec(), i);
                     }

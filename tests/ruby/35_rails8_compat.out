@@ -1,0 +1,64 @@
+[1, 2]
+[3, 4]
+[1, 2, 3]
+[[1], {k: 2}, 3]
+[[4], {}, nil]
+[[5], {}, nil]
+"hi"
+:none
+2
+true
+[:A, :B, :C, :D]
+:on
+"k:base"
+"k:base"
+25
+{x: 3, y: 0}
+1
+true
+[:x, :y]
+"missing keyword: :y"
+[(0/1), (1/2), (1/1)]
+[1.0, 1.5, 2.0]
+#<Encoding:ASCII-8BIT>
+#<Encoding:ASCII-8BIT>
+true
+true
+false
+true
+true
+#<Encoding:US-ASCII>
+#<Encoding:ASCII-8BIT>
+"native library missing"
+"native library missing"
+true
+false
+7
+7
+7
+{}
+[true, true]
+[1, 2]
+[[[1], true], [[2], true]]
+[2, 1]
+1
+3
+[1, 2]
+[[1, 2], [3, 4]]
+Enumerator
+"encoded:{\"a\":[\"b\"]}"
+"encoded:\"s\""
+"{\"a\":1}"
+EncodeAll
+true
+"&lt;a href=&#39;x&#39;&gt;&amp;&quot;&lt;/a&gt;"
+"12"
+false
+true
+true
+[true, true, true, true, false]
+#<Encoding:ASCII-8BIT>
+"axax"
+3
+"a<b>c"
+"a%20b"

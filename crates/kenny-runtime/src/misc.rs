@@ -50,11 +50,17 @@ pub fn each_to_vec(v: V) -> Result<Vec<V>, V> {
 static STOP_TAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 40);
 
 /// Iterate `each`, stopping early when `f` returns Ok(true).
-pub fn each_until(v: V, f: impl FnMut(V) -> Result<bool, V> + 'static) -> Result<(), V> {
+pub fn each_until(v: V, mut f: impl FnMut(V) -> Result<bool, V> + 'static) -> Result<(), V> {
+    each_args_until(v, move |a| f(yielded(a)))
+}
+
+/// Iterate `each` with the values of each yield as given (several for `yield a, b`),
+/// stopping early when `f` returns Ok(true).
+pub fn each_args_until(v: V, f: impl FnMut(&[V]) -> Result<bool, V> + 'static) -> Result<(), V> {
     let tag = STOP_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let f = Rc::new(RefCell::new(f));
     let nb = proc_new_native(
-        Box::new(move |_, args, _| match (f.borrow_mut())(yielded(args)) {
+        Box::new(move |_, args, _| match (f.borrow_mut())(args) {
             Ok(false) => QNIL,
             Ok(true) => {
                 pst().pending = Throw::Break { tag, val: QNIL };
@@ -415,16 +421,28 @@ pub fn init() {
         if !is_proc(b) {
             return enum_for(s, "step", a);
         }
-        let mut i = rgv.lo;
+        // a Float step makes every value a Float, as in CRuby
+        let mut i = if is_float(a[0]) && (is_fix(rgv.lo) || is_big(rgv.lo)) { tri!(send0(rgv.lo, "to_f")) } else { rgv.lo };
         loop {
             if rgv.hi != QNIL {
-                let Some(c) = num_cmp(i, rgv.hi) else { return type_error("step on non-numeric range") };
+                let c = match num_cmp(i, rgv.hi) {
+                    Some(c) => c,
+                    // Rational, BigDecimal, ...: their own <=>
+                    None => {
+                        let c = tri!(send1(i, "<=>", rgv.hi));
+                        if !is_fix(c) {
+                            return type_error("step on non-numeric range");
+                        }
+                        fix(c).cmp(&0)
+                    }
+                };
                 if c.is_gt() || (rgv.excl && c.is_eq()) {
                     break;
                 }
             }
             tri!(call_block(b, &[i]));
-            i = tri!(arith(Op::Add, i, a[0]));
+            let builtin = |v: V| is_fix(v) || is_float(v) || is_big(v);
+            i = if builtin(i) && builtin(a[0]) { tri!(arith(Op::Add, i, a[0])) } else { tri!(send1(i, "+", a[0])) };
         }
         s
     });
@@ -602,7 +620,7 @@ pub fn init() {
         "reduce", "sum", "min", "max", "minmax", "min_by", "max_by", "minmax_by", "sort", "sort_by", "group_by",
         "partition", "tally", "zip", "uniq", "to_h", "each_slice", "each_cons", "each_with_object", "count",
         "drop", "drop_while", "chunk_while", "slice_when", "reverse_each", "none?", "one?", "all?", "cycle",
-        "entries", "to_set", "join",
+        "entries", "join",
     ] {
         let id = sym(name);
         let p = proc_new_native(
@@ -619,6 +637,17 @@ pub fn init() {
         );
         add_method(en, id, Body::Proc(p));
     }
+    init_enum_streaming(en);
+    // as in CRuby's prelude: set.rb leaves this definition alone (`unless method_defined?`)
+    defn(en, "to_set", 0, -1, |s, a, b| {
+        let klass = match a.first() {
+            Some(k) => *k,
+            None => tri!(send(rt().c.object as V, sym("const_get"), &[mksym(sym("Set"))], QNIL)),
+        };
+        let mut args = vec![s];
+        args.extend_from_slice(a.get(1..).unwrap_or(&[]));
+        send(klass, sym("new"), &args, b)
+    });
     defn(en, "to_a", 0, -1, |s, _, _| match each_to_vec(s) {
         Ok(v) => ary_new(v),
         Err(e) => e,
@@ -1231,6 +1260,8 @@ pub fn init() {
     set_global_const("RUBY_PATCHLEVEL", mkfix(0));
     set_global_const("RUBY_RELEASE_DATE", str_from("2026-10-19"));
     set_global_const("RUBY_COPYRIGHT", str_from("Kenny Ruby"));
+    let platform = if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" };
+    set_global_const("RUBY_DESCRIPTION", str_from(&format!("kenny (ruby 3.4.0 compatible) [{platform}]")));
 }
 
 /// Major version of the running kernel (`uname -r`: "24.6.0" -> 24).
@@ -1328,4 +1359,308 @@ pub fn blockless_enumerators() {
             unsafe { (*(m as *mut Method)).vis = vis };
         }
     }
+}
+
+
+/// Enumerable#`id` through Array's implementation: collect what `each` yields first.
+fn enum_via_array(s: V, id: u32, args: &[V], blk: V) -> V {
+    match each_to_vec(s) {
+        Ok(v) => {
+            // keep the temporary array (and the values only it references) alive
+            let tmp = RVec::from(vec![ary_new(v)]);
+            send(tmp[0], id, args, blk)
+        }
+        Err(e) => e,
+    }
+}
+
+/// Enumerable methods that take a block run it while `each` yields, as in CRuby: code such as
+/// Jbuilder's collection rendering (`iter.each_with_info.map { ... }`, where each_with_info
+/// wraps every yield in a scope) depends on that, and so do infinite enumerators. Without a
+/// block (or with arguments that make the block irrelevant) they use Array's implementation.
+/// Enumerable methods that return an Enumerator when called without a block.
+const ENUM_WITHOUT_BLOCK: &[&str] = &[
+    "map", "collect", "flat_map", "collect_concat", "select", "filter", "find_all", "reject", "filter_map",
+    "each_with_object", "group_by", "partition", "sort_by", "min_by", "max_by", "minmax_by", "each_slice", "each_cons",
+];
+
+fn init_enum_streaming(en: *mut Class) {
+    macro_rules! call {
+        ($b:expr, $args:expr) => {{
+            let r = call_block($b, $args);
+            if r == UNDEF {
+                return Err(UNDEF);
+            }
+            r
+        }};
+    }
+    /// Run `f` over every yield, collecting the values it pushes; the array of them.
+    fn collect(s: V, mut f: impl FnMut(&[V], &mut RVec) -> Result<(), V> + 'static) -> V {
+        let acc = Rc::new(RefCell::new(RVec::new()));
+        let a2 = acc.clone();
+        match each_args_until(s, move |a| f(a, &mut a2.borrow_mut()).map(|_| false)) {
+            Ok(()) => {
+                let v = acc.borrow_mut().take();
+                ary_new(v)
+            }
+            Err(e) => e,
+        }
+    }
+    fn streamed(en: *mut Class, names: &[&str], min: i32, max: i32, f: fn(V, &[V], V) -> V) {
+        for name in names {
+            let id = sym(name);
+            let p = proc_new_native(
+                Box::new(move |s, a, b| {
+                    // without a block, an Enumerator over the receiver (so `each_slice(2).first(2)`
+                    // works on an infinite enumerator, and its inspect names the receiver)
+                    if !is_proc(b) && ENUM_WITHOUT_BLOCK.contains(&sym_str(id).as_str()) && (a.len() as i32) >= min {
+                        return enum_for(s, &sym_str(id), a);
+                    }
+                    if !is_proc(b) || (a.len() as i32) < min || (max >= 0 && a.len() as i32 > max) {
+                        enum_via_array(s, id, a, b)
+                    } else {
+                        f(s, a, b)
+                    }
+                }),
+                0,
+                -1,
+            );
+            add_method(en, id, Body::Proc(p));
+        }
+    }
+    streamed(en, &["map", "collect"], 0, 0, |s, _, b| collect(s, move |a, acc| Ok(acc.push(call!(b, a)))));
+    streamed(en, &["flat_map", "collect_concat"], 0, 0, |s, _, b| {
+        collect(s, move |a, acc| {
+            let r = call!(b, a);
+            if is_ary(r) {
+                let items = rary(r).v.to_vec();
+                for x in items {
+                    acc.push(x);
+                }
+            } else {
+                acc.push(r);
+            }
+            Ok(())
+        })
+    });
+    streamed(en, &["select", "filter", "find_all"], 0, 0, |s, _, b| {
+        collect(s, move |a, acc| {
+            if truthy(call!(b, a)) {
+                acc.push(yielded(a));
+            }
+            Ok(())
+        })
+    });
+    streamed(en, &["reject"], 0, 0, |s, _, b| {
+        collect(s, move |a, acc| {
+            if !truthy(call!(b, a)) {
+                acc.push(yielded(a));
+            }
+            Ok(())
+        })
+    });
+    streamed(en, &["filter_map"], 0, 0, |s, _, b| {
+        collect(s, move |a, acc| {
+            let r = call!(b, a);
+            if truthy(r) {
+                acc.push(r);
+            }
+            Ok(())
+        })
+    });
+    streamed(en, &["each_with_object"], 1, 1, |s, a, b| {
+        let memo = RVec::from(vec![a[0]]);
+        let m = memo[0];
+        match each_args_until(s, move |x| {
+            call!(b, &[yielded(x), m]);
+            Ok(false)
+        }) {
+            Ok(()) => memo[0],
+            Err(e) => e,
+        }
+    });
+    // inject { |acc, x| } and inject(init) { |acc, x| }; inject(:sym) goes through Array
+    streamed(en, &["inject", "reduce"], 0, 1, |s, a, b| {
+        let acc = Rc::new(RefCell::new(RVec::from(a.to_vec())));
+        let a2 = acc.clone();
+        let r = each_args_until(s, move |x| {
+            let v = yielded(x);
+            let cur = a2.borrow().first().copied();
+            let next = match cur {
+                None => v,
+                Some(c) => call!(b, &[c, v]),
+            };
+            let mut st = a2.borrow_mut();
+            if st.is_empty() { st.push(next) } else { st[0] = next }
+            Ok(false)
+        });
+        match r {
+            Ok(()) => acc.borrow().first().copied().unwrap_or(QNIL),
+            Err(e) => e,
+        }
+    });
+    streamed(en, &["count"], 0, 0, |s, _, b| {
+        let n = Rc::new(Cell::new(0i64));
+        let n2 = n.clone();
+        match each_args_until(s, move |a| {
+            if truthy(call!(b, a)) {
+                n2.set(n2.get() + 1);
+            }
+            Ok(false)
+        }) {
+            Ok(()) => mkfix(n.get()),
+            Err(e) => e,
+        }
+    });
+    // the block's values, then Array#sum / #to_h on them (Kahan summation, pair checks)
+    streamed(en, &["sum"], 0, 1, |s, a, b| {
+        let vals = RVec::from(vec![collect(s, move |x, acc| Ok(acc.push(call!(b, x))))]);
+        if vals[0] == UNDEF {
+            return UNDEF;
+        }
+        send(vals[0], sym("sum"), a, QNIL)
+    });
+    streamed(en, &["to_h"], 0, 0, |s, _, b| {
+        let vals = RVec::from(vec![collect(s, move |x, acc| Ok(acc.push(call!(b, x))))]);
+        if vals[0] == UNDEF {
+            return UNDEF;
+        }
+        send(vals[0], sym("to_h"), &[], QNIL)
+    });
+    streamed(en, &["group_by"], 0, 0, |s, _, b| {
+        let h = RVec::from(vec![hash_new()]);
+        let hv = h[0];
+        match each_args_until(s, move |a| {
+            let k = call!(b, a);
+            let cur = rhash(hv).m.get(&HKey(k)).copied();
+            match cur {
+                Some(l) => rary(l).v.push(yielded(a)),
+                None => {
+                    crate::hash::hset(hv, k, ary_new(vec![yielded(a)]));
+                }
+            }
+            Ok(false)
+        }) {
+            Ok(()) => h[0],
+            Err(e) => e,
+        }
+    });
+    streamed(en, &["partition"], 0, 0, |s, _, b| {
+        let both = RVec::from(vec![ary_new(vec![]), ary_new(vec![])]);
+        let (yes, no) = (both[0], both[1]);
+        match each_args_until(s, move |a| {
+            let r = call!(b, a);
+            rary(if truthy(r) { yes } else { no }).v.push(yielded(a));
+            Ok(false)
+        }) {
+            Ok(()) => ary_new(vec![both[0], both[1]]),
+            Err(e) => e,
+        }
+    });
+    // keyed by the block: [element, key] pairs while iterating, then Array's method on the
+    // pairs by key, mapped back to the elements
+    fn by_key(s: V, id: u32, a: &[V], b: V, many: bool) -> V {
+        let pairs = collect(s, move |x, acc| {
+            let k = call!(b, x);
+            acc.push(ary_new(vec![yielded(x), k]));
+            Ok(())
+        });
+        if pairs == UNDEF {
+            return UNDEF;
+        }
+        let keep = RVec::from(vec![pairs]);
+        let key = proc_new_native(Box::new(|_, a, _| if is_ary(a[0]) { rary(a[0]).v[1] } else { QNIL }), 1, 1);
+        let r = tri!(send(keep[0], id, a, key));
+        let elem = |p: V| if is_ary(p) { rary(p).v[0] } else { p };
+        if many && is_ary(r) {
+            let items: Vec<V> = rary(r).v.iter().map(|p| elem(*p)).collect();
+            ary_new(items)
+        } else {
+            elem(r)
+        }
+    }
+    streamed(en, &["sort_by"], 0, 0, |s, a, b| by_key(s, sym("sort_by"), a, b, true));
+    streamed(en, &["uniq"], 0, 0, |s, a, b| by_key(s, sym("uniq"), a, b, true));
+    streamed(en, &["min_by"], 0, 1, |s, a, b| by_key(s, sym("min_by"), a, b, !a.is_empty()));
+    streamed(en, &["max_by"], 0, 1, |s, a, b| by_key(s, sym("max_by"), a, b, !a.is_empty()));
+    streamed(en, &["minmax_by"], 0, 0, |s, a, b| by_key(s, sym("minmax_by"), a, b, true));
+    // all? / none? stop at the first element that decides them (a pattern argument uses ===)
+    fn pred(s: V, a: &[V], b: V, stop_on: bool) -> V {
+        let pat = a.first().copied();
+        let stopped = Rc::new(Cell::new(false));
+        let st = stopped.clone();
+        let r = each_args_until(s, move |x| {
+            let t = match pat {
+                Some(p) => send(p, sym("==="), &[yielded(x)], QNIL),
+                None if is_proc(b) => call_block(b, x),
+                None => yielded(x),
+            };
+            if t == UNDEF {
+                return Err(UNDEF);
+            }
+            if truthy(t) == stop_on {
+                st.set(true);
+                return Ok(true);
+            }
+            Ok(false)
+        });
+        match r {
+            Ok(()) => bool_v(!stopped.get()),
+            Err(e) => e,
+        }
+    }
+    defn(en, "all?", 0, 1, |s, a, b| pred(s, a, b, false));
+    defn(en, "none?", 0, 1, |s, a, b| pred(s, a, b, true));
+    streamed(en, &["each_slice"], 1, 1, |s, a, b| {
+        let n = if is_fix(a[0]) { fix(a[0]) } else { 0 };
+        if n <= 0 {
+            return arg_error("invalid slice size");
+        }
+        let buf = Rc::new(RefCell::new(RVec::new()));
+        let b2 = buf.clone();
+        let r = each_args_until(s, move |x| {
+            let full = {
+                let mut bb = b2.borrow_mut();
+                bb.push(yielded(x));
+                (bb.len() as i64 >= n).then(|| bb.take())
+            };
+            if let Some(slice) = full {
+                call!(b, &[ary_new(slice)]);
+            }
+            Ok(false)
+        });
+        if let Err(e) = r {
+            return e;
+        }
+        let rest = buf.borrow_mut().take();
+        if !rest.is_empty() {
+            tri!(call_block(b, &[ary_new(rest)]));
+        }
+        s
+    });
+    streamed(en, &["each_cons"], 1, 1, |s, a, b| {
+        let n = if is_fix(a[0]) { fix(a[0]) } else { 0 };
+        if n <= 0 {
+            return arg_error("invalid size");
+        }
+        let buf = Rc::new(RefCell::new(RVec::new()));
+        let r = each_args_until(s, move |x| {
+            let win = {
+                let mut bb = buf.borrow_mut();
+                bb.push(yielded(x));
+                if bb.len() as i64 > n {
+                    bb.remove(0);
+                }
+                (bb.len() as i64 == n).then(|| bb.to_vec())
+            };
+            if let Some(w) = win {
+                call!(b, &[ary_new(w)]);
+            }
+            Ok(false)
+        });
+        match r {
+            Ok(()) => s,
+            Err(e) => e,
+        }
+    });
 }

@@ -28,6 +28,13 @@ cargo build --release
 (cd examples/blog && RAILS_ENV=production RAILS_SERVE_STATIC_FILES=1 SECRET_KEY_BASE=$(openssl rand -hex 64) ../../blog)
 ruby examples/blog/compare.rb blog   # the same session against Puma and the binary: identical
 
+# a Rails 8.1 app (Zeitwerk, Solid Cache/Queue/Cable on SQLite, Propshaft, importmap, Turbo),
+# built with Ruby 3.3+ and the app's gems installed; its assets are precompiled with Ruby
+(cd examples/blog8 && RAILS_ENV=production SECRET_KEY_BASE=x bin/rails db:prepare assets:precompile)
+./target/release/kenny build examples/blog8/config.ru -o blog8
+(cd examples/blog8 && RAILS_ENV=production SECRET_KEY_BASE=$(openssl rand -hex 64) ../../blog8)
+ruby examples/blog8/compare.rb blog8   # 45 requests against Puma and the binary: identical
+
 # development mode: code reloading, live Sass/CoffeeScript, Rails' error pages, Action Cable
 (cd examples/blog && bundle exec rails db:migrate)
 BUNDLE_WITHOUT=test ./target/release/kenny build examples/blog/config.ru -o blog-dev
@@ -170,6 +177,13 @@ Working:
   scopes, transactions, eager loading): `examples/rails_api_ar` is a JSON API backed by it.
   Rack 2.2 apps run, and all 1,456 source files of Rails 5.2, ActiveSupport 7.1 and their
   dependencies compile.
+  Rails 8.1 runs too: `examples/blog8` is `rails new` (8.1.4) plus two scaffolds (posts, and
+  comments that belong to them), with Zeitwerk eager loading, Solid Cache, Solid Queue and
+  Solid Cable on SQLite, Propshaft, importmap, Turbo and Stimulus, Active Storage (libvips
+  isn't installed, so it falls back as under Ruby) and jbuilder. `examples/blog8/compare.rb`
+  runs a 45-request session (forms with CSRF tokens, validations, JSON views and a JSON API
+  create, deletes, 404/422 pages, the import map's assets) against Puma and the binary: the
+  responses are identical.
 - **Rails development mode and Action Cable:** a binary built with the development gems
   (`BUNDLE_WITHOUT=test`) and run with `RAILS_ENV=development` reloads code like `rails
   server`: `load` (which the classic autoloader, the routes reloader and initializers use)
@@ -193,7 +207,11 @@ Working:
   call's source line, so a backtrace is a walk of the native stack, taken only when needed.
 - **Bundler, socket, FFI:** Bundler's runtime API on gems resolved at build time;
   `TCPSocket`/`TCPServer`/`Socket` name resolution (blocking); FFI bindings load (their
-  declarations work) but calling a C function through FFI raises NotImplementedError.
+  declarations work) but calling a C function through FFI raises NotImplementedError. As with
+  the ffi gem, `ffi_lib` raises LoadError when the library isn't installed, so optional native
+  dependencies (Active Storage's libvips) are skipped. `require "ripper"` gives Ripper's
+  constants and event tables (enough for gems that load it), but parsing with it raises
+  NotImplementedError.
 - **Built-in HTTP server** for Rack apps: one process serves requests on every core
   (`rack.multithread` is true); `WEB_CONCURRENCY=n` forks n processes instead. `rack.hijack`
   (full and partial) hands the connection's socket to the app.
@@ -236,6 +254,7 @@ Web (the machine was also running other work, so treat these as rough; `ab -c 10
 | Rails 5.2 HTML page with layout and partials (`examples/rails_html`) | 10.4k req/s, 42 MB | 23.1k req/s, 83 MB | 4.5k req/s, 44 MB (1 thread) |
 | Rails 5.2 + ActiveRecord/SQLite read (`examples/rails_api_ar`) | 5.7k req/s, 51 MB | 16.7k req/s, 100 MB | 3.0k req/s, 44 MB (1 thread) |
 | Whole Rails 5.2 app (`examples/blog`), scaffold index | 2.7k req/s, 83 MB | 8.7k req/s, 144 MB (125 MB once idle) | 1.5k req/s, 108 MB (1 thread); 4.1k req/s, 1,058 MB (12 workers) |
+| Whole Rails 8.1 app (`examples/blog8`, SQLite, Solid Cache/Queue), scaffold index | 1.9k req/s, 113 MB | 7.7k req/s, 187 MB | 1.1k req/s (1 thread, Ruby 3.3); 4.9k req/s, about 1.1 GB (12 workers) |
 
 Run them yourself: `bench/run.sh`. Tests: `tests/run.sh`. Compile-check a file without linking: `kenny check file.rb`.
 
