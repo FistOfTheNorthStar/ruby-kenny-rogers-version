@@ -190,11 +190,40 @@ pub(crate) unsafe fn dispatch(cache: *mut CallCache, recv: V, mid: V) -> *const 
     }
     unsafe { dispatch_miss(c, e, k, serial, mid) }
 }
+/// `dispatch` for callers that still need `cache` afterwards (`opt::kn_attr_get`): the miss
+/// path hands it back, so the common path needn't keep it in a saved register.
+#[inline(always)]
+pub(crate) unsafe fn dispatch_keep(cache: *mut CallCache, recv: V, mid: V) -> (*const Method, *mut CallCache) {
+    let k = class_of(recv);
+    let c = unsafe { &mut *cache };
+    let serial = serial();
+    let e = c.entry.load(std::sync::atomic::Ordering::Acquire);
+    if !e.is_null() {
+        let e = unsafe { &*e };
+        if e.serial == serial {
+            if e.klass[0] == k {
+                return (e.method[0], cache);
+            }
+            for i in 1..e.n.min(IC_WAYS) {
+                if e.klass[i] == k {
+                    return (e.method[i], cache);
+                }
+            }
+        }
+    }
+    unsafe { dispatch_miss_keep(cache, e, k, serial, mid) }
+}
+#[inline(never)]
+unsafe fn dispatch_miss_keep(cache: *mut CallCache, e: *mut CacheEntry, k: *mut Class, serial: u64, mid: V) -> (*const Method, *mut CallCache) {
+    (unsafe { dispatch_miss(&mut *cache, e, k, serial, mid) }, cache)
+}
+
 /// Free the entries that an eval unit's call-site and constant caches point to (the unit is
 /// being freed: nothing can run its code). `owned` lists (word offset, kind): 1 = CallCache,
 /// 2 = ConstCache (kenny_compiler::OWNED_CALL / OWNED_CONST).
 pub fn free_owned_caches(caches: usize, owned: &[(u32, u8)]) {
     use std::sync::atomic::Ordering;
+    crate::opt::forget_attr_sites(owned.iter().filter(|(_, k)| *k == 1).map(|(off, _)| caches + *off as usize * 8));
     for &(off, kind) in owned {
         let p = caches + off as usize * 8;
         match kind {
@@ -1327,7 +1356,7 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
         return raise(rt().c.name_error, &format!("undefined method '{}' for class '{}'", sym_str(old), class_name(c)));
     }
     let body = crate::kernel::clone_body(unsafe { &(*m).body });
-    let nm = Box::into_raw(Box::new(Method { body, owner: unsafe { (*m).owner }, name: new, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent } }));
+    let nm = Box::into_raw(Box::new(Method { body, owner: unsafe { (*m).owner }, name: new, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
     unsafe { (*c).methods.insert(new, nm) };
     bump_serial();
     mksym(new)

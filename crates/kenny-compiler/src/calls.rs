@@ -69,7 +69,7 @@ impl<M: Module> Compiler<M> {
         let cache = self.owned_cache_ptr(fx, OWNED_CALL);
         let mid = self.sym_val(fx, name);
         if blk.is_none() && args.splat.is_none() && args.vals.len() <= 2 && self.refine_scope.is_none() {
-            return self.send_simple(fx, cache, recv, mid, &args.vals, explicit);
+            return self.send_simple(fx, cache, recv, name, mid, &args.vals, explicit);
         }
         let blk = match blk {
             Some(b) => b,
@@ -342,7 +342,14 @@ impl<M: Module> Compiler<M> {
             self.mark_loc(fx);
             let cache = self.owned_cache_ptr(fx, OWNED_CALL);
             let mid = self.sym_val(fx, &name);
-            self.callc(fx, "kn_vcall", &[cache, recv, mid])
+            let r = if !fx.loops.is_empty() && crate::fastpath::attr_name(&name) {
+                let mode = self.iconst(fx, 2);
+                self.attr_fast(fx, cache, recv, None, |c, fx| c.call(fx, "kn_attr_get", &[cache, recv, mid, mode]))
+            } else {
+                self.call(fx, "kn_vcall", &[cache, recv, mid])
+            };
+            self.check(fx, r);
+            r
         } else if let Some(v) = match &recv_node {
             Some(r) if r.as_self_node().is_none() => self.inline_block_call(fx, c, recv),
             _ => None,

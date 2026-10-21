@@ -100,7 +100,7 @@ pub fn init() {
     tag(c.range, "each", OPT_RANGE_EACH);
 }
 
-use crate::abi::dispatch;
+use crate::abi::{dispatch, dispatch_keep};
 
 #[inline(always)]
 fn approx_sp() -> usize {
@@ -139,24 +139,57 @@ pub(crate) unsafe fn call_found(m: *const Method, recv: V, mid: V, args: &[V], e
             }
             call_native(*f, recv, args, QNIL)
         }
-        Body::AttrReader(iv) if args.is_empty() => attr_get(recv, *iv),
-        Body::AttrWriter(iv) if args.len() == 1 => ivar_set(recv, *iv, args[0]),
+        Body::AttrReader(iv) if args.is_empty() => attr_get(m, recv, *iv),
+        Body::AttrWriter(iv) if args.len() == 1 => attr_set(m, recv, *iv, args[0]),
         _ => invoke(m, recv, args, QNIL),
     }
 }
 
-/// `@x` read for an attr_reader (shape lookup; no per-site cache needed).
+/// The slot of attribute method `m`'s ivar `iv` in plain Object `recv`, through the
+/// method's one-class cache (`Method::attr_slot`); None while the class has no such ivar.
+/// An object's slot table is its class's (fixed at allocation, only appended to), and
+/// classes other than singleton classes are never freed, so a cached index stays valid.
 #[inline(always)]
-fn attr_get(recv: V, iv: u32) -> V {
+fn attr_index(m: *const Method, recv: V, iv: u32) -> Option<usize> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let shape = obj(recv).shape;
+    let cache = unsafe { &(*m).attr_slot };
+    let w = cache.load(Relaxed);
+    if w != 0 && w >> 16 == shape as u64 {
+        return Some((w & 0xFFFF) as usize);
+    }
+    let i = shape_index(unsafe { &*shape }, iv)?;
+    if i <= 0xFFFF && (shape as u64) >> 48 == 0 {
+        cache.store(((shape as u64) << 16) | i as u64, Relaxed);
+    }
+    Some(i as usize)
+}
+
+/// `@x` read for attr_reader `m`.
+#[inline(always)]
+fn attr_get(m: *const Method, recv: V, iv: u32) -> V {
     if is_kind(recv, Kind::Object) {
-        let o = obj(recv);
-        let shape = unsafe { &*o.shape };
-        return match shape_index(shape, iv) {
-            Some(i) => o.ivars.get(i as usize).copied().filter(|x| *x != UNDEF).unwrap_or(QNIL),
+        return match attr_index(m, recv, iv) {
+            Some(i) => obj(recv).ivars.get(i).copied().filter(|x| *x != UNDEF).unwrap_or(QNIL),
             None => QNIL,
         };
     }
     ivar_get(recv, iv)
+}
+
+/// `@x = a` for attr_writer `m` (a new ivar, a frozen receiver...: `ivar_set`).
+#[inline(always)]
+fn attr_set(m: *const Method, recv: V, iv: u32, a: V) -> V {
+    if is_kind(recv, Kind::Object) && hdr(recv).flags & FL_FROZEN == 0 {
+        if let Some(i) = attr_index(m, recv, iv) {
+            let o = obj(recv);
+            if i < o.ivars.len() {
+                o.ivars[i] = a; // (through the write barrier)
+                return a;
+            }
+        }
+    }
+    ivar_set(recv, iv, a)
 }
 
 /// The method's specialisation tag, unless the call must go through the normal path
@@ -170,6 +203,10 @@ fn opt_of(m: *const Method, explicit: u64) -> u8 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_send0(cache: *mut CallCache, recv: V, mid: V, explicit: u64) -> V {
     let m = unsafe { dispatch(cache, recv, mid) };
+    unsafe { send0_found(m, recv, mid, explicit) }
+}
+#[inline(always)]
+unsafe fn send0_found(m: *const Method, recv: V, mid: V, explicit: u64) -> V {
     match opt_of(m, explicit) {
         OPT_ARY_SIZE => return mkfix(rary(recv).v.len() as i64),
         OPT_ARY_EMPTY => return bool_v(rary(recv).v.is_empty()),
@@ -188,6 +225,10 @@ pub unsafe extern "C" fn kn_send0(cache: *mut CallCache, recv: V, mid: V, explic
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_send1(cache: *mut CallCache, recv: V, mid: V, a: V, explicit: u64) -> V {
     let m = unsafe { dispatch(cache, recv, mid) };
+    unsafe { send1_found(m, recv, mid, a, explicit) }
+}
+#[inline(always)]
+unsafe fn send1_found(m: *const Method, recv: V, mid: V, a: V, explicit: u64) -> V {
     match opt_of(m, explicit) {
         OPT_ARY_AREF if is_fix(a) => {
             let v = &rary(recv).v;
@@ -304,4 +345,142 @@ pub extern "C" fn kn_range_first(r: V) -> V {
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_float_box(bits: u64) -> V {
     float_new(f64::from_bits(bits))
+}
+
+// ----- attribute access inline in compiled loops -----
+//
+// Inside loops, a call that may reach an attr_reader/attr_writer (`obj.x`, `obj.x = v`, a
+// bare `x`) first checks its call cache's `attr` word inline (kenny-compiler fastpath.rs
+// `attr_fast`): (receiver class << 16) | ivar index. When that doesn't match it calls
+// `kn_attr_get`/`kn_attr_set`, which make the call like `kn_send0`/`kn_send1`/`kn_vcall`
+// and, when it reached an attribute method the site may call, record the receiver's class
+// in the word. The first class wins until the method serial changes, which clears every
+// recorded word: the recorded sites are listed here.
+
+static ATTR_SITES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static ATTR_SITES_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `mode`: 0 = a call without an explicit receiver, 1 = with one (`obj.x`: no private or
+/// protected method), 2 = a bare identifier (a vcall). Shaped like `kn_send0` (the common
+/// case at a site that isn't an attribute), the attribute work out of line.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_attr_get(cache: *mut CallCache, recv: V, mid: V, mode: u64) -> V {
+    let (m, cache) = unsafe { dispatch_keep(cache, recv, mid) };
+    if !m.is_null() && matches!(unsafe { &(*m).body }, Body::AttrReader(_)) {
+        return unsafe { attr_get_site(cache, m, recv, mid, mode) };
+    }
+    unsafe { get_found(m, recv, mid, mode) }
+}
+#[inline(always)]
+unsafe fn get_found(m: *const Method, recv: V, mid: V, mode: u64) -> V {
+    if mode == 2 {
+        if m.is_null() {
+            return method_missing(recv, sym_id(mid), &[], QNIL, true);
+        }
+        return unsafe { call_found(m, recv, mid, &[], 0) };
+    }
+    unsafe { send0_found(m, recv, mid, mode) }
+}
+#[inline(never)]
+unsafe fn attr_get_site(cache: *mut CallCache, m: *const Method, recv: V, mid: V, mode: u64) -> V {
+    if is_kind(recv, Kind::Object) && (mode != 1 || unsafe { (*m).vis } == VIS_PUBLIC) {
+        if let Body::AttrReader(iv) = unsafe { &(*m).body } {
+            if let Some(i) = attr_index(m, recv, *iv) {
+                if let Some(&v) = obj(recv).ivars.get(i) {
+                    if v != UNDEF {
+                        record_attr_site(cache, m, recv, i);
+                        return v;
+                    }
+                }
+            }
+        }
+    }
+    unsafe { get_found(m, recv, mid, mode) }
+}
+
+/// `recv.mid = a` (`explicit` as for `kn_send1`); see `kn_attr_get`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_attr_set(cache: *mut CallCache, recv: V, mid: V, a: V, explicit: u64) -> V {
+    let (m, cache) = unsafe { dispatch_keep(cache, recv, mid) };
+    if !m.is_null() && matches!(unsafe { &(*m).body }, Body::AttrWriter(_)) {
+        return unsafe { attr_set_site(cache, m, recv, mid, a, explicit) };
+    }
+    unsafe { send1_found(m, recv, mid, a, explicit) }
+}
+#[inline(never)]
+unsafe fn attr_set_site(cache: *mut CallCache, m: *const Method, recv: V, mid: V, a: V, explicit: u64) -> V {
+    if is_kind(recv, Kind::Object) && hdr(recv).flags & FL_FROZEN == 0 && (explicit == 0 || unsafe { (*m).vis } == VIS_PUBLIC) {
+        if let Body::AttrWriter(iv) = unsafe { &(*m).body } {
+            if let Some(i) = attr_index(m, recv, *iv) {
+                let o = obj(recv);
+                if i < o.ivars.len() {
+                    o.ivars[i] = a; // (through the write barrier)
+                    record_attr_site(cache, m, recv, i);
+                    return a;
+                }
+            }
+        }
+    }
+    unsafe { send1_found(m, recv, mid, a, explicit) }
+}
+
+/// Let compiled code access slot `i` of `recv`'s class inline at this site (it reached
+/// attribute method `m` for that class).
+#[inline(always)]
+fn record_attr_site(cache: *mut CallCache, m: *const Method, recv: V, i: usize) {
+    let c = unsafe { &*cache };
+    if c.attr.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        record_attr_site_slow(c, m, recv, i);
+    }
+}
+#[inline(never)]
+fn record_attr_site_slow(c: &CallCache, m: *const Method, recv: V, i: usize) {
+    use std::sync::atomic::Ordering::*;
+    let k = hdr(recv).klass;
+    if k as u64 >> 48 != 0 || i > 0xFFFF {
+        return;
+    }
+    let mut sites = ATTR_SITES.lock().unwrap_or_else(|e| e.into_inner());
+    // count first, then check that the site's cache still maps the class to `m` under the
+    // current serial: a concurrent `clear_attr_sites` either sees the count (and clears
+    // this site once we unlock) or bumped the serial before our check
+    ATTR_SITES_N.fetch_add(1, SeqCst);
+    let serial = SERIAL.load(SeqCst);
+    let e = c.entry.load(Acquire);
+    let current = !e.is_null() && {
+        let e = unsafe { &*e };
+        e.serial == serial && (0..e.n.min(IC_WAYS)).any(|w| e.klass[w] == k && e.method[w] == m)
+    };
+    if !current || c.attr.load(Relaxed) != 0 {
+        ATTR_SITES_N.fetch_sub(1, SeqCst);
+        return;
+    }
+    c.attr.store(((k as u64) << 16) | i as u64, Release);
+    sites.push(c as *const CallCache as usize);
+}
+
+/// The method serial changed (a method defined or removed, a module included, a singleton
+/// class freed...): no site may keep using a recorded attribute.
+pub fn clear_attr_sites() {
+    use std::sync::atomic::Ordering::*;
+    if ATTR_SITES_N.load(SeqCst) == 0 {
+        return;
+    }
+    let mut sites = ATTR_SITES.lock().unwrap_or_else(|e| e.into_inner());
+    for p in sites.drain(..) {
+        unsafe { &*(p as *const CallCache) }.attr.store(0, Release);
+    }
+    ATTR_SITES_N.store(0, SeqCst);
+}
+
+/// A freed eval unit's call caches (their memory gets reused).
+pub fn forget_attr_sites(caches: impl Iterator<Item = usize>) {
+    if ATTR_SITES_N.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return;
+    }
+    let gone: std::collections::HashSet<usize> = caches.collect();
+    let mut sites = ATTR_SITES.lock().unwrap_or_else(|e| e.into_inner());
+    let before = sites.len();
+    sites.retain(|p| !gone.contains(p));
+    ATTR_SITES_N.fetch_sub(before - sites.len(), std::sync::atomic::Ordering::SeqCst);
 }

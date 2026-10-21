@@ -7,7 +7,7 @@
 
 use crate::*;
 use ruby_prism::Node;
-use cranelift_codegen::ir::{condcodes::FloatCC, types::F64, types::I8};
+use cranelift_codegen::ir::{condcodes::FloatCC, types::F64, types::I32, types::I8};
 
 /// Flonum tags (kenny-runtime/src/core.rs): low two bits 0b10; +0.0 has its own encoding.
 const FLONUM_ZERO: i64 = 0x8000_0000_0000_0002u64 as i64;
@@ -461,15 +461,131 @@ impl<M: Module> Compiler<M> {
 
     /// A call with 0-2 positional arguments and no block: `kn_send0/1/2`, which handle the
     /// hot core methods directly (guarded by the inline cache) and skip the argument buffer.
-    pub(crate) fn send_simple(&mut self, fx: &mut Fx, cache: Value, recv: Value, mid: Value, vals: &[Value], explicit: bool) -> Value {
+    /// Inside a loop, a call that may reach an attr_reader / attr_writer first tries the
+    /// site's recorded slot inline (`attr_fast`).
+    pub(crate) fn send_simple(&mut self, fx: &mut Fx, cache: Value, recv: Value, name: &[u8], mid: Value, vals: &[Value], explicit: bool) -> Value {
         let e = self.iconst(fx, explicit as i64);
+        let in_loop = !fx.loops.is_empty();
         match vals {
+            [] if in_loop && attr_name(name) => self.attr_fast(fx, cache, recv, None, |c, fx| c.call(fx, "kn_attr_get", &[cache, recv, mid, e])),
             [] => self.call(fx, "kn_send0", &[cache, recv, mid, e]),
+            [a] if in_loop && name.last() == Some(&b'=') && attr_name(&name[..name.len() - 1]) => {
+                let a = *a;
+                self.attr_fast(fx, cache, recv, Some(a), |c, fx| c.call(fx, "kn_attr_set", &[cache, recv, mid, a, e]))
+            }
             [a] => self.call(fx, "kn_send1", &[cache, recv, mid, *a, e]),
             [a, b] => self.call(fx, "kn_send2", &[cache, recv, mid, *a, *b, e]),
             _ => unreachable!(),
         }
     }
+
+    /// An attribute read (`val` None) or write without a runtime call, once the runtime has
+    /// recorded in the call site's cache that this site reaches an attr_reader/attr_writer
+    /// for receivers of one class (kenny-runtime `CallCache::attr`: class << 16 | ivar index;
+    /// cleared when any method changes). Anything else runs `slow`, `kn_attr_get` or
+    /// `kn_attr_set`, which records the class.
+    ///
+    /// Used only inside loops (`while`/`until`/`for` and inlined `each`/`times`/... blocks):
+    /// elsewhere the call itself is most of the cost, and inlining at every site would grow
+    /// a Rails binary's code by a quarter.
+    pub(crate) fn attr_fast(&mut self, fx: &mut Fx, cache: Value, recv: Value, val: Option<Value>, slow: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
+        let f = mem();
+        let slow_b = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.set_cold_block(slow_b);
+
+        // a recorded attribute (most sites never record one: one load and a branch), and a
+        // heap object (not an immediate, nil or false)
+        let word = fx.b.ins().load(I64, f, cache, CC_ATTR);
+        let b0 = fx.b.create_block();
+        fx.b.ins().brif(word, b0, &[], slow_b, &[]);
+        fx.b.switch_to_block(b0);
+        let low = fx.b.ins().band_imm_s(recv, 7);
+        let aligned = fx.b.ins().icmp_imm_s(IntCC::Equal, low, 0);
+        let not_nil = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, recv, QNIL);
+        let heap = fx.b.ins().band(aligned, not_nil);
+        let b1 = fx.b.create_block();
+        fx.b.ins().brif(heap, b1, &[], slow_b, &[]);
+
+        // of the recorded class, a plain Object
+        fx.b.switch_to_block(b1);
+        let klass = fx.b.ins().load(I64, f, recv, 0);
+        let kind = fx.b.ins().load(I32, f, recv, OBJ_KIND);
+        let wk = fx.b.ins().ushr_imm_u(word, 16);
+        let same = fx.b.ins().icmp(IntCC::Equal, klass, wk);
+        let is_obj = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
+        let ok = fx.b.ins().band(same, is_obj);
+        let b2 = fx.b.create_block();
+        fx.b.ins().brif(ok, b2, &[], slow_b, &[]);
+
+        // the slot is within the object's ivar buffer (capacity first, as SVec::snap does)
+        fx.b.switch_to_block(b2);
+        let cap_addr = fx.b.ins().iadd_imm_s(recv, OBJ_IVARS_CAP as i64);
+        let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
+        let ptr = fx.b.ins().load(I64, f, recv, OBJ_IVARS_PTR);
+        let len = fx.b.ins().load(I64, f, recv, OBJ_IVARS_LEN);
+        let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
+        let n = fx.b.ins().umin(len, capn);
+        let idx = fx.b.ins().band_imm_s(word, 0xFFFF);
+        let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, idx, n);
+        let off = fx.b.ins().ishl_imm_u(idx, 3);
+        let addr = fx.b.ins().iadd(ptr, off);
+        let b3 = fx.b.create_block();
+        match val {
+            None => {
+                fx.b.ins().brif(inb, b3, &[], slow_b, &[]);
+                // an ivar removed with remove_instance_variable reads as nil (slow path)
+                fx.b.switch_to_block(b3);
+                let v = fx.b.ins().load(I64, f, addr, 0);
+                let unset = fx.b.ins().icmp_imm_s(IntCC::Equal, v, UNDEF);
+                fx.b.ins().brif(unset, slow_b, &[], done, &[v.into()]);
+            }
+            Some(a) => {
+                // not frozen, and no write barrier due (an old buffer not yet remembered
+                // takes the runtime path, which remembers it)
+                let flags = fx.b.ins().load(I32, f, recv, OBJ_FLAGS);
+                let frozen = fx.b.ins().band_imm_s(flags, FL_FROZEN);
+                let not_frozen = fx.b.ins().icmp_imm_s(IntCC::Equal, frozen, 0);
+                let old_bits = fx.b.ins().band_imm_s(cap, SVEC_FLAGS);
+                let no_wb = fx.b.ins().icmp_imm_s(IntCC::NotEqual, old_bits, SVEC_OLD);
+                let w1 = fx.b.ins().band(inb, not_frozen);
+                let w = fx.b.ins().band(w1, no_wb);
+                fx.b.ins().brif(w, b3, &[], slow_b, &[]);
+                fx.b.switch_to_block(b3);
+                fx.b.ins().store(f, a, addr, 0);
+                fx.b.ins().jump(done, &[a.into()]);
+            }
+        }
+
+        fx.b.switch_to_block(slow_b);
+        let r = slow(self, fx);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+}
+
+/// Layout read by the attribute fast path (kenny-runtime core.rs `Header`, `RObject` and
+/// `CallCache`, svec.rs `SVec`).
+const OBJ_KIND: i32 = 8;
+const OBJ_FLAGS: i32 = 12;
+const OBJ_IVARS_PTR: i32 = 24;
+const OBJ_IVARS_LEN: i32 = 32;
+const OBJ_IVARS_CAP: i32 = 40;
+const FL_FROZEN: i64 = 1;
+const SVEC_CAP_MASK: i64 = (1 << 56) - 1;
+const SVEC_OLD: i64 = 1 << 62;
+const SVEC_FLAGS: i64 = (1 << 62) | (1 << 61);
+const CC_ATTR: i32 = 16;
+
+/// A name `attr_reader`/`attr_writer` can define (a valid instance variable name minus `@`).
+pub(crate) fn attr_name(name: &[u8]) -> bool {
+    match name.first() {
+        Some(c) if c.is_ascii_alphabetic() || *c == b'_' || *c >= 0x80 => {}
+        _ => return false,
+    }
+    name.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c >= 0x80)
 }
 
 fn int_cc(op: &[u8]) -> IntCC {

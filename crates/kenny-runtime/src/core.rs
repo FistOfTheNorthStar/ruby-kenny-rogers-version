@@ -710,6 +710,9 @@ pub struct Method {
     /// loops, like `loop`, `sleep`, `Queue#pop`): it is called directly instead of through
     /// `call_native`, so a thread waiting in it doesn't stop the GC from moving objects.
     pub gc_transparent: bool,
+    /// attr_reader/attr_writer: (receiver class << 16) | the ivar's slot index for the last
+    /// class it ran on (0 = none), so a call needn't look the slot up by name.
+    pub attr_slot: std::sync::atomic::AtomicU64,
 }
 
 pub const VIS_PUBLIC: u8 = 0;
@@ -729,7 +732,10 @@ pub struct CallCache {
     pub entry: std::sync::atomic::AtomicPtr<CacheEntry>,
     /// Misses after several threads started; past a limit the site stops caching (megamorphic).
     pub misses: u64,
-    pub _spare: u64,
+    /// For compiled code's inline attribute access in loops: (receiver class << 16) | ivar
+    /// index once this site has reached an attr_reader/attr_writer it may use, else 0.
+    /// Cleared whenever the method serial changes (see `opt::kn_attr_get`).
+    pub attr: std::sync::atomic::AtomicU64,
 }
 /// Up to `IC_WAYS` receiver classes and their methods (a polymorphic inline cache), valid
 /// while the method serial is unchanged.
@@ -1105,7 +1111,8 @@ pub fn class_name(c: *mut Class) -> String {
 }
 
 pub fn bump_serial() {
-    SERIAL.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    SERIAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    crate::opt::clear_attr_sites();
     bump_const_serial(); // include/prepend change constant lookup too
 }
 
@@ -1347,7 +1354,7 @@ fn find_super_method_uncached(klass: *mut Class, owner: *mut Class, mid: u32) ->
 }
 
 pub fn add_method(c: *mut Class, mid: u32, body: Body) -> *const Method {
-    let m = Box::into_raw(Box::new(Method { body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: false })) as *const Method;
+    let m = Box::into_raw(Box::new(Method { body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: false, attr_slot: Default::default() })) as *const Method;
     unsafe {
         (*c).methods.insert(mid, m);
     }

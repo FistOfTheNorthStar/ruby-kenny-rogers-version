@@ -301,6 +301,8 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_send0", &[I64, I64, I64, I64], &[I64]),
     ("kn_send1", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_send2", &[I64, I64, I64, I64, I64, I64], &[I64]),
+    ("kn_attr_get", &[I64, I64, I64, I64], &[I64]),
+    ("kn_attr_set", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_opt_check", &[I64, I64, I64, I64], &[I64]),
     ("kn_ary_at", &[I64, I64], &[I64]),
     ("kn_autosplat", &[I64], &[I64]),
