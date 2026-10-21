@@ -149,10 +149,11 @@ Working:
   into the binary (`-I dir`; the stdlib of an installed Ruby is found automatically).
 - **Native stdlib extensions** (Rust instead of C): date, json, yaml (Psych API), bigdecimal,
   strscan, digest, zlib, openssl (digests, HMAC, ciphers), Marshal (byte-compatible format 4.8),
-  cgi/escape, plus `Gem::Version`/`Gem::Requirement`. Nokogiri is native too (html5ever and
-  quick-xml underneath, its own XPath 1.0 engine, and nokogiri's Ruby layer on top), so loofah and
-  the Rails HTML sanitizers work without libxml2. The `sqlite3` gem's C extension is native
-  too (on the bundled SQLite library); the gem's own Ruby files load on top of it.
+  cgi/escape, erb/escape (Rails' `html_escape`), plus `Gem::Version`/`Gem::Requirement`.
+  Nokogiri is native too (html5ever and quick-xml underneath, its own XPath 1.0 engine, and
+  nokogiri's Ruby layer on top), so loofah and the Rails HTML sanitizers work without libxml2.
+  The `sqlite3` gem's C extension is native too (on the bundled SQLite library, for both the
+  1.x and 2.x gem APIs); the gem's own Ruby files load on top of it.
 - **Asset pipeline without Ruby or Node:** the `sassc` gem's API runs on a native Sass
   compiler ([grass](https://github.com/connorskees/grass)), with Sass functions such as
   `asset-path` calling back into Ruby, and ExecJS runs on an embedded JavaScript engine
@@ -175,18 +176,20 @@ Working:
   `examples/rails_api_ar` (below).
   ActiveRecord 5.2 works with the SQLite adapter (migrations/schema, associations, validations,
   scopes, transactions, eager loading): `examples/rails_api_ar` is a JSON API backed by it.
-  Rack 2.2 apps run, and all 1,456 source files of Rails 5.2, ActiveSupport 7.1 and their
-  dependencies compile.
+  Rack 2.2 and Rack 3 apps run, and all 1,456 source files of Rails 5.2, ActiveSupport 7.1
+  and their dependencies compile.
   Rails 8.1 runs too: `examples/blog8` is `rails new` (8.1.4) plus two scaffolds (posts, and
   comments that belong to them), with Zeitwerk eager loading, Solid Cache, Solid Queue and
   Solid Cable on SQLite, Propshaft, importmap, Turbo and Stimulus, Active Storage (libvips
   isn't installed, so it falls back as under Ruby) and jbuilder. `examples/blog8/compare.rb`
   runs a 45-request session (forms with CSRF tokens, validations, JSON views and a JSON API
   create, deletes, 404/422 pages, the import map's assets) against Puma and the binary: the
-  responses are identical.
-- **Rails development mode and Action Cable:** a binary built with the development gems
-  (`BUNDLE_WITHOUT=test`) and run with `RAILS_ENV=development` reloads code like `rails
-  server`: `load` (which the classic autoloader, the routes reloader and initializers use)
+  responses are identical. Its assets are precompiled with Ruby (`rails assets:precompile`)
+  before `kenny build`, since the build-time precompile above runs only for apps that use the
+  sassc or ExecJS gems.
+- **Rails development mode and Action Cable** (shown on the Rails 5.2 `examples/blog`): a
+  binary built with the development gems (`BUNDLE_WITHOUT=test`) and run with
+  `RAILS_ENV=development` reloads code like `rails server`: `load` (which the classic autoloader, the routes reloader and initializers use)
   compiles a file with the embedded JIT when it differs from the copy compiled into the binary
   or is new, so edited controllers, models, routes and views, and newly added files, take
   effect on the next request. `listen` watches the files through FSEvents. Sprockets compiles
