@@ -1,6 +1,8 @@
-//! `require "cgi/escape"`: CRuby's C accelerator for CGI escaping, as CGI::Escape.
+//! `require "cgi/escape"`: CRuby's C accelerator for CGI escaping, as CGI::Escape; and
+//! `require "erb/escape"`: the erb gem's C accelerator, ERB::Escape.html_escape.
 
 use crate::core::*;
+use crate::tri;
 
 fn arg_bytes(v: V) -> Result<Vec<u8>, V> {
     if is_str(v) {
@@ -133,9 +135,12 @@ fn init_cgi_escape() {
     };
     macro_rules! def {
         ($name:expr, $f:expr) => {
-            defn(esc, $name, 1, 1, |_, a, _| match arg_bytes(a[0]) {
-                Ok(b) => same_enc(a[0], $f(&b)),
-                Err(e) => e,
+            defn(esc, $name, 1, 1, |_, a, _| {
+                if !is_str(a[0]) {
+                    return arg_bytes(a[0]).err().unwrap_or(QNIL);
+                }
+                let out = $f(&rstr(a[0]).b);
+                same_enc(a[0], out)
             });
         };
     }
@@ -162,6 +167,52 @@ fn init_cgi_escape() {
     let _ = send(util as V, sym("prepend"), &[esc as V], QNIL);
 }
 
+fn needs_html_escape(b: &[u8]) -> bool {
+    b.iter().any(|c| matches!(c, b'\'' | b'&' | b'"' | b'<' | b'>'))
+}
+
+/// ERB::Escape.html_escape(s): like CGI.escapeHTML, but converts a non-String with to_s and
+/// returns the string itself when nothing needs escaping (Rails' html_escape calls it for
+/// every value a template outputs).
+fn erb_html_escape(_: V, a: &[V], _: V) -> V {
+    let s = if is_str(a[0]) { a[0] } else { tri!(send0(a[0], "to_s")) };
+    if !is_str(s) {
+        return type_error(&format!("can't convert {} to String", class_name(real_class(a[0]))));
+    }
+    if !needs_html_escape(&rstr(s).b) {
+        return s;
+    }
+    let out = escape_html(&rstr(s).b);
+    same_enc(s, out)
+}
+
+fn init_erb_escape() {
+    let o = rt().c.object;
+    let erb = match const_lookup(o, sym("ERB")) {
+        Some(c) if is_class(c) => c as *mut Class,
+        _ => {
+            let c = new_class("ERB", o);
+            set_global_const("ERB", c as V);
+            c
+        }
+    };
+    let esc = match const_get_under(erb, sym("Escape")) {
+        Some(m) if is_class(m) => m as *mut Class,
+        _ => {
+            let m = new_module("ERB::Escape");
+            const_set(erb, sym("Escape"), m as V);
+            m
+        }
+    };
+    // module_function: a singleton method and a private instance method
+    defs(esc, "html_escape", 1, 1, erb_html_escape);
+    defn(esc, "html_escape", 1, 1, erb_html_escape);
+    if let Some(&m) = unsafe { (*esc).methods.get(&sym("html_escape")) } {
+        unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
+    }
+}
+
 pub fn init() {
     crate::compat::provide_feature(&["cgi/escape"], Some(init_cgi_escape));
+    crate::compat::provide_feature(&["erb/escape"], Some(init_erb_escape));
 }

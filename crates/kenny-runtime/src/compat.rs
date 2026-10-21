@@ -382,6 +382,23 @@ pub fn init() {
     for (n, v) in [("$LOAD_PATH", lp), ("$:", lp), ("$-I", lp), ("$LOADED_FEATURES", lf), ("$\"", lf)] {
         rt().gvars.insert(sym(n), v);
     }
+    // $LOAD_PATH.resolve_feature_path(name): [:rb, path] for a compiled-in file, [:so, name]
+    // for a feature the runtime provides natively, nil otherwise (Ruby 3.3's erb/util asks
+    // it whether the erb/escape accelerator exists)
+    defn(singleton_class(lp), "resolve_feature_path", 1, 1, |_, a, _| {
+        let name = match crate::fmt::to_s(a[0]) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(_) => return UNDEF,
+        };
+        let base = name.trim_end_matches(".rb").trim_end_matches(".so").trim_end_matches(".bundle");
+        if FEATURES.get().iter().any(|f| f.names.contains(&base)) {
+            return ary_new(vec![mksym(sym("so")), str_from(&format!("{base}.so"))]);
+        }
+        if compiled_entry(base).is_some() {
+            return ary_new(vec![mksym(sym("rb")), str_from(&format!("{base}.rb"))]);
+        }
+        QNIL
+    });
     let c = rt().c;
     init_objectspace();
     init_binding();

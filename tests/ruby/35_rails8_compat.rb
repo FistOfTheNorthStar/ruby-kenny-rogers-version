@@ -121,3 +121,16 @@ module EncodeAll
 end
 [Enumerable, Object, Array, Hash, String].reverse_each { |k| k.include(EncodeAll) }
 p({ "a" => ["b"] }.to_json, "s".to_json, JSON.generate({ "a" => 1 }), Hash.ancestors[1])
+
+# erb/escape (Rails' html_escape): returns the string itself when nothing needs escaping
+require "erb"
+require "erb/escape"
+plain = +"plain"
+p ERB::Escape.html_escape(plain).equal?(plain), ERB::Util.html_escape("<a href='x'>&\"</a>"), ERB::Escape.html_escape(12)
+
+# match? with a start position, and String#blank?'s whitespace regexp (Unicode spaces too)
+p /b/.match?("abc", 2), "héllo".match?(/l/, 3), /c/.match?("abc", -1)
+p [0x20, 0x85, 0xa0, 0x3000, 0x200b].map { /\A[[:space:]]*\z/.match?(_1.chr(Encoding::UTF_8)) }, 0xe9.chr.encoding
+
+# gsub leaves $~ at the last match; a String pattern expands \0 and \\ in the replacement
+p "abab".gsub(/b/, "x"), $~.begin(0), "abc".gsub("b", '<\0>'), "a b".gsub(" ", " " => "%20")

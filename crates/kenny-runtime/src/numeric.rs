@@ -478,10 +478,29 @@ pub fn init() {
     defn(int, "pred", 0, 0, |s, _, _| arith(Op::Sub, s, mkfix(1)));
     defn(int, "even?", 0, 0, |s, _, _| bool_v(if is_fix(s) { fix(s) & 1 == 0 } else { rbig(s).n.is_even() }));
     defn(int, "odd?", 0, 0, |s, _, _| bool_v(if is_fix(s) { fix(s) & 1 != 0 } else { rbig(s).n.is_odd() }));
-    defn(int, "chr", 0, 1, |s, _, _| {
+    defn(int, "chr", 0, 1, |s, a, _| {
         let c = fix(s);
-        if c < 256 {
-            str_new(vec![c as u8])
+        // with an encoding: UTF-8 encodes the code point, ASCII-8BIT/US-ASCII take one byte
+        let enc = match a.first() {
+            Some(&e) => {
+                let n = match crate::fmt::to_s(e) {
+                    Ok(n) => n,
+                    Err(_) => return UNDEF,
+                };
+                Some(String::from_utf8_lossy(&n).to_ascii_uppercase())
+            }
+            None => None,
+        };
+        let utf8 = matches!(enc.as_deref(), Some("UTF-8" | "UTF8" | "CP65001"));
+        if c < 0 || (c > 255 && matches!(enc.as_deref(), Some("ASCII-8BIT" | "BINARY"))) || (c > 127 && matches!(enc.as_deref(), Some("US-ASCII" | "ASCII"))) {
+            return raise(rt().c.range_error, &format!("{c} out of char range"));
+        }
+        if c < 128 || (c < 256 && !utf8) {
+            let out = str_new(vec![c as u8]);
+            if c >= 128 {
+                hdr(out).flags |= crate::compat::FL_BINARY;
+            }
+            out
         } else {
             match char::from_u32(c as u32) {
                 Some(ch) => new_str_v(ch.to_string()),
