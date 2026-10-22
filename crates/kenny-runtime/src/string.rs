@@ -758,7 +758,18 @@ pub fn init() {
     });
     defn(c, "chars", 0, 0, |s, _, _| ary_new(chars(s).into_iter().map(new_str_v).collect()));
     defn(c, "bytes", 0, 0, |s, _, _| ary_new(rstr(s).b.iter().map(|x| mkfix(*x as i64)).collect()));
-    defn(c, "getbyte", 1, 1, |s, a, _| rstr(s).b.get(fix(a[0]) as usize).map(|x| mkfix(*x as i64)).unwrap_or(QNIL));
+    defn(c, "getbyte", 1, 1, |s, a, _| {
+        let i = if is_fix(a[0]) {
+            fix(a[0])
+        } else if is_float(a[0]) {
+            float_val(a[0]) as i64
+        } else {
+            return type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(a[0]))));
+        };
+        let b = &rstr(s).b;
+        let i = if i < 0 { i + b.len() as i64 } else { i };
+        if i < 0 { QNIL } else { b.get(i as usize).map(|x| mkfix(*x as i64)).unwrap_or(QNIL) }
+    });
     fn lines(s: V) -> Vec<V> {
         let x = rstr(s).b.clone();
         let mut out = Vec::new();

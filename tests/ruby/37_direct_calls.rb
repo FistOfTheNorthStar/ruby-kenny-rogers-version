@@ -297,3 +297,64 @@ class Ra
   def v = :redefined
 end
 p os.map(&:get_v)
+
+# case/when with classes (Module#=== answers remembered per call site and subject class)
+module Wm; end
+class Wa; end
+class Wb < Wa; end
+class Wc; end
+def kind(v)
+  case v
+  when Wb then :wb
+  when Wa then :wa
+  when Wm then :wm
+  when Integer then :int
+  when String, Symbol then :strsym
+  when 1.0..2.0 then :range
+  when /x/ then :re
+  when ->(z) { z == :lam } then :lam
+  when nil then :nil
+  else :other
+  end
+end
+vals = [Wa.new, Wb.new, Wc.new, 1, "s", :y, 1.5, nil, :lam, [1]]
+3.times { p vals.map { |v| kind(v) } }
+class Wc
+  include Wm
+end
+p vals.map { |v| kind(v) }
+w = Wa.new
+3.times { kind(w) }
+w2 = Wc.new.extend(Wm)
+p kind(w2)
+class Wa
+  def self.===(o) = o == :forced
+end
+p [kind(:forced), kind(Wa.new), kind(Wb.new)]
+class << Wa
+  remove_method :===
+end
+p [kind(:forced), kind(Wa.new), kind(Wb.new)]
+p Wa === Wb.new, Wm === 3, Comparable === 3, Class === Wa
+
+# `when CONST` where the constant isn't a class, or is a module or a class's singleton class
+WSTR = "abc"
+WRANGE = 1..3
+WRE = /b/
+WMOD = Comparable
+class Wo; end
+WSING = Wo.new.singleton_class
+def wk(v)
+  case v
+  when WSTR then :str
+  when WRANGE then :range
+  when WRE then :re
+  when WMOD then :cmp
+  when WSING then :sing
+  when BasicObject then :basic
+  end
+end
+3.times { p ["abc", 2, "xbx", 5.0, Wo.new, Object.new].map { |v| wk(v) } }
+o = Wo.new
+def o.x = 1
+p wk(o), wk(Class.new.new)

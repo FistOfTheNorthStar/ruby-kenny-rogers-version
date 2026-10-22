@@ -12,8 +12,11 @@ mod control;
 mod expr;
 mod fastpath;
 mod inline;
+mod statics;
 mod pattern;
 mod scopes;
+mod spec;
+mod vobj;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -79,6 +82,10 @@ pub(crate) struct MethodCtx {
     pub params: Vec<(Vec<u8>, u8)>,
     /// Scope-stack index of the method.
     pub scope: usize,
+    /// Enclosing class/module names of its `def` (statics.rs), when known.
+    pub lex: Option<Vec<Vec<u8>>>,
+    /// `def self.x` / `def Foo.x`: `self` is most likely a class or module
+    pub singleton: bool,
 }
 
 pub(crate) struct Fx<'a> {
@@ -115,6 +122,9 @@ pub(crate) struct Fx<'a> {
     /// depth d < len belongs to inlined block len-1-d; deeper ones are this function's
     /// at depth d - len.
     pub inline_levels: Vec<HashMap<Vec<u8>, Variable>>,
+    /// values known not to be UNDEF (their exception paths were checked already): `check`
+    /// skips them
+    pub checked: std::collections::HashSet<Value>,
     /// Unboxed shadows of register locals assigned from arithmetic: (raw f64, kind) with
     /// kind 0 = the tagged variable is current, 1 = only the raw f64 is, 2 = both.
     pub num_locals: HashMap<Vec<u8>, (Variable, Variable)>,
@@ -122,6 +132,37 @@ pub(crate) struct Fx<'a> {
     /// them or computed from such values: a hint that a Float path is the unlikely one.
     pub int_locals: HashSet<Vec<u8>>,
     pub int_vals: HashSet<Value>,
+    /// Locals that always hold Floats (analysis::typed_locals): (f64 register, the boxed
+    /// Float or 0 when not boxed yet). The box keeps a heap Float's identity (`x.equal?(x)`,
+    /// a NaN Hash key) for as long as the local holds that value.
+    /// (No box for a local only ever used unboxed: analysis::Typed::boxed.)
+    pub flocals: HashMap<Vec<u8>, (Variable, Option<Variable>)>,
+    /// Locals that always hold Integers (analysis::typed_locals), and values known to be
+    /// Integers (Fixnum or Bignum): read from them or computed from such values.
+    pub int_sure: HashSet<Vec<u8>>,
+    pub sure_ints: HashSet<Value>,
+    /// The scope's typed-locals analysis (references and exclusions, for spec.rs).
+    pub typed_info: std::rc::Rc<analysis::Typed>,
+    /// spec.rs: the speculative copy of a loop being compiled.
+    pub spec: Option<spec::SpecCtx>,
+    /// > 0 while compiling either copy of a speculated loop (no nested speculation).
+    pub spec_depth: u32,
+    /// Locals speculated to hold Fixnums (spec.rs), and values known to be Fixnums.
+    pub int_spec: HashSet<Vec<u8>>,
+    pub sure_fix: HashSet<Value>,
+    /// spec.rs: in the generic copy of a speculated loop, the block to continue at after
+    /// the local assignment at each source offset (entered from the speculative copy).
+    pub resume: HashMap<usize, Block>,
+    /// spec.rs: those places, as the fast copy asks for them
+    pub resume_req: HashMap<usize, Block>,
+    /// A method's fast entry (`FnSpec::fast_arity`): its argument values.
+    pub fast_args: Option<Vec<Value>>,
+    /// vobj.rs: locals that may hold a virtual object
+    pub vlocals: HashMap<Vec<u8>, std::rc::Rc<vobj::VLocal>>,
+    /// vobj.rs: compiling a virtual object's `initialize`: its instance variables
+    pub vself: Option<HashMap<Vec<u8>, Variable>>,
+    /// ... for the next inlined method body only
+    pub vself_next: Option<HashMap<Vec<u8>, Variable>>,
 }
 
 pub struct Compiler<M: Module> {
@@ -134,6 +175,24 @@ pub struct Compiler<M: Module> {
     /// Cache slots whose first word points to a heap entry the runtime allocates (word
     /// offset, OWNED_CALL / OWNED_CONST): freed with an eval unit.
     pub(crate) owned_caches: Vec<(u32, u8)>,
+    /// statics.rs: the program's `def`s with predeclared fast entries, by name
+    pub(crate) static_defs: HashMap<Vec<u8>, Vec<statics::StaticDef>>,
+    /// keyword `def`s of the program by name (statics.rs `KwDef`)
+    pub(crate) kw_defs: HashMap<Vec<u8>, Vec<statics::KwDef>>,
+    pub(crate) static_defined: HashSet<FuncId>,
+    pub(crate) static_counter: usize,
+    /// (file, offset) of every `def` scanned -> its enclosing class/module names
+    pub(crate) def_lex: HashMap<(PathBuf, usize), Vec<Vec<u8>>>,
+    /// statics.rs: methods that may be inlined, by (file, offset) of their `def`
+    pub(crate) inline_defs: HashMap<(PathBuf, usize), std::rc::Rc<statics::InlineDef>>,
+    /// statics.rs: the inlined methods being compiled, innermost last
+    pub(crate) inline_ctx: Vec<statics::InlineFrame>,
+    /// (file, offset) of the `def`s whose bodies are being compiled
+    pub(crate) def_stack: Vec<(PathBuf, usize)>,
+    /// (file, offset) of a compiled `def` -> the cache slot of its constant scope (cref)
+    pub(crate) def_cref: HashMap<(PathBuf, usize), usize>,
+    /// vobj.rs: the getters of the classes of the program, by class name
+    pub(crate) class_getters: HashMap<Vec<u8>, vobj::Getters>,
     pub(crate) caches_id: DataId,
     pub(crate) syms_id: DataId,
     pub(crate) strs_id: DataId,
@@ -188,7 +247,11 @@ pub(crate) struct DebugFn {
     pub label: u32,
     pub file: u32,
     pub calls: Vec<(u32, u32)>,
+    /// Only `calls` are frames (kenny-runtime backtrace.rs `Func::exact`; written as the
+    /// size's top bit).
+    pub exact: bool,
 }
+pub(crate) const DEBUG_EXACT: u32 = 1 << 31;
 
 /// (name, params, returns) of every runtime function compiled code may call.
 pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
@@ -216,10 +279,12 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_int_lit", &[I64, I64, I64], &[I64]),
     ("kn_ary_new", &[I64, I64], &[I64]),
     ("kn_ary_push", &[I64, I64], &[I64]),
+    ("kn_ary_sum_vals", &[I64], &[I64]),
     ("kn_ary_concat_splat", &[I64, I64], &[I64]),
     ("kn_ary_len", &[I64], &[I64]),
     ("kn_ary_ptr", &[I64], &[I64]),
     ("kn_hash_new", &[I64, I64, I64], &[I64]),
+    ("kn_hash_new_syms", &[I64, I64, I64], &[I64]),
     ("kn_hash_merge_splat", &[I64, I64], &[I64]),
     ("kn_range_new", &[I64, I64, I64], &[I64]),
     ("kn_proc_new", &[I64, I64, I64, I64, I64, I64], &[I64]),
@@ -245,7 +310,12 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_define_class", &[I64, I64, I64], &[I64]),
     ("kn_define_module", &[I64, I64], &[I64]),
     ("kn_singleton_class_for", &[I64], &[I64]),
-    ("kn_def", &[I64, I64, I64, I64, I64, I64], &[I64]),
+    ("kn_def", &[I64, I64, I64, I64, I64, I64, I64], &[I64]),
+    ("kn_static_fill", &[I64, I64, I64, I64], &[I64]),
+    ("kn_new_fill", &[I64, I64, I64], &[I64]),
+    ("kn_obj_alloc", &[I64], &[I64]),
+    ("kn_math1", &[I64, ir::types::F64], &[ir::types::F64]),
+    ("kn_pow", &[ir::types::F64, ir::types::F64], &[ir::types::F64]),
     ("kn_alias", &[I64, I64, I64], &[I64]),
     ("kn_undef", &[I64, I64], &[I64]),
     ("kn_check_arity", &[I64, I64, I64], &[I64]),
@@ -256,6 +326,9 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_take_kwhash2", &[I64, I64, I64], &[I64]),
     ("kn_kw_dup", &[I64], &[I64]),
     ("kn_kw_take", &[I64, I64], &[I64]),
+    ("kn_kw_get", &[I64, I64], &[I64]),
+    ("kn_kw_count", &[I64], &[I64]),
+    ("kn_kw_unknown", &[I64, I64, I64], &[I64]),
     ("kn_kw_missing", &[I64], &[I64]),
     ("kn_kw_assert_empty", &[I64], &[I64]),
     ("kn_splat_to_ary", &[I64], &[I64]),
@@ -319,6 +392,9 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_range_first", &[I64], &[I64]),
     ("kn_range_last", &[I64], &[I64]),
     ("kn_float_box", &[I64], &[I64]),
+    ("kn_float_unbox", &[I64], &[ir::types::F64]),
+    ("kn_is_float", &[I64], &[I64]),
+    ("kn_vobj_fill", &[I64, I64, I64, I64, I64], &[I64]),
 ];
 
 pub struct Output {
@@ -408,6 +484,16 @@ impl<M: Module> Compiler<M> {
             str_offsets: HashMap::new(),
             cache_words: 0,
             owned_caches: Vec::new(),
+            static_defs: HashMap::new(),
+            kw_defs: HashMap::new(),
+            static_defined: HashSet::new(),
+            static_counter: 0,
+            def_lex: HashMap::new(),
+            inline_defs: HashMap::new(),
+            inline_ctx: Vec::new(),
+            def_stack: Vec::new(),
+            def_cref: HashMap::new(),
+            class_getters: HashMap::new(),
             caches_id,
             syms_id,
             strs_id,
@@ -496,7 +582,7 @@ impl Compiler<ObjectModule> {
                     let fr = self.module.declare_func_in_data(f.id, &mut fns);
                     fns.write_function_addr((i * 32) as u32, fr);
                     fn_bytes.extend_from_slice(&0u64.to_le_bytes());
-                    fn_bytes.extend_from_slice(&f.size.to_le_bytes());
+                    fn_bytes.extend_from_slice(&(f.size | if f.exact { DEBUG_EXACT } else { 0 }).to_le_bytes());
                     fn_bytes.extend_from_slice(&f.label.to_le_bytes());
                     fn_bytes.extend_from_slice(&f.file.to_le_bytes());
                     fn_bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -608,8 +694,8 @@ impl<M: Module> Compiler<M> {
 
     /// Tag the instructions emitted from here on with the current source line (for backtraces).
     pub(crate) fn set_srcloc(&mut self, fx: &mut Fx) {
-        let line = self.line_of(self.cur_offset) as u32;
-        fx.b.set_srcloc(ir::SourceLoc::new(line));
+        let loc = self.loc_bits();
+        fx.b.set_srcloc(ir::SourceLoc::new(loc));
     }
 
     /// Keep the call sites' source locations of a compiled function (see `DebugFn`).
@@ -636,7 +722,7 @@ impl<M: Module> Compiler<M> {
         f.push(0);
         let file = self.str_offset(&f) as u32;
         let size = code.buffer.data().len() as u32;
-        self.debug_fns.push(DebugFn { id, size, label, file, calls });
+        self.debug_fns.push(DebugFn { id, size, label, file, calls, exact: false });
     }
     /// True when compiling a file found via a load path (a dependency, not the app itself).
     pub(crate) fn in_dependency(&self) -> bool {
@@ -704,6 +790,9 @@ impl<M: Module> Compiler<M> {
         v
     }
     pub(crate) fn check(&mut self, fx: &mut Fx, v: Value) {
+        if fx.checked.contains(&v) {
+            return;
+        }
         let is_undef = fx.b.ins().icmp_imm_s(IntCC::Equal, v, UNDEF);
         let cont = fx.b.create_block();
         let target = *fx.unwind.last().unwrap();

@@ -14,6 +14,10 @@
 //!   into Ruby or a safepoint.
 //! * Unused capacity of value buffers is zeroed, so a racing reader never sees garbage.
 //!
+//! * A buffer may live inside its owner (`embedded`: an object's first instance variables, in
+//!   the object's own GC slot). It is never freed; growing past it moves to a heap buffer,
+//!   and the GC moves the pointer along when it moves the owner (`rebase`).
+//!
 //! Layout is `repr(C)` {ptr, len, cap} (compiled code may read ptr/len directly).
 
 use crate::mt;
@@ -26,6 +30,11 @@ const OLD: usize = 1 << 62;
 /// Already in the remembered set since the last collection.
 const REM: usize = 1 << 61;
 const FLAGS: usize = OLD | REM;
+/// The buffer's start was moved forward by `shift` (one OS thread only): the word just
+/// before `ptr` holds how many elements, so freeing finds the allocation (`alloc_start`).
+const SHIFT: usize = 1 << 60;
+/// The buffer is inside the owner (see the module docs): not freed with it.
+const EMBED: usize = 1 << 59;
 const CAP_MASK: usize = (1 << 56) - 1;
 
 #[repr(C)]
@@ -52,6 +61,26 @@ impl<T: Copy> SVec<T> {
     pub fn with_len(self, n: usize) -> Self {
         self.len.store(n.min(self.capacity()), Relaxed);
         self
+    }
+    /// A buffer of capacity `cap` at `p`, inside the owner, holding `fill` `n` times (the
+    /// rest zeroed).
+    ///
+    /// # Safety
+    /// `p` must stay valid for `cap` elements while the owner lives (the GC moves it along
+    /// with `rebase`).
+    pub unsafe fn embedded(p: *mut T, n: usize, cap: usize, fill: T) -> Self {
+        debug_assert!(n <= cap && cap > 0);
+        for i in 0..n {
+            unsafe { p.add(i).write(fill) };
+        }
+        zero_tail::<T>(p, n, cap);
+        SVec { ptr: AtomicPtr::new(p), len: AtomicUsize::new(n), cap: AtomicUsize::new(cap | EMBED), _t: PhantomData }
+    }
+    /// (GC, the owner moved) An embedded buffer is now at `p`.
+    pub fn rebase(&self, p: *mut T) {
+        if self.cap.load(Relaxed) & EMBED != 0 {
+            self.ptr.store(p, Relaxed);
+        }
     }
     pub fn with_capacity(n: usize) -> Self {
         Self::from(Vec::with_capacity(n))
@@ -152,14 +181,26 @@ impl<T: Copy> SVec<T> {
     /// are kept.
     #[inline(always)]
     fn unlock(&self, c: usize) {
-        let flags = self.cap.load(Relaxed) & FLAGS;
+        let flags = self.cap.load(Relaxed) & (FLAGS | SHIFT | EMBED);
         self.cap.store(c | flags, Release);
+    }
+    /// The allocation behind `p` (this buffer's pointer) and its capacity, given capacity
+    /// word `w`: further back by the elements `shift` removed.
+    fn alloc_start(p: *mut T, w: usize) -> (*mut T, usize) {
+        let cap = w & CAP_MASK;
+        if w & SHIFT == 0 {
+            return (p, cap);
+        }
+        let off = unsafe { *(p as *const usize).sub(1) };
+        (unsafe { p.sub(off) }, cap + off)
     }
 
     /// Replace the buffer with one of capacity `newcap` holding the first `n` elements
     /// followed by `extra`. Called with the lock held; unlocks.
     fn grow_with(&self, oldcap: usize, n: usize, newcap: usize, extra: &[T]) {
         let old = self.ptr.load(Relaxed);
+        let w0 = self.cap.load(Relaxed);
+        let (old_start, old_alloc) = Self::alloc_start(old, oldcap | (w0 & SHIFT));
         let total = n + extra.len();
         let newcap = newcap.max(total);
         let mut v: Vec<T> = Vec::with_capacity(newcap);
@@ -173,8 +214,12 @@ impl<T: Copy> SVec<T> {
         zero_tail::<T>(np, total, ncap);
         self.ptr.store(np, Release);
         self.len.store(total, Release);
-        self.unlock(ncap);
-        retire_buf(old, oldcap);
+        // (a fresh buffer: not shifted, not embedded)
+        let flags = self.cap.load(Relaxed) & FLAGS;
+        self.cap.store(ncap | flags, Release);
+        if w0 & EMBED == 0 {
+            retire_buf(old_start, old_alloc);
+        }
     }
 
     // ----- writing -----
@@ -204,6 +249,30 @@ impl<T: Copy> SVec<T> {
         };
         self.unlock(cap);
         r
+    }
+    /// Remove and return the first element: O(1) by moving the buffer's start forward while
+    /// one OS thread runs Ruby code (`Array#shift` in a queue loop), else by copying.
+    pub fn shift(&mut self) -> Option<T> {
+        if std::mem::size_of::<T>() != 8 || mt::multi() || self.cap.load(Relaxed) & EMBED != 0 {
+            return if self.is_empty() { None } else { Some(self.remove(0)) };
+        }
+        let w = self.cap.load(Relaxed);
+        let cap = w & CAP_MASK;
+        let n = self.len.load(Relaxed).min(cap);
+        if n == 0 {
+            return None;
+        }
+        let p = self.ptr.load(Relaxed);
+        unsafe {
+            let x = p.read();
+            let off = if w & SHIFT != 0 { *(p as *const usize).sub(1) } else { 0 };
+            // the vacated slot (now just before the start) records the distance
+            *(p as *mut usize) = off + 1;
+            self.ptr.store(p.add(1), Release);
+            self.len.store(n - 1, Release);
+            self.cap.store((cap - 1) | (w & !CAP_MASK) | SHIFT, Release);
+            Some(x)
+        }
     }
     pub fn truncate(&mut self, k: usize) {
         let cap = self.lock();
@@ -325,8 +394,13 @@ impl<T: Copy> SVec<T> {
             zero_tail::<T>(np, k, ncap);
             self.ptr.store(np, Release);
             self.len.store(k, Release);
-            self.unlock(ncap);
-            retire_buf(old, cap);
+            // (a fresh buffer: not shifted, not embedded; this store also unlocks)
+            let w0 = self.cap.load(Relaxed);
+            self.cap.store(ncap | (w0 & FLAGS), Release);
+            if w0 & EMBED == 0 {
+                let (start, alloc) = Self::alloc_start(old, cap | (w0 & SHIFT));
+                retire_buf(start, alloc);
+            }
         }
     }
     /// Replace the whole contents.
@@ -430,10 +504,14 @@ impl<T: Copy> Default for SVec<T> {
 }
 impl<T: Copy> Drop for SVec<T> {
     fn drop(&mut self) {
-        let cap = self.cap.load(Relaxed) & CAP_MASK;
+        let w = self.cap.load(Relaxed);
+        if w & EMBED != 0 {
+            return;
+        }
         let p = self.ptr.load(Relaxed);
-        if cap != 0 && p != dangling::<T>() {
-            retire_buf(p, cap);
+        let (start, cap) = Self::alloc_start(p, w);
+        if cap != 0 && start != dangling::<T>() {
+            retire_buf(start, cap);
         }
     }
 }

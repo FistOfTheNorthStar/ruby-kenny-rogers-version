@@ -7,7 +7,7 @@
 
 use crate::*;
 use ruby_prism::Node;
-use cranelift_codegen::ir::{condcodes::FloatCC, types::F64, types::I32, types::I8};
+use cranelift_codegen::ir::{condcodes::FloatCC, types::F64, types::I8};
 
 /// Flonum tags (kenny-runtime/src/core.rs): low two bits 0b10; +0.0 has its own encoding.
 const FLONUM_ZERO: i64 = 0x8000_0000_0000_0002u64 as i64;
@@ -44,29 +44,46 @@ pub(crate) enum Num {
     Boxed(Value),
     /// `kind` (I8): 0 = only `boxed` is valid, 1 = only `raw` (an f64) is valid, 2 = both.
     Lazy { boxed: Value, raw: Value, kind: Value, lit: bool },
+    /// Always a Float (an always-Float local, or arithmetic on such values): the f64.
+    F64(Value),
 }
 impl Num {
+    /// (only for `Boxed` / `Lazy`: `Compiler::lazy` turns `F64` into a `Lazy` first)
     fn boxed(&self) -> Value {
         match self {
             Num::Boxed(v) => *v,
             Num::Lazy { boxed, .. } => *boxed,
+            Num::F64(_) => unreachable!("Num::F64 has no tagged value"),
         }
     }
     fn is_float_lit(&self, fx: &Fx) -> bool {
         match self {
             Num::Boxed(v) => const_of(fx, *v).is_some_and(|c| c & 3 == 2),
             Num::Lazy { lit, .. } => *lit,
+            Num::F64(_) => false,
         }
     }
     fn is_int_lit(&self, fx: &Fx) -> bool {
         match self {
             Num::Boxed(v) => const_of(fx, *v).is_some_and(|c| c & 1 == 1),
-            Num::Lazy { .. } => false,
+            _ => false,
         }
+    }
+    /// The f64 when this is known to be a Float (an always-Float value or a literal).
+    fn static_f64(&self) -> Option<Value> {
+        match self {
+            Num::F64(r) => Some(*r),
+            Num::Lazy { raw, lit: true, .. } => Some(*raw),
+            _ => None,
+        }
+    }
+    /// Known to be an Integer (Fixnum or Bignum): a literal or an always-Integer value.
+    fn is_sure_int(&self, fx: &Fx) -> bool {
+        matches!(self, Num::Boxed(v) if fx.sure_ints.contains(v) || const_of(fx, *v).is_some_and(|c| c & 1 == 1))
     }
     /// An Integer literal, or (most likely) an Integer: see `Fx::int_vals`.
     fn is_int_hint(&self, fx: &Fx) -> bool {
-        self.is_int_lit(fx) || matches!(self, Num::Boxed(v) if fx.int_vals.contains(v))
+        self.is_int_lit(fx) || matches!(self, Num::Boxed(v) if fx.int_vals.contains(v) || fx.sure_ints.contains(v))
     }
 }
 
@@ -83,9 +100,255 @@ pub(crate) fn numeric_call<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<(ruby_p
     Some((recv, args.into_iter().next().unwrap()))
 }
 
+/// kenny-runtime opt.rs `MATH_FNS` (same order: `kn_math1`'s `which`).
+const MATH_FNS: [&[u8]; 15] = [b"sqrt", b"sin", b"cos", b"tan", b"atan", b"exp", b"log", b"log2", b"log10", b"cbrt", b"sinh", b"cosh", b"tanh", b"asin", b"acos"];
+
+/// A numeric call computed inline while the methods are the builtin ones (`num_call`).
+pub(crate) enum NumCall<'pr> {
+    /// `Math.f(x)` (index into `MATH_FNS`)
+    Math(usize, ruby_prism::Node<'pr>),
+    /// `x.to_f`
+    ToF(ruby_prism::Node<'pr>),
+    /// `-x`
+    Neg(ruby_prism::Node<'pr>),
+    /// `x ** y`
+    Pow(ruby_prism::Node<'pr>, ruby_prism::Node<'pr>),
+    /// `x << y` / `x >> y` with an Integer literal shift (left: true for `<<`)
+    Shift(ruby_prism::Node<'pr>, ruby_prism::Node<'pr>, bool),
+}
+
+/// `c` as a `NumCall`, if it is one.
+pub(crate) fn num_call_of<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<NumCall<'pr>> {
+    if c.block().is_some() || c.is_safe_navigation() {
+        return None;
+    }
+    let recv = c.receiver()?;
+    let args: Vec<ruby_prism::Node> = match c.arguments() {
+        Some(a) => a.arguments().iter().collect(),
+        None => vec![],
+    };
+    if args.iter().any(|a| a.as_splat_node().is_some() || a.as_keyword_hash_node().is_some() || a.as_block_argument_node().is_some() || a.as_forwarding_arguments_node().is_some()) {
+        return None;
+    }
+    let name = c.name().as_slice();
+    match (name, args.len()) {
+        (b"to_f", 0) => Some(NumCall::ToF(recv)),
+        (b"-@", 0) => Some(NumCall::Neg(recv)),
+        (b"**", 1) => Some(NumCall::Pow(recv, args.into_iter().next().unwrap())),
+        // (`<<` is mostly Array/String append: only with a literal shift)
+        (b"<<" | b">>", 1) if args[0].as_integer_node().is_some() => {
+            Some(NumCall::Shift(recv, args.into_iter().next().unwrap(), name == b"<<"))
+        }
+        (_, 1) => {
+            let which = MATH_FNS.iter().position(|f| *f == name)?;
+            let math = recv.as_constant_read_node().is_some_and(|k| k.name().as_slice() == b"Math")
+                || recv.as_constant_path_node().is_some_and(|k| k.parent().is_none() && k.name().is_some_and(|n| n.as_slice() == b"Math"));
+            math.then(|| NumCall::Math(which, args.into_iter().next().unwrap()))
+        }
+        _ => None,
+    }
+}
+
 impl<M: Module> Compiler<M> {
+    /// A `NumCall` (see `num_call_of`): computed inline on Fixnum/Float operands (the
+    /// result may stay unboxed) while the methods are the builtin ones (`KN_DIRECT.flags`
+    /// `DIRECT_MATH` / `DIRECT_NUM`, and the receiver is the Math module) and the result is
+    /// a plain Float: Math domain errors, `**` that would give a Complex, heap Floats and
+    /// other receivers make the normal call.
+    fn num_call(&mut self, fx: &mut Fx, c: &ruby_prism::CallNode, nc: NumCall) -> Num {
+        let at = c.message_loc().map(|l| l.start_offset()).unwrap_or(c.location().start_offset());
+        let name = c.name().as_slice().to_vec();
+        let (recv, a, b) = match &nc {
+            NumCall::Math(_, arg) => {
+                let r = self.expr(fx, &c.receiver().unwrap());
+                let a = self.num_expr(fx, arg, true);
+                (Num::Boxed(r), self.lazy(fx, a), None)
+            }
+            NumCall::ToF(r) | NumCall::Neg(r) => {
+                let a = self.num_expr(fx, r, true);
+                let a = self.lazy(fx, a);
+                (a, a, None)
+            }
+            NumCall::Pow(r, arg) | NumCall::Shift(r, arg, _) => {
+                let a = self.num_expr(fx, r, true);
+                let b = self.num_expr(fx, arg, true);
+                let (a, b) = (self.lazy(fx, a), self.lazy(fx, b));
+                (a, a, Some(b))
+            }
+        };
+        self.cur_offset = at;
+        let f = mem();
+        let slow = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.append_block_param(done, F64);
+        fx.b.append_block_param(done, I8);
+        fx.b.set_cold_block(slow);
+        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+        let dir = fx.b.ins().symbol_value(I64, gv);
+        let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
+        let bit = fx.b.ins().band_imm_s(flags, if matches!(nc, NumCall::Math(..)) { DIRECT_MATH } else { DIRECT_NUM });
+        let mut ok = fx.b.ins().icmp_imm_s(IntCC::NotEqual, bit, 0);
+        if let NumCall::Math(..) = nc {
+            let mm = fx.b.ins().load(I64, f, dir, KD_MATH_MODULE);
+            let is_math = fx.b.ins().icmp(IntCC::Equal, recv.boxed(), mm);
+            ok = fx.b.ins().band(ok, is_math);
+        }
+        let nil = fx.b.ins().iconst(I64, QNIL);
+        let one = fx.b.ins().iconst(I8, 1);
+        match &nc {
+            NumCall::Neg(_) => {
+                // Fixnum: 2 - tagged is the tagged negation (overflow only for the minimum)
+                let av = a.boxed();
+                let fixb = fx.b.ins().band_imm_s(av, 1);
+                let is_fix = fx.b.ins().icmp_imm_s(IntCC::NotEqual, fixb, 0);
+                let fix_ok = fx.b.ins().band(ok, is_fix);
+                let fb = fx.b.create_block();
+                let flo_b = fx.b.create_block();
+                fx.b.ins().brif(fix_ok, fb, &[], flo_b, &[]);
+                fx.b.switch_to_block(fb);
+                let two = fx.b.ins().iconst(I64, 2);
+                let (r, of) = fx.b.ins().ssub_overflow(two, av);
+                let z = fx.b.ins().f64const(0.0);
+                let k0 = fx.b.ins().iconst(I8, 0);
+                fx.b.ins().brif(of, slow, &[], done, &[r.into(), z.into(), k0.into()]);
+                fx.b.switch_to_block(flo_b);
+                let (sel, _) = self.float_operand(fx, &a, false);
+                let is_flo = match sel.0 {
+                    Some(hr) => fx.b.ins().bor(hr, sel.1),
+                    None => sel.1,
+                };
+                let ok2 = fx.b.ins().band(ok, is_flo);
+                let b2 = fx.b.create_block();
+                fx.b.ins().brif(ok2, b2, &[], slow, &[]);
+                fx.b.switch_to_block(b2);
+                let x = self.float_value(fx, &a, sel);
+                let r = fx.b.ins().fneg(x);
+                fx.b.ins().jump(done, &[nil.into(), r.into(), one.into()]);
+            }
+            NumCall::ToF(_) | NumCall::Math(..) => {
+                let (sel, num_ok) = self.float_operand(fx, &a, false);
+                let ok = fx.b.ins().band(ok, num_ok);
+                let b2 = fx.b.create_block();
+                fx.b.ins().brif(ok, b2, &[], slow, &[]);
+                fx.b.switch_to_block(b2);
+                let x = self.float_value(fx, &a, sel);
+                match nc {
+                    NumCall::Math(which, _) => {
+                        let zero = fx.b.ins().f64const(0.0);
+                        let bad = match which {
+                            // sqrt, log, log2, log10: not below zero
+                            0 | 6 | 7 | 8 => Some(fx.b.ins().fcmp(FloatCC::LessThan, x, zero)),
+                            // asin, acos: within [-1, 1]
+                            13 | 14 => {
+                                let ax = fx.b.ins().fabs(x);
+                                let onef = fx.b.ins().f64const(1.0);
+                                Some(fx.b.ins().fcmp(FloatCC::GreaterThan, ax, onef))
+                            }
+                            _ => None,
+                        };
+                        if let Some(bad) = bad {
+                            let b3 = fx.b.create_block();
+                            fx.b.ins().brif(bad, slow, &[], b3, &[]);
+                            fx.b.switch_to_block(b3);
+                        }
+                        let r = if which == 0 {
+                            let r = fx.b.ins().sqrt(x);
+                            fx.b.ins().fadd(r, zero)
+                        } else {
+                            let w = fx.b.ins().iconst(I64, which as i64);
+                            let call = self.rt_ref(fx, "kn_math1");
+                            let inst = fx.b.ins().call(call, &[w, x]);
+                            fx.b.inst_results(inst)[0]
+                        };
+                        fx.b.ins().jump(done, &[nil.into(), r.into(), one.into()]);
+                    }
+                    _ => {
+                        fx.b.ins().jump(done, &[nil.into(), x.into(), one.into()]);
+                    }
+                }
+            }
+            NumCall::Shift(_, _, left) => {
+                // two Fixnums, a shift by 0..=62 that stays a Fixnum
+                let (av, bv) = (a.boxed(), b.unwrap().boxed());
+                let both = fx.b.ins().band(av, bv);
+                let fixb = fx.b.ins().band_imm_s(both, 1);
+                let is_fix = fx.b.ins().icmp_imm_s(IntCC::NotEqual, fixb, 0);
+                let n = fx.b.ins().sshr_imm_s(bv, 1);
+                let small = fx.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, n, 63);
+                let o1 = fx.b.ins().band(ok, is_fix);
+                let o2 = fx.b.ins().band(o1, small);
+                let b2 = fx.b.create_block();
+                fx.b.ins().brif(o2, b2, &[], slow, &[]);
+                fx.b.switch_to_block(b2);
+                let x = fx.b.ins().sshr_imm_s(av, 1);
+                let z = fx.b.ins().f64const(0.0);
+                let k0 = fx.b.ins().iconst(I8, 0);
+                if *left {
+                    // tagged: (x << n) << 1 | 1, which must shift back to x
+                    let n1 = fx.b.ins().iadd_imm_s(n, 1);
+                    let t = fx.b.ins().ishl(x, n1);
+                    let back = fx.b.ins().sshr(t, n1);
+                    let same = fx.b.ins().icmp(IntCC::Equal, back, x);
+                    let r = fx.b.ins().bor_imm_s(t, 1);
+                    fx.b.ins().brif(same, done, &[r.into(), z.into(), k0.into()], slow, &[]);
+                } else {
+                    let s = fx.b.ins().sshr(x, n);
+                    let t = fx.b.ins().ishl_imm_s(s, 1);
+                    let r = fx.b.ins().bor_imm_s(t, 1);
+                    fx.b.ins().jump(done, &[r.into(), z.into(), k0.into()]);
+                }
+            }
+            NumCall::Pow(..) => {
+                // a Float base (an Integer's ** is another method), a Fixnum/Float exponent
+                let bn = b.unwrap();
+                let (sa, _) = self.float_operand(fx, &a, false);
+                let a_flo = match sa.0 {
+                    Some(hr) => fx.b.ins().bor(hr, sa.1),
+                    None => sa.1,
+                };
+                let (sb, b_ok) = self.float_operand(fx, &bn, false);
+                let o1 = fx.b.ins().band(ok, a_flo);
+                let o2 = fx.b.ins().band(o1, b_ok);
+                let b2 = fx.b.create_block();
+                fx.b.ins().brif(o2, b2, &[], slow, &[]);
+                fx.b.switch_to_block(b2);
+                let x = self.float_value(fx, &a, sa);
+                let y = self.float_value(fx, &bn, sb);
+                // a negative base with a fractional exponent gives a Complex
+                let zero = fx.b.ins().f64const(0.0);
+                let nonneg = fx.b.ins().fcmp(FloatCC::GreaterThanOrEqual, x, zero);
+                let fl = fx.b.ins().floor(y);
+                let integral = fx.b.ins().fcmp(FloatCC::Equal, fl, y);
+                let real = fx.b.ins().bor(nonneg, integral);
+                let b3 = fx.b.create_block();
+                fx.b.ins().brif(real, b3, &[], slow, &[]);
+                fx.b.switch_to_block(b3);
+                let call = self.rt_ref(fx, "kn_pow");
+                let inst = fx.b.ins().call(call, &[x, y]);
+                let r = fx.b.inst_results(inst)[0];
+                fx.b.ins().jump(done, &[nil.into(), r.into(), one.into()]);
+            }
+        }
+        fx.b.switch_to_block(slow);
+        let rv = self.materialize(fx, recv);
+        let args: Vec<Value> = match (&nc, b) {
+            (NumCall::Math(..), _) => vec![self.materialize(fx, a)],
+            (NumCall::Pow(..) | NumCall::Shift(..), Some(bn)) => vec![self.materialize(fx, bn)],
+            _ => vec![],
+        };
+        self.cur_offset = at;
+        let v = self.send(fx, rv, &name, &args, None);
+        let z = fx.b.ins().f64const(0.0);
+        let k0 = fx.b.ins().iconst(I8, 0);
+        fx.b.ins().jump(done, &[v.into(), z.into(), k0.into()]);
+        fx.b.switch_to_block(done);
+        let p = fx.b.block_params(done).to_vec();
+        Num::Lazy { boxed: p[0], raw: p[1], kind: p[2], lit: false }
+    }
+
     /// f64 of a flonum (the caller checked the tag).
-    fn flo_decode(&mut self, fx: &mut Fx, v: Value) -> Value {
+    pub(crate) fn flo_decode(&mut self, fx: &mut Fx, v: Value) -> Value {
         let b63 = fx.b.ins().ushr_imm_s(v, 63);
         let two = fx.b.ins().iconst(I64, 2);
         let hi = fx.b.ins().isub(two, b63);
@@ -132,6 +395,13 @@ impl<M: Module> Compiler<M> {
     pub(crate) fn materialize(&mut self, fx: &mut Fx, n: Num) -> Value {
         match n {
             Num::Boxed(v) => v,
+            Num::F64(r) => {
+                let done = fx.b.create_block();
+                fx.b.append_block_param(done, I64);
+                self.flo_encode_to(fx, r, done, &[]);
+                fx.b.switch_to_block(done);
+                fx.b.block_params(done)[0]
+            }
             Num::Lazy { boxed, raw, kind, .. } => {
                 if let Some(k) = const_of(fx, kind) {
                     if k != 1 {
@@ -149,6 +419,211 @@ impl<M: Module> Compiler<M> {
                 fx.b.block_params(done)[0]
             }
         }
+    }
+
+    /// `F64` as a `Lazy` (only the raw f64 valid), for the paths that handle both kinds.
+    fn lazy(&mut self, fx: &mut Fx, n: Num) -> Num {
+        match n {
+            Num::F64(raw) => {
+                let boxed = fx.b.ins().iconst(I64, 0);
+                let kind = fx.b.ins().iconst(I8, 1);
+                Num::Lazy { boxed, raw, kind, lit: false }
+            }
+            n => n,
+        }
+    }
+
+    /// The f64 of a value that is a Float: a flonum inline, a heap Float in the runtime.
+    pub(crate) fn float_unbox(&mut self, fx: &mut Fx, v: Value) -> Value {
+        let tag = fx.b.ins().band_imm_s(v, 3);
+        let flo = fx.b.ins().icmp_imm_s(IntCC::Equal, tag, 2);
+        let fb = fx.b.create_block();
+        let hb = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, F64);
+        fx.b.set_cold_block(hb);
+        fx.b.ins().brif(flo, fb, &[], hb, &[]);
+        fx.b.switch_to_block(fb);
+        let d = self.flo_decode(fx, v);
+        fx.b.ins().jump(done, &[d.into()]);
+        fx.b.switch_to_block(hb);
+        let call = self.rt_ref(fx, "kn_float_unbox");
+        let inst = fx.b.ins().call(call, &[v]);
+        let r = fx.b.inst_results(inst)[0];
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    /// Can f64 `f` be a flonum (else boxing it makes a heap Float)? Same rule as
+    /// `flo_encode_to`.
+    fn flonum_ok(&mut self, fx: &mut Fx, f: Value) -> (Value, Value) {
+        let t = fx.b.ins().bitcast(I64, MemFlagsData::new(), f);
+        let e = fx.b.ins().ushr_imm_s(t, 60);
+        let e = fx.b.ins().band_imm_s(e, 7);
+        let x = fx.b.ins().iadd_imm_s(e, -3);
+        let in_range = fx.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, x, 1);
+        let not_special = fx.b.ins().icmp_imm_s(IntCC::NotEqual, t, 0x3000_0000_0000_0000);
+        let ok = fx.b.ins().band(in_range, not_special);
+        let is_zero = fx.b.ins().icmp_imm_s(IntCC::Equal, t, 0);
+        (fx.b.ins().bor(ok, is_zero), t)
+    }
+
+    /// An always-Float local's tagged value: its box when it has one, else a flonum, else a
+    /// new heap Float that becomes its box.
+    pub(crate) fn flocal_box(&mut self, fx: &mut Fx, raw: Variable, cache: Option<Variable>) -> Value {
+        let Some(cache) = cache else {
+            let r = fx.b.use_var(raw);
+            return self.materialize(fx, Num::F64(r));
+        };
+        let c = fx.b.use_var(cache);
+        let r = fx.b.use_var(raw);
+        let enc = fx.b.create_block();
+        let hb = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        let has = fx.b.ins().icmp_imm_s(IntCC::NotEqual, c, 0);
+        fx.b.ins().brif(has, done, &[c.into()], enc, &[]);
+        fx.b.switch_to_block(enc);
+        let (ok, t) = self.flonum_ok(fx, r);
+        let rot = fx.b.ins().rotl_imm_s(t, 3);
+        let rot = fx.b.ins().band_imm_s(rot, !1i64);
+        let v = fx.b.ins().bor_imm_s(rot, 2);
+        let is_zero = fx.b.ins().icmp_imm_s(IntCC::Equal, t, 0);
+        let zero = fx.b.ins().iconst(I64, FLONUM_ZERO);
+        let v = fx.b.ins().select(is_zero, zero, v);
+        fx.b.set_cold_block(hb);
+        fx.b.ins().brif(ok, done, &[v.into()], hb, &[]);
+        fx.b.switch_to_block(hb);
+        let v = self.call(fx, "kn_float_box", &[t]);
+        fx.b.def_var(cache, v);
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    /// An always-Float local's box for a copy to another one (`x = y`): its box, boxing it
+    /// now when it is a heap Float without one (so both name the same object); 0 when it
+    /// is a flonum that has no box yet.
+    pub(crate) fn flocal_pin(&mut self, fx: &mut Fx, raw: Variable, cache: Variable) -> Value {
+        let c = fx.b.use_var(cache);
+        let r = fx.b.use_var(raw);
+        let (ok, t) = self.flonum_ok(fx, r);
+        let has = fx.b.ins().icmp_imm_s(IntCC::NotEqual, c, 0);
+        let fine = fx.b.ins().bor(ok, has);
+        let hb = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.set_cold_block(hb);
+        fx.b.ins().brif(fine, done, &[c.into()], hb, &[]);
+        fx.b.switch_to_block(hb);
+        let v = self.call(fx, "kn_float_box", &[t]);
+        fx.b.def_var(cache, v);
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    /// (f64, box or 0) of a numeric value assigned to an always-Float local: a value that
+    /// arrives boxed keeps its box (its identity).
+    pub(crate) fn num_f64_boxed(&mut self, fx: &mut Fx, n: Num) -> (Value, Value) {
+        match n {
+            Num::F64(r) => (r, fx.b.ins().iconst(I64, 0)),
+            Num::Lazy { raw, boxed, lit: true, .. } => (raw, boxed),
+            Num::Lazy { boxed, raw, kind, .. } => {
+                // kind 1: only the f64; otherwise the box is valid (and is a Float)
+                let only_raw = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 1);
+                let rb = fx.b.create_block();
+                let bb = fx.b.create_block();
+                let done = fx.b.create_block();
+                fx.b.append_block_param(done, F64);
+                fx.b.append_block_param(done, I64);
+                fx.b.ins().brif(only_raw, rb, &[], bb, &[]);
+                fx.b.switch_to_block(rb);
+                let z = fx.b.ins().iconst(I64, 0);
+                fx.b.ins().jump(done, &[raw.into(), z.into()]);
+                fx.b.switch_to_block(bb);
+                let f = self.float_unbox(fx, boxed);
+                fx.b.ins().jump(done, &[f.into(), boxed.into()]);
+                fx.b.switch_to_block(done);
+                let p = fx.b.block_params(done);
+                (p[0], p[1])
+            }
+            Num::Boxed(v) => (self.float_unbox(fx, v), v),
+        }
+    }
+
+    /// `a op b` for an arithmetic or comparison operator where one operand is known to be a
+    /// Float and the other a Float or an Integer (`Num::static_f64` / `is_sure_int`): no
+    /// type checks beyond Fixnum for the Integer side (a Bignum, or one too large to
+    /// compare exactly as a double, makes the call). Arithmetic stays an unboxed `F64`.
+    fn typed_float_op(&mut self, fx: &mut Fx, op: &[u8], a: Num, b: Num) -> Num {
+        let arith = matches!(op, b"+" | b"-" | b"*" | b"/");
+        let mut slow: Option<Block> = None;
+        let operand = |fx: &mut Fx, n: &Num, slow: &mut Option<Block>| -> Value {
+            if let Some(r) = n.static_f64() {
+                return r;
+            }
+            let v = n.boxed();
+            if let Some(k) = const_of(fx, v) {
+                let i = k >> 1;
+                if arith || i.unsigned_abs() < (1u64 << 53) {
+                    return fx.b.ins().f64const(i as f64);
+                }
+            }
+            let low = fx.b.ins().band_imm_s(v, 1);
+            let mut ok = fx.b.ins().icmp_imm_s(IntCC::NotEqual, low, 0);
+            let i = fx.b.ins().sshr_imm_s(v, 1);
+            if !arith {
+                let x = fx.b.ins().iadd_imm_s(i, 1i64 << 53);
+                let small = fx.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, x, 1i64 << 54);
+                ok = fx.b.ins().band(ok, small);
+            }
+            let sb = *slow.get_or_insert_with(|| {
+                let b = fx.b.create_block();
+                fx.b.set_cold_block(b);
+                b
+            });
+            let cont = fx.b.create_block();
+            fx.b.ins().brif(ok, cont, &[], sb, &[]);
+            fx.b.switch_to_block(cont);
+
+            fx.b.ins().fcvt_from_sint(F64, i)
+        };
+        let fa = operand(fx, &a, &mut slow);
+        let fb = operand(fx, &b, &mut slow);
+        let r = match op {
+            b"+" => fx.b.ins().fadd(fa, fb),
+            b"-" => fx.b.ins().fsub(fa, fb),
+            b"*" => fx.b.ins().fmul(fa, fb),
+            b"/" => fx.b.ins().fdiv(fa, fb),
+            _ => {
+                let cc = match op {
+                    b"<" => FloatCC::LessThan,
+                    b"<=" => FloatCC::LessThanOrEqual,
+                    b">" => FloatCC::GreaterThan,
+                    b">=" => FloatCC::GreaterThanOrEqual,
+                    b"==" => FloatCC::Equal,
+                    _ => FloatCC::NotEqual,
+                };
+                fx.b.ins().fcmp(cc, fa, fb)
+            }
+        };
+        let Some(sb) = slow else {
+            return if arith { Num::F64(r) } else { Num::Boxed(self.bool_v(fx, r)) };
+        };
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, if arith { F64 } else { I8 });
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(sb);
+        let av = self.materialize(fx, a);
+        let bv = self.materialize(fx, b);
+        let v = self.send(fx, av, op, &[bv], None);
+        let r = if arith { self.float_unbox(fx, v) } else { self.truthy(fx, v) };
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        let r = fx.b.block_params(done)[0];
+        if arith { Num::F64(r) } else { Num::Boxed(self.bool_v(fx, r)) }
     }
 
     /// An operand of an arithmetic/comparison operator, keeping Floats unboxed: arithmetic
@@ -181,6 +656,9 @@ impl<M: Module> Compiler<M> {
             return self.local_get_num(fx, l.name().as_slice(), l.depth());
         }
         if let Some(c) = node.as_call_node() {
+            if let Some(nc) = num_call_of(&c).filter(|_| self.refine_scope.is_none()) {
+                return self.num_call(fx, &c, nc);
+            }
             if let Some((recv, arg)) = numeric_call(&c) {
                 let op = c.name().as_slice().to_vec();
                 let (rs, as_) = (recv.as_symbol_node().is_some(), arg.as_symbol_node().is_some());
@@ -251,6 +729,42 @@ impl<M: Module> Compiler<M> {
     /// Flonum/Fixnum/unboxed mixes, else a call. Arithmetic results stay unboxed
     /// (`Num::Lazy`) until something needs the tagged value.
     pub(crate) fn binop_num(&mut self, fx: &mut Fx, op: &[u8], a: Num, b: Num, lazy: bool) -> Num {
+        if self.refine_scope.is_none()
+            && matches!(op, b"+" | b"-" | b"*" | b"/" | b"<" | b"<=" | b">" | b">=" | b"==" | b"!=")
+            && (matches!(a, Num::F64(_)) || matches!(b, Num::F64(_)) || (a.static_f64().is_some() && b.static_f64().is_some()))
+            && (a.static_f64().is_some() || a.is_sure_int(fx))
+            && (b.static_f64().is_some() || b.is_sure_int(fx))
+        {
+            return self.typed_float_op(fx, op, a, b);
+        }
+        let a = self.lazy(fx, a);
+        let b = self.lazy(fx, b);
+        // two Fixnums for sure (spec.rs): comparisons and bit operations need nothing else
+        let fixv = |fx: &Fx, n: &Num| matches!(n, Num::Boxed(v) if fx.sure_fix.contains(v) || const_of(fx, *v).is_some_and(|c| c & 1 == 1));
+        let both_fix = self.refine_scope.is_none() && fixv(fx, &a) && fixv(fx, &b);
+        if both_fix {
+            let (x, y) = (a.boxed(), b.boxed());
+            match op {
+                b"<" | b"<=" | b">" | b">=" | b"==" | b"!=" => {
+                    let c = fx.b.ins().icmp(int_cc(op), x, y);
+                    return Num::Boxed(self.bool_v(fx, c));
+                }
+                b"&" | b"|" => {
+                    let r = if op == b"&" { fx.b.ins().band(x, y) } else { fx.b.ins().bor(x, y) };
+                    fx.sure_fix.insert(r);
+                    fx.sure_ints.insert(r);
+                    return Num::Boxed(r);
+                }
+                b"^" => {
+                    let t = fx.b.ins().bxor(x, y);
+                    let r = fx.b.ins().bor_imm_s(t, 1);
+                    fx.sure_fix.insert(r);
+                    fx.sure_ints.insert(r);
+                    return Num::Boxed(r);
+                }
+                _ => {}
+            }
+        }
         if !is_fast_op(op) {
             let av = self.materialize(fx, a);
             let bv = self.materialize(fx, b);
@@ -263,6 +777,7 @@ impl<M: Module> Compiler<M> {
         let lit_float = a.is_float_lit(fx) || b.is_float_lit(fx);
         let lit_int = a.is_int_hint(fx) || b.is_int_hint(fx);
         let both_int = a.is_int_hint(fx) && b.is_int_hint(fx);
+        let both_sure = a.is_sure_int(fx) && b.is_sure_int(fx);
         // Float % has CRuby's sign rules and NaN cases (left to the runtime); & | ^ are
         // Integer-only; == and != only get the inline Float path when an operand is known
         // to be a Float (they are everywhere in non-numeric code, mostly on other types)
@@ -290,9 +805,13 @@ impl<M: Module> Compiler<M> {
         } else {
             // an unboxed-only operand (kind 1) has the even dummy 0 in its tagged slot, so
             // this test also rules it out
-            let both = fx.b.ins().band(ab, bb);
-            let bit = fx.b.ins().band_imm_s(both, 1);
-            fx.b.ins().brif(bit, fast, &[], fchk, &[]);
+            if both_fix {
+                fx.b.ins().jump(fast, &[]);
+            } else {
+                let both = fx.b.ins().band(ab, bb);
+                let bit = fx.b.ins().band_imm_s(both, 1);
+                fx.b.ins().brif(bit, fast, &[], fchk, &[]);
+            }
         }
         if lit_int && fchk != slow {
             fx.b.set_cold_block(fchk);
@@ -393,6 +912,9 @@ impl<M: Module> Compiler<M> {
         let p = fx.b.block_params(done).to_vec();
         if both_int && matches!(op, b"+" | b"-" | b"*" | b"/" | b"%" | b"&" | b"|" | b"^") {
             fx.int_vals.insert(p[0]);
+            if both_sure {
+                fx.sure_ints.insert(p[0]);
+            }
         }
         if unboxed {
             Num::Lazy { boxed: p[0], raw: p[1], kind: p[2], lit: false }
@@ -407,18 +929,34 @@ impl<M: Module> Compiler<M> {
     #[allow(clippy::too_many_arguments)]
     fn float_binop(&mut self, fx: &mut Fx, op: &[u8], a: &Num, b: &Num, fchk: Block, slow: Block, done: Block, unboxed: bool) {
         let arith = matches!(op, b"+" | b"-" | b"*" | b"/");
+        let cold = fx.b.func.layout.is_cold(fchk);
         fx.b.switch_to_block(fchk);
+        // two Floats (flonums or raw f64s) first: no Fixnum conversions
+        let (a_f, a_ok) = self.float_only(fx, a, !arith);
+        let (b_f, b_ok) = self.float_only(fx, b, !arith);
+        let ok = fx.b.ins().band(a_ok, b_ok);
+        let ffast = fx.b.create_block();
+        fx.b.append_block_param(ffast, F64);
+        fx.b.append_block_param(ffast, F64);
+        let mixed = fx.b.create_block();
+        if cold {
+            fx.b.set_cold_block(ffast);
+        }
+        fx.b.set_cold_block(mixed);
+        let fa = a_f.unwrap_or_else(|| self.flo_decode(fx, a.boxed()));
+        let fb = b_f.unwrap_or_else(|| self.flo_decode(fx, b.boxed()));
+        fx.b.ins().brif(ok, ffast, &[fa.into(), fb.into()], mixed, &[]);
+        // a Fixnum mixed in (converted as Ruby does)
+        fx.b.switch_to_block(mixed);
         let (a_sel, a_ok) = self.float_operand(fx, a, !arith);
         let (b_sel, b_ok) = self.float_operand(fx, b, !arith);
         let ok = fx.b.ins().band(a_ok, b_ok);
-        let ffast = fx.b.create_block();
-        if fx.b.func.layout.is_cold(fchk) {
-            fx.b.set_cold_block(ffast);
-        }
-        fx.b.ins().brif(ok, ffast, &[], slow, &[]);
+        let ma = self.float_value(fx, a, a_sel);
+        let mb = self.float_value(fx, b, b_sel);
+        fx.b.ins().brif(ok, ffast, &[ma.into(), mb.into()], slow, &[]);
         fx.b.switch_to_block(ffast);
-        let fa = self.float_value(fx, a, a_sel);
-        let fb = self.float_value(fx, b, b_sel);
+        let fa = fx.b.block_params(ffast)[0];
+        let fb = fx.b.block_params(ffast)[1];
         if arith {
             let r = match op {
                 b"+" => fx.b.ins().fadd(fa, fb),
@@ -486,6 +1024,40 @@ impl<M: Module> Compiler<M> {
         }
         ((has_raw, flo), ok)
     }
+    /// (the f64 when it is always valid, usable inline) for one operand of a Float operation
+    /// when only Floats count: a flonum, or a raw f64 (ordered, for comparisons). With no
+    /// f64 given, the caller decodes the operand as a flonum.
+    fn float_only(&mut self, fx: &mut Fx, n: &Num, exact: bool) -> (Option<Value>, Value) {
+        let v = n.boxed();
+        match n {
+            Num::Lazy { raw, kind, .. } => {
+                if let Some(k) = const_of(fx, *kind) {
+                    if k != 0 {
+                        let ok = if exact { fx.b.ins().fcmp(FloatCC::Ordered, *raw, *raw) } else { fx.b.ins().iconst(I8, 1) };
+                        return (Some(*raw), ok);
+                    }
+                }
+                let hr = fx.b.ins().icmp_imm_s(IntCC::NotEqual, *kind, 0);
+                let mut raw_ok = hr;
+                if exact {
+                    let ordered = fx.b.ins().fcmp(FloatCC::Ordered, *raw, *raw);
+                    raw_ok = fx.b.ins().band(hr, ordered);
+                }
+                let tag = fx.b.ins().band_imm_s(v, 3);
+                let flo = fx.b.ins().icmp_imm_s(IntCC::Equal, tag, 2);
+                // (a raw value that is NaN must not use the tagged slot either)
+                let not_raw = fx.b.ins().icmp_imm_s(IntCC::Equal, *kind, 0);
+                let flo = fx.b.ins().band(flo, not_raw);
+                let ok = fx.b.ins().bor(flo, raw_ok);
+                let d = self.flo_decode(fx, v);
+                (Some(fx.b.ins().select(hr, *raw, d)), ok)
+            }
+            _ => {
+                let tag = fx.b.ins().band_imm_s(v, 3);
+                (None, fx.b.ins().icmp_imm_s(IntCC::Equal, tag, 2))
+            }
+        }
+    }
     fn float_value(&mut self, fx: &mut Fx, n: &Num, sel: (Option<Value>, Value)) -> Value {
         let v = n.boxed();
         let d = self.flo_decode(fx, v);
@@ -515,6 +1087,35 @@ impl<M: Module> Compiler<M> {
     /// Inside a loop, a call that may reach an attr_reader / attr_writer first tries the
     /// site's recorded slot inline (`attr_fast`).
     pub(crate) fn send_simple(&mut self, fx: &mut Fx, cache: Value, recv: Value, name: &[u8], mid: Value, vals: &[Value], explicit: bool) -> Value {
+        {
+            let vs = vals.to_vec();
+            let nm = name.to_vec();
+            let inl = self.inline_call(fx, recv, name, mid, vals, explicit, |c, fx| {
+                if explicit { c.send_simple_dyn(fx, cache, recv, &nm, mid, &vs, explicit) } else { c.send_simple_static(fx, cache, recv, &nm, mid, &vs) }
+            });
+            if let Some(r) = inl {
+                return r;
+            }
+        }
+        if !explicit {
+            let vs = vals.to_vec();
+            let nm = name.to_vec();
+            if let Some(r) = self.static_call(fx, recv, name, mid, vals, |c, fx| c.send_simple_dyn(fx, cache, recv, &nm, mid, &vs, explicit)) {
+                return r;
+            }
+        }
+        self.send_simple_dyn(fx, cache, recv, name, mid, vals, explicit)
+    }
+    /// A receiver-less call: static if it can be, else dynamic.
+    fn send_simple_static(&mut self, fx: &mut Fx, cache: Value, recv: Value, name: &[u8], mid: Value, vals: &[Value]) -> Value {
+        let vs = vals.to_vec();
+        let nm = name.to_vec();
+        if let Some(r) = self.static_call(fx, recv, name, mid, vals, |c, fx| c.send_simple_dyn(fx, cache, recv, &nm, mid, &vs, false)) {
+            return r;
+        }
+        self.send_simple_dyn(fx, cache, recv, name, mid, vals, false)
+    }
+    fn send_simple_dyn(&mut self, fx: &mut Fx, cache: Value, recv: Value, name: &[u8], mid: Value, vals: &[Value], explicit: bool) -> Value {
         let e = self.iconst(fx, explicit as i64);
         let in_loop = !fx.loops.is_empty();
         let (inline, stub) = direct_plan(name, in_loop);
@@ -539,6 +1140,20 @@ impl<M: Module> Compiler<M> {
                 c.call(fx, rt, args)
             }
         };
+        // `a[i]` / `a[i] = v` on a plain Array (the app's code, or any loop)
+        if self.refine_scope.is_none() && (in_loop || !self.in_dependency()) {
+            match (name, vals) {
+                (b"[]", [i]) => {
+                    let i = *i;
+                    return self.ary_index_fast(fx, recv, i, None, |c, fx| plain(c, fx, "kn_send1", &[cache, recv, mid, i, e]));
+                }
+                (b"[]=", [i, v]) => {
+                    let (i, v) = (*i, *v);
+                    return self.ary_index_fast(fx, recv, i, Some(v), |c, fx| plain(c, fx, "kn_send2", &[cache, recv, mid, i, v, e]));
+                }
+                _ => {}
+            }
+        }
         match (name, vals) {
             (b"nil?", []) => return self.call_stub(fx, STUB_NIL_P, &[cache, recv, mid, e]),
             (b"is_a?" | b"kind_of?", [a]) => return self.call_stub(fx, STUB_IS_A, &[cache, recv, mid, *a, e]),
@@ -575,32 +1190,22 @@ impl<M: Module> Compiler<M> {
         fx.b.append_block_param(done, I64);
         fx.b.set_cold_block(slow_b);
 
-        // a recorded attribute (most sites never record one: one load and a branch), and a
-        // heap object (not an immediate, nil or false)
+        // a heap object (not an immediate, nil or false) of the recorded class (an empty
+        // cache word matches none), a plain Object (for a write also not frozen: kind and
+        // flags are one word): one test
+        self.require_heap(fx, recv, slow_b);
         let word = fx.b.ins().load(I64, f, cache, CC_ATTR);
-        let b0 = fx.b.create_block();
-        fx.b.ins().brif(word, b0, &[], slow_b, &[]);
-        fx.b.switch_to_block(b0);
-        let low = fx.b.ins().band_imm_s(recv, 7);
-        let aligned = fx.b.ins().icmp_imm_s(IntCC::Equal, low, 0);
-        let not_nil = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, recv, QNIL);
-        let heap = fx.b.ins().band(aligned, not_nil);
-        let b1 = fx.b.create_block();
-        fx.b.ins().brif(heap, b1, &[], slow_b, &[]);
-
-        // of the recorded class, a plain Object
-        fx.b.switch_to_block(b1);
         let klass = fx.b.ins().load(I64, f, recv, 0);
-        let kind = fx.b.ins().load(I32, f, recv, OBJ_KIND);
+        let kf = fx.b.ins().load(I64, f, recv, OBJ_KIND);
+        let mask = if val.is_some() { 0xFFFF_FFFF | (FL_FROZEN << 32) } else { 0xFFFF_FFFF };
+        let kfm = fx.b.ins().band_imm_s(kf, mask);
         let wk = fx.b.ins().ushr_imm_u(word, 16);
-        let same = fx.b.ins().icmp(IntCC::Equal, klass, wk);
-        let is_obj = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
-        let ok = fx.b.ins().band(same, is_obj);
-        let b2 = fx.b.create_block();
-        fx.b.ins().brif(ok, b2, &[], slow_b, &[]);
+        let diff = fx.b.ins().bxor(klass, wk);
+        let bad = fx.b.ins().bor(diff, kfm);
+        let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
+        self.require(fx, ok, slow_b);
 
         // the slot is within the object's ivar buffer (capacity first, as SVec::snap does)
-        fx.b.switch_to_block(b2);
         let cap_addr = fx.b.ins().iadd_imm_s(recv, OBJ_IVARS_CAP as i64);
         let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
         let ptr = fx.b.ins().load(I64, f, recv, OBJ_IVARS_PTR);
@@ -622,15 +1227,11 @@ impl<M: Module> Compiler<M> {
                 fx.b.ins().brif(unset, slow_b, &[], done, &[v.into()]);
             }
             Some(a) => {
-                // not frozen, and no write barrier due (an old buffer not yet remembered
-                // takes the runtime path, which remembers it)
-                let flags = fx.b.ins().load(I32, f, recv, OBJ_FLAGS);
-                let frozen = fx.b.ins().band_imm_s(flags, FL_FROZEN);
-                let not_frozen = fx.b.ins().icmp_imm_s(IntCC::Equal, frozen, 0);
+                // no write barrier due (an old buffer not yet remembered takes the runtime
+                // path, which remembers it)
                 let old_bits = fx.b.ins().band_imm_s(cap, SVEC_FLAGS);
                 let no_wb = fx.b.ins().icmp_imm_s(IntCC::NotEqual, old_bits, SVEC_OLD);
-                let w1 = fx.b.ins().band(inb, not_frozen);
-                let w = fx.b.ins().band(w1, no_wb);
+                let w = fx.b.ins().band(inb, no_wb);
                 fx.b.ins().brif(w, b3, &[], slow_b, &[]);
                 fx.b.switch_to_block(b3);
                 fx.b.ins().store(f, a, addr, 0);
@@ -647,6 +1248,189 @@ impl<M: Module> Compiler<M> {
 }
 
 impl<M: Module> Compiler<M> {
+    /// `recv[i]` (`val` None) or `recv[i] = val` without a call when `recv` is a plain Array
+    /// (its class is Array itself) whose `[]` / `[]=` is the builtin (`KN_DIRECT.flags`) and
+    /// `i` an Integer: an element (nil past the end), or for a write an element that exists,
+    /// of an unfrozen Array with no write barrier due (an immediate value never needs one).
+    /// Anything else runs `slow`.
+    pub(crate) fn ary_index_fast(&mut self, fx: &mut Fx, recv: Value, idx: Value, val: Option<Value>, slow: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
+        let f = mem();
+        let slow_b = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.set_cold_block(slow_b);
+        self.require_heap(fx, recv, slow_b);
+        // all of these as one word that must be 0: the class is Array itself, its method is
+        // the builtin, the index is a Fixnum, (a write) the Array isn't frozen
+        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+        let dir = fx.b.ins().symbol_value(I64, gv);
+        let k = fx.b.ins().load(I64, f, recv, 0);
+        let ak = fx.b.ins().load(I64, f, dir, KD_ARRAY_CLASS);
+        let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
+        let want = if val.is_some() { DIRECT_ARY_ASET } else { DIRECT_ARY_AREF };
+        let bit = fx.b.ins().band_imm_s(flags, want);
+        let no_bit = fx.b.ins().bxor_imm_s(bit, want);
+        let other = fx.b.ins().bxor(k, ak);
+        let not_fix = fx.b.ins().bnot(idx);
+        let not_fix = fx.b.ins().band_imm_s(not_fix, 1);
+        let mut bad = fx.b.ins().bor(other, no_bit);
+        bad = fx.b.ins().bor(bad, not_fix);
+        if val.is_some() {
+            let fl = fx.b.ins().uload32(f, recv, OBJ_FLAGS);
+            let fr = fx.b.ins().band_imm_s(fl, FL_FROZEN);
+            bad = fx.b.ins().bor(bad, fr);
+        }
+        let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
+        self.require(fx, ok, slow_b);
+        // the element (capacity first, as SVec::snap does); a negative index counts from the end
+        let cap_addr = fx.b.ins().iadd_imm_s(recv, ARY_CAP as i64);
+        let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
+        let ptr = fx.b.ins().load(I64, f, recv, ARY_PTR);
+        let len = fx.b.ins().load(I64, f, recv, ARY_LEN);
+        let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
+        let n = fx.b.ins().umin(len, capn);
+        let i = fx.b.ins().sshr_imm_s(idx, 1);
+        let neg = fx.b.ins().icmp_imm_s(IntCC::SignedLessThan, i, 0);
+        let zero = fx.b.ins().iconst(I64, 0);
+        let add = fx.b.ins().select(neg, n, zero);
+        let i = fx.b.ins().iadd(i, add);
+        let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, i, n);
+        let off = fx.b.ins().ishl_imm_u(i, 3);
+        let addr = fx.b.ins().iadd(ptr, off);
+        match val {
+            None => {
+                let b3 = fx.b.create_block();
+                let nil = fx.b.ins().iconst(I64, QNIL);
+                fx.b.ins().brif(inb, b3, &[], done, &[nil.into()]);
+                fx.b.switch_to_block(b3);
+                let v = fx.b.ins().load(I64, f, addr, 0);
+                fx.b.ins().jump(done, &[v.into()]);
+            }
+            Some(v) => {
+                self.require(fx, inb, slow_b);
+                // no write barrier due: the buffer isn't old-and-unremembered, or v is immediate
+                let old_bits = fx.b.ins().band_imm_s(cap, SVEC_FLAGS);
+                let wb_maybe = fx.b.ins().icmp_imm_s(IntCC::Equal, old_bits, SVEC_OLD);
+                let store_b = fx.b.create_block();
+                let old_b = fx.b.create_block();
+                fx.b.ins().brif(wb_maybe, old_b, &[], store_b, &[]);
+                fx.b.switch_to_block(old_b);
+                let r = fx.b.ins().rotr_imm_s(v, 3);
+                let r = fx.b.ins().iadd_imm_s(r, -2);
+                let heap = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, r, (1i64 << 61) - 2);
+                fx.b.ins().brif(heap, slow_b, &[], store_b, &[]);
+                fx.b.switch_to_block(store_b);
+                fx.b.ins().store(f, v, addr, 0);
+                fx.b.ins().jump(done, &[v.into()]);
+            }
+        }
+        fx.b.switch_to_block(slow_b);
+        let r = slow(self, fx);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    /// `recv[idx] += rhs` (`sub`: `-=`) with no call when `recv` is a plain Array whose `[]`
+    /// and `[]=` are the builtins, unfrozen, `idx` a Fixnum within it, and the element and
+    /// `rhs` Fixnums whose sum is one (an immediate: no write barrier). Else `slow`, given the
+    /// element (read only once).
+    pub(crate) fn ary_add_fast(
+        &mut self,
+        fx: &mut Fx,
+        recv: Value,
+        idx: Value,
+        rhs: Value,
+        sub: bool,
+        slow: impl FnOnce(&mut Self, &mut Fx, Value) -> Value,
+    ) -> Value {
+        let f = mem();
+        let slow_b = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.append_block_param(slow_b, I64);
+        fx.b.set_cold_block(slow_b);
+        let unread = fx.b.ins().iconst(I64, UNDEF);
+        // (a heap test that sends `unread` to slow_b)
+        let r = fx.b.ins().rotr_imm_s(recv, 3);
+        let r = fx.b.ins().iadd_imm_s(r, -2);
+        let heap = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, r, (1i64 << 61) - 2);
+        let b0 = fx.b.create_block();
+        fx.b.ins().brif(heap, b0, &[], slow_b, &[unread.into()]);
+        fx.b.switch_to_block(b0);
+        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+        let dir = fx.b.ins().symbol_value(I64, gv);
+        let k = fx.b.ins().load(I64, f, recv, 0);
+        let ak = fx.b.ins().load(I64, f, dir, KD_ARRAY_CLASS);
+        let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
+        let want = DIRECT_ARY_AREF | DIRECT_ARY_ASET;
+        let bits = fx.b.ins().band_imm_s(flags, want);
+        let no_bits = fx.b.ins().bxor_imm_s(bits, want);
+        let other = fx.b.ins().bxor(k, ak);
+        // idx and rhs Fixnums: both low bits set
+        let both = fx.b.ins().band(idx, rhs);
+        let not_fix = fx.b.ins().bnot(both);
+        let not_fix = fx.b.ins().band_imm_s(not_fix, 1);
+        let fl = fx.b.ins().uload32(f, recv, OBJ_FLAGS);
+        let fr = fx.b.ins().band_imm_s(fl, FL_FROZEN);
+        let mut bad = fx.b.ins().bor(other, no_bits);
+        bad = fx.b.ins().bor(bad, not_fix);
+        bad = fx.b.ins().bor(bad, fr);
+        let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
+        let b1 = fx.b.create_block();
+        fx.b.ins().brif(ok, b1, &[], slow_b, &[unread.into()]);
+        fx.b.switch_to_block(b1);
+        let cap_addr = fx.b.ins().iadd_imm_s(recv, ARY_CAP as i64);
+        let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
+        let ptr = fx.b.ins().load(I64, f, recv, ARY_PTR);
+        let len = fx.b.ins().load(I64, f, recv, ARY_LEN);
+        let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
+        let n = fx.b.ins().umin(len, capn);
+        let i = fx.b.ins().sshr_imm_s(idx, 1);
+        let neg = fx.b.ins().icmp_imm_s(IntCC::SignedLessThan, i, 0);
+        let zero = fx.b.ins().iconst(I64, 0);
+        let add = fx.b.ins().select(neg, n, zero);
+        let i = fx.b.ins().iadd(i, add);
+        let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, i, n);
+        let b2 = fx.b.create_block();
+        fx.b.ins().brif(inb, b2, &[], slow_b, &[unread.into()]);
+        fx.b.switch_to_block(b2);
+        let off = fx.b.ins().ishl_imm_u(i, 3);
+        let addr = fx.b.ins().iadd(ptr, off);
+        let cur = fx.b.ins().load(I64, f, addr, 0);
+        // a Fixnum element: tagged sum = cur + (rhs - 1), tagged difference = cur - (rhs - 1)
+        let b3 = fx.b.create_block();
+        let cfix = fx.b.ins().band_imm_s(cur, 1);
+        fx.b.ins().brif(cfix, b3, &[], slow_b, &[cur.into()]);
+        fx.b.switch_to_block(b3);
+        let r1 = fx.b.ins().iadd_imm_s(rhs, -1);
+        let (v, of) = if sub { fx.b.ins().ssub_overflow(cur, r1) } else { fx.b.ins().sadd_overflow(cur, r1) };
+        let b4 = fx.b.create_block();
+        fx.b.ins().brif(of, slow_b, &[cur.into()], b4, &[]);
+        fx.b.switch_to_block(b4);
+        fx.b.ins().store(f, v, addr, 0);
+        fx.b.ins().jump(done, &[v.into()]);
+        // the element: read here already, else (UNDEF) read now
+        fx.b.switch_to_block(slow_b);
+        let got = fx.b.block_params(slow_b)[0];
+        let was_read = fx.b.ins().icmp_imm_s(IntCC::NotEqual, got, UNDEF);
+        let read_now = fx.b.create_block();
+        let have = fx.b.create_block();
+        fx.b.append_block_param(have, I64);
+        fx.b.set_cold_block(read_now);
+        fx.b.set_cold_block(have);
+        fx.b.ins().brif(was_read, have, &[got.into()], read_now, &[]);
+        fx.b.switch_to_block(read_now);
+        let cur = self.send(fx, recv, b"[]", &[idx], None);
+        fx.b.ins().jump(have, &[cur.into()]);
+        fx.b.switch_to_block(have);
+        let cur = fx.b.block_params(have)[0];
+        let r = slow(self, fx, cur);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
     /// `@x` (`val` None) or `@x = val` on `recv` (self) without a runtime call, through the
     /// site's ivar cache (kenny-runtime abi.rs `IvCache`: shape | slot << 48, filled by
     /// `kn_ivar_get`/`kn_ivar_set`) when `recv` is a plain Object of that shape whose ivar
@@ -659,34 +1443,23 @@ impl<M: Module> Compiler<M> {
         fx.b.append_block_param(done, I64);
         fx.b.set_cold_block(slow_b);
 
-        // a filled cache, and a heap object
-        let word = fx.b.ins().load(I64, f, cache, 0);
-        let b0 = fx.b.create_block();
-        fx.b.ins().brif(word, b0, &[], slow_b, &[]);
-        fx.b.switch_to_block(b0);
-        let low = fx.b.ins().band_imm_s(recv, 7);
-        let aligned = fx.b.ins().icmp_imm_s(IntCC::Equal, low, 0);
-        let not_nil = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, recv, QNIL);
-        let heap = fx.b.ins().band(aligned, not_nil);
-        let b1 = fx.b.create_block();
-        fx.b.ins().brif(heap, b1, &[], slow_b, &[]);
-
+        // a heap object
+        self.require_heap(fx, recv, slow_b);
         // a plain Object (kind 0; for a write also not frozen: kind and flags are one word)
-        // of the cached shape
-        fx.b.switch_to_block(b1);
+        // of the cached shape (an empty cache word matches no shape; an object without a
+        // shape yet has no ivars, so the bounds check below sends it to the runtime)
+        let word = fx.b.ins().load(I64, f, cache, 0);
         let kf = fx.b.ins().load(I64, f, recv, OBJ_KIND);
         let mask = if val.is_some() { 0xFFFF_FFFF | (FL_FROZEN << 32) } else { 0xFFFF_FFFF };
         let kfm = fx.b.ins().band_imm_s(kf, mask);
-        let plain = fx.b.ins().icmp_imm_s(IntCC::Equal, kfm, 0);
         let shape = fx.b.ins().load(I64, f, recv, OBJ_SHAPE);
         let wshape = fx.b.ins().band_imm_s(word, IV_PTR);
-        let same = fx.b.ins().icmp(IntCC::Equal, shape, wshape);
-        let ok = fx.b.ins().band(plain, same);
-        let b2 = fx.b.create_block();
-        fx.b.ins().brif(ok, b2, &[], slow_b, &[]);
+        let diff = fx.b.ins().bxor(shape, wshape);
+        let bad = fx.b.ins().bor(kfm, diff);
+        let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
+        self.require(fx, ok, slow_b);
 
         // the slot is within the buffer (capacity first, as SVec::snap does)
-        fx.b.switch_to_block(b2);
         let cap_addr = fx.b.ins().iadd_imm_s(recv, OBJ_IVARS_CAP as i64);
         let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
         let ptr = fx.b.ins().load(I64, f, recv, OBJ_IVARS_PTR);
@@ -730,6 +1503,124 @@ impl<M: Module> Compiler<M> {
 }
 
 impl<M: Module> Compiler<M> {
+    /// A class's or module's own instance variable read (`@x` in `def self.x`), without a
+    /// call once the site's cache (kenny-runtime abi.rs `IvCache::class_pos`: class |
+    /// position << 48) has this receiver: the entry at that position of its ivar map
+    /// (core.rs `CLASS_CIVARS`) still has the key. Anything else runs `slow`.
+    pub(crate) fn civar_fast(&mut self, fx: &mut Fx, cache: Value, recv: Value, id: Value, slow: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
+        let f = mem();
+        let slow_b = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.set_cold_block(slow_b);
+        let word = fx.b.ins().load(I64, f, cache, 8);
+        let cls = fx.b.ins().band_imm_s(word, IV_PTR);
+        let same = fx.b.ins().icmp(IntCC::Equal, cls, recv);
+        let filled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, word, 0);
+        let ok = fx.b.ins().band(same, filled);
+        self.require(fx, ok, slow_b);
+        let mp = fx.b.ins().iadd_imm_s(recv, CLASS_CIVARS as i64);
+        let slab = fx.b.ins().atomic_load(I64, f, mp);
+        let has = fx.b.ins().icmp_imm_s(IntCC::NotEqual, slab, 0);
+        self.require(fx, has, slow_b);
+        let len = fx.b.ins().atomic_load(I64, f, slab);
+        let cap = fx.b.ins().load(I64, f, slab, 8);
+        let n = fx.b.ins().umin(len, cap);
+        let i = fx.b.ins().ushr_imm_u(word, 48);
+        let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, i, n);
+        self.require(fx, inb, slow_b);
+        let off = fx.b.ins().ishl_imm_u(i, 4);
+        let e = fx.b.ins().iadd(slab, off);
+        let key = fx.b.ins().uload32(f, e, 16);
+        let want = fx.b.ins().ushr_imm_u(id, 8);
+        let want = fx.b.ins().band_imm_s(want, 0xFFFF_FFFF);
+        let kok = fx.b.ins().icmp(IntCC::Equal, key, want);
+        self.require(fx, kok, slow_b);
+        let v = fx.b.ins().load(I64, f, e, 24);
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(slow_b);
+        let r = slow(self, fx);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    /// `pat === subj` for a `when` clause: answered inline when the site's cache entry
+    /// (first way) has the builtin Module#=== (`KN_DIRECT.mod_eqq`) for pat's class, pat is
+    /// a class (not a module: those have no superclass chain) and subj a heap object:
+    /// subj's class has pat at pat's depth in its superclass chain. Else a call.
+    pub(crate) fn case_class_eqq(&mut self, fx: &mut Fx, pat: Value, subj: Value) -> Value {
+        self.mark_loc(fx);
+        let cache = self.owned_cache_ptr(fx, OWNED_CALL);
+        let mid = self.sym_val(fx, b"===");
+        let f = mem();
+        let slow = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.set_cold_block(slow);
+        let heap = |c: &mut Self, fx: &mut Fx, v: Value| {
+            let low = fx.b.ins().band_imm_s(v, 7);
+            let aligned = fx.b.ins().icmp_imm_s(IntCC::Equal, low, 0);
+            let not_nil = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, v, QNIL);
+            let _ = c;
+            fx.b.ins().band(aligned, not_nil)
+        };
+        let h1 = heap(self, fx, pat);
+        let h2 = heap(self, fx, subj);
+        let hh = fx.b.ins().band(h1, h2);
+        let e = fx.b.ins().load(I64, f, cache, 0);
+        let has_e = fx.b.ins().icmp_imm_s(IntCC::NotEqual, e, 0);
+        let go = fx.b.ins().band(hh, has_e);
+        let b1 = fx.b.create_block();
+        fx.b.ins().brif(go, b1, &[], slow, &[]);
+        fx.b.switch_to_block(b1);
+        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+        let dir = fx.b.ins().symbol_value(I64, gv);
+        let pk = fx.b.ins().load(I64, f, pat, 0);
+        let ser = fx.b.ins().load(I64, f, e, CE_SERIAL);
+        let cur = fx.b.ins().load(I64, f, dir, 0);
+        let k0 = fx.b.ins().load(I64, f, e, CE_KLASS);
+        let m0 = fx.b.ins().load(I64, f, e, CE_METHOD);
+        let meq = fx.b.ins().load(I64, f, dir, KD_MOD_EQQ);
+        let o1 = fx.b.ins().icmp(IntCC::Equal, ser, cur);
+        let o2 = fx.b.ins().icmp(IntCC::Equal, k0, pk);
+        let o3 = fx.b.ins().icmp(IntCC::Equal, m0, meq);
+        let a1 = fx.b.ins().band(o1, o2);
+        let ok = fx.b.ins().band(a1, o3);
+        let b15 = fx.b.create_block();
+        fx.b.ins().brif(ok, b15, &[], slow, &[]);
+        // (pat has Module#===: a class or module)
+        fx.b.switch_to_block(b15);
+        let cs_len = fx.b.ins().load(I64, f, pat, CLASS_SUP_LEN);
+        let b2 = fx.b.create_block();
+        fx.b.ins().brif(cs_len, b2, &[], slow, &[]);
+        fx.b.switch_to_block(b2);
+        let k = fx.b.ins().load(I64, f, subj, 0);
+        let ks_len = fx.b.ins().load(I64, f, k, CLASS_SUP_LEN);
+        let d = fx.b.ins().iadd_imm_s(cs_len, -1);
+        let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, d, ks_len);
+        let b3 = fx.b.create_block();
+        let no = fx.b.ins().iconst(I64, QFALSE);
+        fx.b.ins().brif(inb, b3, &[], done, &[no.into()]);
+        fx.b.switch_to_block(b3);
+        let ksp = fx.b.ins().load(I64, f, k, CLASS_SUP_PTR);
+        let off = fx.b.ins().ishl_imm_u(d, 3);
+        let addr = fx.b.ins().iadd(ksp, off);
+        let x = fx.b.ins().load(I64, f, addr, 0);
+        let same = fx.b.ins().icmp(IntCC::Equal, x, pat);
+        let t = fx.b.ins().iconst(I64, QTRUE);
+        let fl = fx.b.ins().iconst(I64, QFALSE);
+        let r = fx.b.ins().select(same, t, fl);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(slow);
+        let one = fx.b.ins().iconst(I64, 1);
+        let r = self.call(fx, "kn_send1", &[cache, pat, mid, subj, one]);
+        self.check(fx, r);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
     /// A constant read in a loop: the site's cache entry (kenny-runtime abi.rs `ConstEntry`
     /// {serial, cref, val}) read inline when it is current (`KN_DIRECT.const_serial`) for
     /// this lexical scope, else `kn_const_get_l`, which looks it up and fills it.
@@ -764,6 +1655,34 @@ impl<M: Module> Compiler<M> {
         fx.b.block_params(done)[0]
     }
 
+    /// Go on in a new block only when `c` holds, else to `slow`. (A branch per test: tests
+    /// combined with `band` would each be materialized as a flag first.)
+    pub(crate) fn require(&mut self, fx: &mut Fx, c: Value, slow: Block) {
+        let b = fx.b.create_block();
+        fx.b.ins().brif(c, b, &[], slow, &[]);
+        fx.b.switch_to_block(b);
+    }
+    /// ... when `v` is a heap object (not an immediate, nil or false): rotated right by 3,
+    /// an aligned word is below 2^61 and the heap ones are 2 and up. (One test and branch.)
+    pub(crate) fn require_heap(&mut self, fx: &mut Fx, v: Value, slow: Block) {
+        let r = fx.b.ins().rotr_imm_s(v, 3);
+        let r = fx.b.ins().iadd_imm_s(r, -2);
+        let heap = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, r, (1i64 << 61) - 2);
+        self.require(fx, heap, slow);
+    }
+    /// Nonzero when there is no room on the stack for a call (one OS thread) or a collection
+    /// is pending (`dir`: KN_DIRECT), to be or-ed into a guard word that must be 0.
+    pub(crate) fn no_room(&mut self, fx: &mut Fx, dir: Value) -> Value {
+        let f = mem();
+        let sp = fx.b.ins().get_stack_pointer(I64);
+        let lim = fx.b.ins().load(I64, f, dir, 8);
+        // stack addresses are far below 2^63: sp < lim exactly when sp - lim is negative
+        let d = fx.b.ins().isub(sp, lim);
+        let below = fx.b.ins().ushr_imm_u(d, 63);
+        let gc = fx.b.ins().uload8(I64, f, fx.gcflag, 0);
+        fx.b.ins().bor(below, gc)
+    }
+
     /// A call to a compiled Ruby method without going through the runtime: when the
     /// site's inline cache (kenny-runtime core.rs `CacheEntry`) is current and maps the
     /// receiver's class to a compiled method (`direct`), call its function here. Also
@@ -795,48 +1714,57 @@ impl<M: Module> Compiler<M> {
 
         // a heap receiver whose class is in one of those ways, under the current serial
         fx.b.switch_to_block(b1);
-        let low = fx.b.ins().band_imm_s(recv, 7);
-        let aligned = fx.b.ins().icmp_imm_s(IntCC::Equal, low, 0);
-        let not_nil = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, recv, QNIL);
-        let heap = fx.b.ins().band(aligned, not_nil);
-        let b2h = fx.b.create_block();
-        fx.b.ins().brif(heap, b2h, &[], slow_b, &[]);
-        fx.b.switch_to_block(b2h);
+        self.require_heap(fx, recv, slow_b);
         let k = fx.b.ins().load(I64, f, recv, 0);
         let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
         let dir = fx.b.ins().symbol_value(I64, gv);
         let ser = fx.b.ins().load(I64, f, e, CE_SERIAL);
         let cur = fx.b.ins().load(I64, f, dir, 0);
-        let mut ok = fx.b.ins().icmp(IntCC::Equal, ser, cur);
+        let stale = fx.b.ins().bxor(ser, cur);
+        let bad = self.no_room(fx, dir);
+        let mut bad = fx.b.ins().bor(stale, bad);
         let mut func = fx.b.ins().iconst(I64, 0);
+        let mut msel = fx.b.ins().iconst(I64, 0);
         for w in (0..ways).rev() {
             let kw = fx.b.ins().load(I64, f, e, CE_KLASS + 8 * w as i32);
             let hit = fx.b.ins().icmp(IntCC::Equal, kw, k);
             func = fx.b.ins().select(hit, fs[w], func);
+            let mw = fx.b.ins().load(I64, f, e, CE_METHOD + 8 * w as i32);
+            msel = fx.b.ins().select(hit, mw, msel);
         }
-        // a compiled method (public, with an explicit receiver: the low bit marks private)
-        let callable = if explicit {
+        // a compiled method (public, with an explicit receiver: the low bit marks private),
+        // the current serial, room for the call: one branch on (all fine ? func : 0)
+        if explicit {
             let priv_bit = fx.b.ins().band_imm_s(func, 1);
-            let public = fx.b.ins().icmp_imm_s(IntCC::Equal, priv_bit, 0);
-            let some = fx.b.ins().icmp_imm_s(IntCC::NotEqual, func, 0);
-            fx.b.ins().band(public, some)
+            bad = fx.b.ins().bor(bad, priv_bit);
         } else {
             func = fx.b.ins().band_imm_s(func, !1);
-            fx.b.ins().icmp_imm_s(IntCC::NotEqual, func, 0)
-        };
-        ok = fx.b.ins().band(ok, callable);
-        // room on the stack (one OS thread), no collection pending
-        let sp = fx.b.ins().get_stack_pointer(I64);
-        let lim = fx.b.ins().load(I64, f, dir, 8);
-        let room = fx.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sp, lim);
-        let gc = fx.b.ins().load(I8, f, fx.gcflag, 0);
-        let calm = fx.b.ins().icmp_imm_s(IntCC::Equal, gc, 0);
-        let ok2 = fx.b.ins().band(room, calm);
-        ok = fx.b.ins().band(ok, ok2);
+        }
+        let fine = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
+        let zero = fx.b.ins().iconst(I64, 0);
+        let go = fx.b.ins().select(fine, func, zero);
         let b2 = fx.b.create_block();
-        fx.b.ins().brif(ok, b2, &[], slow_b, &[]);
-
+        fx.b.ins().brif(go, b2, &[], slow_b, &[]);
         fx.b.switch_to_block(b2);
+
+        // the fast entry when the method takes exactly these arguments
+        let fw = fx.b.ins().load(I64, f, msel, METHOD_FAST);
+        let top = fx.b.ins().ushr_imm_u(fw, 56);
+        let fits = fx.b.ins().icmp_imm_s(IntCC::Equal, top, vals.len() as i64 + 1);
+        let fast_b = fx.b.create_block();
+        let gen_b = fx.b.create_block();
+        fx.b.ins().brif(fits, fast_b, &[], gen_b, &[]);
+        fx.b.switch_to_block(fast_b);
+        let fp = fx.b.ins().band_imm_s(fw, (1i64 << 56) - 1);
+        let mut fargs = vec![recv];
+        fargs.extend_from_slice(vals);
+        fargs.push(fx.b.ins().iconst(I64, QNIL));
+        let fsig = self.fast_sig(vals.len());
+        let fsr = fx.b.import_signature(fsig);
+        let call = fx.b.ins().call_indirect(fsr, fp, &fargs);
+        let r = fx.b.inst_results(call)[0];
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(gen_b);
         let argv = if vals.is_empty() { fx.b.ins().iconst(I64, 8) } else { self.args_buf(fx, vals) };
         let argc = fx.b.ins().iconst(I64, vals.len() as i64);
         let nil = fx.b.ins().iconst(I64, QNIL);
@@ -857,8 +1785,11 @@ impl<M: Module> Compiler<M> {
 /// The direct-call stub kinds: the runtime function each one falls back to, its number of
 /// method arguments, whether it takes `explicit` (or `mode`, see opt.rs `kn_attr_get`), and
 /// the attribute access it also does inline (0 none, 1 reader, 2 writer), or the builtin
-/// method it answers (3 nil?, 4 is_a?/kind_of?).
-const STUBS: [(&str, usize, bool, u8); 10] = [
+/// method it answers (3 nil?, 4 is_a?/kind_of?). `VARARGS`: any number of arguments in a
+/// buffer plus a block, the runtime function's own parameters `(cache, recv, mid, argc,
+/// argv, blk)`.
+const VARARGS: usize = usize::MAX;
+const STUBS: [(&str, usize, bool, u8); 12] = [
     ("kn_send0", 0, true, 1),
     ("kn_send1", 1, true, 2),
     ("kn_send2", 2, true, 0),
@@ -870,7 +1801,11 @@ const STUBS: [(&str, usize, bool, u8); 10] = [
     ("kn_send1", 1, true, 0),
     ("kn_send0", 0, true, 3),
     ("kn_send1", 1, true, 4),
+    ("kn_send", VARARGS, false, 0),
+    ("kn_send_pub", VARARGS, false, 0),
 ];
+pub(crate) const STUB_SEND_N: u8 = 10;
+pub(crate) const STUB_SEND_PUB_N: u8 = 11;
 pub(crate) const STUB_SEND0: u8 = 0;
 pub(crate) const STUB_VCALL: u8 = 3;
 pub(crate) const STUB_ATTR_GET: u8 = 4;
@@ -902,8 +1837,9 @@ impl<M: Module> Compiler<M> {
             return id;
         }
         let (rt, nargs, has_explicit, attr) = STUBS[kind as usize];
+        let var = nargs == VARARGS;
         let mut sig = self.module.make_signature();
-        for _ in 0..3 + nargs + has_explicit as usize {
+        for _ in 0..if var { 6 } else { 3 + nargs + has_explicit as usize } {
             sig.params.push(AbiParam::new(I64));
         }
         sig.returns.push(AbiParam::new(I64));
@@ -921,8 +1857,14 @@ impl<M: Module> Compiler<M> {
             b.switch_to_block(entry);
             let p = b.block_params(entry).to_vec();
             let (cache, recv) = (p[0], p[1]);
-            let args = p[3..3 + nargs].to_vec();
-            let explicit = if has_explicit { Some(p[3 + nargs]) } else { None };
+            let args = if var { vec![] } else { p[3..3 + nargs].to_vec() };
+            let explicit = if var {
+                (rt == "kn_send_pub").then(|| b.ins().iconst(I64, 1))
+            } else if has_explicit {
+                Some(p[3 + nargs])
+            } else {
+                None
+            };
             let slow = b.create_block();
             b.set_cold_block(slow);
             let rt_is_a = self.rt_id("kn_is_a");
@@ -989,10 +1931,15 @@ impl<M: Module> Compiler<M> {
             let current = b.ins().icmp(IntCC::Equal, ser, cur);
             let mut fsel = b.ins().iconst(I64, 0);
             let mut asel = b.ins().iconst(I64, 0);
+            let mut msel = b.ins().iconst(I64, 0);
             for w in (0..ways).rev() {
                 let kw = b.ins().load(I64, f, e, CE_KLASS + 8 * w as i32);
                 let hit = b.ins().icmp(IntCC::Equal, kw, k);
                 fsel = b.ins().select(hit, fs[w], fsel);
+                if !var {
+                    let mw = b.ins().load(I64, f, e, CE_METHOD + 8 * w as i32);
+                    msel = b.ins().select(hit, mw, msel);
+                }
                 if attr != 0 {
                     asel = b.ins().select(hit, at[w], asel);
                 }
@@ -1041,7 +1988,31 @@ impl<M: Module> Compiler<M> {
             b.ins().brif(ok, call_b, &[], not_call, &[]);
 
             b.switch_to_block(call_b);
-            let argv = if nargs == 0 {
+            if !var {
+                // the method's fast entry when it takes exactly these arguments
+                // (kenny-runtime core.rs `Method::fast`)
+                let fw = b.ins().load(I64, f, msel, METHOD_FAST);
+                let top = b.ins().ushr_imm_u(fw, 56);
+                let fits = b.ins().icmp_imm_s(IntCC::Equal, top, nargs as i64 + 1);
+                let fast_b = b.create_block();
+                let gen_b = b.create_block();
+                b.ins().brif(fits, fast_b, &[], gen_b, &[]);
+                b.switch_to_block(fast_b);
+                let fp = b.ins().band_imm_s(fw, (1i64 << 56) - 1);
+                let mut fargs = vec![recv];
+                fargs.extend_from_slice(&args);
+                fargs.push(b.ins().iconst(I64, QNIL));
+                let fsig = self.fast_sig(nargs);
+                let fsr = b.import_signature(fsig);
+                let call = b.ins().call_indirect(fsr, fp, &fargs);
+                let r = b.inst_results(call)[0];
+                b.ins().return_(&[r]);
+                b.switch_to_block(gen_b);
+            }
+            let (argc, argv, blk) = if var {
+                (p[3], p[4], p[5])
+            } else {
+                let argv = if nargs == 0 {
                 b.ins().iconst(I64, 8)
             } else {
                 let ss = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (nargs * 8) as u32, 3));
@@ -1049,11 +2020,11 @@ impl<M: Module> Compiler<M> {
                     b.ins().stack_store(I64, *v, ss, (i * 8) as i32);
                 }
                 b.ins().stack_addr(I64, ss, 0)
+                };
+                (b.ins().iconst(I64, nargs as i64), argv, b.ins().iconst(I64, QNIL))
             };
-            let argc = b.ins().iconst(I64, nargs as i64);
-            let nil = b.ins().iconst(I64, QNIL);
             let sr = b.import_signature(msig);
-            let call = b.ins().call_indirect(sr, clean, &[recv, argc, argv, nil]);
+            let call = b.ins().call_indirect(sr, clean, &[recv, argc, argv, blk]);
             let r = b.inst_results(call)[0];
             b.ins().return_(&[r]);
 
@@ -1195,9 +2166,28 @@ const CE_DIRECT: i32 = 80;
 const CE_ATTR: i32 = 112;
 
 const OBJ_SHAPE: i32 = 16;
+/// kenny-runtime core.rs `CLASS_CIVARS`
+const CLASS_CIVARS: i32 = 144;
 /// kenny-runtime core.rs `KnDirect::flags` and its bits, `SYM_TAG`.
 const KD_FLAGS: i32 = 16;
 const KD_CONST_SERIAL: i32 = 24;
+const KD_MOD_EQQ: i32 = 32;
+const KD_MATH_MODULE: i32 = 40;
+const DIRECT_MATH: i64 = 32;
+const DIRECT_NUM: i64 = 64;
+const KD_ARRAY_CLASS: i32 = 48;
+const DIRECT_ARY_AREF: i64 = 8;
+const DIRECT_ARY_ASET: i64 = 16;
+/// kenny-runtime core.rs `RArray::v` (an `SVec`: ptr, len, cap).
+const ARY_PTR: i32 = 16;
+const ARY_LEN: i32 = 24;
+const ARY_CAP: i32 = 32;
+/// kenny-runtime core.rs `Class::sup_ptr` / `sup_len` (`CLASS_SUP_PTR`).
+const CLASS_SUP_PTR: i32 = 272;
+const CLASS_SUP_LEN: i32 = 280;
+const CE_METHOD: i32 = 48;
+/// kenny-runtime core.rs `Method::fast`
+const METHOD_FAST: i32 = 0;
 const DIRECT_SYM_EQ: i64 = 1;
 const DIRECT_NIL_P: i64 = 2;
 const DIRECT_IS_A: i64 = 4;

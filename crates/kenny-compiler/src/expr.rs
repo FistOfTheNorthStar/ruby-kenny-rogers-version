@@ -101,9 +101,60 @@ impl<M: Module> Compiler<M> {
     /// right-hand side Array.
     /// `x = v` / `x op= v`, keeping a Float result unboxed when `x` has a shadow.
     fn local_write_num(&mut self, fx: &mut Fx, node: &Node) -> Option<crate::fastpath::Num> {
+        let at = node.location().start_offset();
+        let r = self.local_write_num_inner(fx, node)?;
+        // the generic copy of a speculated loop: where its fast copy may continue here
+        if let Some(b) = fx.resume.remove(&at) {
+            let v = self.materialize(fx, r);
+            fx.b.ins().jump(b, &[v.into()]);
+            fx.b.switch_to_block(b);
+            return Some(crate::fastpath::Num::Boxed(fx.b.block_params(b)[0]));
+        }
+        Some(r)
+    }
+    fn local_write_num_inner(&mut self, fx: &mut Fx, node: &Node) -> Option<crate::fastpath::Num> {
+        // the fast copy of a speculated loop: a checked assignment
+        if let Some(spec) = &fx.spec {
+            let target = node
+                .as_local_variable_write_node()
+                .map(|n| (n.name().as_slice().to_vec(), n.depth()))
+                .or_else(|| node.as_local_variable_operator_write_node().map(|n| (n.name().as_slice().to_vec(), n.depth())));
+            if let Some((name, 0)) = target {
+                if spec.locals.iter().any(|l| l.name == name) {
+                    let at = node.location().start_offset();
+                    self.cur_offset = at;
+                    let v = if let Some(n) = node.as_local_variable_write_node() {
+                        self.num_expr(fx, &n.value(), true)
+                    } else {
+                        let n = node.as_local_variable_operator_write_node().unwrap();
+                        let cur = self.local_get_num(fx, &name, 0);
+                        let rhs = self.num_expr(fx, &n.value(), true);
+                        self.cur_offset = at;
+                        self.binop_num(fx, n.binary_operator().as_slice(), cur, rhs, true)
+                    };
+                    return Some(self.spec_assign(fx, &name, v, at));
+                }
+            }
+        }
         if let Some(n) = node.as_local_variable_write_node() {
             self.cur_offset = node.location().start_offset();
             let (name, depth) = (n.name().as_slice().to_vec(), n.depth());
+            // `x = y` between always-Float locals: the same object, if it is a heap Float
+            let level = fx.inline_levels.len() as u32;
+            if let (Some(&(rx, cx)), Some(r)) = (fx.flocals.get(&name), n.value().as_local_variable_read_node()) {
+                if let (true, Some(&(ry, cy))) = (depth == level && r.depth() == level, fx.flocals.get(r.name().as_slice())) {
+                    if let Some(cx) = cx {
+                        let boxed = match cy {
+                            Some(cy) => self.flocal_pin(fx, ry, cy),
+                            None => fx.b.ins().iconst(I64, 0),
+                        };
+                        fx.b.def_var(cx, boxed);
+                    }
+                    let f = fx.b.use_var(ry);
+                    fx.b.def_var(rx, f);
+                    return Some(crate::fastpath::Num::F64(f));
+                }
+            }
             if self.has_num_shadow(fx, &name, depth) {
                 let v = self.num_expr(fx, &n.value(), true);
                 self.local_set_num(fx, &name, depth, v);
@@ -137,6 +188,15 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn expr_void(&mut self, fx: &mut Fx, node: &Node) -> Value {
+        if let Some(w) = node.as_local_variable_write_node() {
+            if w.depth() == 0 && fx.inline_levels.is_empty() && fx.vlocals.contains_key(w.name().as_slice()) {
+                if let Some(c) = w.value().as_call_node() {
+                    self.cur_offset = node.location().start_offset();
+                    self.vobj_new(fx, w.name().as_slice(), &c);
+                    return self.nil(fx);
+                }
+            }
+        }
         if node.as_local_variable_write_node().is_some() || node.as_local_variable_operator_write_node().is_some() {
             self.local_write_num(fx, node);
             return self.nil(fx);
@@ -154,13 +214,27 @@ impl<M: Module> Compiler<M> {
                     && elems.iter().all(|e| e.as_splat_node().is_none() && e.as_keyword_hash_node().is_none())
                 {
                     self.cur_offset = node.location().start_offset();
-                    let vals: Vec<Value> = elems.iter().map(|e| self.expr(fx, e)).collect();
+                    // a local with an unboxed shadow keeps a Float result unboxed
+                    let shadow = |s: &Self, fx: &Fx, t: Option<&Node>| {
+                        t.and_then(|t| t.as_local_variable_target_node()).filter(|l| s.has_num_shadow(fx, l.name().as_slice(), l.depth())).map(|l| (l.name().as_slice().to_vec(), l.depth()))
+                    };
+                    let mut vals: Vec<crate::fastpath::Num> = Vec::new();
+                    for (i, e) in elems.iter().enumerate() {
+                        let v = if shadow(self, fx, lefts.get(i)).is_some() { self.num_expr(fx, e, true) } else { crate::fastpath::Num::Boxed(self.expr(fx, e)) };
+                        vals.push(v);
+                    }
                     for (i, t) in lefts.iter().enumerate() {
                         let v = match vals.get(i) {
                             Some(v) => *v,
-                            None => self.nil(fx),
+                            None => crate::fastpath::Num::Boxed(self.nil(fx)),
                         };
-                        self.assign_target(fx, t, v);
+                        match shadow(self, fx, Some(t)) {
+                            Some((name, depth)) => self.local_set_num(fx, &name, depth, v),
+                            None => {
+                                let v = self.materialize(fx, v);
+                                self.assign_target(fx, t, v);
+                            }
+                        }
                     }
                     return self.nil(fx);
                 }
@@ -497,7 +571,9 @@ impl<M: Module> Compiler<M> {
                 let crefp = self.slot_ptr(fx, fx.cref_slot);
                 let s = self.sym_val(fx, n.name().as_slice());
                 let cache = self.owned_cache_ptr(fx, OWNED_CONST);
-                if fx.loops.is_empty() {
+                // inline in loops and the app's own code (in every method of the gems too:
+                // +4.5% code in a Rails app)
+                if fx.loops.is_empty() && self.in_dependency() {
                     self.callc(fx, "kn_const_get_l", &[cache, crefp, s])
                 } else {
                     self.const_cached(fx, cache, crefp, s)
@@ -617,7 +693,7 @@ impl<M: Module> Compiler<M> {
             // ---- control flow, calls ----
             Node::CallNode { .. } => {
                 let c = node.as_call_node().unwrap();
-                if crate::fastpath::numeric_call(&c).is_some() {
+                if crate::fastpath::numeric_call(&c).is_some() || (crate::fastpath::num_call_of(&c).is_some() && self.refine_scope.is_none()) {
                     let n = self.num_expr(fx, node, false);
                     self.materialize(fx, n)
                 } else {
@@ -650,11 +726,11 @@ impl<M: Module> Compiler<M> {
             }
             Node::WhileNode { .. } => {
                 let w = node.as_while_node().unwrap();
-                self.while_loop(fx, &w.predicate(), w.statements(), false, w.is_begin_modifier())
+                self.while_loop(fx, Some(node), &w.predicate(), w.statements(), false, w.is_begin_modifier())
             }
             Node::UntilNode { .. } => {
                 let w = node.as_until_node().unwrap();
-                self.while_loop(fx, &w.predicate(), w.statements(), true, w.is_begin_modifier())
+                self.while_loop(fx, Some(node), &w.predicate(), w.statements(), true, w.is_begin_modifier())
             }
             Node::ForNode { .. } => self.for_loop(fx, &node.as_for_node().unwrap()),
             Node::CaseNode { .. } => self.case_node(fx, &node.as_case_node().unwrap()),
@@ -780,15 +856,30 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn ivar_get(&mut self, fx: &mut Fx, name: &[u8]) -> Value {
+        if let Some(vs) = &fx.vself {
+            // (a virtual object's `initialize`, vobj.rs)
+            return match vs.get(name) {
+                Some(&v) => fx.b.use_var(v),
+                None => self.nil(fx),
+            };
+        }
         let s = self.self_val(fx);
         let id = self.sym_val(fx, name);
         let cache = self.cache_ptr(fx, 2);
+        // `self` is a class or module: in `def self.x` (and its blocks), a class body
+        if self.inline_ivars(fx) && (fx.kind == ScopeKind::Class || fx.method.as_ref().is_some_and(|m| m.singleton)) {
+            return self.civar_fast(fx, cache, s, id, |c, fx| c.call(fx, "kn_ivar_get", &[s, id, cache]));
+        }
         if self.inline_ivars(fx) {
             return self.ivar_fast(fx, cache, s, None, |c, fx| c.call(fx, "kn_ivar_get", &[s, id, cache]));
         }
         self.call(fx, "kn_ivar_get", &[s, id, cache])
     }
     pub(crate) fn ivar_set(&mut self, fx: &mut Fx, name: &[u8], v: Value) -> Value {
+        if let Some(&var) = fx.vself.as_ref().and_then(|vs| vs.get(name)) {
+            fx.b.def_var(var, v);
+            return v;
+        }
         let s = self.self_val(fx);
         let id = self.sym_val(fx, name);
         let cache = self.cache_ptr(fx, 2);
@@ -797,10 +888,11 @@ impl<M: Module> Compiler<M> {
         }
         self.callc(fx, "kn_ivar_set", &[s, id, v, cache])
     }
-    /// Instance variables are read/written inline in loops; elsewhere the call is most of
-    /// the cost and inlining every access would grow a Rails binary's code by ~9%.
+    /// Instance variables are read/written inline in loops and in the app's own code; in the
+    /// gems' other code the call is most of the cost and inlining every access would grow a
+    /// Rails binary's code by ~9%.
     fn inline_ivars(&self, fx: &Fx) -> bool {
-        !fx.loops.is_empty()
+        !fx.loops.is_empty() || !self.in_dependency()
     }
 
     fn interpolate(&mut self, fx: &mut Fx, parts: &NodeList) -> Value {
@@ -870,10 +962,20 @@ impl<M: Module> Compiler<M> {
                 splats.push((None, Some(v)));
             }
         }
+        // keys that are distinct Symbol literals need no copies or duplicate checks
+        let mut syms: Vec<Vec<u8>> = Vec::new();
+        let distinct_syms = splats.is_empty()
+            && elems.iter().all(|e| {
+                let Some(s) = e.as_assoc_node().and_then(|a| a.key().as_symbol_node()) else { return false };
+                let b = s.unescaped().to_vec();
+                let fresh = !syms.contains(&b);
+                syms.push(b);
+                fresh
+            });
         let n = self.iconst(fx, vals.len() as i64);
         let buf = self.args_buf(fx, &vals);
         let k = self.iconst(fx, kw as i64);
-        let h = self.call(fx, "kn_hash_new", &[n, buf, k]);
+        let h = self.call(fx, if distinct_syms && !vals.is_empty() { "kn_hash_new_syms" } else { "kn_hash_new" }, &[n, buf, k]);
         for (pair, splat) in splats {
             if let Some((k, v)) = pair {
                 let two = self.iconst(fx, 2);

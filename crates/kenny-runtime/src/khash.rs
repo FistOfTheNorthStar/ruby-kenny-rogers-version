@@ -251,6 +251,20 @@ impl KMap {
         let i = t.find(hash_of(k.0), k.0)?;
         Some(unsafe { &*(t.entry(i).val.as_ptr() as *const V) })
     }
+    /// `get` for a key equal only to itself (a Symbol): small tables compare keys directly.
+    pub fn get_ident(&self, key: V) -> Option<V> {
+        let t = self.table()?;
+        if t.mask != 0 {
+            return self.get(&HKey(key)).copied();
+        }
+        for i in 0..t.used() {
+            let e = t.entry(i);
+            if e.key.load(Relaxed) == key {
+                return Some(e.val.load(Relaxed));
+            }
+        }
+        None
+    }
     pub fn get_key_value(&self, k: &HKey) -> Option<(&HKey, &V)> {
         let t = self.table()?;
         let i = t.find(hash_of(k.0), k.0)?;
@@ -340,6 +354,22 @@ impl KMap {
         self.tab.store(nt, Release);
         retire_table(old);
         nt
+    }
+
+    /// Give a hash with no table yet room for `n` entries (literals: skips growing).
+    pub fn reserve_empty(&mut self, n: usize) {
+        if n > 0 && self.tab.load(Relaxed).is_null() {
+            self.tab.store(Table::alloc(n.max(4)), Release);
+        }
+    }
+
+    /// Append to a hash no other code has seen yet, with room reserved (`reserve_empty`),
+    /// for a key not already in it (literals with distinct Symbol keys).
+    pub fn push_distinct(&mut self, k: V, v: V) {
+        let t = self.tab.load(Relaxed);
+        debug_assert!(!t.is_null() && unsafe { (*t).n.load(Relaxed) < (*t).cap });
+        unsafe { (*t).push(hash_of(k), k, v) };
+        self.live.fetch_add(1, Relaxed);
     }
 
     pub fn insert(&mut self, k: HKey, v: V) -> Option<V> {

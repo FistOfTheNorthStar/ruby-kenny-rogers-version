@@ -1,0 +1,40 @@
+360
+100
+["nil can't be coerced into Integer", [15, 32, 37]]
+[16, 38]
+[17]
+NoMethodError
+36
+105
+5
+15
+[NoMethodError, "undefined method 'len2' for nil"]
+NoMethodError
+42
+NoMethodError
+5
+:m
+:d
+24
+2432902008176640000
+[:ghost, :len2, :ghost, :dot]
+10
+:pos
+:neg
+[P2, 10, 2, 300, [:@a, :@b]]
+[NoMethodError, [137, 148]]
+[ArgumentError, "wrong number of arguments (given 1, expected 2)"]
+:re
+:custom_new
+:re
+Sub2
+2
+2
+:q
+1
+false
+false
+7
+1
+[:dm, 2]
+:sing_new

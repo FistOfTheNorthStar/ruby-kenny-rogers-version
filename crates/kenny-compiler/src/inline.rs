@@ -33,6 +33,8 @@ enum Kind {
     Reject,
     Any,
     All,
+    Count,
+    Sum,
 }
 
 /// Runtime opt tags (kenny-runtime/src/opt.rs).
@@ -50,6 +52,8 @@ fn opt_tag(k: Kind) -> i64 {
         Kind::EachIndex => 26,
         Kind::Any => 27,
         Kind::All => 28,
+        Kind::Count => 36,
+        Kind::Sum => 37,
     }
 }
 
@@ -67,6 +71,8 @@ fn kind_of(name: &[u8], argc: usize) -> Option<Kind> {
         (b"reject", 0) => Kind::Reject,
         (b"any?", 0) => Kind::Any,
         (b"all?", 0) => Kind::All,
+        (b"count", 0) => Kind::Count,
+        (b"sum", 0) => Kind::Sum,
         _ => return None,
     })
 }
@@ -328,7 +334,7 @@ impl<M: Module> Compiler<M> {
         fx.b.append_block_param(exit, I64);
         // `next` lands in `step` (with the block's value where the loop uses it)
         let step = fx.b.create_block();
-        let collects = matches!(kind, Kind::Map | Kind::Select | Kind::Reject | Kind::Any | Kind::All);
+        let collects = matches!(kind, Kind::Map | Kind::Select | Kind::Reject | Kind::Any | Kind::All | Kind::Count | Kind::Sum);
         if collects {
             fx.b.append_block_param(step, I64);
         }
@@ -340,10 +346,13 @@ impl<M: Module> Compiler<M> {
                 let lo = self.call(fx, "kn_range_first", &[recv]);
                 (fx.b.ins().sshr_imm_s(lo, 1), None)
             }
-            Kind::Map | Kind::Select | Kind::Reject => (zero, Some(self.call(fx, "kn_ary_new", &[zero, zero]))),
+            Kind::Map | Kind::Select | Kind::Reject | Kind::Sum => (zero, Some(self.call(fx, "kn_ary_new", &[zero, zero]))),
             _ => (zero, None),
         };
         fx.b.def_var(i, start);
+        // count's tally (untagged)
+        let hits = fx.b.declare_var(I64);
+        fx.b.def_var(hits, zero);
         // loop bound for the integer loops (untagged, inclusive except for times)
         let bound = match kind {
             Kind::Times => Some(fx.b.ins().sshr_imm_s(recv, 1)),
@@ -357,6 +366,8 @@ impl<M: Module> Compiler<M> {
         let finished = match kind {
             Kind::Map | Kind::Select | Kind::Reject => out.unwrap(),
             Kind::Any => self.iconst(fx, QFALSE),
+            // (never a `break` value: the normal end, see below)
+            Kind::Count | Kind::Sum => self.iconst(fx, UNDEF),
             Kind::All => self.iconst(fx, QTRUE),
             _ => recv,
         };
@@ -413,8 +424,15 @@ impl<M: Module> Compiler<M> {
             // the element again: `elem` is defined in the header, which dominates `step`
             let x = elem.unwrap();
             match kind {
-                Kind::Map => {
+                Kind::Map | Kind::Sum => {
                     self.call(fx, "kn_ary_push", &[out.unwrap(), r]);
+                }
+                Kind::Count => {
+                    let t = self.truthy(fx, r);
+                    let h = fx.b.use_var(hits);
+                    let h1 = fx.b.ins().iadd_imm_s(h, 1);
+                    let h2 = fx.b.ins().select(t, h1, h);
+                    fx.b.def_var(hits, h2);
                 }
                 Kind::Select | Kind::Reject => {
                     let t = self.truthy(fx, r);
@@ -453,6 +471,28 @@ impl<M: Module> Compiler<M> {
         fx.b.ins().jump(header, &[]);
 
         fx.b.switch_to_block(exit);
-        fx.b.block_params(exit)[0]
+        let v = fx.b.block_params(exit)[0];
+        match kind {
+            // (`break` leaves with its own value: only the normal end is the tally / sum)
+            Kind::Count | Kind::Sum => {
+                let normal = fx.b.ins().icmp(IntCC::Equal, v, finished);
+                let end = fx.b.create_block();
+                let join = fx.b.create_block();
+                fx.b.append_block_param(join, I64);
+                fx.b.ins().brif(normal, end, &[], join, &[v.into()]);
+                fx.b.switch_to_block(end);
+                let r = if kind == Kind::Count {
+                    let h = fx.b.use_var(hits);
+                    let t = fx.b.ins().ishl_imm_s(h, 1);
+                    fx.b.ins().iadd_imm_s(t, 1)
+                } else {
+                    self.callc(fx, "kn_ary_sum_vals", &[out.unwrap()])
+                };
+                fx.b.ins().jump(join, &[r.into()]);
+                fx.b.switch_to_block(join);
+                fx.b.block_params(join)[0]
+            }
+            _ => v,
+        }
     }
 }

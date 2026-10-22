@@ -15,6 +15,11 @@ pub(crate) struct FnSpec<'a, 'pr> {
     /// scope's cref slot] (the second is written when a class body starts; 0 = none).
     pub cref_slot: usize,
     pub method: Option<MethodCtx>,
+    /// A method's fast entry: `(self, a0.., a(n-1), blk)` for n required parameters,
+    /// instead of `(self, argc, argv, blk)` (see `fast_wrapper`).
+    pub fast_arity: Option<usize>,
+    /// The function, when declared ahead (statics.rs)
+    pub predeclared: Option<FuncId>,
 }
 
 pub(crate) struct BlockArity {
@@ -24,7 +29,7 @@ pub(crate) struct BlockArity {
 }
 
 /// Method#parameters descriptor: "req:a,opt:b,rest:c,keyreq:d,key:e,keyrest:f,block:g".
-fn params_desc(p: Option<ParametersNode>) -> String {
+pub(crate) fn params_desc(p: Option<ParametersNode>) -> String {
     let Some(p) = p else { return String::new() };
     let name = |n: &Node| -> String {
         n.as_required_parameter_node().map(|r| String::from_utf8_lossy(r.name().as_slice()).into_owned()).unwrap_or_default()
@@ -91,6 +96,7 @@ impl<M: Module> Compiler<M> {
             return Err("syntax errors".into());
         }
         let node = result.node();
+        self.scan_defs(&node);
         let prog = node.as_program_node().unwrap();
         let stmts = prog.statements().as_node();
         let slot = self.cache_alloc(2);
@@ -102,6 +108,8 @@ impl<M: Module> Compiler<M> {
             analysis: vec![&stmts],
             cref_slot: slot,
             method: None,
+            fast_arity: None,
+            predeclared: None,
         };
         Ok(self.build_fn(spec, |c, fx| c.expr(fx, &stmts)))
     }
@@ -140,6 +148,74 @@ impl<M: Module> Compiler<M> {
         Some((fid, flag))
     }
 
+    /// A fast entry's signature: self, n arguments, block.
+    pub(crate) fn fast_sig(&mut self, n: usize) -> ir::Signature {
+        let mut sig = self.module.make_signature();
+        for _ in 0..n + 2 {
+            sig.params.push(AbiParam::new(I64));
+        }
+        sig.returns.push(AbiParam::new(I64));
+        sig
+    }
+
+    /// The `(self, argc, argv, blk)` entry of a method compiled as fast entry `fast` with
+    /// `n` required parameters: checks the count, then calls `fast` with the arguments
+    /// in registers. Its only frame in backtraces is an arity error's (at the `def` line).
+    fn fast_wrapper(&mut self, fast: FuncId, n: usize, label: &str, def_line: u32) -> FuncId {
+        let sig = self.method_sig();
+        self.fn_counter += 1;
+        let l: String = label.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        let name = format!("__kn_{}_{}", self.fn_counter, l);
+        let id = self.module.declare_function(&name, Linkage::Local, &sig).expect("declare fn");
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::user(0, id.as_u32()), sig);
+        let mut fctx = FunctionBuilderContext::new();
+        let fsig = self.fast_sig(n);
+        let arity = self.rt_id("kn_check_arity");
+        {
+            let mut b = FunctionBuilder::new(&mut func, &mut fctx);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            b.switch_to_block(entry);
+            let p = b.block_params(entry).to_vec();
+            let ok = b.ins().icmp_imm_s(IntCC::Equal, p[1], n as i64);
+            let go = b.create_block();
+            let fail = b.create_block();
+            b.set_cold_block(fail);
+            b.ins().brif(ok, go, &[], fail, &[]);
+            b.switch_to_block(go);
+            let mut args = vec![p[0]];
+            for i in 0..n {
+                args.push(b.ins().load(I64, mem(), p[2], (i * 8) as i32));
+            }
+            args.push(p[3]);
+            let fref = self.module.declare_func_in_func(fast, b.func);
+            let _ = fsig;
+            let call = b.ins().call(fref, &args);
+            let r = b.inst_results(call)[0];
+            b.ins().return_(&[r]);
+            b.switch_to_block(fail);
+            b.set_srcloc(ir::SourceLoc::new(def_line));
+            let fr = self.module.declare_func_in_func(arity, b.func);
+            let k = b.ins().iconst(I64, n as i64);
+            let call = b.ins().call(fr, &[p[1], k, k]);
+            let r = b.inst_results(call)[0];
+            b.ins().return_(&[r]);
+            b.seal_all_blocks();
+            b.finalize(self.module.isa().frontend_config());
+        }
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        if let Err(e) = self.module.define_function(id, &mut ctx) {
+            self.errors.push(format!("internal codegen error in {name}: {e:?}"));
+        } else if let Some(code) = ctx.compiled_code() {
+            let before = self.debug_fns.len();
+            self.record_debug_info(id, label, code);
+            if let Some(d) = self.debug_fns.get_mut(before) {
+                d.exact = true;
+            }
+        }
+        id
+    }
+
     pub(crate) fn method_sig(&mut self) -> ir::Signature {
         let mut sig = self.module.make_signature();
         for _ in 0..4 {
@@ -162,7 +238,11 @@ impl<M: Module> Compiler<M> {
         F: for<'b> FnOnce(&mut Compiler<M>, &mut Fx<'b>) -> Value,
     {
         let is_block = spec.kind == ScopeKind::Block;
-        let sig = if is_block { self.block_sig() } else { self.method_sig() };
+        let sig = match spec.fast_arity {
+            Some(n) => self.fast_sig(n),
+            None if is_block => self.block_sig(),
+            None => self.method_sig(),
+        };
         // the frame's name in backtraces, as CRuby labels it
         let bt_label = match spec.kind {
             ScopeKind::Top | ScopeKind::Class if self.eval_unit && !self.file_unit && self.fn_labels.is_empty() => "<eval>".to_string(),
@@ -178,7 +258,10 @@ impl<M: Module> Compiler<M> {
         self.fn_counter += 1;
         let label: String = spec.label.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
         let name = format!("__kn_{}_{}", self.fn_counter, label);
-        let id = self.module.declare_function(&name, Linkage::Local, &sig).expect("declare fn");
+        let id = match spec.predeclared {
+            Some(id) => id,
+            None => self.module.declare_function(&name, Linkage::Local, &sig).expect("declare fn"),
+        };
         let mut func = ir::Function::with_name_signature(ir::UserFuncName::user(0, id.as_u32()), sig);
         let mut fctx = FunctionBuilderContext::new();
         {
@@ -200,7 +283,11 @@ impl<M: Module> Compiler<M> {
                 b.def_var(var, v);
                 var
             };
-            let (self_v, argc_v, argv_v, blk_v, proc_v) = if is_block {
+            let (self_v, argc_v, argv_v, blk_v, proc_v) = if let Some(n) = spec.fast_arity {
+                let c = b.ins().iconst(I64, n as i64);
+                let z = b.ins().iconst(I64, 0);
+                (mk(&mut b, p[0]), mk(&mut b, c), mk(&mut b, z), mk(&mut b, p[n + 1]), None)
+            } else if is_block {
                 (mk(&mut b, p[1]), mk(&mut b, p[2]), mk(&mut b, p[3]), mk(&mut b, p[4]), Some(mk(&mut b, p[0])))
             } else {
                 (mk(&mut b, p[0]), mk(&mut b, p[1]), mk(&mut b, p[2]), mk(&mut b, p[3]), None)
@@ -252,18 +339,8 @@ impl<M: Module> Compiler<M> {
                 }
             }
             // unboxed Float shadows for register locals assigned from arithmetic
-            let mut num_locals = HashMap::new();
-            for n in analysis::numeric_locals(&spec.analysis) {
-                if matches!(locals.get(&n), Some(Local::Var(_))) {
-                    let raw = b.declare_var(ir::types::F64);
-                    let z = b.ins().f64const(0.0);
-                    b.def_var(raw, z);
-                    let kind = b.declare_var(ir::types::I8);
-                    let k = b.ins().iconst(ir::types::I8, 0);
-                    b.def_var(kind, k);
-                    num_locals.insert(n, (raw, kind));
-                }
-            }
+            let (num_locals, flocals, int_sure, typed_info) = typed_setup(&mut b, &locals, &spec.analysis, self.refine_scope.is_none());
+            let vlocals = self.vobj_plan(&mut b, &locals, &spec.analysis);
             let env_v = if has_env {
                 let parent = match penv_v {
                     Some(pe) => b.use_var(pe),
@@ -329,9 +406,24 @@ impl<M: Module> Compiler<M> {
                 zsuper: Vec::new(),
                 redo_block: None,
                 inline_levels: Vec::new(),
+                checked: std::collections::HashSet::new(),
                 num_locals,
                 int_locals: analysis::int_locals(&spec.analysis),
                 int_vals: HashSet::new(),
+                flocals,
+                int_sure,
+                sure_ints: HashSet::new(),
+                typed_info,
+                spec: None,
+                spec_depth: 0,
+                int_spec: HashSet::new(),
+                sure_fix: HashSet::new(),
+                resume: HashMap::new(),
+                resume_req: HashMap::new(),
+                fast_args: spec.fast_arity.map(|n| p[1..=n].to_vec()),
+                vlocals,
+                vself: None,
+                vself_next: None,
             };
             let v = body(self, &mut fx);
             fx.b.ins().return_(&[v]);
@@ -402,13 +494,27 @@ impl<M: Module> Compiler<M> {
         }
         let depth = depth - n;
         if depth == 0 {
+            if fx.vlocals.contains_key(name) {
+                self.vobj_materialize(fx, name);
+            }
             match fx.locals.get(name) {
                 Some(Local::Var(v)) => {
                     let v = *v;
+                    if let Some(&(raw, cache)) = fx.flocals.get(name) {
+                        return self.flocal_box(fx, raw, cache);
+                    }
                     if let Some(&(raw, kind)) = fx.num_locals.get(name) {
                         return self.local_box(fx, v, raw, kind);
                     }
-                    return fx.b.use_var(v);
+                    let r = fx.b.use_var(v);
+                    if fx.int_sure.contains(name) {
+                        fx.sure_ints.insert(r);
+                    }
+                    if fx.int_spec.contains(name) {
+                        fx.sure_ints.insert(r);
+                        fx.sure_fix.insert(r);
+                    }
+                    return r;
                 }
                 Some(Local::Env(i)) => {
                     let i = *i;
@@ -449,9 +555,22 @@ impl<M: Module> Compiler<M> {
         }
         let depth = depth - n;
         if depth == 0 {
+            if let Some(vl) = fx.vlocals.get(name) {
+                let isv = vl.isv;
+                let zero = fx.b.ins().iconst(I64, 0);
+                fx.b.def_var(isv, zero);
+            }
             match fx.locals.get(name) {
                 Some(Local::Var(v)) => {
                     let v = *v;
+                    if let Some(&(raw, cache)) = fx.flocals.get(name) {
+                        let f = self.float_unbox(fx, val);
+                        fx.b.def_var(raw, f);
+                        if let Some(cache) = cache {
+                            fx.b.def_var(cache, val);
+                        }
+                        return;
+                    }
                     fx.b.def_var(v, val);
                     if let Some(&(_, kind)) = fx.num_locals.get(name) {
                         let k = fx.b.ins().iconst(ir::types::I8, 0);
@@ -519,6 +638,9 @@ impl<M: Module> Compiler<M> {
     /// A local as a numeric operand (unboxed if it has a raw Float).
     pub(crate) fn local_get_num(&mut self, fx: &mut Fx, name: &[u8], depth: u32) -> crate::fastpath::Num {
         if depth == fx.inline_levels.len() as u32 {
+            if let (Some(Local::Var(_)), Some(&(raw, _))) = (fx.locals.get(name), fx.flocals.get(name)) {
+                return crate::fastpath::Num::F64(fx.b.use_var(raw));
+            }
             if let (Some(Local::Var(v)), Some(&(raw, kind))) = (fx.locals.get(name), fx.num_locals.get(name)) {
                 let v = *v;
                 let boxed = fx.b.use_var(v);
@@ -535,6 +657,16 @@ impl<M: Module> Compiler<M> {
     }
     /// Assign a numeric result to a local without boxing it (when it has a shadow).
     pub(crate) fn local_set_num(&mut self, fx: &mut Fx, name: &[u8], depth: u32, n: crate::fastpath::Num) {
+        if depth == fx.inline_levels.len() as u32 {
+            if let (Some(Local::Var(_)), Some(&(rawv, cache))) = (fx.locals.get(name), fx.flocals.get(name)) {
+                let (f, boxed) = self.num_f64_boxed(fx, n);
+                fx.b.def_var(rawv, f);
+                if let Some(cache) = cache {
+                    fx.b.def_var(cache, boxed);
+                }
+                return;
+            }
+        }
         if let crate::fastpath::Num::Lazy { boxed, raw, kind: k, .. } = n {
             if depth == fx.inline_levels.len() as u32 {
                 if let (Some(Local::Var(v)), Some(&(rawv, kind))) = (fx.locals.get(name), fx.num_locals.get(name)) {
@@ -551,7 +683,7 @@ impl<M: Module> Compiler<M> {
     }
     /// Does this local keep an unboxed shadow?
     pub(crate) fn has_num_shadow(&self, fx: &Fx, name: &[u8], depth: u32) -> bool {
-        depth == fx.inline_levels.len() as u32 && fx.num_locals.contains_key(name) && matches!(fx.locals.get(name), Some(Local::Var(_)))
+        depth == fx.inline_levels.len() as u32 && (fx.num_locals.contains_key(name) || fx.flocals.contains_key(name)) && matches!(fx.locals.get(name), Some(Local::Var(_)))
     }
 
     /// The env of the enclosing method (for yield / block_given? / return inside blocks).
@@ -677,6 +809,27 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn bind_method_params(&mut self, fx: &mut Fx, params: Option<ParametersNode>) {
+        // a fast entry: only required parameters (and maybe &blk), already counted
+        if let Some(args) = fx.fast_args.clone() {
+            if let Some(p) = params {
+                let reqs: Vec<Node> = p.requireds().iter().collect();
+                for r in reqs.iter() {
+                    if let Some(n) = Self::param_name(r) {
+                        fx.zsuper.push((n, 0));
+                    }
+                }
+                for (i, r) in reqs.iter().enumerate() {
+                    self.bind_param_target(fx, r, args[i]);
+                }
+                if let Some(bp) = p.block() {
+                    if let Some(n) = bp.name() {
+                        let b = fx.b.use_var(fx.blk_v);
+                        self.local_set(fx, n.as_slice(), 0, b);
+                    }
+                }
+            }
+            return;
+        }
         let Some(p) = params else {
             self.arity_check(fx, 0, 0);
             return;
@@ -694,7 +847,8 @@ impl<M: Module> Compiler<M> {
         let (nreq, nopt, npost) = (reqs.len(), opts.len(), posts.len());
 
         let maxpos = if has_rest { -1 } else { (nreq + nopt + npost) as i64 };
-        let kwh = if has_kw { Some(self.extract_kwhash(fx, nreq + npost, maxpos, nreq + npost)) } else { None };
+        let consume = kwrest.as_ref().is_some_and(|k| k.as_keyword_rest_parameter_node().is_some());
+        let kwh = if has_kw { Some(self.extract_kwhash(fx, nreq + npost, maxpos, nreq + npost, consume)) } else { None };
 
         self.arity_check(fx, (nreq + npost) as i64, if has_rest { -1 } else { (nreq + nopt + npost) as i64 });
 
@@ -776,7 +930,9 @@ impl<M: Module> Compiler<M> {
     /// Take the trailing keyword-hash argument (if any) off the positional arguments.
     /// `maxpos`: positional capacity (-1 with a rest param); `nreq2`: required positionals,
     /// for the Ruby 2 rule applied to code from dependencies (see kn_take_kwhash2).
-    fn extract_kwhash(&mut self, fx: &mut Fx, npos_required: usize, maxpos: i64, nreq2: usize) -> Value {
+    /// `consume`: a copy whose keys `bind_keywords` removes (for a `**rest` parameter);
+    /// otherwise the caller's hash itself, read only, or nil when none was passed.
+    fn extract_kwhash(&mut self, fx: &mut Fx, npos_required: usize, maxpos: i64, nreq2: usize, consume: bool) -> Value {
         let argc = fx.b.use_var(fx.argc_v);
         let enough = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, argc, npos_required as i64);
         let check = fx.b.create_block();
@@ -801,20 +957,23 @@ impl<M: Module> Compiler<M> {
         };
         fx.b.ins().brif(is_kw, take, &[], none, &[]);
         fx.b.switch_to_block(take);
-        let h = self.call(fx, "kn_kw_dup", &[last]);
+        let h = if consume { self.call(fx, "kn_kw_dup", &[last]) } else { last };
         let argc = fx.b.use_var(fx.argc_v);
         let argc2 = fx.b.ins().iadd_imm_s(argc, -1);
         fx.b.def_var(fx.argc_v, argc2);
         fx.b.ins().jump(done, &[h.into()]);
         fx.b.switch_to_block(none);
         let nil = self.nil(fx);
-        let h = self.call(fx, "kn_kw_dup", &[nil]);
+        let h = if consume { self.call(fx, "kn_kw_dup", &[nil]) } else { nil };
         fx.b.ins().jump(done, &[h.into()]);
         fx.b.switch_to_block(done);
         fx.b.block_params(done)[0]
     }
 
     fn bind_keywords(&mut self, fx: &mut Fx, h: Value, kws: &[Node], kwrest: Option<&Node>) {
+            if kwrest.and_then(|k| k.as_keyword_rest_parameter_node()).is_none() {
+                return self.bind_keywords_read(fx, h, kws);
+            }
             for k in kws {
                 let (name, default) = if let Some(r) = k.as_required_keyword_parameter_node() {
                     (r.name().as_slice().to_vec(), None)
@@ -859,6 +1018,68 @@ impl<M: Module> Compiler<M> {
             }
     }
 
+    /// Keyword parameters without `**rest`: each read from the caller's keyword hash `h`
+    /// (nil when none was passed) without copying it; any key that none of them matched
+    /// (the count found is less than the hash's size) is an unknown keyword.
+    fn bind_keywords_read(&mut self, fx: &mut Fx, h: Value, kws: &[Node]) {
+        let found = fx.b.declare_var(I64);
+        let zero = self.iconst(fx, 0);
+        fx.b.def_var(found, zero);
+        let mut keys = Vec::new();
+        for k in kws {
+            let (name, default) = if let Some(r) = k.as_required_keyword_parameter_node() {
+                (r.name().as_slice().to_vec(), None)
+            } else if let Some(o) = k.as_optional_keyword_parameter_node() {
+                (o.name().as_slice().to_vec(), Some(o.value()))
+            } else {
+                continue;
+            };
+            let key = name.strip_suffix(b":").unwrap_or(&name).to_vec();
+            keys.push(key.clone());
+            let sk = self.sym_val(fx, &key);
+            let v = self.call(fx, "kn_kw_get", &[h, sk]);
+            let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, v, KW_MISSING);
+            let yes = fx.b.create_block();
+            let no = fx.b.create_block();
+            let done = fx.b.create_block();
+            fx.b.ins().brif(missing, yes, &[], no, &[]);
+            fx.b.switch_to_block(yes);
+            match default {
+                Some(d) => {
+                    let dv = self.expr(fx, &d);
+                    self.local_set(fx, &key, 0, dv);
+                }
+                None => {
+                    let e = self.call(fx, "kn_kw_missing", &[sk]);
+                    self.check(fx, e);
+                }
+            }
+            fx.b.ins().jump(done, &[]);
+            fx.b.switch_to_block(no);
+            self.local_set(fx, &key, 0, v);
+            let n = fx.b.use_var(found);
+            let n1 = fx.b.ins().iadd_imm_s(n, 1);
+            fx.b.def_var(found, n1);
+            fx.b.ins().jump(done, &[]);
+            fx.b.switch_to_block(done);
+        }
+        let n = fx.b.use_var(found);
+        let total = self.call(fx, "kn_kw_count", &[h]);
+        let extra = fx.b.ins().icmp(IntCC::NotEqual, n, total);
+        let bad = fx.b.create_block();
+        let ok = fx.b.create_block();
+        fx.b.set_cold_block(bad);
+        fx.b.ins().brif(extra, bad, &[], ok, &[]);
+        fx.b.switch_to_block(bad);
+        let syms: Vec<Value> = keys.iter().map(|k| self.sym_val(fx, k)).collect();
+        let buf = if syms.is_empty() { self.iconst(fx, 8) } else { self.args_buf(fx, &syms) };
+        let nk = self.iconst(fx, syms.len() as i64);
+        let e = self.call(fx, "kn_kw_unknown", &[h, buf, nk]);
+        self.check(fx, e);
+        fx.b.ins().jump(ok, &[]);
+        fx.b.switch_to_block(ok);
+    }
+
     // ---------- block parameters ----------
 
     pub(crate) fn bind_block_params(&mut self, fx: &mut Fx, params: Option<&Node>) -> BlockArity {
@@ -892,7 +1113,8 @@ impl<M: Module> Compiler<M> {
         let rest = p.rest();
         let (nreq, nopt, npost) = (reqs.len(), opts.len(), posts.len());
         let has_kw = !kws.is_empty() || kwrest.as_ref().is_some_and(|k| k.as_keyword_rest_parameter_node().is_some());
-        let kwh = if has_kw { Some(self.extract_kwhash(fx, 0, -1, nreq + npost)) } else { None };
+        let consume = kwrest.as_ref().is_some_and(|k| k.as_keyword_rest_parameter_node().is_some());
+        let kwh = if has_kw { Some(self.extract_kwhash(fx, 0, -1, nreq + npost, consume)) } else { None };
         let has_rest = rest.is_some();
         let implicit_rest = rest.as_ref().is_some_and(|r| r.as_implicit_rest_node().is_some());
         if !has_rest && npost == 0 {
@@ -984,9 +1206,34 @@ impl<M: Module> Compiler<M> {
             analysis,
             // constants resolve lexically: the enclosing class body's scope
             cref_slot: fx.cref_slot,
-            method: Some(MethodCtx { name: name.clone(), owner_slot, hops: None, params: Vec::new(), scope: self.scopes.len() }),
+            method: Some(MethodCtx {
+                name: name.clone(),
+                owner_slot,
+                hops: None,
+                params: Vec::new(),
+                scope: self.scopes.len(),
+                lex: self.def_lex.get(&(self.file.clone(), d.location().start_offset())).cloned(),
+                singleton: d.receiver().is_some(),
+            }),
+            fast_arity: None,
+            predeclared: None,
         };
         let params = d.parameters();
+        // only required parameters (and maybe &blk): a fast entry taking them in registers
+        // (the app's own code: in gems the extra entry and call guards cost more code than
+        // they save time)
+        let fast_n = crate::statics::fast_arity(&params).filter(|_| !self.in_dependency());
+        let mut spec = spec;
+        spec.fast_arity = fast_n;
+        if fast_n.is_some() && d.receiver().is_none() {
+            spec.predeclared = self.static_fid_for_def(&name, d.location().start_offset());
+        }
+        let label = String::from_utf8_lossy(&name).into_owned();
+        let def_line = self.line_of(d.location().start_offset()) as u32;
+        // (code inlined into this body is compiled with no inline context of its own)
+        let saved_ctx = std::mem::take(&mut self.inline_ctx);
+        self.def_stack.push((self.file.clone(), d.location().start_offset()));
+        self.def_cref.insert((self.file.clone(), d.location().start_offset()), fx.cref_slot);
         let fid = self.build_fn(spec, |c, fx| {
             c.bind_method_params(fx, params);
             match &body {
@@ -994,14 +1241,30 @@ impl<M: Module> Compiler<M> {
                 None => c.nil(fx),
             }
         });
+        self.def_stack.pop();
+        self.inline_ctx = saved_ctx;
+        let (fid, fast) = match fast_n {
+            Some(n) => {
+                let w = self.fast_wrapper(fid, n, &label, def_line);
+                let fa = self.fn_addr(fx, fid);
+                let tag = fx.b.ins().iconst(I64, ((n as i64) + 1) << 56);
+                let tagged = fx.b.ins().bor(fa, tag);
+                (w, tagged)
+            }
+            None => (fid, self.iconst(fx, 0)),
+        };
         let addr = self.fn_addr(fx, fid);
         let k = self.iconst(fx, kind);
         let s = self.sym_val(fx, &name);
         let slot = self.slot_ptr(fx, owner_slot);
         let mut desc = params_desc(d.parameters()).into_bytes();
         desc.push(0);
+        // (a keyword def's calls may be inlined: statics.rs `kw_marker`)
+        if !self.in_dependency() {
+            desc.extend(self.kw_marker(d.location().start_offset()).unwrap_or_default());
+        }
         let (pd, _) = self.str_ptr(fx, &desc);
-        self.callc(fx, "kn_def", &[target, k, s, addr, slot, pd])
+        self.callc(fx, "kn_def", &[target, k, s, addr, slot, pd, fast])
     }
 
     /// Compile a block or lambda literal into a Proc value.
@@ -1029,6 +1292,8 @@ impl<M: Module> Compiler<M> {
             analysis,
             cref_slot: fx.cref_slot,
             method,
+            fast_arity: None,
+            predeclared: None,
         };
         let mut arity = BlockArity { min: 0, max: -1, autosplat: false };
         let fid = {
@@ -1073,6 +1338,8 @@ impl<M: Module> Compiler<M> {
             analysis: body.iter().collect(),
             cref_slot: slot,
             method: None,
+            fast_arity: None,
+            predeclared: None,
         };
         let fid = self.build_fn(spec, |c, fx| match &body {
             Some(b) => c.expr(fx, b),
@@ -1125,4 +1392,69 @@ impl<M: Module> Compiler<M> {
         self.call(fx, "kn_set_lexical_parent", &[sc, cref]);
         self.class_body(fx, sc, "singleton class", names(&s.locals()), s.body())
     }
+}
+
+/// Register shadows for a scope's numeric locals: (unboxed Float shadows with a kind,
+/// f64 registers of always-Float locals, always-Integer locals). See analysis.rs
+/// `numeric_locals` / `typed_locals`.
+#[allow(clippy::type_complexity)]
+pub(crate) fn typed_setup(
+    b: &mut FunctionBuilder,
+    locals: &HashMap<Vec<u8>, Local>,
+    nodes: &[&Node],
+    typed: bool,
+) -> (HashMap<Vec<u8>, (Variable, Variable)>, HashMap<Vec<u8>, (Variable, Option<Variable>)>, HashSet<Vec<u8>>, std::rc::Rc<analysis::Typed>) {
+    let info = std::rc::Rc::new(if typed && std::env::var_os("KENNY_NO_TYPED").is_none() {
+        analysis::typed_locals(nodes)
+    } else {
+        analysis::Typed { types: HashMap::new(), boxed: HashSet::new(), refs: HashMap::new(), bad: HashSet::new(), seed: HashMap::new() }
+    });
+    let (types, boxed) = (&info.types, &info.boxed);
+    if std::env::var_os("KENNY_DEBUG_TYPED").is_some() {
+        let mut v: Vec<String> = types.iter().map(|(n, t)| format!("{}:{:?}{}", String::from_utf8_lossy(n), t, if boxed.contains(n) { "+box" } else { "" })).collect();
+        v.sort();
+        eprintln!("typed: {}", v.join(" "));
+    }
+    let mut num_locals = HashMap::new();
+    let mut flocals = HashMap::new();
+    let mut int_sure = HashSet::new();
+    for (n, t) in types {
+        if !matches!(locals.get(n), Some(Local::Var(_))) {
+            continue;
+        }
+        match t {
+            analysis::Ty::Float => {
+                let raw = b.declare_var(ir::types::F64);
+                let z = b.ins().f64const(0.0);
+                b.def_var(raw, z);
+                let cache = boxed.contains(n).then(|| {
+                    let cache = b.declare_var(I64);
+                    let z = b.ins().iconst(I64, 0);
+                    b.def_var(cache, z);
+                    cache
+                });
+                flocals.insert(n.clone(), (raw, cache));
+            }
+            analysis::Ty::Int => {
+                int_sure.insert(n.clone());
+            }
+        }
+    }
+    for n in analysis::numeric_locals(nodes) {
+        if matches!(locals.get(&n), Some(Local::Var(_))) && !flocals.contains_key(&n) {
+            let raw = b.declare_var(ir::types::F64);
+            let z = b.ins().f64const(0.0);
+            b.def_var(raw, z);
+            let kind = b.declare_var(ir::types::I8);
+            let k = b.ins().iconst(ir::types::I8, 0);
+            b.def_var(kind, k);
+            num_locals.insert(n, (raw, kind));
+        }
+    }
+    if std::env::var_os("KENNY_DEBUG_TYPED").is_some() && !num_locals.is_empty() {
+        let mut v: Vec<String> = num_locals.keys().map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+        v.sort();
+        eprintln!("untyped numeric: {}", v.join(" "));
+    }
+    (num_locals, flocals, int_sure, info)
 }

@@ -64,13 +64,14 @@ impl<M: Module> Compiler<M> {
     }
 
     /// `blk` None: the call passes no block at all.
-    fn send_raw(&mut self, fx: &mut Fx, recv: Value, name: &[u8], args: &Args, blk: Option<Value>, explicit: bool) -> Value {
+    pub(crate) fn send_raw(&mut self, fx: &mut Fx, recv: Value, name: &[u8], args: &Args, blk: Option<Value>, explicit: bool) -> Value {
         self.mark_loc(fx);
         let cache = self.owned_cache_ptr(fx, OWNED_CALL);
         let mid = self.sym_val(fx, name);
         if blk.is_none() && args.splat.is_none() && args.vals.len() <= 2 && self.refine_scope.is_none() {
             return self.send_simple(fx, cache, recv, name, mid, &args.vals, explicit);
         }
+        let blk_given = blk;
         let blk = match blk {
             Some(b) => b,
             None => self.nil(fx),
@@ -93,8 +94,30 @@ impl<M: Module> Compiler<M> {
             None => {
                 let n = self.iconst(fx, args.vals.len() as i64);
                 let buf = self.args_buf(fx, &args.vals);
-                // `obj.foo` must not reach a private method; `foo` / `self.foo` may
-                self.call(fx, if explicit { "kn_send_pub" } else { "kn_send" }, &[cache, recv, mid, n, buf, blk])
+                // `obj.foo` must not reach a private method; `foo` / `self.foo` may.
+                // Through the direct-call stub when the name may be a Ruby method
+                // (not core iterators taking a block, like `each`).
+                let args6 = [cache, recv, mid, n, buf, blk];
+                let core_iter = matches!(
+                    name,
+                    b"each" | b"map" | b"times" | b"each_with_index" | b"select" | b"filter" | b"reject" | b"each_with_object"
+                        | b"inject" | b"reduce" | b"any?" | b"all?" | b"find" | b"detect" | b"sort_by" | b"each_pair"
+                        | b"upto" | b"downto" | b"step" | b"loop" | b"tap" | b"then" | b"collect" | b"flat_map" | b"group_by"
+                        | b"each_key" | b"each_value" | b"count" | b"sum" | b"min_by" | b"max_by" | b"each_slice" | b"zip"
+                        | b"new" | b"define_method" | b"instance_eval" | b"class_eval" | b"fetch" | b"synchronize"
+                );
+                let no_blk = blk_given.is_none();
+                if !explicit && no_blk {
+                    let vals = args.vals.clone();
+                    if let Some(r) = self.static_call(fx, recv, name, mid, &vals, |c, fx| c.call_stub(fx, crate::fastpath::STUB_SEND_N, &args6)) {
+                        return r;
+                    }
+                }
+                if crate::fastpath::may_be_ruby_method(name) && !core_iter {
+                    self.call_stub(fx, if explicit { crate::fastpath::STUB_SEND_PUB_N } else { crate::fastpath::STUB_SEND_N }, &args6)
+                } else {
+                    self.call(fx, if explicit { "kn_send_pub" } else { "kn_send" }, &args6)
+                }
             }
         }
     }
@@ -164,6 +187,16 @@ impl<M: Module> Compiler<M> {
             None => vec![],
         };
         let block = c.block();
+
+        // a getter of a local that may hold a virtual object (vobj.rs)
+        if arg_nodes.is_empty() && block.is_none() && !c.is_safe_navigation() && fx.inline_levels.is_empty() && !fx.vlocals.is_empty() {
+            if let Some(l) = recv_node.as_ref().and_then(|r| r.as_local_variable_read_node()).filter(|l| l.depth() == 0) {
+                self.cur_offset = at_loc;
+                if let Some(v) = self.vobj_get(fx, l.name().as_slice(), &name) {
+                    return v;
+                }
+            }
+        }
 
         // `Kernel.block_given?` / `::Kernel.block_given?` (BasicObject subclasses such as
         // Jbuilder write it so): like the bare call, it asks about the current method's block
@@ -354,11 +387,18 @@ impl<M: Module> Compiler<M> {
                     c.call(fx, rt, args)
                 }
             };
-            let r = if !fx.loops.is_empty() && crate::fastpath::attr_name(&name) {
-                let mode = self.iconst(fx, 2);
-                self.attr_fast(fx, cache, recv, None, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, mode]))
-            } else {
-                plain(self, fx, "kn_vcall", &[cache, recv, mid])
+            let attr = !fx.loops.is_empty() && crate::fastpath::attr_name(&name);
+            let dynamic = |c: &mut Self, fx: &mut Fx| -> Value {
+                if attr {
+                    let mode = c.iconst(fx, 2);
+                    c.attr_fast(fx, cache, recv, None, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, mode]))
+                } else {
+                    plain(c, fx, "kn_vcall", &[cache, recv, mid])
+                }
+            };
+            let r = match self.inline_call(fx, recv, &name, mid, &[], false, |c, fx| dynamic(c, fx)) {
+                Some(r) => r,
+                None => dynamic(self, fx),
             };
             self.check(fx, r);
             r
@@ -367,6 +407,8 @@ impl<M: Module> Compiler<M> {
             _ => None,
         } {
             v
+        } else if let Some(r) = self.kw_inline_site(fx, c, recv, &name, &arg_nodes, block.is_none(), recv_node.as_ref().is_some_and(|r| r.as_self_node().is_none()), at_loc) {
+            r
         } else {
             let args = self.eval_args(fx, c.arguments());
             let forwards = arg_nodes.iter().any(|n| n.as_forwarding_arguments_node().is_some());
@@ -378,6 +420,29 @@ impl<M: Module> Compiler<M> {
             };
             self.cur_offset = at_loc;
             let explicit = recv_node.as_ref().is_some_and(|r| r.as_self_node().is_none());
+            // `C.new(args)`: allocation and `initialize` inline (statics.rs)
+            let const_name = recv_node.as_ref().and_then(|r| match r.as_constant_read_node() {
+                Some(k) => Some(k.name().as_slice().to_vec()),
+                None => r.as_constant_path_node().and_then(|k| k.name().map(|n| n.as_slice().to_vec())),
+            });
+            if let (b"new", true, None, Some(cn)) = (name.as_slice(), no_block, &args.splat, &const_name) {
+                let vals = args.vals.clone();
+                let r = self.inline_new(fx, recv, cn, &vals, |c, fx| {
+                    let r = c.send_raw(fx, recv, b"new", &Args { vals: vals.clone(), splat: None }, None, true);
+                    c.check(fx, r);
+                    r
+                });
+                if let Some(r) = r {
+                    return match safe_done {
+                        Some(done) => {
+                            fx.b.ins().jump(done, &[r.into()]);
+                            fx.b.switch_to_block(done);
+                            fx.b.block_params(done)[0]
+                        }
+                        None => r,
+                    };
+                }
+            }
             let r = self.send_raw(fx, recv, &name, &args, if no_block { None } else { Some(blk) }, explicit);
             let r = match literal {
                 Some(p) => self.catch_break(fx, r, p),
@@ -400,6 +465,61 @@ impl<M: Module> Compiler<M> {
             }
             None => result,
         }
+    }
+
+    /// `name(a, k: x)` with literal keywords to a keyword `def` that can be inlined
+    /// (statics.rs `kw_target`). None (nothing compiled): not such a call.
+    #[allow(clippy::too_many_arguments)]
+    fn kw_inline_site(&mut self, fx: &mut Fx, c: &CallNode, recv: Value, name: &[u8], arg_nodes: &[Node], no_block: bool, explicit: bool, at_loc: usize) -> Option<Value> {
+        if !no_block || c.is_safe_navigation() || c.is_attribute_write() {
+            return None;
+        }
+        let (last, pos) = arg_nodes.split_last()?;
+        let h = last.as_keyword_hash_node()?;
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut vals: Vec<Node> = Vec::new();
+        for e in h.elements().iter() {
+            let a = e.as_assoc_node()?;
+            let k = a.key();
+            let s = k.as_symbol_node()?;
+            let kb = s.unescaped().to_vec();
+            if keys.contains(&kb) {
+                return None;
+            }
+            keys.push(kb);
+            vals.push(a.value());
+        }
+        if pos.iter().any(|n| {
+            n.as_splat_node().is_some() || n.as_forwarding_arguments_node().is_some() || n.as_keyword_hash_node().is_some() || n.as_block_argument_node().is_some()
+        }) {
+            return None;
+        }
+        let target = self.kw_target(fx, name, pos.len(), &keys, explicit)?;
+        let pv: Vec<Value> = pos.iter().map(|n| self.expr(fx, n)).collect();
+        let kv: Vec<(Vec<u8>, Value)> = keys.iter().cloned().zip(vals.iter().map(|n| self.expr(fx, n))).collect();
+        self.cur_offset = at_loc;
+        self.mark_loc(fx);
+        let mid = self.sym_val(fx, name);
+        let name = name.to_vec();
+        let r = self.inline_kw_call(fx, target, recv, mid, &pv, &kv, explicit, |c, fx| {
+            // the call as written: the keywords as a keyword hash
+            let mut hv = Vec::new();
+            for (k, v) in &kv {
+                hv.push(c.sym_val(fx, k));
+                hv.push(*v);
+            }
+            let n = c.iconst(fx, hv.len() as i64);
+            let buf = c.args_buf(fx, &hv);
+            let one = c.iconst(fx, 1);
+            let h = c.call(fx, "kn_hash_new_syms", &[n, buf, one]);
+            let mut vals = pv.clone();
+            vals.push(h);
+            c.cur_offset = at_loc;
+            let r = c.send_raw(fx, recv, &name, &Args { vals, splat: None }, None, explicit);
+            c.check(fx, r);
+            r
+        });
+        Some(r)
     }
 
     fn require_relative(&mut self, fx: &mut Fx, arg: &Node, at: usize) -> Value {
@@ -490,6 +610,28 @@ impl<M: Module> Compiler<M> {
     pub(crate) fn index_op_write(&mut self, fx: &mut Fx, n: &IndexOperatorWriteNode) -> Value {
         let recv = self.recv_or_self(fx, n.receiver());
         let mut args = self.index_args(fx, n.arguments());
+        // `a[i] += k` with k a literal or a local: nothing runs between the read and the
+        // write, so one guard covers both (fastpath.rs `ary_add_fast`)
+        let op = n.binary_operator().as_slice().to_vec();
+        let value = n.value();
+        let simple_rhs = value.as_integer_node().is_some() || value.as_local_variable_read_node().is_some();
+        if args.len() == 1
+            && n.block().is_none()
+            && simple_rhs
+            && matches!(op.as_slice(), b"+" | b"-")
+            && self.refine_scope.is_none()
+            && (!fx.loops.is_empty() || !self.in_dependency())
+        {
+            let rhs = self.expr(fx, &value);
+            let idx = args[0];
+            return self.ary_add_fast(fx, recv, idx, rhs, op == b"-", |c, fx, cur| {
+                // (the local again: a `[]` of another class may have changed it)
+                let rhs = c.expr(fx, &value);
+                let v = c.binop_rhs(fx, &op, cur, crate::fastpath::Num::Boxed(rhs));
+                c.send(fx, recv, b"[]=", &[idx, v], None);
+                v
+            });
+        }
         let cur = self.send(fx, recv, b"[]", &args, None);
         let rhs = self.num_expr(fx, &n.value(), true);
         let v = self.binop_rhs(fx, n.binary_operator().as_slice(), cur, rhs);
