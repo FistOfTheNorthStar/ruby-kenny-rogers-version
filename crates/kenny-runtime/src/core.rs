@@ -300,6 +300,30 @@ pub struct Class {
     pub prepends: SVec<*mut Class>,
     /// Visibility for methods defined next in a class body (`private` with no arguments).
     pub default_vis: u8,
+    /// The superclass chain from the root down to this class (`superclass` never changes),
+    /// so `is_a` for a class is one index: `k.supers[depth(c)] == c`. Empty for modules.
+    /// (Never freed, like classes; compiled code reads both fields, see `CLASS_SUP_PTR`.)
+    pub sup_ptr: *const *mut Class,
+    pub sup_len: usize,
+}
+/// Offsets compiled code uses (kenny-compiler fastpath.rs).
+pub const CLASS_SUP_PTR: usize = std::mem::offset_of!(Class, sup_ptr);
+const _: () = assert!(CLASS_SUP_PTR == 272 && std::mem::offset_of!(Class, sup_len) == 280);
+/// A class's own ivars (`civars`, a `CMap<u32, V>`): compiled code reads them inline
+/// (kenny-compiler fastpath.rs `civar_fast`): the map's first word points to its slab
+/// (len, cap, then (key, value) pairs of 16 bytes, key first).
+pub const CLASS_CIVARS: usize = std::mem::offset_of!(Class, civars);
+const _: () = assert!(
+    CLASS_CIVARS == 144
+        && std::mem::offset_of!((u32, V), 0) == 0
+        && std::mem::offset_of!((u32, V), 1) == 8
+        && std::mem::size_of::<(u32, V)>() == 16
+);
+impl Class {
+    #[inline(always)]
+    pub fn supers(&self) -> &[*mut Class] {
+        if self.sup_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(self.sup_ptr, self.sup_len) } }
+    }
 }
 
 #[inline(always)]
@@ -410,8 +434,23 @@ pub fn object_new(klass: *mut Class) -> V {
     // instances usually get the same ivars as earlier ones: make room for them up front,
     // as unset slots (UNDEF), so setting one is a plain store (also from compiled code)
     let n = if klass.is_null() { 0 } else { unsafe { (*klass).ivar_names.len() } };
-    alloc(RObject { h: header(klass, Kind::Object), shape: klass, ivars: SVec::from(vec![UNDEF; n]) })
+    // up to 6 of them in the object's own slot (no buffer to allocate and free; read in the
+    // same cache line), filling the slot size class: 64 bytes for 1-2, 96 for 3-6
+    let base = std::mem::size_of::<RObject>();
+    let room = (crate::gc::slot_size(base + 8 * n) - base) / 8;
+    if n == 0 || base + 8 * n > crate::gc::MAX_SLOT {
+        return alloc(RObject { h: header(klass, Kind::Object), shape: klass, ivars: SVec::from(vec![UNDEF; n]) });
+    }
+    let p = crate::gc::alloc_slot(base + 8 * room);
+    unsafe {
+        let ivars = SVec::embedded((p + base) as *mut V, n, room, UNDEF);
+        std::ptr::write(p as *mut RObject, RObject { h: header(klass, Kind::Object), shape: klass, ivars });
+    }
+    p as V
 }
+/// Where an object's embedded instance variables start (`SVec::rebase` after a move).
+pub const OBJ_EMBED_OFF: usize = std::mem::size_of::<RObject>();
+const _: () = assert!(OBJ_EMBED_OFF == 48);
 pub fn int_from_big(n: BigInt) -> V {
     use num_traits::ToPrimitive;
     if let Some(i) = n.to_i64() {
@@ -696,7 +735,12 @@ pub enum Body {
     CFunc(*const std::ffi::c_void, i32),
     Undefined,
 }
+#[repr(C)]
 pub struct Method {
+    /// A compiled method's entry taking its arguments in registers, `(self, a0.., blk)`,
+    /// for `n` required parameters: `address | (n + 1) << 56` (0 = none). Compiled code
+    /// calls it when a call passes exactly `n` arguments (kenny-compiler `fast_wrapper`).
+    pub fast: usize,
     pub body: Body,
     pub owner: *mut Class,
     pub name: u32,
@@ -715,6 +759,9 @@ pub struct Method {
     /// two classes it ran on (0 = none), so a call needn't look the slot up by name.
     pub attr_slot: [std::sync::atomic::AtomicU64; 2],
 }
+
+/// (compiled code reads `Method::fast` at this offset)
+const _: () = assert!(std::mem::offset_of!(Method, fast) == 0);
 
 pub const VIS_PUBLIC: u8 = 0;
 pub const VIS_PRIVATE: u8 = 1;
@@ -1013,6 +1060,14 @@ pub struct KnDirect {
     pub flags: std::sync::atomic::AtomicU64,
     /// A copy of `CONST_SERIAL` (constant caches, abi.rs `ConstEntry`).
     pub const_serial: std::sync::atomic::AtomicU64,
+    /// The builtin Module#=== (`*const Method`): `case v when SomeClass` is answered
+    /// inline while a site's cache entry finds this method for the class.
+    pub mod_eqq: std::sync::atomic::AtomicUsize,
+    /// The Math module (compiled code computes Math functions inline while `DIRECT_MATH`).
+    pub math_module: std::sync::atomic::AtomicUsize,
+    /// The Array class (compiled code indexes plain Arrays inline while `DIRECT_ARY_AREF` /
+    /// `DIRECT_ARY_ASET` are set).
+    pub array_class: std::sync::atomic::AtomicUsize,
 }
 #[unsafe(no_mangle)]
 pub static KN_DIRECT: KnDirect = KnDirect {
@@ -1020,10 +1075,24 @@ pub static KN_DIRECT: KnDirect = KnDirect {
     call_limit: std::sync::atomic::AtomicUsize::new(usize::MAX),
     flags: std::sync::atomic::AtomicU64::new(0),
     const_serial: std::sync::atomic::AtomicU64::new(1),
+    mod_eqq: std::sync::atomic::AtomicUsize::new(0),
+    math_module: std::sync::atomic::AtomicUsize::new(0),
+    array_class: std::sync::atomic::AtomicUsize::new(0),
 };
+const _: () = assert!(std::mem::offset_of!(KnDirect, array_class) == 48 && std::mem::offset_of!(KnDirect, math_module) == 40);
+/// What compiled code reads of an Array (fastpath.rs `ARY_*`): the buffer's ptr, len, cap.
+const _: () = assert!(std::mem::offset_of!(RArray, v) == 16);
 pub const DIRECT_SYM_EQ: u64 = 1;
 pub const DIRECT_NIL_P: u64 = 2;
 pub const DIRECT_IS_A: u64 = 4;
+/// Array#[] / Array#[]= of the Array class itself are the builtin ones.
+pub const DIRECT_ARY_AREF: u64 = 8;
+pub const DIRECT_ARY_ASET: u64 = 16;
+/// Every function of `opt::MATH_FNS` is Math's builtin one.
+pub const DIRECT_MATH: u64 = 32;
+/// Integer#to_f, Float#to_f, Integer#-@, Float#-@, Float#**, Integer#<< and Integer#>> are
+/// the builtin ones.
+pub const DIRECT_NUM: u64 = 64;
 /// Set once the builtin methods are tagged (opt.rs `init`).
 pub static DIRECT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// `KN_DIRECT.flags` is 0 until recomputed (methods changed): on the next inline cache
@@ -1061,6 +1130,34 @@ pub fn update_direct_flags() {
     }
     if imm.iter().all(|&k| is(k, is_a, crate::opt::OPT_IS_A) && is(k, kind_of, crate::opt::OPT_IS_A)) {
         flags |= DIRECT_IS_A;
+    }
+    static ARY_IDS: std::sync::OnceLock<[u32; 2]> = std::sync::OnceLock::new();
+    let [aref, aset] = *ARY_IDS.get_or_init(|| [sym("[]"), sym("[]=")]);
+    if is(c.array, aref, crate::opt::OPT_ARY_AREF) {
+        flags |= DIRECT_ARY_AREF;
+    }
+    if is(c.array, aset, crate::opt::OPT_ARY_ASET) {
+        flags |= DIRECT_ARY_ASET;
+    }
+    static NUM_IDS: std::sync::OnceLock<[u32; 5]> = std::sync::OnceLock::new();
+    let [to_f, neg, pow, shl, shr] = *NUM_IDS.get_or_init(|| [sym("to_f"), sym("-@"), sym("**"), sym("<<"), sym(">>")]);
+    let num = crate::opt::OPT_NUM_INLINE;
+    if is(c.integer, to_f, num)
+        && is(c.float, to_f, num)
+        && is(c.integer, neg, num)
+        && is(c.float, neg, num)
+        && is(c.float, pow, num)
+        && is(c.integer, shl, num)
+        && is(c.integer, shr, num)
+    {
+        flags |= DIRECT_NUM;
+    }
+    let math = KN_DIRECT.math_module.load(SeqCst);
+    if math != 0 && is_kind(math as V, Kind::Class) {
+        let sc = singleton_class(math as V);
+        if crate::opt::MATH_FNS.iter().all(|n| is(sc, sym(n), crate::opt::OPT_MATH)) {
+            flags |= DIRECT_MATH;
+        }
     }
     KN_DIRECT.flags.store(flags, SeqCst);
     // changed again meanwhile: what we found may be stale
@@ -1125,7 +1222,18 @@ pub fn new_class_raw(name: &str, superclass: *mut Class, is_module: bool) -> *mu
         module_function: false,
         prepends: SVec::new(),
         default_vis: 0,
+        sup_ptr: std::ptr::null(),
+        sup_len: 0,
     }));
+    if !is_module {
+        let mut s: Vec<*mut Class> = if superclass.is_null() { Vec::new() } else { unsafe { (*superclass).supers().to_vec() } };
+        s.push(c);
+        let s = Box::leak(s.into_boxed_slice());
+        unsafe {
+            (*c).sup_ptr = s.as_ptr();
+            (*c).sup_len = s.len();
+        }
+    }
     crate::gc::register_class(c);
     c
 }
@@ -1486,7 +1594,7 @@ fn find_super_method_uncached(klass: *mut Class, owner: *mut Class, mid: u32) ->
 }
 
 pub fn add_method(c: *mut Class, mid: u32, body: Body) -> *const Method {
-    let m = Box::into_raw(Box::new(Method { body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: false, attr_slot: Default::default() })) as *const Method;
+    let m = Box::into_raw(Box::new(Method { fast: 0, body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: false, attr_slot: Default::default() })) as *const Method;
     unsafe {
         (*c).methods.insert(mid, m);
     }
@@ -1969,6 +2077,12 @@ pub fn is_a(v: V, c: *mut Class) -> bool {
     }
     let is_mod = unsafe { (*c).is_module };
     let mut k = class_of(v);
+    if !is_mod {
+        let (ks, cs) = unsafe { ((*k).supers(), (*c).supers()) };
+        if !cs.is_empty() {
+            return ks.get(cs.len() - 1) == Some(&c);
+        }
+    }
     while !k.is_null() {
         if k == c {
             return true;

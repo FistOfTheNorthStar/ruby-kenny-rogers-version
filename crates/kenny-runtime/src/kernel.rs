@@ -1404,7 +1404,7 @@ fn dup_module(v: V) -> V {
         if let Body::Compiled(f) = mm.body {
             crate::abi::share_owner_of(f);
         }
-        let nm = Box::into_raw(Box::new(Method { body: clone_body(&mm.body), owner: c, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
+        let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: c, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
         k.methods.insert(id, nm);
     }
     k.includes.set(src.includes.clone());
@@ -1428,7 +1428,7 @@ fn dup_module(v: V) -> V {
             if let Body::Compiled(f) = mm.body {
                 crate::abi::share_owner_of(f);
             }
-            let nm = Box::into_raw(Box::new(Method { body: clone_body(&mm.body), owner: dm, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
+            let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: dm, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
             dk.methods.insert(id, nm);
         }
         dk.includes.set(sm.includes.clone());

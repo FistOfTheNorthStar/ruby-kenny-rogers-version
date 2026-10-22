@@ -1,0 +1,44 @@
+11
+3
+7
+"missing keyword: :left"
+"unknown keyword: :bogus"
+"unknown keywords: :x, :y"
+"unknown keyword: \"str\""
+"missing keyword: :left"
+11
+{left: 5, right: 6}
+10
+{left: 1}
+[1, 2, 3, 6, 3]
+[1, 5, 3, 6, 0]
+[1, 2, 3, 6, 3]
+{c: 3}
+[1, {b: 2, c: 3}]
+{a: 1, b: 2, c: 3}
+[0, 1, 2]
+[0, 5, 2]
+[0, 8, 7]
+[1, :dm]
+[2, 3]
+"unknown keyword: :z"
+[2, 4]
+12
+6
+6
+12
+[1, 4]
+"missing keyword: :p"
+5000050000
+{a: 1, b: 2}
+[:a, :b, :c]
+{a: 2}
+11
+11
+true
+nil
+31
+120
+{b: 2}
+nil
+2

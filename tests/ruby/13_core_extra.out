@@ -121,7 +121,7 @@ true
 [0.6931471805599454, 1]
 [0.6025390625, 11]
 1234.0
-"Numerical argument is out of domain - \"atanh\""
+"Numerical argument is out of domain - atanh"
 -- Array
 2
 nil

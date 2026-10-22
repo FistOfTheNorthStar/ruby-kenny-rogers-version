@@ -53,14 +53,26 @@ fn want_int(v: V) -> Result<i64, V> {
         Err(no_conv(v, "Integer"))
     }
 }
-fn math_domain(name: &str) -> V {
+pub(crate) fn math_domain(name: &str) -> V {
     let m = const_lookup(rt().c.object, sym("Math")).unwrap();
     let d = const_get_under(m as *mut Class, sym("DomainError")).unwrap();
-    raise(d as *mut Class, &format!("Numerical argument is out of domain - \"{name}\""))
+    raise(d as *mut Class, &format!("Numerical argument is out of domain - {name}"))
 }
-fn float_arg(v: V) -> Result<f64, V> {
-    match num_to_f(v) {
+/// A Math function's argument as f64: Integer, Float, BigDecimal, or another Numeric
+/// (Rational...) through its `to_f`.
+pub(crate) fn float_arg(v: V) -> Result<f64, V> {
+    match num_to_f(v).or_else(|| crate::bigdecimal::to_f(v)) {
         Some(f) => Ok(f),
+        None if is_a(v, rt().c.numeric) => {
+            let r = send0(v, "to_f");
+            if r == UNDEF {
+                Err(r)
+            } else if is_float(r) {
+                Ok(float_val(r))
+            } else {
+                Err(type_error(&format!("can't convert {} into Float", cname(v))))
+            }
+        }
         None if v == QNIL => Err(type_error("can't convert nil into Float")),
         None if is_str(v) => Err(type_error("can't convert String into Float")),
         None => Err(type_error(&format!("can't convert {} into Float", cname(v)))),

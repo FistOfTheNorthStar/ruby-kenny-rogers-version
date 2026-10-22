@@ -321,6 +321,11 @@ fn new_page(h: &mut Heap, ci: usize) -> usize {
     idx
 }
 
+/// The slot size an object of `size` bytes gets (`size` itself when larger than any slot).
+pub fn slot_size(size: usize) -> usize {
+    SIZE_CLASSES.iter().copied().find(|&c| c >= size).unwrap_or(size)
+}
+
 #[inline(always)]
 fn size_class(size: usize) -> usize {
     if size <= 32 {
@@ -2691,6 +2696,9 @@ fn compact(h: &mut Heap, forced: bool) -> (usize, usize) {
                     };
                     let Some(dst) = dst else { break };
                     unsafe { std::ptr::copy_nonoverlapping(p as *const u8, dst as *mut u8, slot) };
+                    if hdr(dst as V).kind == Kind::Object {
+                        obj(dst as V).ivars.rebase((dst + crate::core::OBJ_EMBED_OFF) as *mut V);
+                    }
                     let hd = hdr(p as V);
                     hd.klass = dst as *mut Class;
                     hd.flags |= FL_MOVED;

@@ -33,7 +33,8 @@ pub const KW_MISSING: V = 0x24;
 #[repr(C)]
 pub struct IvCache {
     pub packed: std::sync::atomic::AtomicU64,
-    pub _spare: u64,
+    /// For a class/module receiver (its own ivars): class | position in `civars` << 48.
+    pub class_pos: std::sync::atomic::AtomicU64,
 }
 const IV_PTR: u64 = (1 << 48) - 1;
 impl IvCache {
@@ -495,8 +496,24 @@ pub extern "C" fn kn_ary_concat_splat(a: V, v: V) -> V {
 pub unsafe extern "C" fn kn_hash_new(n: u64, argv: *const V, kw: u64) -> V {
     let h = hash_new();
     let a = unsafe { args_slice(n, argv) };
+    rhash(h).m.reserve_empty(a.len() / 2);
     for ch in a.chunks(2) {
         rhash(h).m.insert(HKey(crate::hash::key_dup(ch[0])), ch[1]);
+    }
+    if kw != 0 {
+        hdr(h).flags |= FL_KWHASH;
+    }
+    h
+}
+/// A hash literal whose keys are distinct Symbol literals: no key copies or duplicate checks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_hash_new_syms(n: u64, argv: *const V, kw: u64) -> V {
+    let h = hash_new();
+    let a = unsafe { args_slice(n, argv) };
+    let m = &mut rhash(h).m;
+    m.reserve_empty(a.len() / 2);
+    for ch in a.chunks(2) {
+        m.push_distinct(ch[0], ch[1]);
     }
     if kw != 0 {
         hdr(h).flags |= FL_KWHASH;
@@ -587,6 +604,86 @@ pub unsafe extern "C" fn kn_is_a_fill(cache: *mut CallCache, v: V, c: V) -> V {
     }
     bool_v(r)
 }
+/// A static call site's slot ([class, serial], kenny-compiler statics.rs): filled when the
+/// receiver's class has the method whose `Method::fast` is `expect` (one OS thread only).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_static_fill(slot: *mut [u64; 2], recv: V, mid: V, expect: usize) -> V {
+    if !is_heap(recv) || crate::mt::multi() {
+        return QNIL;
+    }
+    // top bit: a call with a receiver (only a public method will do); bit 62: `expect` is
+    // the address of the method's parameter descriptor (a keyword def), else its fast entry
+    let public = expect >> 63 != 0;
+    let by_params = (expect >> 62) & 1 != 0;
+    let expect = expect & !(3 << 62);
+    let k = hdr(recv).klass;
+    let m = find_method(k, sym_id(mid));
+    let have = if m.is_null() { 0 } else if by_params { unsafe { (*m).params as usize } } else { unsafe { (*m).fast } };
+    let same = have != 0 && have == expect;
+    if same && (!public || unsafe { (*m).vis } == VIS_PUBLIC) {
+        unsafe {
+            (*slot)[0] = k as u64;
+            (*slot)[1] = KN_DIRECT.serial.load(std::sync::atomic::Ordering::Acquire);
+        }
+    }
+    QNIL
+}
+/// For an inlined `C.new` (kenny-compiler statics.rs `inline_new`): fill `slot` with
+/// [C, method serial] if C makes plain objects, its `new` is the builtin Class#new and its
+/// `initialize` has the fast entry `expect`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_new_fill(slot: *mut [u64; 2], cls: V, expect: usize) -> V {
+    if !is_class(cls) || crate::mt::multi() {
+        return QNIL;
+    }
+    let k = cls as *mut Class;
+    if unsafe { (*k).is_module || !matches!((*k).alloc, Kind::Object) } || crate::capi::alloc_func(k).is_some() {
+        return QNIL;
+    }
+    static IDS: std::sync::OnceLock<[u32; 2]> = std::sync::OnceLock::new();
+    let [new_id, init_id] = *IDS.get_or_init(|| [sym("new"), sym("initialize")]);
+    let nm = find_method(hdr(cls).klass, new_id);
+    let im = find_method(k, init_id);
+    if nm.is_null() || unsafe { (*nm).opt } != crate::opt::OPT_CLASS_NEW || im.is_null() || unsafe { (*im).fast } != expect {
+        return QNIL;
+    }
+    unsafe {
+        (*slot)[0] = cls as u64;
+        (*slot)[1] = KN_DIRECT.serial.load(std::sync::atomic::Ordering::Acquire);
+    }
+    QNIL
+}
+/// For a virtual object (kenny-compiler vobj.rs): `kn_new_fill`, when also each getter in
+/// `desc` (`n` pairs [name, expect]) is a public method of `cls` that is the attr_reader of
+/// the instance variable `expect` (a Symbol) or has the fast entry `expect`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_vobj_fill(slot: *mut [u64; 2], cls: V, expect: usize, desc: *const V, n: u64) -> V {
+    if !is_class(cls) || crate::mt::multi() {
+        return QNIL;
+    }
+    let k = cls as *mut Class;
+    for i in 0..n as usize {
+        let (name, e) = unsafe { (*desc.add(2 * i), *desc.add(2 * i + 1)) };
+        let m = find_method(k, sym_id(name));
+        if m.is_null() || unsafe { (*m).vis } != VIS_PUBLIC {
+            return QNIL;
+        }
+        let ok = if is_sym(e) {
+            matches!(unsafe { &(*m).body }, Body::AttrReader(id) if *id == sym_id(e))
+        } else {
+            unsafe { (*m).fast == e as usize }
+        };
+        if !ok {
+            return QNIL;
+        }
+    }
+    unsafe { kn_new_fill(slot, cls, expect) }
+}
+/// A plain object of class `cls` (an inlined `C.new`; `kn_new_fill` checked the class).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_obj_alloc(cls: V) -> V {
+    object_new(cls as *mut Class)
+}
 /// Write barrier after compiled code stores into an old (GC-heap) environment.
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_wb_env(env: *mut Env) -> V {
@@ -624,6 +721,27 @@ pub unsafe extern "C" fn kn_ivar_get(self_: V, id: V, cache: *mut IvCache) -> V 
             return o.ivars.get(i as usize).copied().filter(|x| *x != UNDEF).unwrap_or(QNIL);
         }
         return QNIL;
+    }
+    if is_kind(self_, Kind::Class) {
+        // a class-level ivar: its position in the class's table, checked against the key
+        let c = unsafe { &*cache };
+        let iv = &rclass(self_).civars;
+        let w = c.class_pos.load(std::sync::atomic::Ordering::Relaxed);
+        let key = sym_id(id);
+        if w != 0 && (w & IV_PTR) == self_ {
+            if let Some(v) = iv.get_at((w >> 48) as usize, &key) {
+                return v;
+            }
+        }
+        return match iv.index_of(&key) {
+            Some(i) => {
+                if i < 1 << 16 && self_ <= IV_PTR {
+                    c.class_pos.store(self_ | (i as u64) << 48, std::sync::atomic::Ordering::Relaxed);
+                }
+                iv.get_at(i, &key).unwrap_or(QNIL)
+            }
+            None => QNIL,
+        };
     }
     ivar_get(self_, sym_id(id))
 }
@@ -1299,7 +1417,7 @@ const PROTECTED_OPS: &[&str] = &["+", "-", "*", "/", "%", "<", "<=", ">", ">=", 
 /// kind: 0 = def in class body (target = self), 1 = top level, 2 = def inside a method/block,
 /// 3 = singleton def (`def obj.name`).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owner_slot: *mut V, params: *const u8) -> V {
+pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owner_slot: *mut V, params: *const u8, fast: usize) -> V {
     let r = rt();
     let cls: *mut Class = match kind {
         0 => cref_class(target),
@@ -1342,6 +1460,7 @@ pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owne
     unsafe {
         let mm = &mut *(m as *mut Method);
         mm.params = params;
+        mm.fast = fast;
         if !always_private(sym_id(id)) {
             mm.vis = match kind {
                 1 => VIS_PRIVATE, // top-level defs are private methods of Object
@@ -1355,6 +1474,7 @@ pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owne
         let m2 = add_method(singleton_class(cls as V), sym_id(id), Body::Compiled(f));
         unsafe {
             (*(m2 as *mut Method)).params = params;
+            (*(m2 as *mut Method)).fast = fast;
             (*(m2 as *mut Method)).vis = VIS_PUBLIC;
         }
     }
@@ -1391,7 +1511,7 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
         return raise(rt().c.name_error, &format!("undefined method '{}' for class '{}'", sym_str(old), class_name(c)));
     }
     let body = crate::kernel::clone_body(unsafe { &(*m).body });
-    let nm = Box::into_raw(Box::new(Method { body, owner: unsafe { (*m).owner }, name: new, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
+    let nm = Box::into_raw(Box::new(Method { fast: unsafe { (*m).fast }, body, owner: unsafe { (*m).owner }, name: new, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
     unsafe { (*c).methods.insert(new, nm) };
     bump_serial();
     mksym(new)
@@ -1485,6 +1605,26 @@ pub extern "C" fn kn_kw_dup(v: V) -> V {
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_kw_take(h: V, key: V) -> V {
     rhash(h).m.shift_remove(&HKey(key)).unwrap_or(KW_MISSING)
+}
+/// Keyword `key` of keyword hash `h` (nil: none passed) without removing it, or KW_MISSING.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_kw_get(h: V, key: V) -> V {
+    if h == QNIL {
+        return KW_MISSING;
+    }
+    rhash(h).m.get_ident(key).unwrap_or(KW_MISSING)
+}
+/// How many keywords `h` holds (nil: none passed).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_kw_count(h: V) -> u64 {
+    if h == QNIL { 0 } else { rhash(h).m.len() as u64 }
+}
+/// Raise for the keys of `h` that aren't among the `n` method keywords at `keys`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_kw_unknown(h: V, keys: *const V, n: u64) -> V {
+    let known = unsafe { std::slice::from_raw_parts(keys, n as usize) };
+    let names: Vec<String> = rhash(h).m.keys().map(|k| k.0).filter(|k| !known.contains(k)).map(crate::fmt::inspect_lossy).collect();
+    arg_error(&format!("unknown keyword{}: {}", if names.len() > 1 { "s" } else { "" }, names.join(", ")))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_kw_missing(key: V) -> V {
@@ -1842,4 +1982,31 @@ pub extern "C" fn kn_class_leave(c: V) -> V {
         pst().definee.pop();
     }
     c
+}
+
+/// `Math.<MATH_FNS[which]>(x)` for compiled code (which checked the domain).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_math1(which: u64, x: f64) -> f64 {
+    match which {
+        0 => x.sqrt() + 0.0,
+        1 => x.sin(),
+        2 => x.cos(),
+        3 => x.tan(),
+        4 => x.atan(),
+        5 => x.exp(),
+        6 => x.ln(),
+        7 => x.log2(),
+        8 => x.log10(),
+        9 => x.cbrt(),
+        10 => x.sinh(),
+        11 => x.cosh(),
+        12 => x.tanh(),
+        13 => x.asin(),
+        _ => x.acos(),
+    }
+}
+/// Float#** for compiled code (x >= 0 or y integral: a Float result).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_pow(x: f64, y: f64) -> f64 {
+    x.powf(y)
 }

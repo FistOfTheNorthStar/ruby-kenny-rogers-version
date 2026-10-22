@@ -1,7 +1,7 @@
 //! Control flow: if/unless, loops, case/when, begin/rescue/ensure, return/break/next.
 
 use crate::*;
-use cranelift_codegen::ir::{condcodes::IntCC, types::I64, InstBuilder};
+use cranelift_codegen::ir::{condcodes::IntCC, types::I64, Block, InstBuilder};
 use ruby_prism::*;
 
 impl<M: Module> Compiler<M> {
@@ -47,11 +47,34 @@ impl<M: Module> Compiler<M> {
         fx.b.block_params(done)[0]
     }
 
-    pub(crate) fn while_loop(&mut self, fx: &mut Fx, pred: &Node, body: Option<StatementsNode>, until: bool, do_while: bool) -> Value {
-        let header = fx.b.create_block();
-        let body_b = fx.b.create_block();
+    /// `lp`: the WhileNode / UntilNode, when the loop may be speculated on (spec.rs).
+    pub(crate) fn while_loop(&mut self, fx: &mut Fx, lp: Option<&Node>, pred: &Node, body: Option<StatementsNode>, until: bool, do_while: bool) -> Value {
+        if let (Some(lp), false) = (lp, do_while) {
+            let mut core = |c: &mut Self, fx: &mut Fx, exit: Block| {
+                let (p, b) = match lp.as_while_node() {
+                    Some(w) => (w.predicate(), w.statements()),
+                    None => {
+                        let u = lp.as_until_node().unwrap();
+                        (u.predicate(), u.statements())
+                    }
+                };
+                c.while_core(fx, &p, b, until, false, exit);
+            };
+            if let Some(v) = self.spec_loop(fx, lp, &mut core) {
+                return v;
+            }
+        }
         let exit = fx.b.create_block();
         fx.b.append_block_param(exit, I64);
+        self.while_core(fx, pred, body, until, do_while, exit);
+        fx.b.switch_to_block(exit);
+        fx.b.block_params(exit)[0]
+    }
+
+    /// The loop itself, leaving through `exit` (an I64 parameter: the loop's value).
+    fn while_core(&mut self, fx: &mut Fx, pred: &Node, body: Option<StatementsNode>, until: bool, do_while: bool, exit: Block) {
+        let header = fx.b.create_block();
+        let body_b = fx.b.create_block();
         fx.b.ins().jump(if do_while { body_b } else { header }, &[]);
         fx.b.switch_to_block(header);
         let c = self.expr(fx, pred);
@@ -68,8 +91,6 @@ impl<M: Module> Compiler<M> {
         fx.loops.pop();
         self.safepoint(fx);
         fx.b.ins().jump(header, &[]);
-        fx.b.switch_to_block(exit);
-        fx.b.block_params(exit)[0]
     }
 
     pub(crate) fn for_loop(&mut self, fx: &mut Fx, f: &ForNode) -> Value {
@@ -142,8 +163,20 @@ impl<M: Module> Compiler<M> {
                                 let cv = self.expr(fx, &cond);
                                 fx.b.ins().icmp(IntCC::Equal, cv, s)
                             } else {
-                                let cv = self.expr(fx, &cond);
-                                let r = self.send(fx, cv, b"===", &[s], None);
+                                // `when SomeClass`: the constant through the inline cache
+                                let r = match cond.as_constant_read_node() {
+                                    Some(c) if self.refine_scope.is_none() => {
+                                        let crefp = self.slot_ptr(fx, fx.cref_slot);
+                                        let sym = self.sym_val(fx, c.name().as_slice());
+                                        let cache = self.owned_cache_ptr(fx, OWNED_CONST);
+                                        let cv = self.const_cached(fx, cache, crefp, sym);
+                                        self.case_class_eqq(fx, cv, s)
+                                    }
+                                    _ => {
+                                        let cv = self.expr(fx, &cond);
+                                        self.send(fx, cv, b"===", &[s], None)
+                                    }
+                                };
                                 self.truthy(fx, r)
                             }
                         }

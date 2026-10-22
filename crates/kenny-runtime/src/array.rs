@@ -276,6 +276,12 @@ pub fn join(s: V, sep: &[u8], seen: &mut Vec<V>) -> Result<Vec<u8>, V> {
     Ok(out)
 }
 
+/// `sum` of the block values an inlined `ary.sum { ... }` collected (as Array#sum does after
+/// mapping with the block).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_ary_sum_vals(vals: V) -> V {
+    kahan_sum(mkfix(0), &snapshot(vals))
+}
 fn kahan_sum(init: V, vals: &[V]) -> V {
     let mut acc = init;
     let mut i = 0;
@@ -459,11 +465,7 @@ pub fn init() {
         let v = mutv!(s);
         match a.first() {
             None => {
-                if v.is_empty() {
-                    QNIL
-                } else {
-                    v.remove(0)
-                }
+                v.shift().unwrap_or(QNIL)
             }
             Some(n) => {
                 let k = (fix(*n).max(0) as usize).min(v.len());

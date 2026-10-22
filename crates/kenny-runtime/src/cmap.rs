@@ -28,6 +28,8 @@ struct Slab<K, V> {
     items: [(K, V); 0],
 }
 
+/// (`p` first: compiled code reads a class's ivar map inline, see core.rs `CLASS_CIVARS`.)
+#[repr(C)]
 pub struct CMap<K: Copy + Ord, V: Copy> {
     p: AtomicPtr<Slab<K, V>>,
     /// Generational GC: written since the last collection (and recorded).
@@ -97,6 +99,15 @@ impl<K: Copy + Ord, V: Copy> CMap<K, V> {
     pub fn get(&self, k: &K) -> Option<&V> {
         let it = self.items();
         it.binary_search_by(|e| e.0.cmp(k)).ok().map(|i| &it[i].1)
+    }
+    /// Position of `k` (a hint for `get_at`, valid until keys are added or removed).
+    pub fn index_of(&self, k: &K) -> Option<usize> {
+        self.find(k).ok()
+    }
+    /// The value at position `i` if the key there is `k`.
+    #[inline]
+    pub fn get_at(&self, i: usize, k: &K) -> Option<V> {
+        self.items().get(i).filter(|e| e.0 == *k).map(|e| e.1)
     }
     pub fn contains_key(&self, k: &K) -> bool {
         self.find(k).is_ok()

@@ -46,6 +46,23 @@ pub const OPT_ARY_ANY: u8 = 27;
 pub const OPT_ARY_ALL: u8 = 28;
 pub const OPT_STR_APPEND: u8 = 29;
 pub const OPT_IS_A: u8 = 30;
+/// Module#=== (`case x when SomeClass`)
+pub const OPT_MOD_EQQ: u8 = 31;
+pub const OPT_STR_GETBYTE: u8 = 32;
+pub const OPT_STR_SETBYTE: u8 = 33;
+pub const OPT_STR_BYTESIZE: u8 = 34;
+pub const OPT_INT_SUCC: u8 = 35;
+pub const OPT_ARY_COUNT: u8 = 36;
+pub const OPT_ARY_SUM: u8 = 37;
+/// The builtin Math functions compiled code computes inline (`MATH_FNS`).
+pub const OPT_MATH: u8 = 38;
+/// Integer#to_f, Float#to_f, Integer#-@, Float#-@, Float#** (`DIRECT_NUM`).
+pub const OPT_NUM_INLINE: u8 = 39;
+/// Class#new (kenny-runtime abi.rs `kn_new_fill`).
+pub const OPT_CLASS_NEW: u8 = 40;
+/// The Math functions compiled code may compute inline, in the order of `kn_math1`'s
+/// `which` (kenny-compiler fastpath.rs `MATH_FNS` must match).
+pub const MATH_FNS: [&str; 15] = ["sqrt", "sin", "cos", "tan", "atan", "exp", "log", "log2", "log10", "cbrt", "sinh", "cosh", "tanh", "asin", "acos"];
 
 fn tag(c: *mut Class, name: &str, t: u8) {
     let m = unsafe { (*c).methods.get(&sym(name)).copied() };
@@ -97,10 +114,36 @@ pub fn init() {
     tag(c.kernel, "nil?", OPT_NIL_P);
     tag(c.kernel, "is_a?", OPT_IS_A);
     tag(c.kernel, "kind_of?", OPT_IS_A);
+    tag(c.module, "===", OPT_MOD_EQQ);
+    tag(c.string, "getbyte", OPT_STR_GETBYTE);
+    tag(c.string, "setbyte", OPT_STR_SETBYTE);
+    tag(c.string, "bytesize", OPT_STR_BYTESIZE);
+    tag(c.integer, "succ", OPT_INT_SUCC);
+    tag(c.array, "count", OPT_ARY_COUNT);
+    tag(c.array, "sum", OPT_ARY_SUM);
+    if let Some(math) = crate::core::const_lookup(c.object, sym("Math")) {
+        let sc = crate::core::singleton_class(math);
+        for n in MATH_FNS {
+            tag(sc, n, OPT_MATH);
+        }
+        crate::core::KN_DIRECT.math_module.store(math as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+    for k in [c.integer, c.float] {
+        tag(k, "to_f", OPT_NUM_INLINE);
+        tag(k, "-@", OPT_NUM_INLINE);
+    }
+    tag(c.float, "**", OPT_NUM_INLINE);
+    tag(c.integer, "<<", OPT_NUM_INLINE);
+    tag(c.integer, ">>", OPT_NUM_INLINE);
+    tag(c.class, "new", OPT_CLASS_NEW);
+    if let Some(m) = unsafe { (*c.module).methods.get(&sym("===")).copied() } {
+        crate::core::KN_DIRECT.mod_eqq.store(m as usize, std::sync::atomic::Ordering::Relaxed);
+    }
     tag(c.integer, "times", OPT_INT_TIMES);
     tag(c.integer, "upto", OPT_INT_UPTO);
     tag(c.integer, "downto", OPT_INT_DOWNTO);
     tag(c.range, "each", OPT_RANGE_EACH);
+    crate::core::KN_DIRECT.array_class.store(c.array as usize, std::sync::atomic::Ordering::Relaxed);
     crate::core::DIRECT_READY.store(true, std::sync::atomic::Ordering::SeqCst);
     crate::core::update_direct_flags();
 }
@@ -226,6 +269,9 @@ unsafe fn send0_found(m: *const Method, recv: V, mid: V, explicit: u64) -> V {
         OPT_HASH_SIZE => return mkfix(rhash(recv).m.len() as i64),
         OPT_HASH_EMPTY => return bool_v(rhash(recv).m.is_empty()),
         OPT_STR_EMPTY => return bool_v(rstr(recv).b.is_empty()),
+        OPT_STR_BYTESIZE => return mkfix(rstr(recv).b.len() as i64),
+        // (fixnum + 1 stays a fixnum below the largest one)
+        OPT_INT_SUCC if is_fix(recv) && fix(recv) < (1 << 61) => return mkfix(fix(recv) + 1),
         OPT_NIL_P => return bool_v(recv == QNIL),
         _ => {}
     }
@@ -269,6 +315,13 @@ unsafe fn send1_found(m: *const Method, recv: V, mid: V, a: V, explicit: u64) ->
         }
         OPT_IDENTITY_EQ => return bool_v(recv == a),
         OPT_IS_A => return bool_v(is_class(a) && is_a(recv, a as *mut Class)),
+        OPT_MOD_EQQ => return bool_v(is_a(a, recv as *mut Class)),
+        OPT_STR_GETBYTE if is_fix(a) => {
+            let b = &rstr(recv).b;
+            let i = fix(a);
+            let i = if i < 0 { i + b.len() as i64 } else { i };
+            return if i < 0 { QNIL } else { b.get(i as usize).map(|x| mkfix(*x as i64)).unwrap_or(QNIL) };
+        }
         _ => {}
     }
     unsafe { call_found(m, recv, mid, &[a], explicit) }
@@ -279,6 +332,15 @@ unsafe fn send1_found(m: *const Method, recv: V, mid: V, a: V, explicit: u64) ->
 pub unsafe extern "C" fn kn_send2(cache: *mut CallCache, recv: V, mid: V, a: V, b: V, explicit: u64) -> V {
     let m = unsafe { dispatch(cache, recv, mid) };
     match opt_of(m, explicit) {
+        OPT_STR_SETBYTE if is_fix(a) && is_fix(b) && !is_frozen(recv) => {
+            let s = &mut rstr(recv).b;
+            let i = fix(a);
+            let j = if i < 0 { i + s.len() as i64 } else { i };
+            if j >= 0 && (j as usize) < s.len() {
+                s[j as usize] = fix(b) as u8;
+                return b;
+            }
+        }
         OPT_ARY_ASET if is_fix(a) && !is_frozen(recv) => {
             let v = &mut rary(recv).v;
             let i = fix(a);
@@ -357,6 +419,24 @@ pub extern "C" fn kn_range_first(r: V) -> V {
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_float_box(bits: u64) -> V {
     float_new(f64::from_bits(bits))
+}
+
+/// Is `v` a Float (flonum or heap)? (kenny-compiler spec.rs: a speculated Float local)
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_is_float(v: V) -> i64 {
+    is_float(v) as i64
+}
+
+/// The f64 of a heap Float stored into a local that only ever holds Floats (kenny-compiler
+/// fastpath.rs `float_unbox`; flonums are decoded inline). Anything else is a compiler bug.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_float_unbox(v: V) -> f64 {
+    if is_float(v) {
+        float_val(v)
+    } else {
+        eprintln!("kenny: internal error: a Float local got a {}", class_name(class_of(v)));
+        std::process::abort()
+    }
 }
 
 // ----- attribute access inline in compiled loops -----

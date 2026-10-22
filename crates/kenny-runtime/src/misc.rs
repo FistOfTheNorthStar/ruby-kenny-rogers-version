@@ -1111,44 +1111,73 @@ pub fn init() {
     const_set(m, sym("E"), float_new(std::f64::consts::E));
     let dom = new_class("Math::DomainError", c.argument_error);
     const_set(m, sym("DomainError"), dom as V);
+    use crate::extra::{float_arg, math_domain};
     macro_rules! math1 {
         ($name:expr, $f:expr) => {
-            defs(m, $name, 1, 1, |_, a, _| match math_f(a[0]) {
-                Some(x) => float_new($f(x)),
-                None => type_error("can't convert into Float"),
+            defs(m, $name, 1, 1, |_, a, _| match float_arg(a[0]) {
+                Ok(x) => float_new($f(x)),
+                Err(e) => e,
             });
         };
     }
-    defs(m, "sqrt", 1, 1, |_, a, _| match math_f(a[0]) {
-        Some(x) if x < 0.0 => {
-            let d = const_get_under(const_lookup(rt().c.object, sym("Math")).unwrap() as *mut Class, sym("DomainError")).unwrap();
-            raise(d as *mut Class, "Numerical argument is out of domain - \"sqrt\"")
-        }
-        Some(x) => float_new(x.sqrt()),
-        None => type_error("can't convert into Float"),
-    });
+    /// one argument, which must not be below zero
+    macro_rules! math1_pos {
+        ($name:expr, $f:expr) => {
+            defs(m, $name, 1, 1, |_, a, _| match float_arg(a[0]) {
+                Ok(x) if x < 0.0 => math_domain($name),
+                Ok(x) => float_new($f(x)),
+                Err(e) => e,
+            });
+        };
+    }
+    // (+0.0 for -0.0, as CRuby)
+    math1_pos!("sqrt", |x: f64| x.sqrt() + 0.0);
     math1!("cbrt", f64::cbrt);
     math1!("sin", f64::sin);
     math1!("cos", f64::cos);
     math1!("tan", f64::tan);
-    math1!("asin", f64::asin);
-    math1!("acos", f64::acos);
+    /// one argument within [-1, 1]
+    macro_rules! math1_unit {
+        ($name:expr, $f:expr) => {
+            defs(m, $name, 1, 1, |_, a, _| match float_arg(a[0]) {
+                Ok(x) if !(-1.0..=1.0).contains(&x) && !x.is_nan() => math_domain($name),
+                Ok(x) => float_new($f(x)),
+                Err(e) => e,
+            });
+        };
+    }
+    math1_unit!("asin", f64::asin);
+    math1_unit!("acos", f64::acos);
     math1!("atan", f64::atan);
     math1!("sinh", f64::sinh);
     math1!("cosh", f64::cosh);
     math1!("tanh", f64::tanh);
     math1!("exp", f64::exp);
-    math1!("log2", f64::log2);
-    math1!("log10", f64::log10);
+    math1_pos!("log2", f64::log2);
+    math1_pos!("log10", f64::log10);
     defs(m, "log", 1, 2, |_, a, _| {
-        let x = math_f(a[0]).unwrap_or(f64::NAN);
-        match a.get(1).and_then(|b| math_f(*b)) {
-            Some(b) => float_new(x.ln() / b.ln()),
+        let x = match float_arg(a[0]) {
+            Ok(x) if x < 0.0 => return math_domain("log"),
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        match a.get(1).map(|b| float_arg(*b)) {
+            Some(Ok(b)) if b < 0.0 => math_domain("log"),
+            Some(Ok(b)) => float_new(x.ln() / b.ln()),
+            Some(Err(e)) => e,
             None => float_new(x.ln()),
         }
     });
-    defs(m, "atan2", 2, 2, |_, a, _| float_new(math_f(a[0]).unwrap_or(0.0).atan2(math_f(a[1]).unwrap_or(0.0))));
-    defs(m, "hypot", 2, 2, |_, a, _| float_new(math_f(a[0]).unwrap_or(0.0).hypot(math_f(a[1]).unwrap_or(0.0))));
+    macro_rules! math2 {
+        ($name:expr, $f:expr) => {
+            defs(m, $name, 2, 2, |_, a, _| match (float_arg(a[0]), float_arg(a[1])) {
+                (Ok(x), Ok(y)) => float_new($f(x, y)),
+                (Err(e), _) | (_, Err(e)) => e,
+            });
+        };
+    }
+    math2!("atan2", f64::atan2);
+    math2!("hypot", f64::hypot);
     defs(m, "pow", 2, 2, |_, a, _| float_new(math_f(a[0]).unwrap_or(0.0).powf(math_f(a[1]).unwrap_or(0.0))));
 
     // ---- IO, File, Dir: see io.rs ----

@@ -74,6 +74,44 @@ fn int128(v: V) -> Option<i128> {
     }
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn __cospi(x: f64) -> f64;
+    fn __sinpi(x: f64) -> f64;
+}
+#[cfg(target_os = "macos")]
+fn cospi(x: f64) -> f64 {
+    unsafe { __cospi(x) }
+}
+#[cfg(target_os = "macos")]
+fn sinpi(x: f64) -> f64 {
+    unsafe { __sinpi(x) }
+}
+#[cfg(not(target_os = "macos"))]
+fn cospi(x: f64) -> f64 {
+    (std::f64::consts::PI * x).cos()
+}
+#[cfg(not(target_os = "macos"))]
+fn sinpi(x: f64) -> f64 {
+    (std::f64::consts::PI * x).sin()
+}
+/// `p ** q` for a negative base and a fractional exponent: a Complex, as CRuby's
+/// rb_dbl_complex_new_polar_pi(pow(-p, q), q).
+fn neg_pow(p: f64, q: f64) -> V {
+    let mut abs = (-p).powf(q);
+    let fi = q.trunc();
+    let fr = q - fi;
+    let pos = fr == 0.5;
+    if pos || fr == -0.5 {
+        let h = fi / 2.0;
+        if ((h - h.trunc()) != fr) ^ pos {
+            abs = -abs;
+        }
+        return crate::rational::complex_new(float_new(0.0), float_new(abs));
+    }
+    crate::rational::complex_new(float_new(abs * cospi(q)), float_new(abs * sinpi(q)))
+}
+
 pub fn arith(op: Op, a: V, b: V) -> V {
     // Integers within i128 (the usual Bignums): no BigInt copies unless the result needs one
     if let (Some(p), Some(q)) = (int128(a), int128(b)) {
@@ -110,6 +148,9 @@ pub fn arith(op: Op, a: V, b: V) -> V {
     match (&x, &y) {
         (N::F(_), _) | (_, N::F(_)) => {
             let (p, q) = (flt(&x), flt(&y));
+            if op == Op::Pow && p < 0.0 && q.is_finite() && q != q.trunc() {
+                return neg_pow(p, q);
+            }
             float_new(match op {
                 Op::Add => p + q,
                 Op::Sub => p - q,
@@ -576,15 +617,48 @@ pub fn init() {
     defn(int, "|", 1, 1, |s, a, _| bitop(s, a[0], |x, y| x | y, |x, y| x | y));
     defn(int, "^", 1, 1, |s, a, _| bitop(s, a[0], |x, y| x ^ y, |x, y| x ^ y));
     defn(int, "~", 0, 0, |s, _, _| int_from_big(!big(&num(s).unwrap())));
-    defn(int, "<<", 1, 1, |s, a, _| {
-        let n = fix(a[0]);
+    /// `s << n` (a negative n shifts right)
+    fn shift_left(s: V, n: V) -> V {
+        let n = if is_fix(n) {
+            fix(n)
+        } else if is_float(n) {
+            float_val(n) as i64
+        } else if is_big(n) {
+            // only a right shift by that much is representable: 0 or -1
+            return if rbig(n).n.is_negative() { mkfix(if big(&num(s).unwrap()).is_negative() { -1 } else { 0 }) } else { raise(rt().c.range_error, "shift width too big") };
+        } else {
+            return type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(n))));
+        };
+        if is_fix(s) {
+            let x = fix(s);
+            if (0..63).contains(&n) {
+                let r = x.checked_shl(n as u32).filter(|r| r >> n == x);
+                if let Some(r) = r.filter(|r| (FIX_MIN..=FIX_MAX).contains(r)) {
+                    return mkfix(r);
+                }
+            } else if n < 0 {
+                return mkfix(if n <= -63 { if x < 0 { -1 } else { 0 } } else { x >> (-n) });
+            }
+        }
         let b = big(&num(s).unwrap());
-        int_from_big(if n >= 0 { b << n as usize } else { b >> (-n) as usize })
-    });
+        if n > (1 << 32) {
+            return raise(rt().c.range_error, "shift width too big");
+        }
+        int_from_big(if n >= 0 { b << n as usize } else { b >> n.unsigned_abs() as usize })
+    }
+    defn(int, "<<", 1, 1, |s, a, _| shift_left(s, a[0]));
     defn(int, ">>", 1, 1, |s, a, _| {
-        let n = fix(a[0]);
-        let b = big(&num(s).unwrap());
-        int_from_big(if n >= 0 { b >> n as usize } else { b << (-n) as usize })
+        let n = a[0];
+        if is_fix(n) {
+            return shift_left(s, mkfix(fix(n).checked_neg().unwrap_or(i64::MAX)));
+        }
+        if is_float(n) {
+            return shift_left(s, mkfix(-(float_val(n) as i64)));
+        }
+        if is_big(n) {
+            return if rbig(n).n.is_negative() { raise(rt().c.range_error, "shift width too big") } else { mkfix(if big(&num(s).unwrap()).is_negative() { -1 } else { 0 }) };
+        }
+        shift_left(s, n)
     });
     defn(int, "[]", 1, 1, |s, a, _| {
         let b = big(&num(s).unwrap());

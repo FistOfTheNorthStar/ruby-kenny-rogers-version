@@ -75,3 +75,19 @@ nil
 :single_v
 7
 [:redefined, :redefined, :overridden, :redefined]
+[:wa, :wb, :other, :int, :strsym, :strsym, :range, :nil, :strsym, :other]
+[:wa, :wb, :other, :int, :strsym, :strsym, :range, :nil, :strsym, :other]
+[:wa, :wb, :other, :int, :strsym, :strsym, :range, :nil, :strsym, :other]
+[:wa, :wb, :wm, :int, :strsym, :strsym, :range, :nil, :strsym, :other]
+:wm
+[:wb, :other, :other]
+[:strsym, :wa, :wb]
+true
+false
+true
+true
+[:str, :range, :re, :cmp, :basic, :basic]
+[:str, :range, :re, :cmp, :basic, :basic]
+[:str, :range, :re, :cmp, :basic, :basic]
+:basic
+:basic

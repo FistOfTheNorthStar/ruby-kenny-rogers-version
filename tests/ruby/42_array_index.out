@@ -1,0 +1,51 @@
+10
+30
+10
+nil
+nil
+nil
+20
+[10, 20]
+[20, 30]
+[TypeError, "no implicit conversion of String into Integer"]
+nil
+nil
+:a
+:c
+:f
+[:a, 20, :c, nil, nil, :f]
+[IndexError, "index -10 too small for array; minimum: -6"]
+[0, 5]
+NoMethodError
+1
+[FrozenError, "can't modify frozen Array: [1, 2]"]
+[1, 2]
+[:my, 2]
+5
+[10, 2, 3]
+:single
+7
+:zero
+:one
+{0 => :zero, 1 => :one}
+"e"
+NoMethodError
+1
+0
+4
+9
+"s2-0s2-0"
+"s2-999s2-999"
+11780
+749250.0
+[125, 125, 125, 125, 125, 125, 125, 125]
+[31000.0, 31062.5, 31125.0, 31187.5, 31250.0, 31312.5, 31375.0, 31437.5]
+[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
+[3, 5, 1, 9]
+[:redef, 0]
+5
+[:set_redef, 2]
+:set_redef
+6
+[:set_redef, 6]
+[1000, 1000, 1000, 1000]

@@ -1,0 +1,36 @@
+8
+6
+"hi 1"
+"hello 2"
+[20, 1010, 30, 1020]
+-10
+20
+[[:sup, 2, 2], [:sup, 2, 0]]
+[:none, :noblock, 5]
+6
+4
+[1, 2, 3]
+[4, nil, 5]
+"wrong number of arguments (given 1, expected 2)"
+40
+"wrong number of arguments (given 3, expected 2)"
+2
+[[:req, :a], [:req, :b]]
+5
+9
+2
+2
+2
+"too big 3"
+10000
+SystemStackError
+100
+2000
+[:mm, :nothing_here, [1]]
+21
+4
+3
+11
+[500500, 500500, 500500, 500500]
+49
+[6, 12]
