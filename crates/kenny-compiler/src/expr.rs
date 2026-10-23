@@ -119,10 +119,30 @@ impl<M: Module> Compiler<M> {
                 .as_local_variable_write_node()
                 .map(|n| (n.name().as_slice().to_vec(), n.depth()))
                 .or_else(|| node.as_local_variable_operator_write_node().map(|n| (n.name().as_slice().to_vec(), n.depth())));
-            if let Some((name, 0)) = target {
+            // (a block inlined into the loop has locals of its own at depth 0)
+            if let Some((name, _)) = target.filter(|t| t.1 as usize == fx.inline_levels.len()) {
                 if spec.locals.iter().any(|l| l.name == name) {
                     let at = node.location().start_offset();
                     self.cur_offset = at;
+                    // `i = i + 1` / `i += 1` on a Fixnum local
+                    let arith = match node.as_local_variable_write_node() {
+                        Some(n) => n.value().as_call_node().and_then(|c| {
+                            let (a, b) = crate::fastpath::numeric_call(&c)?;
+                            Some((c.name().as_slice().to_vec(), a, b))
+                        }),
+                        None => None,
+                    };
+                    if let Some((op, a, b)) = arith {
+                        if let Some(r) = self.spec_int_arith(fx, &name, &op, Some(&a), &b, at) {
+                            return Some(r);
+                        }
+                    }
+                    if let Some(n) = node.as_local_variable_operator_write_node() {
+                        let op = n.binary_operator().as_slice().to_vec();
+                        if let Some(r) = self.spec_int_arith(fx, &name, &op, None, &n.value(), at) {
+                            return Some(r);
+                        }
+                    }
                     let v = if let Some(n) = node.as_local_variable_write_node() {
                         self.num_expr(fx, &n.value(), true)
                     } else {
@@ -862,6 +882,13 @@ impl<M: Module> Compiler<M> {
                 Some(&v) => fx.b.use_var(v),
                 None => self.nil(fx),
             };
+        }
+        // remembered across a loop's iterations (licm.rs)
+        if !fx.licm.is_empty() {
+            let nm = name.to_vec();
+            if let Some(v) = self.licm_ivar(fx, name, |c, fx| c.ivar_get(fx, &nm)) {
+                return v;
+            }
         }
         let s = self.self_val(fx);
         let id = self.sym_val(fx, name);

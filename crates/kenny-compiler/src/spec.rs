@@ -28,6 +28,8 @@ pub struct SpecLocal {
     pub live: bool,
     /// read other than as an operator's operand: keeps a box (a heap Float's identity)
     pub boxed: bool,
+    /// the loop assigns it
+    pub assigned: bool,
 }
 
 /// While compiling the fast copy of a loop.
@@ -537,6 +539,23 @@ pub fn plan(lp: &Node, typed: &crate::analysis::Typed, register: &dyn Fn(&[u8]) 
             env.remove(&n);
         }
     }
+    // always-Integer locals (analysis.rs `typed_locals`): Fixnums, most likely (their
+    // arithmetic then needs no Bignum path, their comparisons no tag checks)
+    let mut ints: Vec<Vec<u8>> = Vec::new();
+    for name in w.reads.keys().chain(w.writes.keys()) {
+        if std::env::var_os("KENNY_NO_SPEC_INTS").is_none() && typed.types.get(name) == Some(&Ty::Int)
+            && !typed.bad.contains(name)
+            && register(name)
+            && !w.writes.get(name).is_some_and(|ws| ws.iter().any(|(_, stmt)| !stmt))
+            && !guess.contains_key(name)
+            && !ints.contains(name)
+        {
+            ints.push(name.clone());
+        }
+    }
+    for n in &ints {
+        guess.insert(n.clone(), Ty::Int);
+    }
     if guess.is_empty() {
         return None;
     }
@@ -566,7 +585,7 @@ pub fn plan(lp: &Node, typed: &crate::analysis::Typed, register: &dyn Fn(&[u8]) 
             let first = *refs.iter().min().unwrap();
             w.stmt_writes.get(&first).is_some_and(|&(s, e)| refs.iter().all(|&r| r == first || (r >= s && r < e)))
         };
-        out.push(SpecLocal { name: name.clone(), ty: guess[name], live: !private, boxed: boxed.contains(name) });
+        out.push(SpecLocal { name: name.clone(), ty: guess[name], live: !private, boxed: boxed.contains(name), assigned: w.writes.contains_key(name) });
     }
     Some(out)
 }
@@ -583,9 +602,9 @@ impl<M: Module> Compiler<M> {
         }
         let register = |n: &[u8]| matches!(fx.locals.get(n), Some(Local::Var(_))) && !fx.flocals.contains_key(n);
         let locals = plan(lp, &fx.typed_info, &register)?;
-        // worth a second copy: a Float register, or a Fixnum that would otherwise carry an
-        // unboxed-Float shadow through the loop
-        if !locals.iter().any(|l| l.ty == Ty::Float || fx.num_locals.contains_key(&l.name)) {
+        // worth a second copy: a Float register, a Fixnum that would otherwise carry an
+        // unboxed-Float shadow through the loop, or one the loop computes (no overflow joins)
+        if !locals.iter().any(|l| l.ty == Ty::Float || fx.num_locals.contains_key(&l.name) || l.assigned) {
             return None;
         }
         if std::env::var_os("KENNY_DEBUG_SPEC").is_some() {
@@ -736,6 +755,74 @@ impl<M: Module> Compiler<M> {
         }
     }
 
+    /// In the fast copy: `name = a op b` (or `name op= b`) for a Fixnum-speculated local and
+    /// `op` one of + - *: the Fixnum operation stored as is; anything else (an operand that
+    /// isn't a Fixnum, an overflow) computes the operation in full and hands over to the
+    /// generic copy with that value. None (nothing compiled): not such an assignment.
+    /// (`a`: None for `name op= b`)
+    pub(crate) fn spec_int_arith(&mut self, fx: &mut Fx, name: &[u8], op: &[u8], a: Option<&Node>, b: &Node, at: usize) -> Option<crate::fastpath::Num> {
+        if !matches!(op, b"+" | b"-" | b"*") || fx.spec.as_ref()?.fvars.contains_key(name) || !fx.spec.as_ref()?.locals.iter().any(|l| l.name == name && l.ty == Ty::Int) {
+            return None;
+        }
+        let x = match a {
+            Some(a) => self.expr(fx, a),
+            None => self.local_get(fx, name, fx.inline_levels.len() as u32),
+        };
+        let y = self.expr(fx, b);
+        self.cur_offset = at;
+        let deopt = fx.b.create_block();
+        fx.b.append_block_param(deopt, I64);
+        fx.b.set_cold_block(deopt);
+        let slow = fx.b.create_block();
+        fx.b.set_cold_block(slow);
+        let fix = |fx: &Fx, v: Value| fx.sure_fix.contains(&v) || crate::fastpath::const_of(fx, v).is_some_and(|c| c & 1 == 1);
+        if !(fix(fx, x) && fix(fx, y)) {
+            let both = fx.b.ins().band(x, y);
+            let bit = fx.b.ins().band_imm_s(both, 1);
+            let cont = fx.b.create_block();
+            fx.b.ins().brif(bit, cont, &[], slow, &[]);
+            fx.b.switch_to_block(cont);
+        }
+        let (r, of) = match op {
+            b"+" => {
+                let ym1 = fx.b.ins().iadd_imm_s(y, -1);
+                fx.b.ins().sadd_overflow(x, ym1)
+            }
+            b"-" => {
+                // (x - y) + 1 without a separate step when y is a constant
+                match crate::fastpath::const_of(fx, y).filter(|&c| c != i64::MIN + 1) {
+                    Some(c) => {
+                        let k = fx.b.ins().iconst(I64, 1 - c);
+                        fx.b.ins().sadd_overflow(x, k)
+                    }
+                    None => {
+                        let (d, of) = fx.b.ins().ssub_overflow(x, y);
+                        (fx.b.ins().iadd_imm_s(d, 1), of)
+                    }
+                }
+            }
+            _ => {
+                let xs = fx.b.ins().sshr_imm_s(x, 1);
+                let ym1 = fx.b.ins().iadd_imm_s(y, -1);
+                let (p, of) = fx.b.ins().smul_overflow(xs, ym1);
+                (fx.b.ins().iadd_imm_s(p, 1), of)
+            }
+        };
+        let ok = fx.b.create_block();
+        fx.b.ins().brif(of, slow, &[], ok, &[]);
+        fx.b.switch_to_block(slow);
+        let v = self.send(fx, x, op, &[y], None);
+        fx.b.ins().jump(deopt, &[v.into()]);
+        fx.b.switch_to_block(ok);
+        if let Some(Local::Var(var)) = fx.locals.get(name) {
+            fx.b.def_var(*var, r);
+        }
+        fx.sure_fix.insert(r);
+        fx.sure_ints.insert(r);
+        self.spec_deopt(fx, name, deopt, at);
+        Some(crate::fastpath::Num::Boxed(r))
+    }
+
     /// In the fast copy: assign `n` to speculated local `name` (the statement at `at`),
     /// or hand over to the generic copy when it doesn't have the expected type.
     pub(crate) fn spec_assign(&mut self, fx: &mut Fx, name: &[u8], n: crate::fastpath::Num, at: usize) -> crate::fastpath::Num {
@@ -767,7 +854,13 @@ impl<M: Module> Compiler<M> {
                 crate::fastpath::Num::Boxed(v)
             }
         };
-        // the hand-over: everything boxed, the new value in place, on to the generic copy
+        self.spec_deopt(fx, name, deopt, at);
+        r
+    }
+
+    /// Fill `deopt` (one parameter: `name`'s new value) with the hand-over: everything boxed,
+    /// the new value in place, on to the generic copy after the assignment at `at`.
+    fn spec_deopt(&mut self, fx: &mut Fx, name: &[u8], deopt: Block, at: usize) {
         let cont = fx.b.current_block().unwrap();
         fx.b.switch_to_block(deopt);
         let v = fx.b.block_params(deopt)[0];
@@ -786,7 +879,6 @@ impl<M: Module> Compiler<M> {
         });
         fx.b.ins().jump(target, &[v.into()]);
         fx.b.switch_to_block(cont);
-        r
     }
 
     /// (f64, box or 0) of `n` for a speculated Float local: to `deopt` with the value when

@@ -75,6 +75,7 @@ impl<M: Module> Compiler<M> {
     fn while_core(&mut self, fx: &mut Fx, pred: &Node, body: Option<StatementsNode>, until: bool, do_while: bool, exit: Block) {
         let header = fx.b.create_block();
         let body_b = fx.b.create_block();
+        let remembered = self.licm_enter(fx, pred, body.as_ref());
         fx.b.ins().jump(if do_while { body_b } else { header }, &[]);
         fx.b.switch_to_block(header);
         let c = self.expr(fx, pred);
@@ -91,6 +92,7 @@ impl<M: Module> Compiler<M> {
         fx.loops.pop();
         self.safepoint(fx);
         fx.b.ins().jump(header, &[]);
+        self.licm_leave(fx, remembered);
     }
 
     pub(crate) fn for_loop(&mut self, fx: &mut Fx, f: &ForNode) -> Value {
@@ -386,15 +388,31 @@ impl<M: Module> Compiler<M> {
     pub(crate) fn return_node(&mut self, fx: &mut Fx, args: Option<ArgumentsNode>) -> Value {
         let v = self.jump_value(fx, args);
         match fx.kind {
+            // through the `ensure`s to this function's own unwind path
             ScopeKind::Method if fx.ensure_depth > 0 => {
                 let tag = fx.b.use_var(fx.tag_v);
                 self.call(fx, "kn_throw_return", &[tag, v]);
                 self.jump_unwind(fx);
             }
-            ScopeKind::Block if !fx.lambda => {
-                let tag = match self.method_env(fx) {
-                    Some(e) => e,
-                    None => self.iconst(fx, 0),
+            ScopeKind::Block if fx.ret_here && fx.ensure_depth > 0 => {
+                let tag = fx.b.use_var(fx.tag_v);
+                self.call(fx, "kn_throw_return", &[tag, v]);
+                self.jump_unwind(fx);
+            }
+            ScopeKind::Block if !fx.lambda && !fx.ret_here => {
+                // to the enclosing lambda / method body block, else the method
+                let tag = match fx.ret_hops {
+                    Some(h) => {
+                        let mut p = fx.b.use_var(fx.penv_v.expect("a block's parent env"));
+                        for _ in 0..h {
+                            p = fx.b.ins().load(I64, mem(), p, ENV_PARENT);
+                        }
+                        p
+                    }
+                    None => match self.method_env(fx) {
+                        Some(e) => e,
+                        None => self.iconst(fx, 0),
+                    },
                 };
                 self.call(fx, "kn_throw_return", &[tag, v]);
                 self.jump_unwind(fx);

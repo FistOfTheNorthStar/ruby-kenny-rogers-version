@@ -214,7 +214,7 @@ fn init_fields(d: &InlineDef) -> Option<Vec<Vec<u8>>> {
         }
     }
     let mut fields: Vec<Vec<u8>> = Vec::new();
-    let Some(body) = d.node.body() else { return Some(fields) };
+    let Some(body) = d.body() else { return Some(fields) };
     let s = body.as_statements_node()?;
     for st in s.body().iter() {
         let w = st.as_instance_variable_write_node()?;
@@ -242,7 +242,7 @@ impl<M: Module> Compiler<M> {
             return None;
         }
         let idef = self.inline_defs.get(&(sd.file.clone(), sd.offset))?.clone();
-        if idef.file != self.file || idef.consts {
+        if idef.file != self.file || idef.consts || idef.yields > 0 {
             return None;
         }
         Some((sd, idef))

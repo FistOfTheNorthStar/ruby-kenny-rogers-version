@@ -80,6 +80,8 @@ fn kind_of(name: &[u8], argc: usize) -> Option<Kind> {
 /// Rejects block bodies that can't run inside the caller's frame.
 struct Check {
     ok: bool,
+    /// `return` is fine (a block inlined at a `yield`: it returns from the same frame)
+    allow_return: bool,
 }
 impl<'pr> Visit<'pr> for Check {
     fn visit_block_node(&mut self, _: &BlockNode<'pr>) {
@@ -100,8 +102,11 @@ impl<'pr> Visit<'pr> for Check {
     fn visit_singleton_class_node(&mut self, _: &SingletonClassNode<'pr>) {
         self.ok = false;
     }
-    fn visit_return_node(&mut self, _: &ReturnNode<'pr>) {
-        self.ok = false;
+    fn visit_return_node(&mut self, node: &ReturnNode<'pr>) {
+        if !self.allow_return {
+            self.ok = false;
+        }
+        visit_return_node(self, node);
     }
     fn visit_redo_node(&mut self, _: &RedoNode<'pr>) {
         self.ok = false;
@@ -159,8 +164,22 @@ impl<'pr> Visit<'pr> for Check {
     }
 }
 
+/// Can `bn`'s body be compiled in its caller's frame at a `yield` (statics.rs
+/// `inline_yield`): small, and nothing that needs a frame of its own.
+pub(crate) fn yield_inlinable(bn: &BlockNode, allow_return: bool) -> bool {
+    let mut chk = Check { ok: true, allow_return };
+    if let Some(b) = bn.body() {
+        let l = b.location();
+        if l.end_offset() - l.start_offset() > MAX_INLINE_BODY {
+            return false;
+        }
+        chk.visit(&b);
+    }
+    chk.ok
+}
+
 /// The names of a block's parameters when they are all plain required ones (`|a, b|`).
-fn simple_params(params: Option<Node>) -> Option<Vec<Vec<u8>>> {
+pub(crate) fn simple_params(params: Option<Node>) -> Option<Vec<Vec<u8>>> {
     let Some(pn) = params else { return Some(vec![]) };
     let bp = pn.as_block_parameters_node()?;
     let Some(p) = bp.parameters() else { return Some(vec![]) };
@@ -197,7 +216,7 @@ impl<M: Module> Compiler<M> {
         }
         let kind = kind_of(c.name().as_slice(), args.len())?;
         let params = simple_params(bn.parameters())?;
-        let mut chk = Check { ok: true };
+        let mut chk = Check { ok: true, allow_return: false };
         if let Some(b) = bn.body() {
             // the body is compiled twice (loop + fallback closure): only small ones, where the
             // per-iteration call overhead matters most
@@ -268,6 +287,11 @@ impl<M: Module> Compiler<M> {
         self.warnings.truncate(nwarn);
         fx.b.switch_to_block(done);
         Some(fx.b.block_params(done)[0])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn inline_body_pub(&mut self, fx: &mut Fx, bn: &BlockNode, params: &[Vec<u8>], locals: &[Vec<u8>], vals: &[Value], splat: bool, value_used: bool) -> Value {
+        self.inline_body(fx, bn, params, locals, vals, splat, value_used)
     }
 
     /// One iteration's block call, inline: fresh locals, parameters bound to `vals` (with

@@ -1,0 +1,19 @@
+7
+11
+[:inner, :after]
+[1, :method_continues]
+200
+ensure
+1
+ensure2
+:m
+baz ensure
+6
+3
+:z
+6
+20
+:early
+ensure ran
+:from_block
+[:lam, :from_block]

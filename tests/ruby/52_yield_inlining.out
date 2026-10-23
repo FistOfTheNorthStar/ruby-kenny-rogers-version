@@ -1,0 +1,26 @@
+1000
+[20, 22]
+[:before, 15, :after]
+[:before, 42, :after]
+:broke
+3
+[1, 2]
+[3, 4]
+[3, 4]
+[nil, nil]
+200
+"rescued boom"
+["83"]
+[7, :user, User]
+[1, :overridden]
+no block given (yield)
+5
+:empty
+2
+:missing
+:from_proc
+:no_closure
+10
+[:from_lambda, :after]
+ensure ran
+14

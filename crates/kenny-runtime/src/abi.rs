@@ -106,7 +106,9 @@ pub unsafe extern "C" fn kn_start(
                 let mut code = 0;
                 if res == UNDEF {
                     match pst().pending {
-                        Throw::Return { .. } | Throw::Kill => pst().pending = Throw::None,
+                        // (a top-level `return`, also from a block; one for a method that has
+                        // already returned is reported below)
+                        Throw::Return { tag: 0, .. } | Throw::Kill => pst().pending = Throw::None,
                         _ => {
                             code = report_uncaught();
                         }
@@ -162,6 +164,8 @@ fn report_uncaught() -> i32 {
             format!("{}: uncaught throw {} (UncaughtThrowError)\n", r.script_name, crate::fmt::inspect_lossy(tag))
         }
         Throw::Break { .. } => format!("{}: break from proc-closure (LocalJumpError)\n", r.script_name),
+        // a proc's `return` for a method that had already returned (nothing caught it)
+        Throw::Return { tag, .. } if tag != 0 => format!("{}: unexpected return (LocalJumpError)\n", r.script_name),
         Throw::Return { .. } | Throw::None | Throw::StopLoop(_) | Throw::Kill => return 0,
     };
     crate::kernel::err_out(msg.as_bytes());
@@ -1422,6 +1426,16 @@ pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owne
     let cls: *mut Class = match kind {
         0 => cref_class(target),
         1 => r.c.object,
+        // `define_method(:name) { ... }` compiled as a def (the compiler's statics.rs
+        // `block_def`): only while `define_method` here is the builtin; 0 tells the caller to
+        // make the call as written
+        4 => {
+            let dm = find_method(class_of(target), sym("define_method"));
+            if dm.is_null() || !matches!(unsafe { &(*dm).body }, Body::Native(..)) {
+                return QFALSE;
+            }
+            if is_class(target) { target as *mut Class } else { r.c.object }
+        }
         3 => {
             if check_singleton_ok(target) == UNDEF {
                 return UNDEF;
@@ -1464,6 +1478,7 @@ pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owne
         if !always_private(sym_id(id)) {
             mm.vis = match kind {
                 1 => VIS_PRIVATE, // top-level defs are private methods of Object
+                4 => (*cls).default_vis, // (as `define_method` adds it)
                 3 => VIS_PUBLIC,
                 _ => (*cls).default_vis,
             };

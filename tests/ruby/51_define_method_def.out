@@ -1,0 +1,33 @@
+0
+7
+5
+0
+:y
+true
+false
+2
+[[:req, :a], [:req, :b]]
+Object
+503500
+:two
+2
+:meth
+:neg
+20
+:none
+wrong number of arguments (given 0, expected 1)
+6
+24
+:hidden
+private method 'secret' called for an instance of Shape
+600
+added w1
+1
+20
+custom define_method hello
+[:wrapped, 2]
+:first
+:second
+:third
+"hi bob from Person"
+[:base, :derived]

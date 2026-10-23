@@ -93,6 +93,113 @@ pub(crate) fn fast_arity(params: &Option<ParametersNode>) -> Option<usize> {
     }
 }
 
+/// `define_method(:name) { |a, b| body }` that runs exactly like `def name(a, b) body end`
+/// (the block uses nothing of the scope around it, and nothing that differs between a
+/// block and a method): (name, the block's parameters, the block). Compiled as a `def`
+/// (scopes.rs `def_from_block`) while `define_method` is the builtin one.
+pub(crate) fn block_def<'pr>(c: &CallNode<'pr>) -> Option<(Vec<u8>, Option<ParametersNode<'pr>>, BlockNode<'pr>)> {
+    if c.name().as_slice() != b"define_method" || c.receiver().is_some() || c.is_safe_navigation() {
+        return None;
+    }
+    let args: Vec<Node> = c.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    let name = arg.as_symbol_node()?.unescaped().to_vec();
+    if name.is_empty() {
+        return None;
+    }
+    let blk = c.block()?.as_block_node()?;
+    let params = match blk.parameters() {
+        None => None,
+        Some(p) => {
+            let bp = p.as_block_parameters_node()?;
+            match bp.parameters() {
+                None => None,
+                Some(ps) => {
+                    let ps = Some(ps);
+                    let p = ps.as_ref().unwrap();
+                    if fast_arity(&ps).is_none() || p.block().is_some() || !p.requireds().iter().all(|r| r.as_required_parameter_node().is_some()) {
+                        return None;
+                    }
+                    ps
+                }
+            }
+        }
+    };
+    let mut v = DefLike { ok: true, nest: 0 };
+    if let Some(b) = blk.body() {
+        v.visit(&b);
+    }
+    v.ok.then_some((name, params, blk))
+}
+
+/// See `block_def`: no outer locals, `yield`, `super`, `next`/`break`/`redo`/`retry`,
+/// nested definitions, or calls that look at the caller's frame.
+struct DefLike {
+    ok: bool,
+    /// blocks entered inside the body
+    nest: u32,
+}
+impl DefLike {
+    fn local(&mut self, depth: u32) {
+        if depth > self.nest {
+            self.ok = false;
+        }
+    }
+}
+impl<'pr> Visit<'pr> for DefLike {
+    fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
+        self.check(&node);
+    }
+    fn visit_leaf_node_enter(&mut self, node: Node<'pr>) {
+        self.check(&node);
+    }
+    fn visit_block_node(&mut self, node: &BlockNode<'pr>) {
+        self.nest += 1;
+        visit_block_node(self, node);
+        self.nest -= 1;
+    }
+    fn visit_lambda_node(&mut self, node: &LambdaNode<'pr>) {
+        self.nest += 1;
+        visit_lambda_node(self, node);
+        self.nest -= 1;
+    }
+}
+impl DefLike {
+    fn check(&mut self, node: &Node) {
+        match node {
+            Node::YieldNode { .. }
+            | Node::SuperNode { .. }
+            | Node::ForwardingSuperNode { .. }
+            | Node::NextNode { .. }
+            | Node::BreakNode { .. }
+            | Node::RedoNode { .. }
+            | Node::RetryNode { .. }
+            | Node::DefNode { .. }
+            | Node::ClassNode { .. }
+            | Node::ModuleNode { .. }
+            | Node::SingletonClassNode { .. }
+            | Node::ForwardingArgumentsNode { .. } => self.ok = false,
+            Node::LocalVariableReadNode { .. } => self.local(node.as_local_variable_read_node().unwrap().depth()),
+            Node::LocalVariableWriteNode { .. } => self.local(node.as_local_variable_write_node().unwrap().depth()),
+            Node::LocalVariableTargetNode { .. } => self.local(node.as_local_variable_target_node().unwrap().depth()),
+            Node::LocalVariableOperatorWriteNode { .. } => self.local(node.as_local_variable_operator_write_node().unwrap().depth()),
+            Node::LocalVariableAndWriteNode { .. } => self.local(node.as_local_variable_and_write_node().unwrap().depth()),
+            Node::LocalVariableOrWriteNode { .. } => self.local(node.as_local_variable_or_write_node().unwrap().depth()),
+            Node::CallNode { .. } => {
+                let c = node.as_call_node().unwrap();
+                if matches!(
+                    c.name().as_slice(),
+                    b"block_given?" | b"iterator?" | b"binding" | b"local_variables" | b"eval" | b"proc" | b"lambda" | b"caller" | b"caller_locations" | b"__callee__"
+                ) && c.receiver().is_none()
+                {
+                    self.ok = false;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn const_name(n: &Node) -> Vec<u8> {
     let l = n.location();
     l.as_slice().to_vec()
@@ -141,6 +248,17 @@ impl<'pr> Visit<'pr> for Scan {
                         let iv = [&b"@"[..], &m].concat();
                         self.getters.push((last_seg(cls), m, iv, None));
                     }
+                }
+            }
+        }
+        // `define_method(:name) { |a| ... }` compiled as a def (see `block_def`)
+        if self.dynamic == 0 {
+            if let Some((name, params, _)) = block_def(node) {
+                let off = node.location().start_offset();
+                self.all.push((off, self.lex.clone()));
+                if let Some(n) = fast_arity(&params) {
+                    let label = String::from_utf8_lossy(&name).into_owned();
+                    self.found.push((name, off, n, label.into_bytes(), self.lex.clone()));
                 }
             }
         }
@@ -303,6 +421,107 @@ impl<M: Module> Compiler<M> {
 // method's locals are fresh variables. Calls made by the inlined code are recorded with an
 // inline location (kenny-runtime backtrace.rs) so backtraces still show the method's frame.
 
+impl InlineDef {
+    pub(crate) fn params(&self) -> Option<ParametersNode<'static>> {
+        match &self.node {
+            DefSrc::Def(d) => d.parameters(),
+            DefSrc::Block(c) => block_def(c).and_then(|(_, p, _)| p),
+        }
+    }
+    pub(crate) fn body(&self) -> Option<Node<'static>> {
+        match &self.node {
+            DefSrc::Def(d) => d.body(),
+            DefSrc::Block(c) => block_def(c).and_then(|(_, _, b)| b.body()),
+        }
+    }
+    pub(crate) fn locals(&self) -> Vec<Vec<u8>> {
+        let ids = match &self.node {
+            DefSrc::Def(d) => d.locals(),
+            DefSrc::Block(c) => match block_def(c) {
+                Some((_, _, b)) => b.locals(),
+                None => return Vec::new(),
+            },
+        };
+        ids.iter().map(|l| l.as_slice().to_vec()).collect()
+    }
+}
+
+/// The parts of `Fx` that belong to one Ruby scope: swapped out while an inlined method
+/// body compiles, and back in for its caller's block at a `yield` (`inline_yield`).
+pub(crate) struct ScopeState {
+    self_v: Variable,
+    locals: HashMap<Vec<u8>, Local>,
+    num_locals: HashMap<Vec<u8>, (Variable, Variable)>,
+    int_locals: HashSet<Vec<u8>>,
+    flocals: HashMap<Vec<u8>, (Variable, Option<Variable>)>,
+    int_sure: HashSet<Vec<u8>>,
+    inline_levels: Vec<HashMap<Vec<u8>, Variable>>,
+    vlocals: HashMap<Vec<u8>, std::rc::Rc<crate::vobj::VLocal>>,
+    vself: Option<HashMap<Vec<u8>, Variable>>,
+    /// (a speculated loop is about its own scope's locals)
+    spec: Option<crate::spec::SpecCtx>,
+    int_spec: HashSet<Vec<u8>>,
+    cref_slot: usize,
+    inl_self: Vec<crate::licm::Entry>,
+    /// (an attr read being remembered: not the inlined body's)
+    licm_pending: Option<crate::licm::Entry>,
+}
+impl ScopeState {
+    /// Move the current scope's state out of `fx` (leaving it empty).
+    fn take(fx: &mut Fx) -> ScopeState {
+        ScopeState {
+            self_v: fx.self_v,
+            locals: std::mem::take(&mut fx.locals),
+            num_locals: std::mem::take(&mut fx.num_locals),
+            int_locals: std::mem::take(&mut fx.int_locals),
+            flocals: std::mem::take(&mut fx.flocals),
+            int_sure: std::mem::take(&mut fx.int_sure),
+            inline_levels: std::mem::take(&mut fx.inline_levels),
+            vlocals: std::mem::take(&mut fx.vlocals),
+            vself: fx.vself.take(),
+            spec: fx.spec.take(),
+            int_spec: std::mem::take(&mut fx.int_spec),
+            cref_slot: fx.cref_slot,
+            inl_self: std::mem::take(&mut fx.inl_self),
+            licm_pending: fx.licm_pending.take(),
+        }
+    }
+    fn put(self, fx: &mut Fx) {
+        fx.self_v = self.self_v;
+        fx.locals = self.locals;
+        fx.num_locals = self.num_locals;
+        fx.int_locals = self.int_locals;
+        fx.flocals = self.flocals;
+        fx.int_sure = self.int_sure;
+        fx.inline_levels = self.inline_levels;
+        fx.vlocals = self.vlocals;
+        fx.vself = self.vself;
+        fx.spec = self.spec;
+        fx.int_spec = self.int_spec;
+        fx.cref_slot = self.cref_slot;
+        fx.inl_self = self.inl_self;
+        fx.licm_pending = self.licm_pending;
+    }
+}
+
+/// A call's literal block, compiled in place at each `yield` of the inlined method.
+pub(crate) struct YieldBlock {
+    pub blk: BlockNode<'static>,
+    pub params: Vec<Vec<u8>>,
+    pub locals: Vec<Vec<u8>>,
+}
+
+/// An inlined method body with a block to yield to (innermost last).
+pub(crate) struct YieldTarget {
+    yb: YieldBlock,
+    /// `inline_ctx` depth of that body
+    depth: usize,
+    /// where `break` in the block goes: the call's result
+    brk: Block,
+    /// the caller's scope, while the body compiles
+    caller: Option<ScopeState>,
+}
+
 /// How deep inlined code may itself inline.
 const MAX_INLINE_DEPTH: usize = 2;
 /// Most nodes an inlined body may have.
@@ -310,10 +529,19 @@ const MAX_INLINE_NODES: usize = 40;
 /// kenny-runtime abi.rs `kn_static_fill`: the target must be public (a call with a receiver).
 const FILL_PUBLIC: i64 = 1 << 63;
 
+/// Where an inlinable method comes from: a `def`, or a `define_method` call compiled as one
+/// (`block_def`).
+pub(crate) enum DefSrc {
+    Def(DefNode<'static>),
+    Block(CallNode<'static>),
+}
+
 /// A `def` that may be inlined (its body re-parsed into a tree that lives forever).
 pub(crate) struct InlineDef {
-    pub node: DefNode<'static>,
+    pub node: DefSrc,
     pub name: Vec<u8>,
+    /// how many `yield`s its body has (see `Simple::yields`)
+    pub yields: usize,
     /// reads constants (only inlined where they resolve the same way)
     pub consts: bool,
     pub lex: Vec<Vec<u8>>,
@@ -338,6 +566,8 @@ struct Simple {
     ok: bool,
     nodes: usize,
     consts: bool,
+    /// `yield`s (with plain arguments): inlined only with a literal block (`inline_yield`)
+    yields: usize,
 }
 impl<'pr> Visit<'pr> for Simple {
     fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
@@ -378,6 +608,15 @@ impl Simple {
                 self.consts = true;
                 true
             }
+            Node::YieldNode { .. } => {
+                self.yields += 1;
+                let y = node.as_yield_node().unwrap();
+                y.arguments().is_none_or(|a| {
+                    a.arguments().iter().all(|x| {
+                        x.as_splat_node().is_none() && x.as_block_argument_node().is_none() && x.as_keyword_hash_node().is_none() && x.as_forwarding_arguments_node().is_none()
+                    })
+                })
+            }
             Node::CallNode { .. } => {
                 let c = node.as_call_node().unwrap();
                 !matches!(
@@ -400,15 +639,21 @@ impl Simple {
 /// The `def`s of a re-parsed file at these offsets.
 struct FindDefs<'a> {
     want: &'a HashSet<usize>,
-    found: Vec<DefNode<'static>>,
+    found: Vec<DefSrc>,
 }
 impl<'a> Visit<'static> for FindDefs<'a> {
     fn visit_def_node(&mut self, node: &DefNode<'static>) {
         if self.want.contains(&node.location().start_offset()) {
             // (DefNode isn't Clone: look it up again through its own location)
-            self.found.push(unsafe { std::ptr::read(node) });
+            self.found.push(DefSrc::Def(unsafe { std::ptr::read(node) }));
         }
         visit_def_node(self, node);
+    }
+    fn visit_call_node(&mut self, node: &CallNode<'static>) {
+        if self.want.contains(&node.location().start_offset()) && block_def(node).is_some() {
+            self.found.push(DefSrc::Block(unsafe { std::ptr::read(node) }));
+        }
+        visit_call_node(self, node);
     }
 }
 
@@ -424,9 +669,13 @@ impl<M: Module> Compiler<M> {
         let mut fd = FindDefs { want: &want, found: Vec::new() };
         fd.visit(&pr.node());
         for d in fd.found {
-            let off = d.location().start_offset();
+            let off = match &d {
+                DefSrc::Def(d) => d.location().start_offset(),
+                DefSrc::Block(c) => c.location().start_offset(),
+            };
             let Some((name, _, lex)) = cands.iter().find(|c| c.1 == off) else { continue };
-            let params_ok = match d.parameters() {
+            let idef = InlineDef { node: d, name: name.clone(), consts: false, yields: 0, lex: lex.clone(), file: self.file.clone(), offset: off };
+            let params_ok = match idef.params() {
                 None => true,
                 Some(p) => {
                     p.block().is_none()
@@ -437,15 +686,15 @@ impl<M: Module> Compiler<M> {
             if !params_ok {
                 continue;
             }
-            let mut s = Simple { ok: true, nodes: 0, consts: false };
-            if let Some(b) = d.body() {
+            let mut s = Simple { ok: true, nodes: 0, consts: false, yields: 0 };
+            if let Some(b) = idef.body() {
                 s.visit(&b);
             }
             if !s.ok {
                 continue;
             }
             let key = (self.file.clone(), off);
-            let idef = InlineDef { node: d, name: name.clone(), consts: s.consts, lex: lex.clone(), file: self.file.clone(), offset: off };
+            let idef = InlineDef { consts: s.consts, yields: s.yields, ..idef };
             self.inline_defs.insert(key, std::rc::Rc::new(idef));
         }
     }
@@ -483,10 +732,14 @@ impl<M: Module> Compiler<M> {
         explicit: bool,
         dynamic: impl FnOnce(&mut Self, &mut Fx) -> Value,
     ) -> Option<Value> {
+        self.inline_call_with(fx, recv, name, mid, vals, explicit, None, dynamic)
+    }
+
+    /// The method `inline_call` would inline (with a literal block when `with_block`).
+    pub(crate) fn inline_target(&self, fx: &Fx, name: &[u8], n: usize, explicit: bool, with_block: bool) -> Option<(StaticDef, std::rc::Rc<InlineDef>)> {
         if self.refine_scope.is_some() || self.in_dependency() || self.eval_unit || !may_be_ruby_method(name) || self.inline_ctx.len() >= MAX_INLINE_DEPTH {
             return None;
         }
-        let n = vals.len();
         let sd = if explicit {
             let defs = self.static_defs.get(name)?;
             let mut c = defs.iter().filter(|d| d.arity == n);
@@ -507,6 +760,27 @@ impl<M: Module> Compiler<M> {
         if idef.consts && self.cur_lex(fx).as_ref() != Some(&idef.lex) && !self.def_cref.contains_key(&key) {
             return None;
         }
+        // a `yield` needs the literal block (each one compiles it again: at most two)
+        if if with_block { idef.yields > 2 } else { idef.yields > 0 } {
+            return None;
+        }
+        Some((sd, idef))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn inline_call_with(
+        &mut self,
+        fx: &mut Fx,
+        recv: Value,
+        name: &[u8],
+        mid: Value,
+        vals: &[Value],
+        explicit: bool,
+        yb: Option<YieldBlock>,
+        dynamic: impl FnOnce(&mut Self, &mut Fx) -> Value,
+    ) -> Option<Value> {
+        let n = vals.len();
+        let (sd, idef) = self.inline_target(fx, name, n, explicit, yb.is_some())?;
         if std::env::var_os("KENNY_DEBUG_INLINE").is_some() {
             let line = self.line_of(self.cur_offset);
             eprintln!("kenny: inline {} into {}:{} (depth {})", String::from_utf8_lossy(name), self.file.display(), line, self.inline_ctx.len() + 1);
@@ -530,7 +804,7 @@ impl<M: Module> Compiler<M> {
         let d = fx.b.ins().bor(d1, d2);
         let same = fx.b.ins().icmp_imm_s(IntCC::Equal, d, 0);
         self.require(fx, same, slow);
-        let r = self.inline_method_body(fx, &idef, recv, vals, &[]);
+        let r = self.inline_method_body(fx, &idef, recv, vals, &[], yb.map(|y| (y, done)));
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(slow);
         let fa = self.fn_addr(fx, sd.fid);
@@ -548,13 +822,46 @@ impl<M: Module> Compiler<M> {
         Some(r)
     }
 
+    /// `yield` in an inlined method body called with a literal block: the block's body,
+    /// here, in the caller's scope (`next` gives the yield's value, `break` the call's).
+    pub(crate) fn inline_yield(&mut self, fx: &mut Fx, y: &YieldNode) -> Option<Value> {
+        if self.yield_targets.last()?.depth != self.inline_ctx.len() {
+            return None;
+        }
+        let vals: Vec<Value> = match y.arguments() {
+            Some(a) => a.arguments().iter().map(|n| self.expr(fx, &n)).collect(),
+            None => Vec::new(),
+        };
+        let at = self.cur_offset;
+        let mut t = self.yield_targets.pop().unwrap();
+        let frame = self.inline_ctx.pop().unwrap();
+        let callee = ScopeState::take(fx);
+        t.caller.take().expect("caller scope").put(fx);
+        let next = fx.b.create_block();
+        fx.b.append_block_param(next, I64);
+        fx.loops.push(LoopCtx { next, exit: t.brk, redo: next, next_val: true });
+        let v = self.inline_body_pub(fx, &t.yb.blk, &t.yb.params, &t.yb.locals, &vals, vals.len() == 1, true);
+        fx.loops.pop();
+        fx.b.ins().jump(next, &[v.into()]);
+        fx.b.switch_to_block(next);
+        let r = fx.b.block_params(next)[0];
+        t.caller = Some(ScopeState::take(fx));
+        callee.put(fx);
+        self.inline_ctx.push(frame);
+        self.yield_targets.push(t);
+        self.cur_offset = at;
+        self.set_srcloc(fx);
+        Some(r)
+    }
+
     /// `inline_method_body` for vobj.rs.
     pub(crate) fn inline_method_body_pub(&mut self, fx: &mut Fx, d: &InlineDef, recv: Value, vals: &[Value]) -> Value {
-        self.inline_method_body(fx, d, recv, vals, &[])
+        self.inline_method_body(fx, d, recv, vals, &[], None)
     }
 
     /// Compile `d`'s body here with `recv` as self and `vals` as its parameters.
-    fn inline_method_body(&mut self, fx: &mut Fx, d: &InlineDef, recv: Value, vals: &[Value], kw: &[(Vec<u8>, Value)]) -> Value {
+    /// `yb`: the call's literal block and the call's result block (for `break`).
+    fn inline_method_body(&mut self, fx: &mut Fx, d: &InlineDef, recv: Value, vals: &[Value], kw: &[(Vec<u8>, Value)], yb: Option<(YieldBlock, Block)>) -> Value {
         let at = self.cur_offset;
         let call_loc = self.loc_bits();
         let mut label = d.name.clone();
@@ -564,28 +871,20 @@ impl<M: Module> Compiler<M> {
         file.push(0);
         let file_off = self.str_offset(&file) as u32;
         // the callee's scope
-        let saved_self = fx.self_v;
-        let saved_locals = std::mem::take(&mut fx.locals);
-        let saved_num = std::mem::take(&mut fx.num_locals);
-        let saved_int = std::mem::take(&mut fx.int_locals);
-        let saved_flo = std::mem::take(&mut fx.flocals);
-        let saved_sure = std::mem::take(&mut fx.int_sure);
-        let saved_levels = std::mem::take(&mut fx.inline_levels);
-        let saved_vlocals = std::mem::take(&mut fx.vlocals);
-        let saved_vself = fx.vself.take();
+        let mut caller = Some(ScopeState::take(fx));
+        fx.inl_self = self.licm_inl_self(fx, recv);
         let sv = fx.b.declare_var(I64);
         fx.b.def_var(sv, recv);
         fx.self_v = sv;
         let nil = fx.b.ins().iconst(I64, QNIL);
-        for l in d.node.locals().iter() {
-            let n = l.as_slice().to_vec();
+        for n in d.locals() {
             if !fx.locals.contains_key(&n) {
                 let v = fx.b.declare_var(I64);
                 fx.b.def_var(v, nil);
                 fx.locals.insert(n, Local::Var(v));
             }
         }
-        if let Some(p) = d.node.parameters() {
+        if let Some(p) = d.params() {
             for (r, v) in p.requireds().iter().zip(vals) {
                 if let Some(rp) = r.as_required_parameter_node() {
                     if let Some(Local::Var(var)) = fx.locals.get(rp.name().as_slice()) {
@@ -599,9 +898,9 @@ impl<M: Module> Compiler<M> {
                 fx.b.def_var(*var, *v);
             }
         }
-        let body = d.node.body();
+        let body = d.body();
         let mut analysis: Vec<&Node> = Vec::new();
-        let params = d.node.parameters().map(|p| p.as_node());
+        let params = d.params().map(|p| p.as_node());
         if let Some(p) = &params {
             analysis.push(p);
         }
@@ -617,26 +916,23 @@ impl<M: Module> Compiler<M> {
         // (a virtual object's `initialize`: its instance variables)
         fx.vself = fx.vself_next.take();
         // constants resolve in the method's own scope
-        let saved_cref = fx.cref_slot;
         if let Some(&slot) = self.def_cref.get(&(d.file.clone(), d.offset)) {
             fx.cref_slot = slot;
         }
         self.inline_ctx.push(InlineFrame { key: (d.file.clone(), d.offset), label_off, file_off, call_loc, lex: d.lex.clone() });
+        if let Some((yb, brk)) = yb {
+            self.yield_targets.push(YieldTarget { yb, depth: self.inline_ctx.len(), brk, caller: caller.take() });
+        }
         let r = match &body {
             Some(b) => self.expr(fx, b),
             None => self.nil(fx),
         };
+        let caller = match caller {
+            Some(c) => c,
+            None => self.yield_targets.pop().and_then(|t| t.caller).expect("yield target"),
+        };
         self.inline_ctx.pop();
-        fx.cref_slot = saved_cref;
-        fx.self_v = saved_self;
-        fx.locals = saved_locals;
-        fx.num_locals = saved_num;
-        fx.int_locals = saved_int;
-        fx.flocals = saved_flo;
-        fx.int_sure = saved_sure;
-        fx.inline_levels = saved_levels;
-        fx.vlocals = saved_vlocals;
-        fx.vself = saved_vself;
+        caller.put(fx);
         self.cur_offset = at;
         self.set_srcloc(fx);
         r
@@ -667,6 +963,9 @@ impl<M: Module> Compiler<M> {
         if idef.consts && self.cur_lex(fx).as_ref() != Some(&idef.lex) && !self.def_cref.contains_key(&key) {
             return None;
         }
+        if idef.yields > 0 {
+            return None;
+        }
         if std::env::var_os("KENNY_DEBUG_INLINE").is_some() {
             let line = self.line_of(self.cur_offset);
             eprintln!("kenny: inline {}.new into {}:{} (depth {})", String::from_utf8_lossy(cname), self.file.display(), line, self.inline_ctx.len() + 1);
@@ -688,7 +987,7 @@ impl<M: Module> Compiler<M> {
         let same = fx.b.ins().icmp_imm_s(IntCC::Equal, d, 0);
         self.require(fx, same, slow);
         let o = self.call(fx, "kn_obj_alloc", &[recv]);
-        self.inline_method_body(fx, &idef, o, vals, &[]);
+        self.inline_method_body(fx, &idef, o, vals, &[], None);
         fx.b.ins().jump(done, &[o.into()]);
         fx.b.switch_to_block(slow);
         let fa = self.fn_addr(fx, sd.fid);
@@ -754,6 +1053,9 @@ impl<M: Module> Compiler<M> {
         if idef.consts && self.cur_lex(fx).as_ref() != Some(&idef.lex) && !self.def_cref.contains_key(&key) {
             return None;
         }
+        if idef.yields > 0 {
+            return None;
+        }
         Some((d.clone(), idef))
     }
 
@@ -793,10 +1095,10 @@ impl<M: Module> Compiler<M> {
         let dd = fx.b.ins().bor(d1, d2);
         let same = fx.b.ins().icmp_imm_s(IntCC::Equal, dd, 0);
         self.require(fx, same, slow);
-        let r = self.inline_method_body(fx, &idef, recv, pos, kw);
+        let r = self.inline_method_body(fx, &idef, recv, pos, kw, None);
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(slow);
-        let mut desc = crate::scopes::params_desc(idef.node.parameters()).into_bytes();
+        let mut desc = crate::scopes::params_desc(idef.params()).into_bytes();
         desc.push(0);
         desc.extend(self.kw_marker(d.offset).unwrap_or_default());
         let (p, _) = self.str_ptr(fx, &desc);

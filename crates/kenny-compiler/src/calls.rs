@@ -197,6 +197,19 @@ impl<M: Module> Compiler<M> {
                 }
             }
         }
+        // `define_method(:name) { |a| ... }` as a `def` (statics.rs `block_def`)
+        if name == b"define_method" && !fx.no_block_def {
+            self.cur_offset = at_loc;
+            if let Some(v) = self.def_from_block(fx, c) {
+                return v;
+            }
+        }
+        // a read remembered across a loop's iterations (licm.rs)
+        if arg_nodes.is_empty() && block.is_none() && !c.is_safe_navigation() && !fx.licm.is_empty() {
+            if let Some(v) = self.licm_read(fx, c) {
+                return v;
+            }
+        }
 
         // `Kernel.block_given?` / `::Kernel.block_given?` (BasicObject subclasses such as
         // Jbuilder write it so): like the bare call, it asks about the current method's block
@@ -409,6 +422,8 @@ impl<M: Module> Compiler<M> {
             v
         } else if let Some(r) = self.kw_inline_site(fx, c, recv, &name, &arg_nodes, block.is_none(), recv_node.as_ref().is_some_and(|r| r.as_self_node().is_none()), at_loc) {
             r
+        } else if let Some(r) = self.yield_inline_site(fx, c, recv, &name, &arg_nodes, at_loc) {
+            r
         } else {
             let args = self.eval_args(fx, c.arguments());
             let forwards = arg_nodes.iter().any(|n| n.as_forwarding_arguments_node().is_some());
@@ -416,7 +431,11 @@ impl<M: Module> Compiler<M> {
             let (blk, literal) = if forwards && block.is_none() {
                 (self.forwarded_local(fx, b"&"), None)
             } else {
-                self.block_arg(fx, block, false)
+                // a method's body: `return` returns from it
+                self.bmethod_next = matches!(name.as_slice(), b"define_method" | b"define_singleton_method") && block.as_ref().is_some_and(|b| b.as_block_node().is_some());
+                let r = self.block_arg(fx, block, false);
+                self.bmethod_next = false;
+                r
             };
             self.cur_offset = at_loc;
             let explicit = recv_node.as_ref().is_some_and(|r| r.as_self_node().is_none());
@@ -465,6 +484,61 @@ impl<M: Module> Compiler<M> {
             }
             None => result,
         }
+    }
+
+    /// `m(args) { |a| ... }` to a small method of this program that yields (statics.rs
+    /// `inline_target`): its body inline, the block's body at each `yield` (`inline_yield`).
+    /// None (nothing compiled): not such a call.
+    fn yield_inline_site(&mut self, fx: &mut Fx, c: &CallNode, recv: Value, name: &[u8], arg_nodes: &[Node], at_loc: usize) -> Option<Value> {
+        if fx.spec.is_some() || c.is_safe_navigation() || c.is_attribute_write() || std::env::var_os("KENNY_NO_INLINE").is_some() {
+            return None;
+        }
+        let bn = c.block()?.as_block_node()?;
+        if arg_nodes.iter().any(|n| n.as_splat_node().is_some() || n.as_keyword_hash_node().is_some() || n.as_block_argument_node().is_some() || n.as_forwarding_arguments_node().is_some()) {
+            return None;
+        }
+        let explicit = c.receiver().is_some_and(|r| r.as_self_node().is_none());
+        self.inline_target(fx, name, arg_nodes.len(), explicit, true)?;
+        let params = crate::inline::simple_params(bn.parameters())?;
+        // `return` leaves this frame's method (or block, as the closure would)
+        if !crate::inline::yield_inlinable(&bn, matches!(fx.kind, ScopeKind::Method | ScopeKind::Block)) {
+            return None;
+        }
+        let vals: Vec<Value> = arg_nodes.iter().map(|n| self.expr(fx, n)).collect();
+        self.cur_offset = at_loc;
+        self.mark_loc(fx);
+        let mid = self.sym_val(fx, name);
+        let locals: Vec<Vec<u8>> = bn.locals().iter().map(|l| l.as_slice().to_vec()).collect();
+        // (the tree outlives the compilation of this call)
+        let blk: BlockNode<'static> = unsafe { std::mem::transmute::<BlockNode<'_>, BlockNode<'static>>(c.block()?.as_block_node()?) };
+        let yb = crate::statics::YieldBlock { blk, params, locals };
+        let (nerr, nwarn) = (self.errors.len(), self.warnings.len());
+        let nm = name.to_vec();
+        let vs = vals.clone();
+        let r = self.inline_call_with(fx, recv, name, mid, &vals, explicit, Some(yb), |c2, fx| {
+            // the call as written, with the block as a closure
+            let (blk, literal) = c2.block_arg(fx, c.block(), false);
+            c2.cur_offset = at_loc;
+            let r = c2.send_raw(fx, recv, &nm, &Args { vals: vs, splat: None }, Some(blk), explicit);
+            match literal {
+                Some(p) => c2.catch_break(fx, r, p),
+                None => r,
+            }
+        });
+        // (the block's body was compiled more than once: report things once)
+        let e: Vec<String> = self.errors.drain(nerr..).collect();
+        for x in e {
+            if !self.errors[nerr..].contains(&x) {
+                self.errors.push(x);
+            }
+        }
+        let w: Vec<_> = self.warnings.drain(nwarn..).collect();
+        for x in w {
+            if !self.warnings[nwarn..].contains(&x) {
+                self.warnings.push(x);
+            }
+        }
+        r
     }
 
     /// `name(a, k: x)` with literal keywords to a keyword `def` that can be inlined
@@ -632,6 +706,15 @@ impl<M: Module> Compiler<M> {
                 v
             });
         }
+        // one index: the inline Array read and write (each a real send when it doesn't apply)
+        if args.len() == 1 && n.block().is_none() && self.refine_scope.is_none() && (!fx.loops.is_empty() || !self.in_dependency()) {
+            let idx = args[0];
+            let cur = self.ary_index_fast(fx, recv, idx, None, |c, fx| c.send(fx, recv, b"[]", &[idx], None));
+            let rhs = self.num_expr(fx, &value, true);
+            let v = self.binop_rhs(fx, &op, cur, rhs);
+            self.ary_index_fast(fx, recv, idx, Some(v), |c, fx| c.send(fx, recv, b"[]=", &[idx, v], None));
+            return v;
+        }
         let cur = self.send(fx, recv, b"[]", &args, None);
         let rhs = self.num_expr(fx, &n.value(), true);
         let v = self.binop_rhs(fx, n.binary_operator().as_slice(), cur, rhs);
@@ -781,6 +864,12 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn yield_node(&mut self, fx: &mut Fx, y: &YieldNode) -> Value {
+        // in a method inlined with a literal block: that block, here
+        if !self.yield_targets.is_empty() {
+            if let Some(v) = self.inline_yield(fx, y) {
+                return v;
+            }
+        }
         let blk = self.method_block(fx);
         let args = self.eval_args(fx, y.arguments());
         match args.splat {

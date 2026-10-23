@@ -20,12 +20,35 @@ pub(crate) struct FnSpec<'a, 'pr> {
     pub fast_arity: Option<usize>,
     /// The function, when declared ahead (statics.rs)
     pub predeclared: Option<FuncId>,
+    /// Its name in backtraces, when not the usual one for its kind (a `define_method`
+    /// block compiled as a method keeps its "block in ..." label)
+    pub bt_label: Option<String>,
+    /// A block that becomes a method's body (`define_method(:m) { }`): its `return`
+    /// returns from it, as a lambda's does
+    pub bmethod: bool,
+    /// For a block: env hops from its parent env to the env of the lambda (or method
+    /// body block) that its `return` returns from; None: the method's (`method_env`)
+    pub ret_hops: Option<u32>,
 }
 
 pub(crate) struct BlockArity {
     pub min: i64,
     pub max: i64,
     pub autosplat: bool,
+}
+
+/// What `def_parts` compiles: a `def`, or a `define_method` block that is one.
+pub(crate) struct DefParts<'pr> {
+    pub name: Vec<u8>,
+    /// where it goes, and how (kenny-runtime abi.rs `kn_def`)
+    pub target: Value,
+    pub kind: i64,
+    pub params: Option<ParametersNode<'pr>>,
+    pub body: Option<Node<'pr>>,
+    pub locals: Vec<Vec<u8>>,
+    pub offset: usize,
+    pub singleton: bool,
+    pub bt_label: Option<String>,
 }
 
 /// Method#parameters descriptor: "req:a,opt:b,rest:c,keyreq:d,key:e,keyrest:f,block:g".
@@ -110,6 +133,9 @@ impl<M: Module> Compiler<M> {
             method: None,
             fast_arity: None,
             predeclared: None,
+            bt_label: None,
+            bmethod: false,
+            ret_hops: None,
         };
         Ok(self.build_fn(spec, |c, fx| c.expr(fx, &stmts)))
     }
@@ -245,6 +271,7 @@ impl<M: Module> Compiler<M> {
         };
         // the frame's name in backtraces, as CRuby labels it
         let bt_label = match spec.kind {
+            _ if spec.bt_label.is_some() => spec.bt_label.clone().unwrap(),
             ScopeKind::Top | ScopeKind::Class if self.eval_unit && !self.file_unit && self.fn_labels.is_empty() => "<eval>".to_string(),
             ScopeKind::Top if self.fn_labels.is_empty() && self.file == self.main_file => "<main>".to_string(),
             ScopeKind::Top => "<top (required)>".to_string(),
@@ -341,7 +368,14 @@ impl<M: Module> Compiler<M> {
             // unboxed Float shadows for register locals assigned from arithmetic
             let (num_locals, flocals, int_sure, typed_info) = typed_setup(&mut b, &locals, &spec.analysis, self.refine_scope.is_none());
             let vlocals = self.vobj_plan(&mut b, &locals, &spec.analysis);
-            let env_v = if has_env {
+            // a method whose locals all stay in registers needs its env only for the blocks it
+            // makes into closures (their way back to this frame): made when the first one is
+            // (`lazy_env`), so a method whose blocks were all inlined never makes it
+            let lazy_env = has_env && spec.kind == ScopeKind::Method && env_slots.is_empty();
+            let env_v = if lazy_env {
+                let z = b.ins().iconst(I64, 0);
+                Some(mk(&mut b, z))
+            } else if has_env {
                 let parent = match penv_v {
                     Some(pe) => b.use_var(pe),
                     None => b.ins().iconst(I64, 0),
@@ -356,10 +390,11 @@ impl<M: Module> Compiler<M> {
             } else {
                 None
             };
-            if spec.kind == ScopeKind::Method {
+            let ret_here = is_block && (spec.lambda || spec.bmethod);
+            if spec.kind == ScopeKind::Method || ret_here {
                 let tag = match env_v {
-                    Some(e) => b.use_var(e),
-                    None => {
+                    Some(e) if !lazy_env => b.use_var(e),
+                    _ => {
                         let ss = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
                         b.ins().stack_addr(I64, ss, 0)
                     }
@@ -382,6 +417,8 @@ impl<M: Module> Compiler<M> {
                 b,
                 kind: spec.kind,
                 lambda: spec.lambda,
+                ret_here,
+                ret_hops: spec.ret_hops,
                 self_v,
                 blk_v,
                 argc_v,
@@ -424,12 +461,19 @@ impl<M: Module> Compiler<M> {
                 vlocals,
                 vself: None,
                 vself_next: None,
+                licm: Vec::new(),
+                licm_pending: None,
+                licm_vals: Vec::new(),
+                no_block_def: false,
+                lazy_env,
+                inl_self: Vec::new(),
+                bools: HashMap::new(),
             };
             let v = body(self, &mut fx);
             fx.b.ins().return_(&[v]);
             // unwinding out of this function
             fx.b.switch_to_block(exit);
-            if fx.kind == ScopeKind::Method {
+            if fx.kind == ScopeKind::Method || fx.ret_here {
                 let tag = fx.b.use_var(fx.tag_v);
                 let r = self.call(&mut fx, "kn_catch_return", &[tag]);
                 fx.b.ins().return_(&[r]);
@@ -459,6 +503,7 @@ impl<M: Module> Compiler<M> {
     pub(crate) fn call_fn(&mut self, fx: &mut Fx, id: FuncId, args: &[Value]) -> Value {
         let f = self.module.declare_func_in_func(id, fx.b.func);
         let inst = fx.b.ins().call(f, args);
+        self.licm_kill(fx);
         fx.b.inst_results(inst)[0]
     }
 
@@ -507,6 +552,9 @@ impl<M: Module> Compiler<M> {
                         return self.local_box(fx, v, raw, kind);
                     }
                     let r = fx.b.use_var(v);
+                    if !fx.licm.is_empty() {
+                        self.licm_note(fx, name, r);
+                    }
                     if fx.int_sure.contains(name) {
                         fx.sure_ints.insert(r);
                     }
@@ -687,6 +735,28 @@ impl<M: Module> Compiler<M> {
     }
 
     /// The env of the enclosing method (for yield / block_given? / return inside blocks).
+    /// This method's env (`Fx::lazy_env`), made now if it isn't yet; it is also the tag that
+    /// a `return` in its blocks names.
+    fn lazy_env(&mut self, fx: &mut Fx) -> Value {
+        let ev = fx.env_v.unwrap();
+        let e = fx.b.use_var(ev);
+        let make = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.set_cold_block(make);
+        fx.b.ins().brif(e, done, &[e.into()], make, &[]);
+        fx.b.switch_to_block(make);
+        let zero = self.iconst(fx, 0);
+        let blk = fx.b.use_var(fx.blk_v);
+        let n = self.iconst(fx, 0);
+        let ne = self.call(fx, "kn_env_new", &[zero, blk, n]);
+        fx.b.def_var(ev, ne);
+        fx.b.def_var(fx.tag_v, ne);
+        fx.b.ins().jump(done, &[ne.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
     pub(crate) fn method_env(&mut self, fx: &mut Fx) -> Option<Value> {
         let hops = fx.method.as_ref()?.hops?;
         let pe = fx.penv_v?;
@@ -1176,7 +1246,6 @@ impl<M: Module> Compiler<M> {
 
     pub(crate) fn def_node(&mut self, fx: &mut Fx, d: &DefNode) -> Value {
         let name = d.name().as_slice().to_vec();
-        let owner_slot = self.cache_alloc(1);
         let (target, kind) = match d.receiver() {
             Some(r) => (self.expr(fx, &r), 3),
             None => {
@@ -1189,8 +1258,63 @@ impl<M: Module> Compiler<M> {
                 (s, k)
             }
         };
-        let params_node = d.parameters().map(|p| p.as_node());
-        let body = d.body();
+        let parts = DefParts {
+            name,
+            target,
+            kind,
+            params: d.parameters(),
+            body: d.body(),
+            locals: names(&d.locals()),
+            offset: d.location().start_offset(),
+            singleton: d.receiver().is_some(),
+            bt_label: None,
+        };
+        self.def_parts(fx, parts)
+    }
+
+    /// `define_method(:name) { |a| ... }` that can be a `def` (statics.rs `block_def`):
+    /// compiled as one, defined by `kn_def` while `define_method` is the builtin (else the
+    /// call as written).
+    pub(crate) fn def_from_block(&mut self, fx: &mut Fx, c: &CallNode) -> Option<Value> {
+        if !matches!(fx.kind, ScopeKind::Top | ScopeKind::Class) || !fx.inline_levels.is_empty() || !self.inline_ctx.is_empty() {
+            return None;
+        }
+        let (name, params, blk) = crate::statics::block_def(c)?;
+        let parent = self.fn_labels.last().map(|l| l.trim_start_matches("block in ").to_string()).unwrap_or_else(|| "<main>".into());
+        let target = self.self_val(fx);
+        let parts = DefParts {
+            name,
+            target,
+            kind: 4,
+            params,
+            body: blk.body(),
+            locals: names(&blk.locals()),
+            offset: c.location().start_offset(),
+            singleton: false,
+            bt_label: Some(format!("block in {parent}")),
+        };
+        let r = self.def_parts(fx, parts);
+        // 0: `define_method` isn't the builtin one here
+        let generic = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.set_cold_block(generic);
+        fx.b.ins().brif(r, done, &[r.into()], generic, &[]);
+        fx.b.switch_to_block(generic);
+        fx.no_block_def = true;
+        let v = self.call_node(fx, c);
+        fx.no_block_def = false;
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(done);
+        Some(fx.b.block_params(done)[0])
+    }
+
+    fn def_parts(&mut self, fx: &mut Fx, d: DefParts) -> Value {
+        let DefParts { name, target, kind, params, body, locals, offset, singleton, bt_label } = d;
+        let wrapper_label = bt_label.clone().unwrap_or_else(|| String::from_utf8_lossy(&name).into_owned());
+        let owner_slot = self.cache_alloc(1);
+        let params_node = params.as_ref().map(|p| p.as_node());
+        let params_copy = params_node.as_ref().and_then(|p| p.as_parameters_node());
         let mut analysis = Vec::new();
         if let Some(p) = &params_node {
             analysis.push(p);
@@ -1202,7 +1326,7 @@ impl<M: Module> Compiler<M> {
             kind: ScopeKind::Method,
             lambda: false,
             label: String::from_utf8_lossy(&name).into_owned(),
-            locals: names(&d.locals()),
+            locals,
             analysis,
             // constants resolve lexically: the enclosing class body's scope
             cref_slot: fx.cref_slot,
@@ -1212,28 +1336,29 @@ impl<M: Module> Compiler<M> {
                 hops: None,
                 params: Vec::new(),
                 scope: self.scopes.len(),
-                lex: self.def_lex.get(&(self.file.clone(), d.location().start_offset())).cloned(),
-                singleton: d.receiver().is_some(),
+                lex: self.def_lex.get(&(self.file.clone(), offset)).cloned(),
+                singleton,
             }),
             fast_arity: None,
             predeclared: None,
+            bt_label,
+            bmethod: false,
+            ret_hops: None,
         };
-        let params = d.parameters();
         // only required parameters (and maybe &blk): a fast entry taking them in registers
         // (the app's own code: in gems the extra entry and call guards cost more code than
         // they save time)
         let fast_n = crate::statics::fast_arity(&params).filter(|_| !self.in_dependency());
         let mut spec = spec;
         spec.fast_arity = fast_n;
-        if fast_n.is_some() && d.receiver().is_none() {
-            spec.predeclared = self.static_fid_for_def(&name, d.location().start_offset());
+        if fast_n.is_some() && !singleton {
+            spec.predeclared = self.static_fid_for_def(&name, offset);
         }
-        let label = String::from_utf8_lossy(&name).into_owned();
-        let def_line = self.line_of(d.location().start_offset()) as u32;
+        let def_line = self.line_of(offset) as u32;
         // (code inlined into this body is compiled with no inline context of its own)
         let saved_ctx = std::mem::take(&mut self.inline_ctx);
-        self.def_stack.push((self.file.clone(), d.location().start_offset()));
-        self.def_cref.insert((self.file.clone(), d.location().start_offset()), fx.cref_slot);
+        self.def_stack.push((self.file.clone(), offset));
+        self.def_cref.insert((self.file.clone(), offset), fx.cref_slot);
         let fid = self.build_fn(spec, |c, fx| {
             c.bind_method_params(fx, params);
             match &body {
@@ -1245,7 +1370,7 @@ impl<M: Module> Compiler<M> {
         self.inline_ctx = saved_ctx;
         let (fid, fast) = match fast_n {
             Some(n) => {
-                let w = self.fast_wrapper(fid, n, &label, def_line);
+                let w = self.fast_wrapper(fid, n, &wrapper_label, def_line);
                 let fa = self.fn_addr(fx, fid);
                 let tag = fx.b.ins().iconst(I64, ((n as i64) + 1) << 56);
                 let tagged = fx.b.ins().bor(fa, tag);
@@ -1257,11 +1382,11 @@ impl<M: Module> Compiler<M> {
         let k = self.iconst(fx, kind);
         let s = self.sym_val(fx, &name);
         let slot = self.slot_ptr(fx, owner_slot);
-        let mut desc = params_desc(d.parameters()).into_bytes();
+        let mut desc = params_desc(params_copy).into_bytes();
         desc.push(0);
         // (a keyword def's calls may be inlined: statics.rs `kw_marker`)
         if !self.in_dependency() {
-            desc.extend(self.kw_marker(d.location().start_offset()).unwrap_or_default());
+            desc.extend(self.kw_marker(offset).unwrap_or_default());
         }
         let (pd, _) = self.str_ptr(fx, &desc);
         self.callc(fx, "kn_def", &[target, k, s, addr, slot, pd, fast])
@@ -1269,6 +1394,15 @@ impl<M: Module> Compiler<M> {
 
     /// Compile a block or lambda literal into a Proc value.
     pub(crate) fn block_proc(&mut self, fx: &mut Fx, params: Option<Node>, body: Option<Node>, locals: Vec<Vec<u8>>, lambda: bool) -> Value {
+        // (only this literal: the blocks in its body are ordinary)
+        let bmethod = std::mem::take(&mut self.bmethod_next);
+        // what its `return` returns from: this frame when it is a lambda or a method body
+        // block (its env, one hop up), else whatever this frame's own returns from
+        let ret_hops = match fx.kind {
+            ScopeKind::Block if fx.ret_here => Some(0),
+            ScopeKind::Block => fx.ret_hops.map(|h| h + 1),
+            _ => None,
+        };
         let method = fx.method.as_ref().map(|m| MethodCtx {
             hops: Some(match m.hops {
                 None => 0,
@@ -1294,6 +1428,9 @@ impl<M: Module> Compiler<M> {
             method,
             fast_arity: None,
             predeclared: None,
+            bt_label: None,
+            bmethod,
+            ret_hops,
         };
         let mut arity = BlockArity { min: 0, max: -1, autosplat: false };
         let fid = {
@@ -1312,6 +1449,7 @@ impl<M: Module> Compiler<M> {
         };
         let addr = self.fn_addr(fx, fid);
         let env = match fx.env_v {
+            Some(_) if fx.lazy_env => self.lazy_env(fx),
             Some(e) => fx.b.use_var(e),
             None => self.iconst(fx, 0),
         };
@@ -1340,6 +1478,9 @@ impl<M: Module> Compiler<M> {
             method: None,
             fast_arity: None,
             predeclared: None,
+            bt_label: None,
+            bmethod: false,
+            ret_hops: None,
         };
         let fid = self.build_fn(spec, |c, fx| match &body {
             Some(b) => c.expr(fx, b),
