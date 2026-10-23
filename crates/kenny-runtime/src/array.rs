@@ -555,6 +555,10 @@ pub fn init() {
         if !is_proc(b) {
             return crate::misc::enum_for(s, "each_with_index", &[]);
         }
+        // (Enumerable's in Ruby: through a redefined `each`)
+        if unsafe { find_method(class_of(s), sym("each")).as_ref() }.is_none_or(|m| m.opt != crate::opt::OPT_ARY_EACH) {
+            return crate::misc::each_with_index_via_each(s, b);
+        }
         let mut i = 0;
         while i < rary(s).v.len() {
             let x = rary(s).v[i];

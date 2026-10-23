@@ -1,0 +1,49 @@
+[true, false]
+[false, true]
+[true, false]
+[false, true]
+[false, true]
+[false, true]
+[false, true]
+[false, true]
+[true, false]
+[true, false]
+[true, false]
+[false, true]
+[true, false]
+[true, false]
+true
+false
+true
+true
+"undefined method '[]' for nil"
+true
+1
+true
+true
+String
+3
+3
+"b"
+"c"
+nil
+5
+0
+4
+true
+"é"
+6
+true
+6
+true
+true
+false
+true
+false
+true
+"x"
+false
+:neq
+false
+-1
+3

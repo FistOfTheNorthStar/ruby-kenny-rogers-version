@@ -151,6 +151,9 @@ pub const FL_KWHASH: u32 = 2;
 pub const FL_BINARY: u32 = 16;
 /// Proc flag: the block declares keyword parameters (a trailing keyword hash is not positional).
 pub const FL_PROC_KW: u32 = 256;
+/// String flag: frozen and ASCII-only, known (string.rs `ascii_only`; a frozen String's
+/// bytes never change, so this stays true).
+pub const FL_STR_ASCII: u32 = 1 << 12;
 
 #[repr(C)]
 pub struct Header {
@@ -1113,6 +1116,16 @@ pub const DIRECT_IS_A_HEAP: u64 = 128;
 pub const DIRECT_MOD_EQQ_ALL: u64 = 256;
 /// String#getbyte and String#setbyte of the String class itself are the builtin ones.
 pub const DIRECT_STR_BYTE: u64 = 512;
+/// String#+ of the String class itself is the builtin one (string.rs `kn_str_append_own`).
+pub const DIRECT_STR_PLUS: u64 = 1024;
+/// String#[], String#==, NilClass#== and the #!= of both are the builtin ones (string.rs
+/// `kn_str_idx_eq`).
+pub const DIRECT_STR_IDX_EQ: u64 = 2048;
+/// The Array methods compiled code runs as inline loops (kenny-compiler inline.rs) are
+/// the public builtin ones of Array itself.
+pub const DIRECT_ARY_ITER: u64 = 4096;
+/// Integer#times, #upto and #downto are the public builtin ones.
+pub const DIRECT_INT_ITER: u64 = 8192;
 /// Set once the builtin methods are tagged (opt.rs `init`).
 pub static DIRECT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// `KN_DIRECT.flags` is 0 until recomputed (methods changed): on the next inline cache
@@ -1163,6 +1176,45 @@ pub fn update_direct_flags() {
     let [getbyte, setbyte] = *STR_IDS.get_or_init(|| [sym("getbyte"), sym("setbyte")]);
     if is(c.string, getbyte, crate::opt::OPT_STR_GETBYTE) && is(c.string, setbyte, crate::opt::OPT_STR_SETBYTE) {
         flags |= DIRECT_STR_BYTE;
+    }
+    if is(c.string, sym("+"), crate::opt::OPT_STR_PLUS) {
+        flags |= DIRECT_STR_PLUS;
+    }
+    let public = |k: *mut Class, name: &str, opt: u8| {
+        let m = find_method(k, sym(name));
+        !m.is_null() && unsafe { (*m).opt == opt && (*m).vis != VIS_PRIVATE }
+    };
+    {
+        use crate::opt::*;
+        let ary = [
+            ("each", OPT_ARY_EACH),
+            ("each_with_index", OPT_ARY_EACH_WITH_INDEX),
+            ("each_index", OPT_ARY_EACH_INDEX),
+            ("map", OPT_ARY_MAP),
+            ("collect", OPT_ARY_MAP),
+            ("select", OPT_ARY_SELECT),
+            ("filter", OPT_ARY_SELECT),
+            ("reject", OPT_ARY_REJECT),
+            ("any?", OPT_ARY_ANY),
+            ("all?", OPT_ARY_ALL),
+            ("count", OPT_ARY_COUNT),
+            ("sum", OPT_ARY_SUM),
+        ];
+        if ary.iter().all(|&(n, o)| public(c.array, n, o)) {
+            flags |= DIRECT_ARY_ITER;
+        }
+        if public(c.integer, "times", OPT_INT_TIMES) && public(c.integer, "upto", OPT_INT_UPTO) && public(c.integer, "downto", OPT_INT_DOWNTO) {
+            flags |= DIRECT_INT_ITER;
+        }
+    }
+    let ne = sym("!=");
+    if is(c.string, sym("[]"), crate::opt::OPT_STR_AREF)
+        && is(c.string, eq, crate::opt::OPT_STR_EQ)
+        && is(c.nil, eq, crate::opt::OPT_IDENTITY_EQ)
+        && is(c.string, ne, crate::opt::OPT_NEQ)
+        && is(c.nil, ne, crate::opt::OPT_NEQ)
+    {
+        flags |= DIRECT_STR_IDX_EQ;
     }
     static NUM_IDS: std::sync::OnceLock<[u32; 5]> = std::sync::OnceLock::new();
     let [to_f, neg, pow, shl, shr] = *NUM_IDS.get_or_init(|| [sym("to_f"), sym("-@"), sym("**"), sym("<<"), sym(">>")]);

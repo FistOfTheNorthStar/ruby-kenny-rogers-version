@@ -580,6 +580,7 @@ pub(crate) struct ScopeState {
     inl_self: Vec<crate::licm::Entry>,
     /// (an attr read being remembered: not the inlined body's)
     licm_pending: Option<crate::licm::Entry>,
+    owned: HashMap<Vec<u8>, Variable>,
 }
 impl ScopeState {
     /// Move the current scope's state out of `fx` (leaving it empty).
@@ -599,6 +600,7 @@ impl ScopeState {
             cref_slot: fx.cref_slot,
             inl_self: std::mem::take(&mut fx.inl_self),
             licm_pending: fx.licm_pending.take(),
+            owned: std::mem::take(&mut fx.owned),
         }
     }
     fn put(self, fx: &mut Fx) {
@@ -616,6 +618,7 @@ impl ScopeState {
         fx.cref_slot = self.cref_slot;
         fx.inl_self = self.inl_self;
         fx.licm_pending = self.licm_pending;
+        fx.owned = self.owned;
     }
 }
 

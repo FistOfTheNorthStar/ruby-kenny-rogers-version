@@ -60,6 +60,14 @@ pub const OPT_MATH: u8 = 38;
 pub const OPT_NUM_INLINE: u8 = 39;
 /// Class#new (kenny-runtime abi.rs `kn_new_fill`).
 pub const OPT_CLASS_NEW: u8 = 40;
+/// String#+ (`DIRECT_STR_PLUS`, string.rs `kn_str_append_own`).
+pub const OPT_STR_PLUS: u8 = 41;
+/// String#[] / #slice (an Integer index: string.rs `aref_idx`).
+pub const OPT_STR_AREF: u8 = 42;
+/// String#length / #size.
+pub const OPT_STR_LENGTH: u8 = 43;
+/// BasicObject#!= (`!(self == other)`).
+pub const OPT_NEQ: u8 = 44;
 /// The Math functions compiled code may compute inline, in the order of `kn_math1`'s
 /// `which` (kenny-compiler fastpath.rs `MATH_FNS` must match).
 pub const MATH_FNS: [&str; 15] = ["sqrt", "sin", "cos", "tan", "atan", "exp", "log", "log2", "log10", "cbrt", "sinh", "cosh", "tanh", "asin", "acos"];
@@ -118,6 +126,12 @@ pub fn init() {
     tag(c.string, "getbyte", OPT_STR_GETBYTE);
     tag(c.string, "setbyte", OPT_STR_SETBYTE);
     tag(c.string, "bytesize", OPT_STR_BYTESIZE);
+    tag(c.string, "+", OPT_STR_PLUS);
+    tag(c.string, "[]", OPT_STR_AREF);
+    tag(c.string, "slice", OPT_STR_AREF);
+    tag(c.string, "length", OPT_STR_LENGTH);
+    tag(c.string, "size", OPT_STR_LENGTH);
+    tag(c.basic_object, "!=", OPT_NEQ);
     tag(c.integer, "succ", OPT_INT_SUCC);
     tag(c.array, "count", OPT_ARY_COUNT);
     tag(c.array, "sum", OPT_ARY_SUM);
@@ -271,6 +285,7 @@ unsafe fn send0_found(m: *const Method, recv: V, mid: V, explicit: u64) -> V {
         OPT_HASH_EMPTY => return bool_v(rhash(recv).m.is_empty()),
         OPT_STR_EMPTY => return bool_v(rstr(recv).b.is_empty()),
         OPT_STR_BYTESIZE => return mkfix(rstr(recv).b.len() as i64),
+        OPT_STR_LENGTH => return mkfix(crate::string::char_len(recv) as i64),
         // (fixnum + 1 stays a fixnum below the largest one)
         OPT_INT_SUCC if is_fix(recv) && fix(recv) < (1 << 61) => return mkfix(fix(recv) + 1),
         OPT_NIL_P => return bool_v(recv == QNIL),
@@ -304,6 +319,17 @@ unsafe fn send1_found(m: *const Method, recv: V, mid: V, a: V, explicit: u64) ->
         OPT_HASH_AREF => return crate::hash::hget(recv, a),
         OPT_HASH_KEY => return bool_v(rhash(recv).m.contains_key(&HKey(a))),
         OPT_STR_EQ => return bool_v(is_str(a) && rstr(recv).b == rstr(a).b),
+        OPT_STR_AREF if is_fix(a) => return crate::string::aref_idx(recv, fix(a)),
+        // `!(recv == a)`: answered here when that `==` is a builtin one
+        OPT_NEQ => {
+            static EQ: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let eq = find_method(class_of(recv), *EQ.get_or_init(|| sym("==")));
+            match opt_of(eq, 0) {
+                OPT_IDENTITY_EQ => return bool_v(recv != a),
+                OPT_STR_EQ => return bool_v(!(is_str(a) && rstr(recv).b == rstr(a).b)),
+                _ => {}
+            }
+        }
         OPT_STR_APPEND if is_str(a) && !is_frozen(recv) => {
             if a == recv {
                 let add = rstr(a).b.clone();
@@ -375,6 +401,11 @@ pub unsafe extern "C" fn kn_opt_check(cache: *mut CallCache, recv: V, mid: V, wa
         OPT_INT_TIMES | OPT_INT_UPTO | OPT_INT_DOWNTO => is_fix(recv),
         OPT_RANGE_EACH => {
             is_range(recv) && is_fix(rrange(recv).lo) && is_fix(rrange(recv).hi) && !(rrange(recv).excl && fix(rrange(recv).hi) == FIX_MIN)
+        }
+        // (Enumerable's in Ruby: runs `each`, which must be the builtin one too)
+        OPT_ARY_EACH_WITH_INDEX => {
+            static EACH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            is_ary(recv) && opt_of(find_method(class_of(recv), *EACH.get_or_init(|| sym("each"))), 1) == OPT_ARY_EACH
         }
         _ => is_ary(recv),
     };

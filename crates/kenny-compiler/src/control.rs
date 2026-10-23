@@ -26,6 +26,49 @@ impl<M: Module> Compiler<M> {
         fx.b.block_params(done)[0]
     }
 
+    /// `if` as a statement (its branches' statements too: `expr_void`).
+    pub(crate) fn if_void(&mut self, fx: &mut Fx, n: &IfNode) -> Value {
+        let c = self.expr(fx, &n.predicate());
+        let t = self.truthy_br(fx, c);
+        let then_b = fx.b.create_block();
+        let else_b = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.ins().brif(t, then_b, &[], else_b, &[]);
+        fx.b.switch_to_block(then_b);
+        self.stmts_void(fx, n.statements());
+        fx.b.ins().jump(done, &[]);
+        fx.b.switch_to_block(else_b);
+        if let Some(s) = n.subsequent() {
+            match s.as_else_node() {
+                Some(e) => self.stmts_void(fx, e.statements()),
+                None => {
+                    self.expr_void(fx, &s);
+                }
+            }
+        }
+        fx.b.ins().jump(done, &[]);
+        fx.b.switch_to_block(done);
+        self.nil(fx)
+    }
+    pub(crate) fn unless_void(&mut self, fx: &mut Fx, n: &UnlessNode) -> Value {
+        let c = self.expr(fx, &n.predicate());
+        let t = self.truthy_br(fx, c);
+        let then_b = fx.b.create_block();
+        let else_b = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.ins().brif(t, else_b, &[], then_b, &[]);
+        fx.b.switch_to_block(then_b);
+        self.stmts_void(fx, n.statements());
+        fx.b.ins().jump(done, &[]);
+        fx.b.switch_to_block(else_b);
+        if let Some(e) = n.else_clause() {
+            self.stmts_void(fx, e.statements());
+        }
+        fx.b.ins().jump(done, &[]);
+        fx.b.switch_to_block(done);
+        self.nil(fx)
+    }
+
     pub(crate) fn unless_node(&mut self, fx: &mut Fx, n: &UnlessNode) -> Value {
         let c = self.expr(fx, &n.predicate());
         let t = self.truthy_br(fx, c);

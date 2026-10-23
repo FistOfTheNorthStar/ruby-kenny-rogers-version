@@ -472,7 +472,23 @@ impl<M: Module> Compiler<M> {
                 lazy_env,
                 inl_self: Vec::new(),
                 bools: HashMap::new(),
+                owned: HashMap::new(),
             };
+            if self.refine_scope.is_none() && std::env::var_os("KENNY_NO_OWNED").is_none() {
+                for n in crate::owned::append_locals(&spec.analysis) {
+                    let plain = matches!(fx.locals.get(&n), Some(Local::Var(_)))
+                        && !fx.num_locals.contains_key(&n)
+                        && !fx.flocals.contains_key(&n)
+                        && !fx.int_sure.contains(&n)
+                        && !fx.vlocals.contains_key(&n);
+                    if plain {
+                        let v = fx.b.declare_var(ir::types::I8);
+                        let z = fx.b.ins().iconst(ir::types::I8, 0);
+                        fx.b.def_var(v, z);
+                        fx.owned.insert(n, v);
+                    }
+                }
+            }
             if spec.entry_check {
                 self.entry_check(&mut fx);
             }
@@ -559,6 +575,11 @@ impl<M: Module> Compiler<M> {
                         return self.local_box(fx, v, raw, kind);
                     }
                     let r = fx.b.use_var(v);
+                    // (the value may be kept: no longer appended to in place)
+                    if let Some(&ov) = fx.owned.get(name) {
+                        let z = fx.b.ins().iconst(ir::types::I8, 0);
+                        fx.b.def_var(ov, z);
+                    }
                     if !fx.licm.is_empty() {
                         self.licm_note(fx, name, r);
                     }
@@ -627,6 +648,10 @@ impl<M: Module> Compiler<M> {
                         return;
                     }
                     fx.b.def_var(v, val);
+                    if let Some(&ov) = fx.owned.get(name) {
+                        let z = fx.b.ins().iconst(ir::types::I8, 0);
+                        fx.b.def_var(ov, z);
+                    }
                     if let Some(&(_, kind)) = fx.num_locals.get(name) {
                         let k = fx.b.ins().iconst(ir::types::I8, 0);
                         fx.b.def_var(kind, k);

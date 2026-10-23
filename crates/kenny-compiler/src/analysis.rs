@@ -207,7 +207,8 @@ pub fn numeric_locals<'pr>(nodes: &[&Node<'pr>]) -> HashSet<Vec<u8>> {
         v.visit(n);
     }
     let ints = int_locals(nodes);
-    v.names.retain(|n| !ints.contains(n));
+    let strs = crate::owned::string_locals(nodes);
+    v.names.retain(|n| !ints.contains(n) && !strs.contains(n));
     v.names
 }
 

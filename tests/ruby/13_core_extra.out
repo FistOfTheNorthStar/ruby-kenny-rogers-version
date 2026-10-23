@@ -57,8 +57,8 @@
 [3.25, -1.0]
 [3]
 [nil]
-#<Encoding:ASCII-8BIT>
-#<Encoding:ASCII-8BIT>
+#<Encoding:BINARY (ASCII-8BIT)>
+#<Encoding:BINARY (ASCII-8BIT)>
 #<Encoding:UTF-8>
 "invalid base64"
 -- base64
@@ -74,9 +74,9 @@
 "\a\b\v\f"
 "\xFF\xFE"
 "café\xFF"
-#<Encoding:ASCII-8BIT>
+#<Encoding:BINARY (ASCII-8BIT)>
 #<Encoding:UTF-8>
-#<Encoding:ASCII-8BIT>
+#<Encoding:BINARY (ASCII-8BIT)>
 #<Encoding:US-ASCII>
 #<Encoding:UTF-8>
 #<Encoding:UTF-8>
@@ -404,7 +404,7 @@ true
 true
 42
 5
-#<Encoding:ASCII-8BIT>
+#<Encoding:BINARY (ASCII-8BIT)>
 true
 true
 true

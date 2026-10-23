@@ -25,7 +25,7 @@ true
 "#<Node:X @me=#<Node:X ...>, @list=[#<Node:X ...>]>"
 String
 String
-#<Encoding:ASCII-8BIT>
+#<Encoding:BINARY (ASCII-8BIT)>
 #<struct Empty>
 1
 [:ready, :ready, :ready, :ready]

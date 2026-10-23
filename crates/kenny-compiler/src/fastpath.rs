@@ -664,6 +664,9 @@ impl<M: Module> Compiler<M> {
             if let Some((recv, arg)) = numeric_call(&c) {
                 let op = c.name().as_slice().to_vec();
                 let (rs, as_) = (recv.as_symbol_node().is_some(), arg.as_symbol_node().is_some());
+                if let (true, Some((sn, ix, lit))) = (self.refine_scope.is_none(), str_idx_eq_parts(&c)) {
+                    return Num::Boxed(self.str_idx_eq(fx, &c, &sn, &ix, &lit));
+                }
                 if matches!(op.as_slice(), b"==" | b"!=") && (rs || as_) && self.refine_scope.is_none() {
                     let a = self.expr(fx, &recv);
                     let b = self.expr(fx, &arg);
@@ -677,6 +680,41 @@ impl<M: Module> Compiler<M> {
             }
         }
         Num::Boxed(self.expr(fx, node))
+    }
+
+    /// `s[i] == "x"` / `s[i] != "x"`: compared in place when `s` is a plain String
+    /// (kenny-runtime string.rs `kn_str_idx_eq`), else `s[i]` and the literal made and `==`
+    /// / `!=` called.
+    fn str_idx_eq(&mut self, fx: &mut Fx, c: &ruby_prism::CallNode, sn: &Node, ix: &Node, lit: &ruby_prism::StringNode) -> Value {
+        let neq = c.name().as_slice() == b"!=";
+        let s = self.expr(fx, sn);
+        let i = self.expr(fx, ix);
+        let bytes = lit.unescaped().to_vec();
+        self.cur_offset = c.message_loc().map(|l| l.start_offset()).unwrap_or(c.location().start_offset());
+        let (p, l) = self.str_ptr(fx, &bytes);
+        let ne = fx.b.ins().iconst(I64, neq as i64);
+        let r = self.call(fx, "kn_str_idx_eq", &[s, i, p, l, ne]);
+        let undef = fx.b.ins().icmp_imm_s(IntCC::Equal, r, UNDEF);
+        let slow = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.set_cold_block(slow);
+        fx.b.ins().brif(undef, slow, &[], done, &[r.into()]);
+        fx.b.switch_to_block(slow);
+        let at = self.cur_offset;
+        self.cur_offset = c.receiver().and_then(|r| r.as_call_node()).and_then(|r| r.opening_loc()).map(|l| l.start_offset()).unwrap_or(at);
+        let ch = self.send(fx, s, b"[]", &[i], None);
+        let lv = if lit.is_mutable() {
+            let (p, l) = self.str_ptr(fx, &bytes);
+            self.call(fx, "kn_str_new", &[p, l])
+        } else {
+            self.str_lit(fx, &bytes)
+        };
+        self.cur_offset = at;
+        let v = self.send(fx, ch, c.name().as_slice(), &[lv], None);
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
     }
 
     /// `a == b` / `a != b` with a Symbol literal on one side (`lit_recv`: on the left):
@@ -1332,6 +1370,58 @@ impl<M: Module> Compiler<M> {
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(done);
         fx.b.block_params(done)[0]
+    }
+
+    /// An inline loop's guard without a call (inline.rs): to `ok` when `recv` is a Fixnum
+    /// (`int`: times/upto/downto) or a plain Array (its class is Array itself) and those
+    /// methods are the public builtins (`KN_DIRECT.flags`), else to `check`.
+    pub(crate) fn loop_guard_fast(&mut self, fx: &mut Fx, recv: Value, int: bool, ok: Block, check: Block) {
+        let f = mem();
+        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+        let dir = fx.b.ins().symbol_value(I64, gv);
+        let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
+        if int {
+            let bit = fx.b.ins().band_imm_s(flags, DIRECT_INT_ITER);
+            let fix = fx.b.ins().band_imm_s(recv, 1);
+            let fix = fx.b.ins().ishl_imm_u(fix, DIRECT_INT_ITER.trailing_zeros() as i64);
+            let good = fx.b.ins().band(bit, fix);
+            fx.b.ins().brif(good, ok, &[], check, &[]);
+            return;
+        }
+        let r = fx.b.ins().rotr_imm_s(recv, 3);
+        let r = fx.b.ins().iadd_imm_s(r, -2);
+        let heap = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, r, (1i64 << 61) - 2);
+        let b0 = fx.b.create_block();
+        fx.b.ins().brif(heap, b0, &[], check, &[]);
+        fx.b.switch_to_block(b0);
+        let k = fx.b.ins().load(I64, f, recv, 0);
+        let ak = fx.b.ins().load(I64, f, dir, KD_ARRAY_CLASS);
+        let bits = fx.b.ins().band_imm_s(flags, DIRECT_ARY_ITER);
+        let no_bits = fx.b.ins().bxor_imm_s(bits, DIRECT_ARY_ITER);
+        let other = fx.b.ins().bxor(k, ak);
+        let bad = fx.b.ins().bor(other, no_bits);
+        fx.b.ins().brif(bad, check, &[], ok, &[]);
+    }
+
+    /// Element `i` (untagged) of the Array `recv` for an inline loop, or on to `end` (with
+    /// `end_args`) past its end; read again each time, as the block may change the Array
+    /// (capacity first, as SVec::snap does).
+    pub(crate) fn loop_ary_elem(&mut self, fx: &mut Fx, recv: Value, i: Value, end: Block, end_args: &[Value]) -> Value {
+        let f = mem();
+        let cap_addr = fx.b.ins().iadd_imm_s(recv, ARY_CAP as i64);
+        let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
+        let ptr = fx.b.ins().load(I64, f, recv, ARY_PTR);
+        let len = fx.b.ins().load(I64, f, recv, ARY_LEN);
+        let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
+        let n = fx.b.ins().umin(len, capn);
+        let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, i, n);
+        let ld = fx.b.create_block();
+        let args: Vec<cranelift_codegen::ir::BlockArg> = end_args.iter().map(|&v| v.into()).collect();
+        fx.b.ins().brif(inb, ld, &[], end, &args);
+        fx.b.switch_to_block(ld);
+        let off = fx.b.ins().ishl_imm_u(i, 3);
+        let addr = fx.b.ins().iadd(ptr, off);
+        fx.b.ins().load(I64, f, addr, 0)
     }
 
     /// `recv.getbyte(i)` (`val` None) or `recv.setbyte(i, val)` without a call when `recv` is
@@ -2434,6 +2524,9 @@ const STR_PTR: i32 = 16;
 const STR_LEN: i32 = 24;
 const STR_CAP: i32 = 32;
 const DIRECT_ARY_AREF: i64 = 8;
+/// kenny-runtime core.rs `DIRECT_ARY_ITER` / `DIRECT_INT_ITER`
+const DIRECT_ARY_ITER: i64 = 4096;
+const DIRECT_INT_ITER: i64 = 8192;
 const DIRECT_ARY_ASET: i64 = 16;
 /// kenny-runtime core.rs `RArray::v` (an `SVec`: ptr, len, cap).
 const ARY_PTR: i32 = 16;
@@ -2491,6 +2584,30 @@ fn int_cc(op: &[u8]) -> IntCC {
         b"==" => IntCC::Equal,
         _ => IntCC::NotEqual,
     }
+}
+
+/// `s[i] == "x"` / `s[i] != "x"`: (s, i, the literal).
+fn str_idx_eq_parts<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<(Node<'pr>, Node<'pr>, ruby_prism::StringNode<'pr>)> {
+    if !matches!(c.name().as_slice(), b"==" | b"!=") || c.block().is_some() || c.is_safe_navigation() {
+        return None;
+    }
+    let args: Vec<Node> = c.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    let lit = arg.as_string_node()?;
+    let r = c.receiver()?.as_call_node()?;
+    if r.name().as_slice() != b"[]" || r.block().is_some() || r.is_safe_navigation() {
+        return None;
+    }
+    let s = r.receiver()?;
+    let mut ra: Vec<Node> = r.arguments()?.arguments().iter().collect();
+    if ra.len() != 1 {
+        return None;
+    }
+    let ix = ra.pop().unwrap();
+    if ix.as_splat_node().is_some() || ix.as_keyword_hash_node().is_some() || ix.as_block_argument_node().is_some() || ix.as_string_node().is_some() || ix.as_range_node().is_some() {
+        return None;
+    }
+    Some((s, ix, lit))
 }
 
 pub(crate) fn is_fast_op(op: &[u8]) -> bool {
