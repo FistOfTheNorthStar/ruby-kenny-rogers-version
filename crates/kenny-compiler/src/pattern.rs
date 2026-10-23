@@ -230,7 +230,7 @@ impl<M: Module> Compiler<M> {
             if let Some(inner) = g.statements().and_then(|s| s.body().iter().next()) {
                 self.pattern(fx, &inner, v, fail);
                 let c = self.expr(fx, &g.predicate());
-                let t = self.truthy(fx, c);
+                let t = self.truthy_br(fx, c);
                 let ok = fx.b.create_block();
                 fx.b.ins().brif(t, fail, &[], ok, &[]);
                 fx.b.switch_to_block(ok);

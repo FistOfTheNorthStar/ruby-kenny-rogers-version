@@ -47,7 +47,10 @@ fn set_vis(c: *mut Class, names: &[u32], vis: u8) -> V {
     for &id in names {
         let own = unsafe { (*c).methods.get(&id).copied() };
         match own {
-            Some(m) => unsafe { (*(m as *mut Method)).vis = vis },
+            Some(m) => unsafe {
+                crate::core::touch_method_name(c, id);
+                (*(m as *mut Method)).vis = vis
+            },
             None => {
                 let m = find_method(c, id);
                 if m.is_null() {

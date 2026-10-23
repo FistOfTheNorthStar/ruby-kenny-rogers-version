@@ -585,7 +585,18 @@ pub extern "C" fn kn_env_new(parent: *mut Env, blk: V, nslots: u64) -> *mut Env 
 /// `v.is_a?(c)` for the builtin is_a?/kind_of? (compiled code checked that it is).
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_is_a(v: V, c: V) -> V {
-    bool_v(is_class(c) && is_a(v, c as *mut Class))
+    is_a_v(v, c)
+}
+/// `recv.is_a?(c)` / `recv.kind_of?(c)` at a call site whose inline cache missed
+/// (kenny-compiler fastpath.rs `STUBS`): a heap receiver's is_a? is the builtin one while
+/// `IS_A_TOUCHED` is unset, so a site that sees many classes skips the method lookup.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_is_a_send(cache: *mut CallCache, recv: V, mid: V, c: V, explicit: u64) -> V {
+    use std::sync::atomic::Ordering::Relaxed;
+    if is_heap(recv) && is_class(c) && crate::core::DIRECT_READY.load(Relaxed) && !crate::core::IS_A_TOUCHED.load(Relaxed) {
+        return bool_v(is_a(recv, c as *mut Class));
+    }
+    unsafe { crate::opt::kn_send1(cache, recv, mid, c, explicit) }
 }
 /// `kn_is_a` for a heap receiver at a call site whose cache entry has the builtin is_a? for
 /// the receiver's class: also records the answer for `c` in that way's `attr` word
@@ -593,7 +604,10 @@ pub extern "C" fn kn_is_a(v: V, c: V) -> V {
 /// one OS thread runs Ruby code: entries are changed in place.)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_is_a_fill(cache: *mut CallCache, v: V, c: V) -> V {
-    let r = is_class(c) && is_a(v, c as *mut Class);
+    if !is_class(c) {
+        return is_a_v(v, c);
+    }
+    let r = is_a(v, c as *mut Class);
     if is_class(c) && (c as u64) < 1 << 47 && !crate::mt::multi() {
         let e = unsafe { (*cache).entry.load(std::sync::atomic::Ordering::Acquire) };
         if !e.is_null() {
@@ -629,6 +643,18 @@ pub unsafe extern "C" fn kn_static_fill(slot: *mut [u64; 2], recv: V, mid: V, ex
             (*slot)[0] = k as u64;
             (*slot)[1] = KN_DIRECT.serial.load(std::sync::atomic::Ordering::Acquire);
         }
+    }
+    QNIL
+}
+/// On entry to a compiled method that calls itself (kenny-compiler statics.rs
+/// `entry_check`): the stack below `KN_DIRECT.entry_limit` or a collection pending.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_entry_slow() -> V {
+    if crate::gc::safepoint() {
+        return UNDEF;
+    }
+    if crate::core::approx_sp() < pst().stack_limit {
+        return raise(rt().c.system_stack_error, "stack level too deep");
     }
     QNIL
 }
@@ -1422,6 +1448,12 @@ const PROTECTED_OPS: &[&str] = &["+", "-", "*", "/", "%", "<", "<=", ">", ">=", 
 /// 3 = singleton def (`def obj.name`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owner_slot: *mut V, params: *const u8, fast: usize) -> V {
+    unsafe { kn_def_claim(target, kind, id, f, owner_slot, params, fast, std::ptr::null_mut()) }
+}
+/// `kn_def` of a method that calls itself, with its word for those calls (kenny-compiler
+/// statics.rs `self_call`, core.rs `claim`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn, owner_slot: *mut V, params: *const u8, fast: usize, claim: *mut u64) -> V {
     let r = rt();
     let cls: *mut Class = match kind {
         0 => cref_class(target),
@@ -1471,6 +1503,9 @@ pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owne
         }
     }
     let m = add_method(cls, sym_id(id), Body::Compiled(f));
+    if !claim.is_null() {
+        crate::core::claim(claim, cls, sym_id(id), fast);
+    }
     unsafe {
         let mm = &mut *(m as *mut Method);
         mm.params = params;
@@ -1527,7 +1562,10 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
     }
     let body = crate::kernel::clone_body(unsafe { &(*m).body });
     let nm = Box::into_raw(Box::new(Method { fast: unsafe { (*m).fast }, body, owner: unsafe { (*m).owner }, name: new, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
-    unsafe { (*c).methods.insert(new, nm) };
+    if unsafe { (*c).methods.insert(new, nm) }.is_none() {
+        crate::core::method_name_count(new, true);
+    }
+    crate::core::touch_method_name(c, new);
     bump_serial();
     mksym(new)
 }

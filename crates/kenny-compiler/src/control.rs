@@ -7,7 +7,7 @@ use ruby_prism::*;
 impl<M: Module> Compiler<M> {
     pub(crate) fn if_node(&mut self, fx: &mut Fx, n: &IfNode) -> Value {
         let c = self.expr(fx, &n.predicate());
-        let t = self.truthy(fx, c);
+        let t = self.truthy_br(fx, c);
         let then_b = fx.b.create_block();
         let else_b = fx.b.create_block();
         let done = fx.b.create_block();
@@ -28,7 +28,7 @@ impl<M: Module> Compiler<M> {
 
     pub(crate) fn unless_node(&mut self, fx: &mut Fx, n: &UnlessNode) -> Value {
         let c = self.expr(fx, &n.predicate());
-        let t = self.truthy(fx, c);
+        let t = self.truthy_br(fx, c);
         let then_b = fx.b.create_block();
         let else_b = fx.b.create_block();
         let done = fx.b.create_block();
@@ -79,7 +79,7 @@ impl<M: Module> Compiler<M> {
         fx.b.ins().jump(if do_while { body_b } else { header }, &[]);
         fx.b.switch_to_block(header);
         let c = self.expr(fx, pred);
-        let t = self.truthy(fx, c);
+        let t = self.truthy_br(fx, c);
         let nil = self.nil(fx);
         if until {
             fx.b.ins().brif(t, exit, &[nil.into()], body_b, &[]);
@@ -279,7 +279,7 @@ impl<M: Module> Compiler<M> {
                     let body_bb = fx.b.create_block();
                     for cls in classes {
                         let m = self.callc(fx, "kn_exc_match", &[exc, cls]);
-                        let t = self.truthy(fx, m);
+                        let t = self.truthy_br(fx, m);
                         let next = fx.b.create_block();
                         fx.b.ins().brif(t, body_bb, &[], next, &[]);
                         fx.b.switch_to_block(next);
@@ -349,7 +349,7 @@ impl<M: Module> Compiler<M> {
         let s = self.sym_val(fx, b"StandardError");
         let cls = self.callc(fx, "kn_const_get", &[cref, s]);
         let m = self.callc(fx, "kn_exc_match", &[exc, cls]);
-        let t = self.truthy(fx, m);
+        let t = self.truthy_br(fx, m);
         let body_bb = fx.b.create_block();
         let outer = *fx.unwind.last().unwrap();
         fx.b.ins().brif(t, body_bb, &[], outer, &[]);

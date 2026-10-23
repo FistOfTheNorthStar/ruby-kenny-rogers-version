@@ -92,6 +92,19 @@ impl<M: Module> Compiler<M> {
         match args.splat {
             Some(a) => self.call(fx, "kn_send_splat", &[cache, recv, mid, a, blk]),
             None => {
+                let no_blk = blk_given.is_none();
+                if !explicit && no_blk {
+                    // (the argument buffer only on the way that uses it)
+                    let vals = args.vals.clone();
+                    let dynamic = |c: &mut Self, fx: &mut Fx| {
+                        let n = c.iconst(fx, vals.len() as i64);
+                        let buf = c.args_buf(fx, &vals);
+                        c.call_stub(fx, crate::fastpath::STUB_SEND_N, &[cache, recv, mid, n, buf, blk])
+                    };
+                    if let Some(r) = self.static_call(fx, recv, name, mid, &args.vals, dynamic) {
+                        return r;
+                    }
+                }
                 let n = self.iconst(fx, args.vals.len() as i64);
                 let buf = self.args_buf(fx, &args.vals);
                 // `obj.foo` must not reach a private method; `foo` / `self.foo` may.
@@ -106,13 +119,6 @@ impl<M: Module> Compiler<M> {
                         | b"each_key" | b"each_value" | b"count" | b"sum" | b"min_by" | b"max_by" | b"each_slice" | b"zip"
                         | b"new" | b"define_method" | b"instance_eval" | b"class_eval" | b"fetch" | b"synchronize"
                 );
-                let no_blk = blk_given.is_none();
-                if !explicit && no_blk {
-                    let vals = args.vals.clone();
-                    if let Some(r) = self.static_call(fx, recv, name, mid, &vals, |c, fx| c.call_stub(fx, crate::fastpath::STUB_SEND_N, &args6)) {
-                        return r;
-                    }
-                }
                 if crate::fastpath::may_be_ruby_method(name) && !core_iter {
                     self.call_stub(fx, if explicit { crate::fastpath::STUB_SEND_PUB_N } else { crate::fastpath::STUB_SEND_N }, &args6)
                 } else {

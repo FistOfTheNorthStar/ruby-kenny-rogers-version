@@ -1,0 +1,22 @@
+6765
+[:new, 2]
+[:new, 2]
+["Walker", "Walker"]
+["LoudWalker", "LoudWalker", "LoudWalker", :loud]
+["Walker", "Walker"]
+5
+5
+-1
+3
+[:undef, NoMethodError]
+3
+1200
+:bottom
+:bottom
+[:bound, NoMethodError]
+[:missing, :haunt, 1]
+SystemStackError
+100
+[610, 987, 1597]
+2584
+50

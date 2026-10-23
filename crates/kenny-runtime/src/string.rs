@@ -104,10 +104,20 @@ pub fn find(h: &[u8], n: &[u8], from: usize) -> Option<usize> {
     if n.is_empty() {
         return if from <= h.len() { Some(from) } else { None };
     }
-    if n.len() > h.len() {
+    if n.len() > h.len() || from > h.len() - n.len() {
         return None;
     }
-    (from..=h.len() - n.len()).find(|&i| &h[i..i + n.len()] == n)
+    // candidates by the first byte, then the rest compared
+    let last = h.len() - n.len();
+    let mut i = from;
+    while i <= last {
+        let j = i + h[i..=last].iter().position(|&b| b == n[0])?;
+        if h[j + 1..j + n.len()] == n[1..] {
+            return Some(j);
+        }
+        i = j + 1;
+    }
+    None
 }
 fn rfind(h: &[u8], n: &[u8]) -> Option<usize> {
     if n.len() > h.len() {
@@ -129,11 +139,12 @@ fn strip_r(x: &[u8]) -> &[u8] {
 }
 
 fn split(s: V, sep: V, limit: i64) -> V {
-    let bytes = rstr(s).b.clone();
+    // (no Ruby code runs here: s and sep stay as they are)
+    let bytes: &[u8] = &rstr(s).b;
     let mut parts: Vec<Vec<u8>> = Vec::new();
     let awk = sep == QNIL || (is_str(sep) && rstr(sep).b == b" ");
     if awk {
-        let mut rest: &[u8] = strip_l(&bytes);
+        let mut rest: &[u8] = strip_l(bytes);
         while !rest.is_empty() {
             if limit > 0 && parts.len() as i64 == limit - 1 {
                 parts.push(rest.to_vec());
@@ -148,9 +159,9 @@ fn split(s: V, sep: V, limit: i64) -> V {
             parts.push(c.to_string().into_bytes());
         }
     } else if is_str(sep) {
-        let sp = rstr(sep).b.clone();
+        let sp: &[u8] = &rstr(sep).b;
         let mut start = 0;
-        while let Some(i) = find(&bytes, &sp, start) {
+        while let Some(i) = find(bytes, sp, start) {
             if limit > 0 && parts.len() as i64 == limit - 1 {
                 break;
             }
@@ -860,7 +871,7 @@ pub fn init() {
     defn(c, "to_i", 0, 1, |s, a, _| {
         let base = a.first().map(|x| fix(*x) as u32).unwrap_or(10);
         if base == 10 {
-            return crate::kernel::parse_int(&rstr(s).b.clone(), false).unwrap_or(mkfix(0));
+            return crate::kernel::parse_int(&rstr(s).b, false).unwrap_or(mkfix(0));
         }
         let t = s_of(s);
         let t = t.trim();

@@ -29,6 +29,8 @@ pub(crate) struct FnSpec<'a, 'pr> {
     /// For a block: env hops from its parent env to the env of the lambda (or method
     /// body block) that its `return` returns from; None: the method's (`method_env`)
     pub ret_hops: Option<u32>,
+    /// statics.rs `entry_check` (a method that calls itself)
+    pub entry_check: bool,
 }
 
 pub(crate) struct BlockArity {
@@ -136,6 +138,7 @@ impl<M: Module> Compiler<M> {
             bt_label: None,
             bmethod: false,
             ret_hops: None,
+            entry_check: false,
         };
         Ok(self.build_fn(spec, |c, fx| c.expr(fx, &stmts)))
     }
@@ -417,6 +420,7 @@ impl<M: Module> Compiler<M> {
                 b,
                 kind: spec.kind,
                 lambda: spec.lambda,
+                self_fid: if spec.kind == ScopeKind::Method { spec.predeclared } else { None },
                 ret_here,
                 ret_hops: spec.ret_hops,
                 self_v,
@@ -469,6 +473,9 @@ impl<M: Module> Compiler<M> {
                 inl_self: Vec::new(),
                 bools: HashMap::new(),
             };
+            if spec.entry_check {
+                self.entry_check(&mut fx);
+            }
             let v = body(self, &mut fx);
             fx.b.ins().return_(&[v]);
             // unwinding out of this function
@@ -1344,6 +1351,7 @@ impl<M: Module> Compiler<M> {
             bt_label,
             bmethod: false,
             ret_hops: None,
+            entry_check: false,
         };
         // only required parameters (and maybe &blk): a fast entry taking them in registers
         // (the app's own code: in gems the extra entry and call guards cost more code than
@@ -1354,6 +1362,14 @@ impl<M: Module> Compiler<M> {
         if fast_n.is_some() && !singleton {
             spec.predeclared = self.static_fid_for_def(&name, offset);
         }
+        // calls to itself: checked by a word (statics.rs `self_call`), which the def hands over
+        let claim = match (spec.predeclared, fast_n, &body) {
+            (Some(fid), Some(n), Some(b)) if crate::statics::calls_itself(&name, n, b) => {
+                spec.entry_check = true;
+                Some(self.claim_word_id(fid))
+            }
+            _ => None,
+        };
         let def_line = self.line_of(offset) as u32;
         // (code inlined into this body is compiled with no inline context of its own)
         let saved_ctx = std::mem::take(&mut self.inline_ctx);
@@ -1389,7 +1405,14 @@ impl<M: Module> Compiler<M> {
             desc.extend(self.kw_marker(offset).unwrap_or_default());
         }
         let (pd, _) = self.str_ptr(fx, &desc);
-        self.callc(fx, "kn_def", &[target, k, s, addr, slot, pd, fast])
+        match claim {
+            Some(id) => {
+                let gv = self.module.declare_data_in_func(id, fx.b.func);
+                let w = fx.b.ins().symbol_value(I64, gv);
+                self.callc(fx, "kn_def_claim", &[target, k, s, addr, slot, pd, fast, w])
+            }
+            None => self.callc(fx, "kn_def", &[target, k, s, addr, slot, pd, fast]),
+        }
     }
 
     /// Compile a block or lambda literal into a Proc value.
@@ -1431,6 +1454,7 @@ impl<M: Module> Compiler<M> {
             bt_label: None,
             bmethod,
             ret_hops,
+            entry_check: false,
         };
         let mut arity = BlockArity { min: 0, max: -1, autosplat: false };
         let fid = {
@@ -1481,6 +1505,7 @@ impl<M: Module> Compiler<M> {
             bt_label: None,
             bmethod: false,
             ret_hops: None,
+            entry_check: false,
         };
         let fid = self.build_fn(spec, |c, fx| match &body {
             Some(b) => c.expr(fx, b),

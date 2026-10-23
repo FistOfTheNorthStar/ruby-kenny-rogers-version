@@ -144,6 +144,7 @@ pub fn init() {
     tag(c.integer, "downto", OPT_INT_DOWNTO);
     tag(c.range, "each", OPT_RANGE_EACH);
     crate::core::KN_DIRECT.array_class.store(c.array as usize, std::sync::atomic::Ordering::Relaxed);
+    crate::core::KN_DIRECT.string_class.store(c.string as usize, std::sync::atomic::Ordering::Relaxed);
     crate::core::DIRECT_READY.store(true, std::sync::atomic::Ordering::SeqCst);
     crate::core::update_direct_flags();
 }
@@ -314,7 +315,7 @@ unsafe fn send1_found(m: *const Method, recv: V, mid: V, a: V, explicit: u64) ->
             return recv;
         }
         OPT_IDENTITY_EQ => return bool_v(recv == a),
-        OPT_IS_A => return bool_v(is_class(a) && is_a(recv, a as *mut Class)),
+        OPT_IS_A => return is_a_v(recv, a),
         OPT_MOD_EQQ => return bool_v(is_a(a, recv as *mut Class)),
         OPT_STR_GETBYTE if is_fix(a) => {
             let b = &rstr(recv).b;

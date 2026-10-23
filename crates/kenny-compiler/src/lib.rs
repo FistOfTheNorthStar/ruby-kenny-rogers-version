@@ -44,6 +44,8 @@ pub const OWNED_CONST: u8 = 2;
 /// Offsets into runtime structs read by compiled code.
 pub const PROC_ENV_OFFSET: i32 = 24;
 pub const ENV_PARENT: i32 = 0;
+/// kenny-runtime core.rs `KnDirect::entry_limit`
+pub const KN_DIRECT_ENTRY_LIMIT: i32 = 56;
 pub const ENV_BLK: i32 = 8;
 pub const ENV_SLOTS: i32 = 16;
 
@@ -93,6 +95,8 @@ pub(crate) struct Fx<'a> {
     pub b: FunctionBuilder<'a>,
     pub kind: ScopeKind,
     pub lambda: bool,
+    /// a method's own fast entry (statics.rs: the `def`'s static target), in its body
+    pub self_fid: Option<FuncId>,
     /// a block whose `return` returns from it (a lambda, a method body block): its unwind
     /// path catches its own tag (`tag_v`)
     pub ret_here: bool,
@@ -201,6 +205,8 @@ pub struct Compiler<M: Module> {
     /// keyword `def`s of the program by name (statics.rs `KwDef`)
     pub(crate) kw_defs: HashMap<Vec<u8>, Vec<statics::KwDef>>,
     pub(crate) static_defined: HashSet<FuncId>,
+    /// statics.rs `claim_word`: a def's word for its calls to itself
+    pub(crate) claim_words: HashMap<FuncId, DataId>,
     pub(crate) static_counter: usize,
     /// (file, offset) of every `def` scanned -> its enclosing class/module names
     pub(crate) def_lex: HashMap<(PathBuf, usize), Vec<Vec<u8>>>,
@@ -336,7 +342,9 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_define_module", &[I64, I64], &[I64]),
     ("kn_singleton_class_for", &[I64], &[I64]),
     ("kn_def", &[I64, I64, I64, I64, I64, I64, I64], &[I64]),
+    ("kn_def_claim", &[I64, I64, I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_static_fill", &[I64, I64, I64, I64], &[I64]),
+    ("kn_entry_slow", &[], &[I64]),
     ("kn_new_fill", &[I64, I64, I64], &[I64]),
     ("kn_obj_alloc", &[I64], &[I64]),
     ("kn_math1", &[I64, ir::types::F64], &[ir::types::F64]),
@@ -406,6 +414,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_send_refined", &[I64, I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_send0", &[I64, I64, I64, I64], &[I64]),
     ("kn_send1", &[I64, I64, I64, I64, I64], &[I64]),
+    ("kn_is_a_send", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_send2", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_attr_get", &[I64, I64, I64, I64], &[I64]),
     ("kn_is_a", &[I64, I64], &[I64]),
@@ -512,6 +521,7 @@ impl<M: Module> Compiler<M> {
             static_defs: HashMap::new(),
             kw_defs: HashMap::new(),
             static_defined: HashSet::new(),
+            claim_words: HashMap::new(),
             static_counter: 0,
             def_lex: HashMap::new(),
             inline_defs: HashMap::new(),
@@ -848,7 +858,9 @@ impl<M: Module> Compiler<M> {
     }
     pub(crate) fn sym_val(&mut self, fx: &mut Fx, name: &[u8]) -> Value {
         let i = self.sym_index(name);
-        fx.b.ins().load(I64, mem(), fx.syms, (i * 8) as i32)
+        // (filled at startup, before any Ruby code runs: the load may move to where the
+        // value is used, often a cold path)
+        fx.b.ins().load(I64, mem().with_readonly().with_can_move(), fx.syms, (i * 8) as i32)
     }
     pub(crate) fn cache_ptr(&mut self, fx: &mut Fx, words: usize) -> Value {
         let i = self.cache_alloc(words);
@@ -894,6 +906,14 @@ impl<M: Module> Compiler<M> {
         }
         let m = fx.b.ins().band_imm_s(v, !QNIL);
         fx.b.ins().icmp_imm_s(IntCC::NotEqual, m, 0)
+    }
+    /// Ruby truthiness, for a branch only (`brif`: nonzero is true): no compare with 0
+    /// (fastpath.rs `require_zero`).
+    pub(crate) fn truthy_br(&mut self, fx: &mut Fx, v: Value) -> Value {
+        if let Some(&c) = fx.bools.get(&v) {
+            return c;
+        }
+        fx.b.ins().band_imm_s(v, !QNIL)
     }
     pub(crate) fn bool_v(&mut self, fx: &mut Fx, c: Value) -> Value {
         let t = fx.b.ins().iconst(I64, QTRUE);
@@ -968,7 +988,7 @@ impl<M: Module> Compiler<M> {
 
     /// GC safepoint for loop back-edges: a load and a rarely taken branch.
     pub(crate) fn safepoint(&mut self, fx: &mut Fx) {
-        let flag = fx.b.ins().load(ir::types::I8, mem(), fx.gcflag, 0);
+        let flag = fx.b.ins().uload8(ir::types::I32, mem(), fx.gcflag, 0);
         let slow = fx.b.create_block();
         let cont = fx.b.create_block();
         fx.b.ins().brif(flag, slow, &[], cont, &[]);

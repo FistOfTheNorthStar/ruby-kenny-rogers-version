@@ -1,0 +1,2 @@
+[:a, :b, :c, :m, :int, :str, :other, :other, :other]
+[:a, :b, :c, :m, :c, :str, :other, :other, :other]
