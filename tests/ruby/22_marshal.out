@@ -139,7 +139,7 @@ true
 2023-11-15 03:43:20.000005 +0530
 19800
 5
-[#<Encoding:UTF-8>, #<Encoding:ASCII-8BIT>, #<Encoding:US-ASCII>]
+[#<Encoding:UTF-8>, #<Encoding:BINARY (ASCII-8BIT)>, #<Encoding:US-ASCII>]
 :ü
 [:a, :b, :a]
 /ab+c/ix
@@ -183,7 +183,7 @@ true
 8
 "\x04\bi\x06"
 "\x04\b[\x06[\x06i\x06"
-#<Encoding:ASCII-8BIT>
+#<Encoding:BINARY (ASCII-8BIT)>
 == errors
 TypeError: no _dump_data is defined for class Proc
 TypeError: no _dump_data is defined for class Method

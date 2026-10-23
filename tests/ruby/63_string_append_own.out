@@ -1,0 +1,19 @@
+"01234!"
+"01234"
+["a", "ab"]
+["x", "xx", "xxx", "xxxx"]
+["0123", [0, 1, 2, 3, "0", "012"]]
+["abcd0", "abcd1", "abcd2"]
+"abc"
+[false, "ab"]
+"no implicit conversion of Integer into String"
+"xconv"
+["mx", String, "m", MyStr]
+["aé", #<Encoding:UTF-8>, 2, #<Encoding:BINARY (ASCII-8BIT)>, 1]
+"01<boom>3"
+"yyy"
+"[]y[]y[]y"
+"yyy"
+"YYY"
+"AB"
+false

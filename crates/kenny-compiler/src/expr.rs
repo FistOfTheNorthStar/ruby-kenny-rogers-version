@@ -182,6 +182,13 @@ impl<M: Module> Compiler<M> {
             }
             let v = self.expr(fx, &n.value());
             self.local_set(fx, &name, depth, v);
+            // a new String only this local has (owned.rs)
+            if depth == 0 && fx.inline_levels.is_empty() && crate::owned::fresh_str(&n.value()) {
+                if let Some(&ov) = fx.owned.get(&name) {
+                    let one = fx.b.ins().iconst(cranelift_codegen::ir::types::I8, 1);
+                    fx.b.def_var(ov, one);
+                }
+            }
             return Some(crate::fastpath::Num::Boxed(v));
         }
         if let Some(n) = node.as_local_variable_operator_write_node() {
@@ -198,6 +205,42 @@ impl<M: Module> Compiler<M> {
         None
     }
 
+    /// `s = s + x` / `s += x` as a statement, `s` a local of `fx.owned` (owned.rs):
+    /// appended to in place while its owned register is set.
+    fn append_own(&mut self, fx: &mut Fx, node: &Node, name: &[u8], ov: Variable) -> Value {
+        use cranelift_codegen::ir::types::I8;
+        self.cur_offset = node.location().start_offset();
+        let arg = crate::owned::append_arg(node, name).unwrap();
+        let Some(&Local::Var(var)) = fx.locals.get(name) else { unreachable!() };
+        let cur = fx.b.use_var(var);
+        let e = self.expr(fx, &arg);
+        self.cur_offset = match node.as_local_variable_write_node() {
+            Some(w) => w.value().as_call_node().and_then(|c| c.message_loc()).map(|l| l.start_offset()),
+            None => node.as_local_variable_operator_write_node().map(|w| w.binary_operator_loc().start_offset()),
+        }
+        .unwrap_or(node.location().start_offset());
+        let own8 = fx.b.use_var(ov);
+        let own = fx.b.ins().uextend(I64, own8);
+        let r = self.call(fx, "kn_str_append_own", &[cur, e, own]);
+        let undef = fx.b.ins().icmp_imm_s(IntCC::Equal, r, UNDEF);
+        let slow = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.append_block_param(done, I8);
+        fx.b.set_cold_block(slow);
+        let one = fx.b.ins().iconst(I8, 1);
+        fx.b.ins().brif(undef, slow, &[], done, &[r.into(), one.into()]);
+        fx.b.switch_to_block(slow);
+        let v = self.send(fx, cur, b"+", &[e], None);
+        let zero = fx.b.ins().iconst(I8, 0);
+        fx.b.ins().jump(done, &[v.into(), zero.into()]);
+        fx.b.switch_to_block(done);
+        let (v, o) = (fx.b.block_params(done)[0], fx.b.block_params(done)[1]);
+        fx.b.def_var(var, v);
+        fx.b.def_var(ov, o);
+        self.nil(fx)
+    }
+
     /// Statements whose values are not used (loop bodies).
     pub(crate) fn stmts_void(&mut self, fx: &mut Fx, s: Option<StatementsNode>) {
         if let Some(s) = s {
@@ -208,6 +251,20 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn expr_void(&mut self, fx: &mut Fx, node: &Node) -> Value {
+        if !fx.owned.is_empty() && fx.inline_levels.is_empty() {
+            if let Some(name) = crate::owned::append_target(node) {
+                if let Some(&ov) = fx.owned.get(&name) {
+                    return self.append_own(fx, node, &name, ov);
+                }
+            }
+            // (so that appends in its branches are statements too)
+            if let Some(n) = node.as_if_node() {
+                return self.if_void(fx, &n);
+            }
+            if let Some(n) = node.as_unless_node() {
+                return self.unless_void(fx, &n);
+            }
+        }
         if let Some(w) = node.as_local_variable_write_node() {
             if w.depth() == 0 && fx.inline_levels.is_empty() && fx.vlocals.contains_key(w.name().as_slice()) {
                 if let Some(c) = w.value().as_call_node() {

@@ -12,12 +12,23 @@ fn b(v: V) -> &'static mut SVec<u8> {
 fn s_of(v: V) -> String {
     String::from_utf8_lossy(&rstr(v).b).into_owned()
 }
+/// A String argument's bytes, converted with `to_str` (Err: the exception raised).
 fn want_str(v: V) -> Result<Vec<u8>, V> {
     if is_str(v) {
-        Ok(rstr(v).b.clone())
-    } else {
-        Err(type_error(&format!("no implicit conversion of {} into String", nil_name(v))))
+        return Ok(rstr(v).b.clone());
     }
+    if is_heap(v) && respond_to(v, sym("to_str")) {
+        let r = send0(v, "to_str");
+        if r == UNDEF {
+            return Err(r);
+        }
+        if is_str(r) {
+            return Ok(rstr(r).b.clone());
+        }
+        let c = nil_name(v);
+        return Err(type_error(&format!("can't convert {c} to String ({c}#to_str gives {})", nil_name(r))));
+    }
+    Err(type_error(&format!("no implicit conversion of {} into String", nil_name(v))))
 }
 fn nil_name(v: V) -> String {
     if v == QNIL { "nil".into() } else { class_name(real_class(v)) }
@@ -25,9 +36,21 @@ fn nil_name(v: V) -> String {
 fn chars(v: V) -> Vec<String> {
     s_of(v).chars().map(|c| c.to_string()).collect()
 }
-fn char_len(v: V) -> usize {
+pub(crate) fn char_len(v: V) -> usize {
     let bytes = &rstr(v).b;
-    if bytes.is_ascii() || is_binary(v) { bytes.len() } else { String::from_utf8_lossy(bytes).chars().count() }
+    if ascii_only(v) || is_binary(v) { bytes.len() } else { String::from_utf8_lossy(bytes).chars().count() }
+}
+/// The bytes are all ASCII (remembered for a frozen String: `FL_STR_ASCII`).
+fn ascii_only(v: V) -> bool {
+    let h = hdr(v);
+    if h.flags & FL_STR_ASCII != 0 {
+        return true;
+    }
+    let a = rstr(v).b.is_ascii();
+    if a && h.flags & FL_FROZEN != 0 {
+        h.flags |= FL_STR_ASCII;
+    }
+    a
 }
 /// ASCII-8BIT strings (`str.b`, digests, ciphertext) index by byte.
 fn is_binary(v: V) -> bool {
@@ -39,6 +62,43 @@ fn mutate(s: V) -> Result<&'static mut SVec<u8>, V> {
         return Err(e);
     }
     Ok(b(s))
+}
+
+const ENC_MASK: u32 = crate::compat::FL_BINARY | (crate::compat::FL_BINARY << 1);
+/// String#+ of `s` and the bytes `o` of `arg`.
+fn str_plus(s: V, o: &[u8], arg: V) -> V {
+    let mut v = Vec::with_capacity(rstr(s).b.len() + o.len());
+    v.extend_from_slice(&rstr(s).b);
+    v.extend_from_slice(o);
+    // result keeps the receiver's encoding (binary + binary stays ASCII-8BIT),
+    // unless the receiver is ASCII-only and the argument is not
+    let src = if !o.is_ascii() && rstr(s).b.is_ascii() && is_str(arg) { arg } else { s };
+    let flags = hdr(src).flags & ENC_MASK;
+    let r = str_new(v);
+    hdr(r).flags |= flags;
+    r
+}
+
+/// `s = s + e` in compiled code, where the local `s` is only ever built this way
+/// (kenny-compiler owned.rs): when `own` (the local holds the only reference to a String
+/// made by a literal or by this function) `s` is appended to in place, else this is the
+/// builtin String#+. UNDEF when String#+ is not the builtin one or an operand is not a
+/// String: the caller then calls `+`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_str_append_own(s: V, e: V, own: u64) -> V {
+    if !is_str(s) || !is_str(e) || KN_DIRECT.flags.load(std::sync::atomic::Ordering::Relaxed) & DIRECT_STR_PLUS == 0 {
+        return UNDEF;
+    }
+    if own != 0 && s != e && hdr(s).klass == rt().c.string && !is_frozen(s) {
+        let add: &[u8] = &rstr(e).b;
+        if !add.is_ascii() && rstr(s).b.is_ascii() {
+            let h = hdr(s);
+            h.flags = (h.flags & !ENC_MASK) | (hdr(e).flags & ENC_MASK);
+        }
+        b(s).extend_from_slice(add);
+        return s;
+    }
+    str_plus(s, &rstr(e).b, e)
 }
 
 /// s[start, len] in characters
@@ -55,7 +115,7 @@ fn substr(s: V, start: i64, len: i64) -> V {
         hdr(r).flags |= crate::compat::FL_BINARY;
         return r;
     }
-    if bytes.is_ascii() {
+    if ascii_only(s) {
         return str_new(bytes[start as usize..end as usize].to_vec());
     }
     let cs: String = String::from_utf8_lossy(bytes).chars().skip(start as usize).take((end - start) as usize).collect();
@@ -77,6 +137,36 @@ pub fn range_bounds(r: V, len: i64) -> Option<(i64, i64)> {
     Some((lo, count))
 }
 
+/// `s[i]`, an Integer index.
+pub(crate) fn aref_idx(s: V, i: i64) -> V {
+    let r = substr(s, i, 1);
+    if r != QNIL && rstr(r).b.is_empty() { QNIL } else { r }
+}
+
+/// `s[i] == lit` / `s[i] != lit` (`neq`) in compiled code (kenny-compiler fastpath.rs
+/// `str_idx_eq`), `lit` the bytes of a String literal: without making `s[i]` or the literal.
+/// UNDEF when `s` is not a plain String, `i` not a Fixnum or a method involved is not the
+/// builtin one (`DIRECT_STR_IDX_EQ`): the caller then makes both and calls `==` / `!=`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_str_idx_eq(s: V, i: V, p: *const u8, n: u64, neq: u64) -> V {
+    if !is_str(s) || !is_fix(i) || hdr(s).klass != rt().c.string || KN_DIRECT.flags.load(std::sync::atomic::Ordering::Relaxed) & DIRECT_STR_IDX_EQ == 0 {
+        return UNDEF;
+    }
+    let lit = unsafe { std::slice::from_raw_parts(p, n as usize) };
+    let eq = if ascii_only(s) || is_binary(s) {
+        // one byte (nil when out of range: never equal)
+        let b = &rstr(s).b;
+        let len = b.len() as i64;
+        let i = fix(i);
+        let i = if i < 0 { i + len } else { i };
+        i >= 0 && i < len && lit.len() == 1 && b[i as usize] == lit[0]
+    } else {
+        let c = aref_idx(s, fix(i));
+        c != QNIL && rstr(c).b[..] == *lit
+    };
+    bool_v(eq != (neq != 0))
+}
+
 fn aref(s: V, a: &[V]) -> V {
     if crate::regex::is_regexp(a[0]) {
         return crate::regex::str_aref(s, a[0], a.get(1).copied());
@@ -86,8 +176,7 @@ fn aref(s: V, a: &[V]) -> V {
     }
     let i = a[0];
     if is_fix(i) {
-        let r = substr(s, fix(i), 1);
-        if r != QNIL && rstr(r).b.is_empty() { QNIL } else { r }
+        aref_idx(s, fix(i))
     } else if is_range(i) {
         match range_bounds(i, char_len(s) as i64) {
             Some((st, n)) => substr(s, st, n),
@@ -95,8 +184,18 @@ fn aref(s: V, a: &[V]) -> V {
         }
     } else if is_str(i) {
         if find(&rstr(s).b, &rstr(i).b, 0).is_some() { str_new(rstr(i).b.clone()) } else { QNIL }
+    } else if is_float(i) {
+        let f = float_val(i);
+        if f.is_finite() {
+            aref_idx(s, f.trunc() as i64)
+        } else {
+            raise(rt().c.float_domain_error, &float_to_s(f))
+        }
+    } else if is_heap(i) && respond_to(i, sym("to_int")) {
+        let r = crate::tri!(send0(i, "to_int"));
+        if is_fix(r) { aref_idx(s, fix(r)) } else { type_error("no implicit conversion into Integer") }
     } else {
-        type_error("no implicit conversion into Integer")
+        type_error(&format!("no implicit conversion of {} into Integer", nil_name(i)))
     }
 }
 
@@ -439,16 +538,7 @@ pub fn init() {
             Ok(o) => o,
             Err(e) => return e,
         };
-        let mut v = rstr(s).b.clone();
-        v.extend_from_slice(&o);
-        // result keeps the receiver's encoding (binary + binary stays ASCII-8BIT),
-        // unless the receiver is ASCII-only and the argument is not
-        let enc_mask = crate::compat::FL_BINARY | (crate::compat::FL_BINARY << 1);
-        let src = if rstr(s).b.is_ascii() && !o.is_ascii() && is_str(a[0]) { a[0] } else { s };
-        let flags = hdr(src).flags & enc_mask;
-        let r = str_new(v);
-        hdr(r).flags |= flags;
-        r
+        str_plus(s, &o, a[0])
     });
     defn(c, "*", 1, 1, |s, a, _| {
         // a Float count is truncated (NUM2LONG), anything else non-Integer is a TypeError
@@ -1082,7 +1172,12 @@ pub fn init() {
     const_set(enc, sym("ASCII_8BIT"), bin);
     defn(enc, "to_s", 0, 0, |s, _, _| ivar_get(s, sym("@__name")));
     defn(enc, "name", 0, 0, |s, _, _| ivar_get(s, sym("@__name")));
-    defn(enc, "inspect", 0, 0, |s, _, _| new_str_v(format!("#<Encoding:{}>", s_of(ivar_get(s, sym("@__name"))))));
+    defn(enc, "inspect", 0, 0, |s, _, _| {
+        let n = s_of(ivar_get(s, sym("@__name")));
+        // (Ruby 3.4 names ASCII-8BIT BINARY first)
+        let n = if n == "ASCII-8BIT" { "BINARY (ASCII-8BIT)".to_string() } else { n };
+        new_str_v(format!("#<Encoding:{n}>"))
+    });
 
     // ---- Symbol ----
     let y = rt().c.symbol;

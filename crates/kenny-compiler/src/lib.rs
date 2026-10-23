@@ -18,6 +18,7 @@ mod scopes;
 mod spec;
 mod vobj;
 mod licm;
+mod owned;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -169,6 +170,8 @@ pub(crate) struct Fx<'a> {
     pub fast_args: Option<Vec<Value>>,
     /// vobj.rs: locals that may hold a virtual object
     pub vlocals: HashMap<Vec<u8>, std::rc::Rc<vobj::VLocal>>,
+    /// owned.rs: locals appended to in place, and their i8 "owned" registers
+    pub owned: HashMap<Vec<u8>, Variable>,
     /// vobj.rs: compiling a virtual object's `initialize`: its instance variables
     pub vself: Option<HashMap<Vec<u8>, Variable>>,
     /// ... for the next inlined method body only
@@ -415,6 +418,8 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_send0", &[I64, I64, I64, I64], &[I64]),
     ("kn_send1", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_is_a_send", &[I64, I64, I64, I64, I64], &[I64]),
+    ("kn_str_append_own", &[I64, I64, I64], &[I64]),
+    ("kn_str_idx_eq", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_send2", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_attr_get", &[I64, I64, I64, I64], &[I64]),
     ("kn_is_a", &[I64, I64], &[I64]),

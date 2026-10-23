@@ -243,9 +243,23 @@ impl<M: Module> Compiler<M> {
         let mid = self.sym_val(fx, &name);
         // Range#each and Array#each share the call: try Array first, then Range
         let (range_inl, guard_kind) = if kind == Kind::Each { (Some(fx.b.create_block()), Kind::Each) } else { (None, kind) };
+        // (plain Arrays and Fixnums with the builtin methods: no call)
+        let check = fx.b.create_block();
+        let joined = fx.b.create_block();
+        fx.b.append_block_param(joined, cranelift_codegen::ir::types::I8);
+        let ok_b = fx.b.create_block();
+        let int = matches!(guard_kind, Kind::Times | Kind::Upto | Kind::Downto);
+        self.loop_guard_fast(fx, recv, int, ok_b, check);
+        fx.b.switch_to_block(ok_b);
+        let one = fx.b.ins().iconst(cranelift_codegen::ir::types::I8, 1);
+        fx.b.ins().jump(joined, &[one.into()]);
+        fx.b.switch_to_block(check);
         let tag = self.iconst(fx, opt_tag(guard_kind));
         let ok = self.call(fx, "kn_opt_check", &[cache, recv, mid, tag]);
-        let mut ok = fx.b.ins().icmp_imm_s(IntCC::NotEqual, ok, 0);
+        let ok = fx.b.ins().icmp_imm_s(IntCC::NotEqual, ok, 0);
+        fx.b.ins().jump(joined, &[ok.into()]);
+        fx.b.switch_to_block(joined);
+        let mut ok = fx.b.block_params(joined)[0];
         if let Some(a) = arg {
             let fixa = fx.b.ins().band_imm_s(a, 1);
             let fixa = fx.b.ins().icmp_imm_s(IntCC::NotEqual, fixa, 0);
@@ -417,9 +431,8 @@ impl<M: Module> Compiler<M> {
                 None
             }
             _ => {
-                let x = self.call(fx, "kn_ary_at", &[recv, iv]);
-                let end = fx.b.ins().icmp_imm_s(IntCC::Equal, x, UNDEF);
-                fx.b.ins().brif(end, exit, &[finished.into()], body_b, &[]);
+                let x = self.loop_ary_elem(fx, recv, iv, exit, &[finished]);
+                fx.b.ins().jump(body_b, &[]);
                 Some(x)
             }
         };

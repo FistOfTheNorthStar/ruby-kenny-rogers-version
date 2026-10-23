@@ -657,19 +657,7 @@ pub fn init() {
         if !is_proc(b) {
             return enum_for(s, "each_with_index", &[]);
         }
-        let i = Rc::new(Cell::new(0i64));
-        let nb = proc_new_native(
-            Box::new(move |_, args, _| {
-                let r = call_block(b, &[yielded(args), mkfix(i.get())]);
-                i.set(i.get() + 1);
-                r
-            }),
-            0,
-            -1,
-        );
-        rproc(nb).autosplat = false;
-        tri!(send(s, sym("each"), &[], nb));
-        s
+        each_with_index_via_each(s, b)
     });
     fn find_impl(s: V, b: V) -> V {
         let found = Rc::new(RefCell::new(RVec::new()));
@@ -1692,4 +1680,22 @@ fn init_enum_streaming(en: *mut Class) {
             Err(e) => e,
         }
     });
+}
+
+/// Enumerable#each_with_index: `each`, with the index (also Array's when its `each` is
+/// not the builtin one).
+pub(crate) fn each_with_index_via_each(s: V, b: V) -> V {
+    let i = Rc::new(Cell::new(0i64));
+    let nb = proc_new_native(
+        Box::new(move |_, args, _| {
+            let r = call_block(b, &[yielded(args), mkfix(i.get())]);
+            i.set(i.get() + 1);
+            r
+        }),
+        0,
+        -1,
+    );
+    rproc(nb).autosplat = false;
+    tri!(send(s, sym("each"), &[], nb));
+    s
 }

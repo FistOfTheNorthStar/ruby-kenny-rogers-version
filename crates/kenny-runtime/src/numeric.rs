@@ -508,10 +508,14 @@ pub fn init() {
         if !is_proc(b) {
             return crate::misc::enum_for(s, "times", &[]);
         }
-        if !is_fix(s) {
-            return s;
-        }
-        let n = fix(s);
+        // (a Bignum: more Fixnums than any loop gets through, if positive)
+        let n = if is_fix(s) {
+            fix(s)
+        } else if truthy(tri!(send(s, sym(">"), &[mkfix(0)], QNIL))) {
+            FIX_MAX
+        } else {
+            0
+        };
         let mut i = 0;
         while i < n {
             tri!(call_block(b, &[mkfix(i)]));

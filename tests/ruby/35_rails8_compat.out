@@ -20,15 +20,15 @@ true
 "missing keyword: :y"
 [(0/1), (1/2), (1/1)]
 [1.0, 1.5, 2.0]
-#<Encoding:ASCII-8BIT>
-#<Encoding:ASCII-8BIT>
+#<Encoding:BINARY (ASCII-8BIT)>
+#<Encoding:BINARY (ASCII-8BIT)>
 true
 true
 false
 true
 true
 #<Encoding:US-ASCII>
-#<Encoding:ASCII-8BIT>
+#<Encoding:BINARY (ASCII-8BIT)>
 "native library missing"
 "native library missing"
 true
@@ -57,7 +57,7 @@ false
 true
 true
 [true, true, true, true, false]
-#<Encoding:ASCII-8BIT>
+#<Encoding:BINARY (ASCII-8BIT)>
 "axax"
 3
 "a<b>c"
