@@ -1,0 +1,5 @@
+[[true, false, true, false], [false, false, true, false], [false, false, true, false], [false, false, true, false], [false, false, true, false], [false, false, true, false], [false, true, true, false], [false, false, true, true], [false, false, true, true], [false, false, true, false], [false, false, true, true], [false, false, true, false]]
+TypeError class or module required
+[[true, false, true, false], [false, false, true, false], [:mine, false, :mine, :mine], [false, false, true, false], [false, false, true, false], [false, false, true, false], [false, true, true, false], [false, false, true, true], [false, false, true, true], [false, false, true, false], [false, false, true, true], [false, false, true, false]]
+:single
+false

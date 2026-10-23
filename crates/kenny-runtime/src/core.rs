@@ -158,6 +158,8 @@ pub struct Header {
     pub kind: Kind,
     pub flags: u32,
 }
+/// (compiled code reads the kind: kenny-compiler fastpath.rs `HDR_KIND`, `KIND_CLASS`)
+const _: () = assert!(std::mem::offset_of!(Header, kind) == 8 && Kind::Class as u32 == 7);
 
 #[repr(C)]
 pub struct RObject {
@@ -1068,6 +1070,13 @@ pub struct KnDirect {
     /// The Array class (compiled code indexes plain Arrays inline while `DIRECT_ARY_AREF` /
     /// `DIRECT_ARY_ASET` are set).
     pub array_class: std::sync::atomic::AtomicUsize,
+    /// The stack limit checked on entry to compiled methods that call themselves directly
+    /// (kenny-compiler statics.rs `entry_check`): `call_limit` while only one OS thread runs
+    /// Ruby code, else 0 (no such direct calls then).
+    pub entry_limit: std::sync::atomic::AtomicUsize,
+    /// The String class (compiled code runs getbyte/setbyte of plain Strings inline while
+    /// `DIRECT_STR_BYTE` is set).
+    pub string_class: std::sync::atomic::AtomicUsize,
 }
 #[unsafe(no_mangle)]
 pub static KN_DIRECT: KnDirect = KnDirect {
@@ -1078,8 +1087,13 @@ pub static KN_DIRECT: KnDirect = KnDirect {
     mod_eqq: std::sync::atomic::AtomicUsize::new(0),
     math_module: std::sync::atomic::AtomicUsize::new(0),
     array_class: std::sync::atomic::AtomicUsize::new(0),
+    entry_limit: std::sync::atomic::AtomicUsize::new(0),
+    string_class: std::sync::atomic::AtomicUsize::new(0),
 };
 const _: () = assert!(std::mem::offset_of!(KnDirect, array_class) == 48 && std::mem::offset_of!(KnDirect, math_module) == 40);
+const _: () = assert!(std::mem::offset_of!(KnDirect, entry_limit) == 56 && std::mem::offset_of!(KnDirect, string_class) == 64);
+/// What compiled code reads of a String (fastpath.rs `STR_*`): the buffer's ptr, len, cap.
+const _: () = assert!(std::mem::offset_of!(RString, b) == 16);
 /// What compiled code reads of an Array (fastpath.rs `ARY_*`): the buffer's ptr, len, cap.
 const _: () = assert!(std::mem::offset_of!(RArray, v) == 16);
 pub const DIRECT_SYM_EQ: u64 = 1;
@@ -1093,6 +1107,12 @@ pub const DIRECT_MATH: u64 = 32;
 /// Integer#to_f, Float#to_f, Integer#-@, Float#-@, Float#**, Integer#<< and Integer#>> are
 /// the builtin ones.
 pub const DIRECT_NUM: u64 = 64;
+/// Every heap object's is_a? / kind_of? is the builtin one (`IS_A_TOUCHED` unset).
+pub const DIRECT_IS_A_HEAP: u64 = 128;
+/// Every class's and module's === is the builtin Module#=== (`EQQ_TOUCHED` unset).
+pub const DIRECT_MOD_EQQ_ALL: u64 = 256;
+/// String#getbyte and String#setbyte of the String class itself are the builtin ones.
+pub const DIRECT_STR_BYTE: u64 = 512;
 /// Set once the builtin methods are tagged (opt.rs `init`).
 pub static DIRECT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// `KN_DIRECT.flags` is 0 until recomputed (methods changed): on the next inline cache
@@ -1139,6 +1159,11 @@ pub fn update_direct_flags() {
     if is(c.array, aset, crate::opt::OPT_ARY_ASET) {
         flags |= DIRECT_ARY_ASET;
     }
+    static STR_IDS: std::sync::OnceLock<[u32; 2]> = std::sync::OnceLock::new();
+    let [getbyte, setbyte] = *STR_IDS.get_or_init(|| [sym("getbyte"), sym("setbyte")]);
+    if is(c.string, getbyte, crate::opt::OPT_STR_GETBYTE) && is(c.string, setbyte, crate::opt::OPT_STR_SETBYTE) {
+        flags |= DIRECT_STR_BYTE;
+    }
     static NUM_IDS: std::sync::OnceLock<[u32; 5]> = std::sync::OnceLock::new();
     let [to_f, neg, pow, shl, shr] = *NUM_IDS.get_or_init(|| [sym("to_f"), sym("-@"), sym("**"), sym("<<"), sym(">>")]);
     let num = crate::opt::OPT_NUM_INLINE;
@@ -1159,7 +1184,20 @@ pub fn update_direct_flags() {
             flags |= DIRECT_MATH;
         }
     }
+    if !IS_A_TOUCHED.load(SeqCst) {
+        flags |= DIRECT_IS_A_HEAP;
+    }
+    if !EQQ_TOUCHED.load(SeqCst) && is(c.module, sym("==="), crate::opt::OPT_MOD_EQQ) {
+        flags |= DIRECT_MOD_EQQ_ALL;
+    }
     KN_DIRECT.flags.store(flags, SeqCst);
+    // (set meanwhile)
+    if IS_A_TOUCHED.load(SeqCst) {
+        KN_DIRECT.flags.fetch_and(!DIRECT_IS_A_HEAP, SeqCst);
+    }
+    if EQQ_TOUCHED.load(SeqCst) {
+        KN_DIRECT.flags.fetch_and(!DIRECT_MOD_EQQ_ALL, SeqCst);
+    }
     // changed again meanwhile: what we found may be stale
     if DIRECT_FLAGS_DIRTY.load(SeqCst) {
         KN_DIRECT.flags.store(0, SeqCst);
@@ -1169,8 +1207,9 @@ pub fn update_direct_flags() {
 /// Set the running stack's limit (`PState::stack_limit`), for direct calls too.
 pub fn set_stack_limit(limit: usize) {
     pst().stack_limit = limit;
-    let l = if crate::mt::multi() { usize::MAX } else { limit };
-    KN_DIRECT.call_limit.store(l, std::sync::atomic::Ordering::SeqCst);
+    let multi = crate::mt::multi();
+    KN_DIRECT.call_limit.store(if multi { usize::MAX } else { limit }, std::sync::atomic::Ordering::SeqCst);
+    KN_DIRECT.entry_limit.store(if multi { 0 } else { limit }, std::sync::atomic::Ordering::SeqCst);
 }
 #[inline(always)]
 pub fn serial() -> u64 {
@@ -1201,6 +1240,10 @@ pub fn init_runtime_at(stack_base: usize) {
 // ---------- classes ----------
 
 pub fn new_class_raw(name: &str, superclass: *mut Class, is_module: bool) -> *mut Class {
+    if !superclass.is_null() && DIRECT_READY.load(std::sync::atomic::Ordering::SeqCst) && superclass == rt().c.basic_object {
+        // (its instances have no is_a?)
+        is_a_touched();
+    }
     let alloc_kind = if superclass.is_null() { Kind::Object } else { unsafe { (*superclass).alloc } };
     let c = Box::into_raw(Box::new(Class {
         h: header(std::ptr::null_mut(), Kind::Class),
@@ -1347,9 +1390,111 @@ pub fn class_name(c: *mut Class) -> String {
     }
 }
 
+/// How many method tables have an entry of each name: never too low (every new entry
+/// counts; a freed table's entries are not taken off). For `claim`.
+static METHOD_NAMES: std::sync::Mutex<Option<std::collections::HashMap<u32, u32>>> = std::sync::Mutex::new(None);
+/// Set (for good) once a method named is_a? or kind_of? is defined, removed, undefined or
+/// made private/protected after startup, or a class inherits from BasicObject directly:
+/// until then every heap object's is_a?/kind_of? is the builtin one (abi.rs `kn_is_a_send`).
+pub static IS_A_TOUCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set (for good) once a method named === is defined, removed, undefined or made
+/// private/protected after startup in a singleton class, a module (it may be `extend`ed) or
+/// Module/Class: until then every class's and module's === is the builtin Module#===
+/// (`DIRECT_MOD_EQQ_ALL`).
+pub static EQQ_TOUCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Class `c`'s method table entry of name `mid` changed (see `IS_A_TOUCHED`, `EQQ_TOUCHED`).
+pub fn touch_method_name(c: *mut Class, mid: u32) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if !DIRECT_READY.load(SeqCst) {
+        return;
+    }
+    static IDS: std::sync::OnceLock<[u32; 3]> = std::sync::OnceLock::new();
+    let [is_a, kind_of, eqq] = *IDS.get_or_init(|| [sym("is_a?"), sym("kind_of?"), sym("===")]);
+    if mid == is_a || mid == kind_of {
+        is_a_touched();
+    } else if mid == eqq && !c.is_null() {
+        let k = unsafe { &*c };
+        if k.is_singleton || k.is_module || c == rt().c.module || c == rt().c.class {
+            EQQ_TOUCHED.store(true, SeqCst);
+            KN_DIRECT.flags.fetch_and(!DIRECT_MOD_EQQ_ALL, SeqCst);
+        }
+    }
+}
+/// Module `m` was included in or prepended to `target`: its methods named === count as
+/// defined in `target` (`EQQ_TOUCHED`).
+pub fn touch_mixin(target: *mut Class, m: *mut Class) {
+    if DIRECT_READY.load(std::sync::atomic::Ordering::SeqCst) && !find_method(m, sym("===")).is_null() {
+        touch_method_name(target, sym("==="));
+    }
+}
+pub fn is_a_touched() {
+    use std::sync::atomic::Ordering::SeqCst;
+    IS_A_TOUCHED.store(true, SeqCst);
+    KN_DIRECT.flags.fetch_and(!DIRECT_IS_A_HEAP, SeqCst);
+}
+/// A method table got an entry of name `mid` (`added`) or lost one.
+pub fn method_name_count(mid: u32, added: bool) {
+    let mut g = METHOD_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let c = g.get_or_insert_with(Default::default).entry(mid).or_insert(0);
+    if added {
+        *c += 1;
+    } else {
+        *c = c.saturating_sub(1);
+    }
+}
+pub fn methods_named(mid: u32) -> u32 {
+    let g = METHOD_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().and_then(|m| m.get(&mid).copied()).unwrap_or(0)
+}
+/// A compiled method's word for its calls to itself (kenny-compiler statics.rs
+/// `self_call`): 0 while the method is the only one of its name in any method table, its
+/// owner a class (a module's method may be bound to any object), and one OS thread runs
+/// Ruby code; else 1. Set by its `def` (abi.rs `kn_def_claim`), redone on every method table
+/// change (`bump_serial`).
+struct Claim {
+    word: usize,
+    owner: usize,
+    mid: u32,
+    fast: usize,
+}
+static CLAIMS: std::sync::Mutex<Vec<Claim>> = std::sync::Mutex::new(Vec::new());
+fn claim_holds(c: &Claim) -> bool {
+    let k = c.owner as *mut Class;
+    !crate::mt::multi()
+        && methods_named(c.mid) == 1
+        && unsafe { (*k).methods.get(&c.mid) }.is_some_and(|&m| unsafe { (*m).fast } == c.fast)
+}
+fn set_claim_word(c: &Claim) {
+    let v = if claim_holds(c) { 0 } else { 1 };
+    unsafe { (*(c.word as *const std::sync::atomic::AtomicU64)).store(v, std::sync::atomic::Ordering::SeqCst) };
+}
+/// `def` of a method that calls itself, with fast entry `fast`, in `owner`.
+pub fn claim(word: *mut u64, owner: *mut Class, mid: u32, fast: usize) {
+    let mut cs = CLAIMS.lock().unwrap_or_else(|e| e.into_inner());
+    cs.retain(|x| x.word != word as usize);
+    // (a singleton class may be freed: never kept here)
+    let kept = unsafe { !(*owner).is_module && !(*owner).is_singleton };
+    // (the method's fast entry is set after `add_method`: so is this)
+    let holds = kept && !crate::mt::multi() && methods_named(mid) == 1;
+    unsafe { (*(word as *const std::sync::atomic::AtomicU64)).store(if holds { 0 } else { 1 }, std::sync::atomic::Ordering::SeqCst) };
+    if kept {
+        cs.push(Claim { word: word as usize, owner: owner as usize, mid, fast });
+    }
+}
+fn redo_claims() {
+    for c in CLAIMS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        set_claim_word(c);
+    }
+}
+/// Several OS threads may now run Ruby code: no more claims.
+pub fn drop_claims() {
+    redo_claims();
+}
+
 pub fn bump_serial() {
     let s = SERIAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     KN_DIRECT.serial.store(s, std::sync::atomic::Ordering::SeqCst);
+    redo_claims();
     crate::opt::clear_attr_sites();
     invalidate_direct_flags();
     bump_const_serial(); // include/prepend change constant lookup too
@@ -1595,9 +1740,10 @@ fn find_super_method_uncached(klass: *mut Class, owner: *mut Class, mid: u32) ->
 
 pub fn add_method(c: *mut Class, mid: u32, body: Body) -> *const Method {
     let m = Box::into_raw(Box::new(Method { fast: 0, body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: false, attr_slot: Default::default() })) as *const Method;
-    unsafe {
-        (*c).methods.insert(mid, m);
+    if unsafe { (*c).methods.insert(mid, m) }.is_none() {
+        method_name_count(mid, true);
     }
+    touch_method_name(c, mid);
     bump_serial();
     m
 }
@@ -1623,7 +1769,7 @@ pub fn respond_to(v: V, mid: u32) -> bool {
 // ---------- calling ----------
 
 #[inline(always)]
-fn approx_sp() -> usize {
+pub(crate) fn approx_sp() -> usize {
     let x = 0u8;
     &x as *const u8 as usize
 }
@@ -2051,6 +2197,13 @@ pub fn check_singleton_ok(v: V) -> V {
         return type_error("can't define singleton");
     }
     QNIL
+}
+/// The builtin `v.is_a?(c)`.
+pub fn is_a_v(v: V, c: V) -> V {
+    if !is_class(c) {
+        return type_error("class or module required");
+    }
+    bool_v(is_a(v, c as *mut Class))
 }
 pub fn type_error(msg: &str) -> V {
     raise(rt().c.type_error, msg)

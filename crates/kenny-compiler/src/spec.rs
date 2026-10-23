@@ -396,9 +396,7 @@ pub fn plan(lp: &Node, typed: &crate::analysis::Typed, register: &dyn Fn(&[u8]) 
         }
         cands.push(name.clone());
     }
-    if cands.is_empty() {
-        return None;
-    }
+    // (no candidates: always-Integer locals may still be, below)
     // guess each candidate's type from its assignments and what it is used with
     let mut env: HashMap<Vec<u8>, Ty> = typed.types.clone();
     let mut guess: HashMap<Vec<u8>, Ty> = HashMap::new();

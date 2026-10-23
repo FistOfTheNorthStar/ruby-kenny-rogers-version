@@ -375,6 +375,14 @@ impl<M: Module> Compiler<M> {
             return None;
         }
         let fid = self.static_target(fx, name, vals.len())?;
+        if fx.kind == ScopeKind::Method && fx.self_fid == Some(fid) && self.inline_ctx.is_empty() && self.claim_words.contains_key(&fid) {
+            return Some(self.self_call(fx, fid, recv, vals, dynamic));
+        }
+        Some(self.static_guarded(fx, fid, recv, mid, vals, dynamic))
+    }
+
+    /// `static_call` to `fid`, behind the site's slot.
+    fn static_guarded(&mut self, fx: &mut Fx, fid: FuncId, recv: Value, mid: Value, vals: &[Value], dynamic: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
         let f = mem();
         let slot = self.cache_ptr(fx, 2);
         let slow = fx.b.create_block();
@@ -394,8 +402,7 @@ impl<M: Module> Compiler<M> {
         let d = fx.b.ins().bor(d1, d2);
         let bad = self.no_room(fx, dir);
         let d = fx.b.ins().bor(d, bad);
-        let same = fx.b.ins().icmp_imm_s(IntCC::Equal, d, 0);
-        self.require(fx, same, slow);
+        self.require_zero(fx, d, slow);
         let mut args = vec![recv];
         args.extend_from_slice(vals);
         args.push(fx.b.ins().iconst(I64, QNIL));
@@ -409,7 +416,115 @@ impl<M: Module> Compiler<M> {
         let r = dynamic(self, fx);
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(done);
-        Some(fx.b.block_params(done)[0])
+        fx.b.block_params(done)[0]
+    }
+}
+
+/// Whether a `def`'s body calls the method itself without a receiver (or with `self`),
+/// with `n` plain arguments, outside blocks: those calls can be `self_call`s.
+pub(crate) fn calls_itself(name: &[u8], n: usize, body: &Node) -> bool {
+    struct S<'a> {
+        name: &'a [u8],
+        n: usize,
+        found: bool,
+    }
+    impl<'pr> Visit<'pr> for S<'_> {
+        fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+            let plain = node.receiver().is_none_or(|r| r.as_self_node().is_some());
+            let args: Vec<Node> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            let simple = args.iter().all(|a| {
+                a.as_splat_node().is_none() && a.as_keyword_hash_node().is_none() && a.as_block_argument_node().is_none() && a.as_forwarding_arguments_node().is_none()
+            });
+            if plain && node.name().as_slice() == self.name && args.len() == self.n && simple && node.block().is_none() {
+                self.found = true;
+            }
+            visit_call_node(self, node);
+        }
+        // (another `self`, or code that runs later)
+        fn visit_block_node(&mut self, _: &BlockNode<'pr>) {}
+        fn visit_lambda_node(&mut self, _: &LambdaNode<'pr>) {}
+        fn visit_def_node(&mut self, _: &DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _: &ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, _: &SingletonClassNode<'pr>) {}
+    }
+    let mut s = S { name, n, found: false };
+    s.visit(body);
+    s.found
+}
+
+impl<M: Module> Compiler<M> {
+    /// The word of a `def` that calls itself (see `self_call`): 0 while the runtime vouches
+    /// that this method is the only one of its name in any class (kenny-runtime abi.rs
+    /// `kn_def`, core.rs `Claim`), else nonzero. Starts at 1: the `def` hands it over.
+    pub(crate) fn claim_word_id(&mut self, fid: FuncId) -> DataId {
+        if let Some(&id) = self.claim_words.get(&fid) {
+            return id;
+        }
+        let id = self.module.declare_data(&format!("__kn_claim_{}", fid.as_u32()), Linkage::Local, true, false).expect("claim word");
+        let mut d = DataDescription::new();
+        d.define(Box::new(1u64.to_le_bytes()));
+        d.set_align(8);
+        self.module.define_data(id, &d).expect("claim word");
+        self.claim_words.insert(fid, id);
+        id
+    }
+
+    /// A method calling itself without a receiver, in its own body (not inlined, not in a
+    /// block): `self` was dispatched to this method, so while it is the only method of its
+    /// name in any method table (and defined in a class: a module's method may be bound
+    /// to any object) the call reaches it. One word to check instead of the receiver's class
+    /// and the serial; room on the stack and a pending collection are checked on entry
+    /// (`entry_check`). Else `dynamic`: its one call keeps the slow path from holding values
+    /// across calls (they would take callee-saved registers, saved on every call).
+    fn self_call(&mut self, fx: &mut Fx, fid: FuncId, recv: Value, vals: &[Value], dynamic: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
+        let id = self.claim_word_id(fid);
+        let gv = self.module.declare_data_in_func(id, fx.b.func);
+        let word = fx.b.ins().symbol_value(I64, gv);
+        let slow = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.set_cold_block(slow);
+        let w = fx.b.ins().load(I64, mem(), word, 0);
+        // (on the word itself: a compare with 0 would bring a constant 0 that Cranelift
+        // shares with the cold paths' and then keeps in a callee-saved register)
+        let go = fx.b.create_block();
+        fx.b.ins().brif(w, slow, &[], go, &[]);
+        fx.b.switch_to_block(go);
+        let mut args = vec![recv];
+        args.extend_from_slice(vals);
+        args.push(fx.b.ins().iconst(I64, QNIL));
+        let r = self.call_fn(fx, fid, &args);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(slow);
+        let r = dynamic(self, fx);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    /// On entry to a method that calls itself (`self_call`s skip these checks): room on the
+    /// stack (`KN_DIRECT.entry_limit`: 0 while several OS threads run Ruby code, their calls
+    /// to themselves going through the runtime) and no collection pending.
+    pub(crate) fn entry_check(&mut self, fx: &mut Fx) {
+        let f = mem();
+        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+        let dir = fx.b.ins().symbol_value(I64, gv);
+        let lim = fx.b.ins().load(I64, f, dir, KN_DIRECT_ENTRY_LIMIT);
+        let sp = fx.b.ins().get_stack_pointer(I64);
+        let low = fx.b.ins().icmp(IntCC::UnsignedLessThan, sp, lim);
+        let low = fx.b.ins().uextend(I64, low);
+        let gc = fx.b.ins().uload8(I64, f, fx.gcflag, 0);
+        let bad = fx.b.ins().bor(low, gc);
+        let slow = fx.b.create_block();
+        let cont = fx.b.create_block();
+        fx.b.ins().brif(bad, slow, &[], cont, &[]);
+        fx.b.set_cold_block(slow);
+        fx.b.switch_to_block(slow);
+        let r = self.call(fx, "kn_entry_slow", &[]);
+        self.check(fx, r);
+        fx.b.ins().jump(cont, &[]);
+        fx.b.switch_to_block(cont);
     }
 }
 
@@ -802,8 +917,7 @@ impl<M: Module> Compiler<M> {
         let d1 = fx.b.ins().bxor(k, sk);
         let d2 = fx.b.ins().bxor(ss, cur);
         let d = fx.b.ins().bor(d1, d2);
-        let same = fx.b.ins().icmp_imm_s(IntCC::Equal, d, 0);
-        self.require(fx, same, slow);
+        self.require_zero(fx, d, slow);
         let r = self.inline_method_body(fx, &idef, recv, vals, &[], yb.map(|y| (y, done)));
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(slow);
@@ -984,8 +1098,7 @@ impl<M: Module> Compiler<M> {
         let d1 = fx.b.ins().bxor(recv, sk);
         let d2 = fx.b.ins().bxor(ss, cur);
         let d = fx.b.ins().bor(d1, d2);
-        let same = fx.b.ins().icmp_imm_s(IntCC::Equal, d, 0);
-        self.require(fx, same, slow);
+        self.require_zero(fx, d, slow);
         let o = self.call(fx, "kn_obj_alloc", &[recv]);
         self.inline_method_body(fx, &idef, o, vals, &[], None);
         fx.b.ins().jump(done, &[o.into()]);
@@ -1093,8 +1206,7 @@ impl<M: Module> Compiler<M> {
         let d1 = fx.b.ins().bxor(k, sk);
         let d2 = fx.b.ins().bxor(ss, cur);
         let dd = fx.b.ins().bor(d1, d2);
-        let same = fx.b.ins().icmp_imm_s(IntCC::Equal, dd, 0);
-        self.require(fx, same, slow);
+        self.require_zero(fx, dd, slow);
         let r = self.inline_method_body(fx, &idef, recv, pos, kw, None);
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(slow);

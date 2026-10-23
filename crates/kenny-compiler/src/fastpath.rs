@@ -356,7 +356,9 @@ impl<M: Module> Compiler<M> {
         let t = fx.b.ins().bor(hi, body);
         let r = fx.b.ins().rotr_imm_s(t, 3);
         let is_zero = fx.b.ins().icmp_imm_s(IntCC::Equal, v, FLONUM_ZERO);
-        let zero = fx.b.ins().iconst(I64, 0);
+        // (0 then, but not a constant: one would be materialized once for the whole function
+        // and kept across calls in a callee-saved register)
+        let zero = fx.b.ins().bxor_imm_s(v, FLONUM_ZERO);
         let bits = fx.b.ins().select(is_zero, zero, r);
         fx.b.ins().bitcast(F64, MemFlagsData::new(), bits)
     }
@@ -1151,6 +1153,14 @@ impl<M: Module> Compiler<M> {
                     let (i, v) = (*i, *v);
                     return self.ary_index_fast(fx, recv, i, Some(v), |c, fx| plain(c, fx, "kn_send2", &[cache, recv, mid, i, v, e]));
                 }
+                (b"getbyte", [i]) => {
+                    let i = *i;
+                    return self.str_byte_fast(fx, recv, i, None, |c, fx| plain(c, fx, "kn_send1", &[cache, recv, mid, i, e]));
+                }
+                (b"setbyte", [i, v]) => {
+                    let (i, v) = (*i, *v);
+                    return self.str_byte_fast(fx, recv, i, Some(v), |c, fx| plain(c, fx, "kn_send2", &[cache, recv, mid, i, v, e]));
+                }
                 _ => {}
             }
         }
@@ -1203,8 +1213,7 @@ impl<M: Module> Compiler<M> {
         let wk = fx.b.ins().ushr_imm_u(word, 16);
         let diff = fx.b.ins().bxor(klass, wk);
         let bad = fx.b.ins().bor(diff, kfm);
-        let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
-        self.require(fx, ok, slow_b);
+        self.require_zero(fx, bad, slow_b);
 
         // the slot is within the object's ivar buffer (capacity first, as SVec::snap does)
         let cap_addr = fx.b.ins().iadd_imm_s(recv, OBJ_IVARS_CAP as i64);
@@ -1325,6 +1334,84 @@ impl<M: Module> Compiler<M> {
         fx.b.block_params(done)[0]
     }
 
+    /// `recv.getbyte(i)` (`val` None) or `recv.setbyte(i, val)` without a call when `recv` is
+    /// a plain String (its class is String itself) whose getbyte and setbyte are the builtins
+    /// (`KN_DIRECT.flags`) and `i` (and `val`) Integers: the byte (nil past the end), or for a
+    /// write a byte that exists of an unfrozen String. Anything else runs `slow`.
+    pub(crate) fn str_byte_fast(&mut self, fx: &mut Fx, recv: Value, idx: Value, val: Option<Value>, slow: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
+        let f = mem();
+        let slow_b = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.set_cold_block(slow_b);
+        let fixes = match val {
+            Some(v) => fx.b.ins().band(idx, v),
+            None => idx,
+        };
+        let not_fix = fx.b.ins().bnot(fixes);
+        let not_fix = fx.b.ins().band_imm_s(not_fix, 1);
+        let r = fx.b.ins().rotr_imm_s(recv, 3);
+        let r = fx.b.ins().iadd_imm_s(r, -2);
+        let heap = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, r, (1i64 << 61) - 2);
+        let b0 = fx.b.create_block();
+        fx.b.ins().brif(heap, b0, &[], slow_b, &[]);
+        fx.b.switch_to_block(b0);
+        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+        let dir = fx.b.ins().symbol_value(I64, gv);
+        let k = fx.b.ins().load(I64, f, recv, 0);
+        let sk = fx.b.ins().load(I64, f, dir, KD_STRING_CLASS);
+        let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
+        let bits = fx.b.ins().band_imm_s(flags, DIRECT_STR_BYTE);
+        let no_bits = fx.b.ins().bxor_imm_s(bits, DIRECT_STR_BYTE);
+        let other = fx.b.ins().bxor(k, sk);
+        let mut bad = fx.b.ins().bor(other, no_bits);
+        bad = fx.b.ins().bor(bad, not_fix);
+        if val.is_some() {
+            let fl = fx.b.ins().uload32(f, recv, OBJ_FLAGS);
+            let fr = fx.b.ins().band_imm_s(fl, FL_FROZEN);
+            bad = fx.b.ins().bor(bad, fr);
+        }
+        let cont = fx.b.create_block();
+        fx.b.ins().brif(bad, slow_b, &[], cont, &[]);
+        fx.b.switch_to_block(cont);
+        // the byte (capacity first, as SVec::snap does); a negative index counts from the end
+        let cap_addr = fx.b.ins().iadd_imm_s(recv, STR_CAP as i64);
+        let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
+        let ptr = fx.b.ins().load(I64, f, recv, STR_PTR);
+        let len = fx.b.ins().load(I64, f, recv, STR_LEN);
+        let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
+        let n = fx.b.ins().umin(len, capn);
+        let i = fx.b.ins().sshr_imm_s(idx, 1);
+        let sign = fx.b.ins().sshr_imm_s(i, 63);
+        let add = fx.b.ins().band(sign, n);
+        let i = fx.b.ins().iadd(i, add);
+        let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, i, n);
+        let addr = fx.b.ins().iadd(ptr, i);
+        match val {
+            None => {
+                let b3 = fx.b.create_block();
+                let nil = fx.b.ins().iconst(I64, QNIL);
+                fx.b.ins().brif(inb, b3, &[], done, &[nil.into()]);
+                fx.b.switch_to_block(b3);
+                let byte = fx.b.ins().uload8(I64, f, addr, 0);
+                let t = fx.b.ins().ishl_imm_u(byte, 1);
+                let r = fx.b.ins().bor_imm_s(t, 1);
+                fx.b.ins().jump(done, &[r.into()]);
+            }
+            Some(v) => {
+                self.require(fx, inb, slow_b);
+                let byte = fx.b.ins().ushr_imm_u(v, 1);
+                fx.b.ins().istore8(f, byte, addr, 0);
+                fx.b.ins().jump(done, &[v.into()]);
+            }
+        }
+        fx.b.switch_to_block(slow_b);
+        let r = slow(self, fx);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
     /// The checks of an inline Array index path, falling through when they pass, else to
     /// `slow_b` (with `slow_args`): `recv` is a heap object whose class is Array itself, its
     /// `[]` is the builtin and for a `write` also `[]=`, and not frozen; and `not_fix`
@@ -1370,8 +1457,7 @@ impl<M: Module> Compiler<M> {
                 heap_check(fx, &args);
                 let bad = recv_bad(self, fx);
                 let bad = fx.b.ins().bor(bad, not_fix);
-                let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
-                fx.b.ins().brif(ok, cont, &[], slow_b, &args);
+                fx.b.ins().brif(bad, slow_b, &args, cont, &[]);
             }
             Some(e) => {
                 let known = fx.b.create_block();
@@ -1381,15 +1467,13 @@ impl<M: Module> Compiler<M> {
                 fx.b.switch_to_block(chk);
                 heap_check(fx, &args);
                 let bad = recv_bad(self, fx);
-                let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
                 let rec = fx.b.create_block();
-                fx.b.ins().brif(ok, rec, &[], slow_b, &args);
+                fx.b.ins().brif(bad, slow_b, &args, rec, &[]);
                 fx.b.switch_to_block(rec);
                 self.licm_record(fx, &e, recv);
                 fx.b.ins().jump(known, &[]);
                 fx.b.switch_to_block(known);
-                let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, not_fix, 0);
-                fx.b.ins().brif(ok, cont, &[], slow_b, &args);
+                fx.b.ins().brif(not_fix, slow_b, &args, cont, &[]);
             }
         }
         fx.b.switch_to_block(cont);
@@ -1496,8 +1580,7 @@ impl<M: Module> Compiler<M> {
         let wshape = fx.b.ins().band_imm_s(word, IV_PTR);
         let diff = fx.b.ins().bxor(shape, wshape);
         let bad = fx.b.ins().bor(kfm, diff);
-        let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
-        self.require(fx, ok, slow_b);
+        self.require_zero(fx, bad, slow_b);
 
         // the slot is within the buffer (capacity first, as SVec::snap does)
         let cap_addr = fx.b.ins().iadd_imm_s(recv, OBJ_IVARS_CAP as i64);
@@ -1565,8 +1648,7 @@ impl<M: Module> Compiler<M> {
         self.require(fx, ok, slow_b);
         let mp = fx.b.ins().iadd_imm_s(recv, CLASS_CIVARS as i64);
         let slab = fx.b.ins().atomic_load(I64, f, mp);
-        let has = fx.b.ins().icmp_imm_s(IntCC::NotEqual, slab, 0);
-        self.require(fx, has, slow_b);
+        self.require_nonzero(fx, slab, slow_b);
         let len = fx.b.ins().atomic_load(I64, f, slab);
         let cap = fx.b.ins().load(I64, f, slab, 8);
         let n = fx.b.ins().umin(len, cap);
@@ -1592,10 +1674,10 @@ impl<M: Module> Compiler<M> {
         fx.b.block_params(done)[0]
     }
 
-    /// `pat === subj` for a `when` clause: answered inline when the site's cache entry
-    /// (first way) has the builtin Module#=== (`KN_DIRECT.mod_eqq`) for pat's class, pat is
-    /// a class (not a module: those have no superclass chain) and subj a heap object:
-    /// subj's class has pat at pat's depth in its superclass chain. Else a call.
+    /// `pat === subj` for a `when` clause: answered inline while every class's === is the
+    /// builtin Module#=== (`DIRECT_MOD_EQQ_ALL`), pat is a class (not a module: those have
+    /// no superclass chain) and subj a heap object: subj's class has pat at pat's depth in
+    /// its superclass chain. Else a call.
     pub(crate) fn case_class_eqq(&mut self, fx: &mut Fx, pat: Value, subj: Value) -> Value {
         self.mark_loc(fx);
         let cache = self.owned_cache_ptr(fx, OWNED_CALL);
@@ -1615,28 +1697,20 @@ impl<M: Module> Compiler<M> {
         let h1 = heap(self, fx, pat);
         let h2 = heap(self, fx, subj);
         let hh = fx.b.ins().band(h1, h2);
-        let e = fx.b.ins().load(I64, f, cache, 0);
-        let has_e = fx.b.ins().icmp_imm_s(IntCC::NotEqual, e, 0);
-        let go = fx.b.ins().band(hh, has_e);
         let b1 = fx.b.create_block();
-        fx.b.ins().brif(go, b1, &[], slow, &[]);
+        fx.b.ins().brif(hh, b1, &[], slow, &[]);
         fx.b.switch_to_block(b1);
         let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
         let dir = fx.b.ins().symbol_value(I64, gv);
-        let pk = fx.b.ins().load(I64, f, pat, 0);
-        let ser = fx.b.ins().load(I64, f, e, CE_SERIAL);
-        let cur = fx.b.ins().load(I64, f, dir, 0);
-        let k0 = fx.b.ins().load(I64, f, e, CE_KLASS);
-        let m0 = fx.b.ins().load(I64, f, e, CE_METHOD);
-        let meq = fx.b.ins().load(I64, f, dir, KD_MOD_EQQ);
-        let o1 = fx.b.ins().icmp(IntCC::Equal, ser, cur);
-        let o2 = fx.b.ins().icmp(IntCC::Equal, k0, pk);
-        let o3 = fx.b.ins().icmp(IntCC::Equal, m0, meq);
-        let a1 = fx.b.ins().band(o1, o2);
-        let ok = fx.b.ins().band(a1, o3);
+        let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
+        let off_bit = fx.b.ins().band_imm_s(flags, DIRECT_MOD_EQQ_ALL);
+        let off = fx.b.ins().bxor_imm_s(off_bit, DIRECT_MOD_EQQ_ALL);
+        let kind = fx.b.ins().uload32(f, pat, HDR_KIND);
+        let not_cls = fx.b.ins().bxor_imm_s(kind, KIND_CLASS);
+        let bad = fx.b.ins().bor(off, not_cls);
         let b15 = fx.b.create_block();
-        fx.b.ins().brif(ok, b15, &[], slow, &[]);
-        // (pat has Module#===: a class or module)
+        fx.b.ins().brif(bad, slow, &[], b15, &[]);
+        // (pat is a class or module)
         fx.b.switch_to_block(b15);
         let cs_len = fx.b.ins().load(I64, f, pat, CLASS_SUP_LEN);
         let b2 = fx.b.create_block();
@@ -1707,6 +1781,21 @@ impl<M: Module> Compiler<M> {
     pub(crate) fn require(&mut self, fx: &mut Fx, c: Value, slow: Block) {
         let b = fx.b.create_block();
         fx.b.ins().brif(c, b, &[], slow, &[]);
+        fx.b.switch_to_block(b);
+    }
+    /// ... when `v` is 0. (A branch on `v` itself: `v == 0` would bring a constant 0, which
+    /// Cranelift shares with the other uses of 0, cold calls' arguments among them, without
+    /// rematerializing it: kept across calls in a callee-saved register, saved and restored
+    /// on every call of the function.)
+    pub(crate) fn require_zero(&mut self, fx: &mut Fx, v: Value, slow: Block) {
+        let b = fx.b.create_block();
+        fx.b.ins().brif(v, slow, &[], b, &[]);
+        fx.b.switch_to_block(b);
+    }
+    /// ... when `v` is not 0 (see `require_zero`).
+    pub(crate) fn require_nonzero(&mut self, fx: &mut Fx, v: Value, slow: Block) {
+        let b = fx.b.create_block();
+        fx.b.ins().brif(v, b, &[], slow, &[]);
         fx.b.switch_to_block(b);
     }
     /// ... when `v` is a heap object (not an immediate, nil or false): rotated right by 3,
@@ -1849,7 +1938,7 @@ const STUBS: [(&str, usize, bool, u8); 12] = [
     ("kn_send0", 0, true, 0),
     ("kn_send1", 1, true, 0),
     ("kn_send0", 0, true, 3),
-    ("kn_send1", 1, true, 4),
+    ("kn_is_a_send", 1, true, 4),
     ("kn_send", VARARGS, false, 0),
     ("kn_send_pub", VARARGS, false, 0),
 ];
@@ -1948,6 +2037,120 @@ impl<M: Module> Compiler<M> {
                     b.ins().return_(&[r]);
                 }
                 b.switch_to_block(on);
+                if attr == 4 {
+                    // every heap object's is_a? is the builtin one and the argument a class
+                    // (not a module): the receiver's class has it at its depth in its
+                    // superclass chain (kenny-runtime core.rs `is_a`)
+                    let cache_b = b.create_block();
+                    let flags = b.ins().load(I64, f, dir, KD_FLAGS);
+                    let bit = b.ins().band_imm_s(flags, DIRECT_IS_A_HEAP);
+                    let c1 = b.create_block();
+                    b.ins().brif(bit, c1, &[], cache_b, &[]);
+                    b.switch_to_block(c1);
+                    let a = args[0];
+                    let low = b.ins().band_imm_s(a, 7);
+                    let aligned = b.ins().icmp_imm_s(IntCC::Equal, low, 0);
+                    let not_nil = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, a, QNIL);
+                    let heap = b.ins().band(aligned, not_nil);
+                    let c2 = b.create_block();
+                    b.ins().brif(heap, c2, &[], cache_b, &[]);
+                    b.switch_to_block(c2);
+                    let kind = b.ins().uload32(f, a, HDR_KIND);
+                    let is_cls = b.ins().icmp_imm_s(IntCC::Equal, kind, KIND_CLASS);
+                    let c3 = b.create_block();
+                    b.ins().brif(is_cls, c3, &[], cache_b, &[]);
+                    b.switch_to_block(c3);
+                    let cs_len = b.ins().load(I64, f, a, CLASS_SUP_LEN);
+                    let c4 = b.create_block();
+                    b.ins().brif(cs_len, c4, &[], cache_b, &[]);
+                    b.switch_to_block(c4);
+                    let k = b.ins().load(I64, f, recv, 0);
+                    let ks_len = b.ins().load(I64, f, k, CLASS_SUP_LEN);
+                    let d = b.ins().iadd_imm_s(cs_len, -1);
+                    let inb = b.ins().icmp(IntCC::UnsignedLessThan, d, ks_len);
+                    let c5 = b.create_block();
+                    let no_b = b.create_block();
+                    b.ins().brif(inb, c5, &[], no_b, &[]);
+                    b.switch_to_block(no_b);
+                    let no = b.ins().iconst(I64, QFALSE);
+                    b.ins().return_(&[no]);
+                    b.switch_to_block(c5);
+                    let ksp = b.ins().load(I64, f, k, CLASS_SUP_PTR);
+                    let off = b.ins().ishl_imm_u(d, 3);
+                    let addr = b.ins().iadd(ksp, off);
+                    let x = b.ins().load(I64, f, addr, 0);
+                    let same = b.ins().icmp(IntCC::Equal, x, a);
+                    let t = b.ins().iconst(I64, QTRUE);
+                    let fl = b.ins().iconst(I64, QFALSE);
+                    let r = b.ins().select(same, t, fl);
+                    b.ins().return_(&[r]);
+                    b.switch_to_block(cache_b);
+                }
+            }
+
+            if attr == 1 && !var {
+                // the common case first: way 0 is an attribute reader of the receiver's
+                // class (a plain Object of that class, the slot within its buffer)
+                let general = b.create_block();
+                let e = b.ins().load(I64, f, cache, 0);
+                let w0 = b.create_block();
+                b.ins().brif(e, w0, &[], general, &[]);
+                // (a site that calls a method: to the general path after one check)
+                b.switch_to_block(w0);
+                let a0 = b.ins().load(I64, f, e, CE_ATTR);
+                let ak = b.ins().band_imm_s(a0, 6);
+                let da = b.ins().bxor_imm_s(ak, 4);
+                let w1 = b.create_block();
+                b.ins().brif(da, general, &[], w1, &[]);
+                b.switch_to_block(w1);
+                let low = b.ins().band_imm_s(recv, 7);
+                let aligned = b.ins().icmp_imm_s(IntCC::Equal, low, 0);
+                let not_nil = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, recv, QNIL);
+                let heap = b.ins().band(aligned, not_nil);
+                let w2 = b.create_block();
+                b.ins().brif(heap, w2, &[], general, &[]);
+                b.switch_to_block(w2);
+                let k = b.ins().load(I64, f, recv, 0);
+                let k0 = b.ins().load(I64, f, e, CE_KLASS);
+                let ser = b.ins().load(I64, f, e, CE_SERIAL);
+                let cur = b.ins().load(I64, f, dir, 0);
+                let kf = b.ins().load(I64, f, recv, OBJ_KIND);
+                let shape = b.ins().load(I64, f, recv, OBJ_SHAPE);
+                // differences, all 0 when it is that case
+                let dk = b.ins().bxor(k, k0);
+                let ds = b.ins().bxor(ser, cur);
+                let dshape = b.ins().bxor(shape, k);
+                let kfm = b.ins().band_imm_s(kf, 0xFFFF_FFFF);
+                let mut bad = b.ins().bor(dk, ds);
+                bad = b.ins().bor(bad, dshape);
+                bad = b.ins().bor(bad, kfm);
+                if let Some(x) = explicit {
+                    let pb = b.ins().band_imm_s(a0, 1);
+                    let denied = b.ins().band(pb, x);
+                    bad = b.ins().bor(bad, denied);
+                }
+                let w3 = b.create_block();
+                b.ins().brif(bad, general, &[], w3, &[]);
+                b.switch_to_block(w3);
+                let cap_addr = b.ins().iadd_imm_s(recv, OBJ_IVARS_CAP as i64);
+                let cap = b.ins().atomic_load(I64, f, cap_addr);
+                let ptr = b.ins().load(I64, f, recv, OBJ_IVARS_PTR);
+                let len = b.ins().load(I64, f, recv, OBJ_IVARS_LEN);
+                let capn = b.ins().band_imm_s(cap, SVEC_CAP_MASK);
+                let n = b.ins().umin(len, capn);
+                let idx = b.ins().ushr_imm_u(a0, 8);
+                let inb = b.ins().icmp(IntCC::UnsignedLessThan, idx, n);
+                let w4 = b.create_block();
+                b.ins().brif(inb, w4, &[], general, &[]);
+                b.switch_to_block(w4);
+                let off = b.ins().ishl_imm_u(idx, 3);
+                let addr = b.ins().iadd(ptr, off);
+                let v = b.ins().load(I64, f, addr, 0);
+                let unset = b.ins().icmp_imm_s(IntCC::Equal, v, UNDEF);
+                let nil = b.ins().iconst(I64, QNIL);
+                let r = b.ins().select(unset, nil, v);
+                b.ins().return_(&[r]);
+                b.switch_to_block(general);
             }
 
             // a filled cache with a compiled method or an attribute in a checked way
@@ -2220,11 +2423,16 @@ const CLASS_CIVARS: i32 = 144;
 /// kenny-runtime core.rs `KnDirect::flags` and its bits, `SYM_TAG`.
 const KD_FLAGS: i32 = 16;
 const KD_CONST_SERIAL: i32 = 24;
-const KD_MOD_EQQ: i32 = 32;
 const KD_MATH_MODULE: i32 = 40;
 const DIRECT_MATH: i64 = 32;
 const DIRECT_NUM: i64 = 64;
 const KD_ARRAY_CLASS: i32 = 48;
+/// kenny-runtime core.rs `KnDirect::string_class`, `DIRECT_STR_BYTE`, `RString::b`.
+const KD_STRING_CLASS: i32 = 64;
+const DIRECT_STR_BYTE: i64 = 512;
+const STR_PTR: i32 = 16;
+const STR_LEN: i32 = 24;
+const STR_CAP: i32 = 32;
 const DIRECT_ARY_AREF: i64 = 8;
 const DIRECT_ARY_ASET: i64 = 16;
 /// kenny-runtime core.rs `RArray::v` (an `SVec`: ptr, len, cap).
@@ -2233,6 +2441,11 @@ const ARY_LEN: i32 = 24;
 const ARY_CAP: i32 = 32;
 /// kenny-runtime core.rs `Class::sup_ptr` / `sup_len` (`CLASS_SUP_PTR`).
 const CLASS_SUP_PTR: i32 = 272;
+/// kenny-runtime core.rs `Header::kind`, `Kind::Class`, `DIRECT_IS_A_HEAP`.
+const HDR_KIND: i32 = 8;
+const KIND_CLASS: i64 = 7;
+const DIRECT_IS_A_HEAP: i64 = 128;
+const DIRECT_MOD_EQQ_ALL: i64 = 256;
 const CLASS_SUP_LEN: i32 = 280;
 const CE_METHOD: i32 = 48;
 /// kenny-runtime core.rs `Method::fast`

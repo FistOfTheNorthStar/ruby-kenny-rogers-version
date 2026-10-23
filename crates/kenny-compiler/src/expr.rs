@@ -848,7 +848,7 @@ impl<M: Module> Compiler<M> {
     where
         F: FnOnce(&mut Compiler<M>, &mut Fx) -> Value,
     {
-        let t = self.truthy(fx, cur);
+        let t = self.truthy_br(fx, cur);
         let no = fx.b.create_block();
         let done = fx.b.create_block();
         fx.b.append_block_param(done, I64);
@@ -863,7 +863,7 @@ impl<M: Module> Compiler<M> {
     where
         F: FnOnce(&mut Compiler<M>, &mut Fx) -> Value,
     {
-        let t = self.truthy(fx, cur);
+        let t = self.truthy_br(fx, cur);
         let yes = fx.b.create_block();
         let done = fx.b.create_block();
         fx.b.append_block_param(done, I64);

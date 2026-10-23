@@ -195,6 +195,7 @@ pub fn do_include(target: *mut Class, m: V) -> V {
     }
     if !ancestors(target).contains(&(m as *mut Class)) {
         unsafe { (*target).includes.push(m as *mut Class) };
+        crate::core::touch_mixin(target, m as *mut Class);
         note_include(target, m as *mut Class);
         bump_serial();
     }
@@ -275,6 +276,16 @@ fn cmp_fail(a: V, b: V) -> V {
 }
 
 pub fn parse_int(b: &[u8], strict: bool) -> Option<V> {
+    // the common case: an optional sign and up to 18 decimal digits, nothing else
+    let (neg, ds) = match b.first() {
+        Some(b'-') => (true, &b[1..]),
+        Some(b'+') => (false, &b[1..]),
+        _ => (false, b),
+    };
+    if !ds.is_empty() && ds.len() <= 18 && ds.iter().all(|c| c.is_ascii_digit()) {
+        let n = ds.iter().fold(0i64, |n, c| n * 10 + (c - b'0') as i64);
+        return Some(mkfix(if neg { -n } else { n }));
+    }
     let s = String::from_utf8_lossy(b);
     let t = s.trim();
     let t: String = t.chars().filter(|c| *c != '_').collect();
@@ -282,7 +293,10 @@ pub fn parse_int(b: &[u8], strict: bool) -> Option<V> {
         Some(r) => (true, r.to_string()),
         None => (false, t.strip_prefix('+').unwrap_or(&t).to_string()),
     };
-    let (radix, digits) = if let Some(r) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+    // (radix prefixes for Integer() only: "0x1A".to_i is 0)
+    let (radix, digits) = if !strict {
+        (10, body.clone())
+    } else if let Some(r) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         (16, r.to_string())
     } else if let Some(r) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
         (2, r.to_string())
@@ -647,8 +661,8 @@ pub fn init() {
             Err(()) => UNDEF,
         }
     });
-    defn(k, "is_a?", 1, 1, |s, a, _| bool_v(is_class(a[0]) && is_a(s, a[0] as *mut Class)));
-    defn(k, "kind_of?", 1, 1, |s, a, _| bool_v(is_class(a[0]) && is_a(s, a[0] as *mut Class)));
+    defn(k, "is_a?", 1, 1, |s, a, _| is_a_v(s, a[0]));
+    defn(k, "kind_of?", 1, 1, |s, a, _| is_a_v(s, a[0]));
     defn(k, "instance_of?", 1, 1, |s, a, _| bool_v(real_class(s) as V == a[0]));
     defn(k, "respond_to?", 1, 2, |s, a, _| {
         let id = match sym_arg(a[0]) {
@@ -867,6 +881,7 @@ pub fn init() {
         unsafe {
             if !(*target).prepends.contains(&m) {
                 (*target).prepends.push(m);
+                crate::core::touch_mixin(target, m);
             }
         }
         bump_serial();
@@ -936,7 +951,10 @@ pub fn init() {
     defn(md, "remove_method", 0, -1, |s, a, _| {
         for &n in a {
             if let Ok(id) = sym_arg(n) {
-                rclass(s).methods.remove(&id);
+                if rclass(s).methods.remove(&id).is_some() {
+                    crate::core::method_name_count(id, false);
+                    crate::core::touch_method_name(s as *mut Class, id);
+                }
             }
         }
         bump_serial();
@@ -1405,7 +1423,10 @@ fn dup_module(v: V) -> V {
             crate::abi::share_owner_of(f);
         }
         let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: c, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
-        k.methods.insert(id, nm);
+        if k.methods.insert(id, nm).is_none() {
+            crate::core::method_name_count(id, true);
+        }
+        crate::core::touch_method_name(c, id);
     }
     k.includes.set(src.includes.clone());
     k.prepends.set(src.prepends.clone());
@@ -1429,7 +1450,10 @@ fn dup_module(v: V) -> V {
                 crate::abi::share_owner_of(f);
             }
             let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: dm, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
-            dk.methods.insert(id, nm);
+            if dk.methods.insert(id, nm).is_none() {
+                crate::core::method_name_count(id, true);
+            }
+            crate::core::touch_method_name(dm, id);
         }
         dk.includes.set(sm.includes.clone());
         dk.prepends.set(sm.prepends.clone());

@@ -345,8 +345,7 @@ impl<M: Module> Compiler<M> {
         let d1 = fx.b.ins().bxor(recv, sk);
         let d2 = fx.b.ins().bxor(ss, cur);
         let d = fx.b.ins().bor(d1, d2);
-        let same = fx.b.ins().icmp_imm_s(IntCC::Equal, d, 0);
-        self.require(fx, same, slow);
+        self.require_zero(fx, d, slow);
         // virtual: `initialize` with its instance variables as variables
         let nil = self.nil(fx);
         for (_, v) in &vl.fields {
