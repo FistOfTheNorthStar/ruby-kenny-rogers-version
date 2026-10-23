@@ -161,3 +161,89 @@ rescue => e
   [e.class, log]
 end
 p with_ensure([1.0, 2.0]), with_ensure([1.0, :x])
+
+# an inlined method's own locals named like the loop's speculated ones
+class Clash
+  attr_reader :start, :f
+  def initialize
+    @start = 0
+    @f = 0.5
+  end
+  def get(i)
+    i + i
+  end
+  def fl(x)
+    x * 2
+  end
+end
+def clash_run(a)
+  x = a.f
+  i = a.start
+  s = nil
+  t = nil
+  while i < 3
+    x = x + 1.0
+    s = a.get("ab")
+    t = a.fl("cd")
+    i = i + 1
+  end
+  [x, s, t, i]
+end
+p clash_run(Clash.new)
+
+# Integer locals in speculated loops: overflow into Bignum mid-loop, a Float showing up,
+# a Bignum on entry
+def grow(start, steps)
+  x = start
+  i = 0
+  while i < steps
+    x = x * 3
+    i += 1
+  end
+  x
+end
+p grow(1, 50), grow(-7, 45)
+
+def add_up(start, step, n)
+  s = start
+  i = 0
+  while i < n
+    s += step
+    i = i + 1
+  end
+  s
+end
+p add_up(4611686018427387900, 1, 10), add_up(-4611686018427387900, -1, 10), add_up(0, 3, 1000)
+
+def count_down(from)
+  k = from
+  n = 0
+  while k > 0
+    k = k - 1
+    n -= 2
+  end
+  [k, n]
+end
+p count_down(100), count_down(2**64 + 3 - 2**64)
+
+def mixed(vals)
+  t = 0
+  i = 0
+  while i < vals.size
+    t = t + vals[i]
+    i += 1
+  end
+  t
+end
+p mixed([1, 2, 3]), mixed([1, 2.5, 3]), mixed([2**70, 1]), mixed([1, Rational(1, 2)])
+
+def big_entry(n)
+  i = n
+  c = 0
+  while i < n + 5
+    i = i + 1
+    c = c + i
+  end
+  c
+end
+p big_entry(2**80), big_entry(10)

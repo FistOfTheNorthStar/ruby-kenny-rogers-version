@@ -703,6 +703,13 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     }
 }
 
+/// Start counting malloc'd bytes against the limit (once the runtime has booted: what boot
+/// allocates stays). Until the first collection, the limit was never armed, so a program
+/// whose garbage is mostly large buffers (`Array.new(8192)` in a loop) never collected.
+pub fn arm_malloc_limit() {
+    MALLOC_SINCE.store(0, Ordering::Relaxed);
+    MALLOC_LIMIT.store(malloc_limit(), Ordering::Relaxed);
+}
 /// Bytes that may be malloc'd between collections (KENNY_GC_MALLOC_LIMIT, in MB; default 32).
 fn malloc_limit() -> isize {
     static M: G<isize> = G::new(0);

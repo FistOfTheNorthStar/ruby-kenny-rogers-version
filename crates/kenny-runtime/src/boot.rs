@@ -160,4 +160,5 @@ pub fn boot() {
     crate::socket::init();
     crate::misc::blockless_enumerators();
     crate::opt::init();
+    crate::gc::arm_malloc_limit();
 }

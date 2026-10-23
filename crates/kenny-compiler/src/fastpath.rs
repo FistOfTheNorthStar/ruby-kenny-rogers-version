@@ -26,7 +26,7 @@ pub(crate) fn f64_to_flonum(d: f64) -> Option<i64> {
 }
 
 /// The value of `v` if it is an `iconst` (a literal operand).
-fn const_of(fx: &Fx, v: Value) -> Option<i64> {
+pub(crate) fn const_of(fx: &Fx, v: Value) -> Option<i64> {
     use cranelift_codegen::ir::{InstructionData, Opcode, ValueDef};
     let dfg = &fx.b.func.dfg;
     match dfg.value_def(v) {
@@ -1185,6 +1185,7 @@ impl<M: Module> Compiler<M> {
     /// entry, made monomorphic loops like nbody's 3-5% slower.)
     pub(crate) fn attr_fast(&mut self, fx: &mut Fx, cache: Value, recv: Value, val: Option<Value>, slow: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
         let f = mem();
+        let remember = if val.is_none() { self.licm_take(fx, false) } else { None };
         let slow_b = fx.b.create_block();
         let done = fx.b.create_block();
         fx.b.append_block_param(done, I64);
@@ -1224,7 +1225,18 @@ impl<M: Module> Compiler<M> {
                 fx.b.switch_to_block(b3);
                 let v = fx.b.ins().load(I64, f, addr, 0);
                 let unset = fx.b.ins().icmp_imm_s(IntCC::Equal, v, UNDEF);
-                fx.b.ins().brif(unset, slow_b, &[], done, &[v.into()]);
+                match &remember {
+                    None => {
+                        fx.b.ins().brif(unset, slow_b, &[], done, &[v.into()]);
+                    }
+                    Some(e) => {
+                        let b4 = fx.b.create_block();
+                        fx.b.ins().brif(unset, slow_b, &[], b4, &[]);
+                        fx.b.switch_to_block(b4);
+                        self.licm_record(fx, e, v);
+                        fx.b.ins().jump(done, &[v.into()]);
+                    }
+                }
             }
             Some(a) => {
                 // no write barrier due (an old buffer not yet remembered takes the runtime
@@ -1235,6 +1247,7 @@ impl<M: Module> Compiler<M> {
                 fx.b.ins().brif(w, b3, &[], slow_b, &[]);
                 fx.b.switch_to_block(b3);
                 fx.b.ins().store(f, a, addr, 0);
+                self.licm_kill(fx);
                 fx.b.ins().jump(done, &[a.into()]);
             }
         }
@@ -1259,29 +1272,10 @@ impl<M: Module> Compiler<M> {
         let done = fx.b.create_block();
         fx.b.append_block_param(done, I64);
         fx.b.set_cold_block(slow_b);
-        self.require_heap(fx, recv, slow_b);
-        // all of these as one word that must be 0: the class is Array itself, its method is
-        // the builtin, the index is a Fixnum, (a write) the Array isn't frozen
-        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
-        let dir = fx.b.ins().symbol_value(I64, gv);
-        let k = fx.b.ins().load(I64, f, recv, 0);
-        let ak = fx.b.ins().load(I64, f, dir, KD_ARRAY_CLASS);
-        let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
-        let want = if val.is_some() { DIRECT_ARY_ASET } else { DIRECT_ARY_AREF };
-        let bit = fx.b.ins().band_imm_s(flags, want);
-        let no_bit = fx.b.ins().bxor_imm_s(bit, want);
-        let other = fx.b.ins().bxor(k, ak);
+        // the index is a Fixnum
         let not_fix = fx.b.ins().bnot(idx);
         let not_fix = fx.b.ins().band_imm_s(not_fix, 1);
-        let mut bad = fx.b.ins().bor(other, no_bit);
-        bad = fx.b.ins().bor(bad, not_fix);
-        if val.is_some() {
-            let fl = fx.b.ins().uload32(f, recv, OBJ_FLAGS);
-            let fr = fx.b.ins().band_imm_s(fl, FL_FROZEN);
-            bad = fx.b.ins().bor(bad, fr);
-        }
-        let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
-        self.require(fx, ok, slow_b);
+        self.ary_guard(fx, recv, val.is_some(), not_fix, slow_b, &[]);
         // the element (capacity first, as SVec::snap does); a negative index counts from the end
         let cap_addr = fx.b.ins().iadd_imm_s(recv, ARY_CAP as i64);
         let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
@@ -1290,9 +1284,9 @@ impl<M: Module> Compiler<M> {
         let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
         let n = fx.b.ins().umin(len, capn);
         let i = fx.b.ins().sshr_imm_s(idx, 1);
-        let neg = fx.b.ins().icmp_imm_s(IntCC::SignedLessThan, i, 0);
-        let zero = fx.b.ins().iconst(I64, 0);
-        let add = fx.b.ins().select(neg, n, zero);
+        // (n when i < 0, else 0: a mask, not a select against a 0 that ends up spilled)
+        let sign = fx.b.ins().sshr_imm_s(i, 63);
+        let add = fx.b.ins().band(sign, n);
         let i = fx.b.ins().iadd(i, add);
         let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, i, n);
         let off = fx.b.ins().ishl_imm_u(i, 3);
@@ -1331,6 +1325,76 @@ impl<M: Module> Compiler<M> {
         fx.b.block_params(done)[0]
     }
 
+    /// The checks of an inline Array index path, falling through when they pass, else to
+    /// `slow_b` (with `slow_args`): `recv` is a heap object whose class is Array itself, its
+    /// `[]` is the builtin and for a `write` also `[]=`, and not frozen; and `not_fix`
+    /// (index checks the caller computed) is 0.
+    ///
+    /// When `recv` was read from an Array local that a loop doesn't assign (licm.rs), the
+    /// first set of checks runs only until it passes, then again after anything that could
+    /// change it (a call); `not_fix` is checked every time.
+    pub(crate) fn ary_guard(&mut self, fx: &mut Fx, recv: Value, write: bool, not_fix: Value, slow_b: Block, slow_args: &[Value]) {
+        let f = mem();
+        let args: Vec<cranelift_codegen::ir::BlockArg> = slow_args.iter().map(|&v| v.into()).collect();
+        let fact = self.licm_ary(fx, recv, write);
+        // the checks on recv alone, as one word that must be 0
+        let recv_bad = |c: &mut Self, fx: &mut Fx| -> Value {
+            let gv = c.module.declare_data_in_func(c.direct_id, fx.b.func);
+            let dir = fx.b.ins().symbol_value(I64, gv);
+            let k = fx.b.ins().load(I64, f, recv, 0);
+            let ak = fx.b.ins().load(I64, f, dir, KD_ARRAY_CLASS);
+            let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
+            let want = if write { DIRECT_ARY_AREF | DIRECT_ARY_ASET } else { DIRECT_ARY_AREF };
+            let bits = fx.b.ins().band_imm_s(flags, want);
+            let no_bits = fx.b.ins().bxor_imm_s(bits, want);
+            let other = fx.b.ins().bxor(k, ak);
+            let mut bad = fx.b.ins().bor(other, no_bits);
+            if write {
+                let fl = fx.b.ins().uload32(f, recv, OBJ_FLAGS);
+                let fr = fx.b.ins().band_imm_s(fl, FL_FROZEN);
+                bad = fx.b.ins().bor(bad, fr);
+            }
+            bad
+        };
+        let heap_check = |fx: &mut Fx, args: &[cranelift_codegen::ir::BlockArg]| {
+            let r = fx.b.ins().rotr_imm_s(recv, 3);
+            let r = fx.b.ins().iadd_imm_s(r, -2);
+            let heap = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, r, (1i64 << 61) - 2);
+            let b0 = fx.b.create_block();
+            fx.b.ins().brif(heap, b0, &[], slow_b, args);
+            fx.b.switch_to_block(b0);
+        };
+        let cont = fx.b.create_block();
+        match fact {
+            None => {
+                heap_check(fx, &args);
+                let bad = recv_bad(self, fx);
+                let bad = fx.b.ins().bor(bad, not_fix);
+                let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
+                fx.b.ins().brif(ok, cont, &[], slow_b, &args);
+            }
+            Some(e) => {
+                let known = fx.b.create_block();
+                let chk = fx.b.create_block();
+                let valid = fx.b.use_var(e.valid);
+                fx.b.ins().brif(valid, known, &[], chk, &[]);
+                fx.b.switch_to_block(chk);
+                heap_check(fx, &args);
+                let bad = recv_bad(self, fx);
+                let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
+                let rec = fx.b.create_block();
+                fx.b.ins().brif(ok, rec, &[], slow_b, &args);
+                fx.b.switch_to_block(rec);
+                self.licm_record(fx, &e, recv);
+                fx.b.ins().jump(known, &[]);
+                fx.b.switch_to_block(known);
+                let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, not_fix, 0);
+                fx.b.ins().brif(ok, cont, &[], slow_b, &args);
+            }
+        }
+        fx.b.switch_to_block(cont);
+    }
+
     /// `recv[idx] += rhs` (`sub`: `-=`) with no call when `recv` is a plain Array whose `[]`
     /// and `[]=` are the builtins, unfrozen, `idx` a Fixnum within it, and the element and
     /// `rhs` Fixnums whose sum is one (an immediate: no write barrier). Else `slow`, given the
@@ -1351,35 +1415,11 @@ impl<M: Module> Compiler<M> {
         fx.b.append_block_param(slow_b, I64);
         fx.b.set_cold_block(slow_b);
         let unread = fx.b.ins().iconst(I64, UNDEF);
-        // (a heap test that sends `unread` to slow_b)
-        let r = fx.b.ins().rotr_imm_s(recv, 3);
-        let r = fx.b.ins().iadd_imm_s(r, -2);
-        let heap = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, r, (1i64 << 61) - 2);
-        let b0 = fx.b.create_block();
-        fx.b.ins().brif(heap, b0, &[], slow_b, &[unread.into()]);
-        fx.b.switch_to_block(b0);
-        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
-        let dir = fx.b.ins().symbol_value(I64, gv);
-        let k = fx.b.ins().load(I64, f, recv, 0);
-        let ak = fx.b.ins().load(I64, f, dir, KD_ARRAY_CLASS);
-        let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
-        let want = DIRECT_ARY_AREF | DIRECT_ARY_ASET;
-        let bits = fx.b.ins().band_imm_s(flags, want);
-        let no_bits = fx.b.ins().bxor_imm_s(bits, want);
-        let other = fx.b.ins().bxor(k, ak);
         // idx and rhs Fixnums: both low bits set
         let both = fx.b.ins().band(idx, rhs);
         let not_fix = fx.b.ins().bnot(both);
         let not_fix = fx.b.ins().band_imm_s(not_fix, 1);
-        let fl = fx.b.ins().uload32(f, recv, OBJ_FLAGS);
-        let fr = fx.b.ins().band_imm_s(fl, FL_FROZEN);
-        let mut bad = fx.b.ins().bor(other, no_bits);
-        bad = fx.b.ins().bor(bad, not_fix);
-        bad = fx.b.ins().bor(bad, fr);
-        let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
-        let b1 = fx.b.create_block();
-        fx.b.ins().brif(ok, b1, &[], slow_b, &[unread.into()]);
-        fx.b.switch_to_block(b1);
+        self.ary_guard(fx, recv, true, not_fix, slow_b, &[unread]);
         let cap_addr = fx.b.ins().iadd_imm_s(recv, ARY_CAP as i64);
         let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
         let ptr = fx.b.ins().load(I64, f, recv, ARY_PTR);
@@ -1387,9 +1427,9 @@ impl<M: Module> Compiler<M> {
         let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
         let n = fx.b.ins().umin(len, capn);
         let i = fx.b.ins().sshr_imm_s(idx, 1);
-        let neg = fx.b.ins().icmp_imm_s(IntCC::SignedLessThan, i, 0);
-        let zero = fx.b.ins().iconst(I64, 0);
-        let add = fx.b.ins().select(neg, n, zero);
+        // (n when i < 0, else 0: a mask, not a select against a 0 that ends up spilled)
+        let sign = fx.b.ins().sshr_imm_s(i, 63);
+        let add = fx.b.ins().band(sign, n);
         let i = fx.b.ins().iadd(i, add);
         let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, i, n);
         let b2 = fx.b.create_block();
@@ -1480,6 +1520,9 @@ impl<M: Module> Compiler<M> {
                 let unset = fx.b.ins().icmp_imm_s(IntCC::Equal, v, UNDEF);
                 let nil = fx.b.ins().iconst(I64, QNIL);
                 let r = fx.b.ins().select(unset, nil, v);
+                if let Some(e) = self.licm_take(fx, true) {
+                    self.licm_record(fx, &e, r);
+                }
                 fx.b.ins().jump(done, &[r.into()]);
             }
             Some(a) => {
@@ -1490,6 +1533,7 @@ impl<M: Module> Compiler<M> {
                 fx.b.ins().brif(w, b3, &[], slow_b, &[]);
                 fx.b.switch_to_block(b3);
                 fx.b.ins().store(f, a, addr, 0);
+                self.licm_kill(fx);
                 fx.b.ins().jump(done, &[a.into()]);
             }
         }
@@ -1537,6 +1581,9 @@ impl<M: Module> Compiler<M> {
         let kok = fx.b.ins().icmp(IntCC::Equal, key, want);
         self.require(fx, kok, slow_b);
         let v = fx.b.ins().load(I64, f, e, 24);
+        if let Some(en) = self.licm_take(fx, true) {
+            self.licm_record(fx, &en, v);
+        }
         fx.b.ins().jump(done, &[v.into()]);
         fx.b.switch_to_block(slow_b);
         let r = slow(self, fx);
@@ -1762,6 +1809,7 @@ impl<M: Module> Compiler<M> {
         let fsig = self.fast_sig(vals.len());
         let fsr = fx.b.import_signature(fsig);
         let call = fx.b.ins().call_indirect(fsr, fp, &fargs);
+        self.licm_kill(fx);
         let r = fx.b.inst_results(call)[0];
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(gen_b);
@@ -1771,6 +1819,7 @@ impl<M: Module> Compiler<M> {
         let sig = self.method_sig();
         let sr = fx.b.import_signature(sig);
         let call = fx.b.ins().call_indirect(sr, func, &[recv, argc, argv, nil]);
+        self.licm_kill(fx);
         let r = fx.b.inst_results(call)[0];
         fx.b.ins().jump(done, &[r.into()]);
 

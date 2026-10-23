@@ -17,6 +17,7 @@ mod pattern;
 mod scopes;
 mod spec;
 mod vobj;
+mod licm;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -92,6 +93,11 @@ pub(crate) struct Fx<'a> {
     pub b: FunctionBuilder<'a>,
     pub kind: ScopeKind,
     pub lambda: bool,
+    /// a block whose `return` returns from it (a lambda, a method body block): its unwind
+    /// path catches its own tag (`tag_v`)
+    pub ret_here: bool,
+    /// FnSpec::ret_hops
+    pub ret_hops: Option<u32>,
     pub self_v: Variable,
     pub blk_v: Variable,
     pub argc_v: Variable,
@@ -163,6 +169,21 @@ pub(crate) struct Fx<'a> {
     pub vself: Option<HashMap<Vec<u8>, Variable>>,
     /// ... for the next inlined method body only
     pub vself_next: Option<HashMap<Vec<u8>, Variable>>,
+    /// attribute reads remembered across a loop's iterations (licm.rs)
+    pub licm: Vec<licm::Entry>,
+    /// the read being compiled: the attr fast path at this inline depth records its value
+    pub licm_pending: Option<licm::Entry>,
+    /// values read from a remembered Array local (licm.rs `Entry` for `[]` / `[]=`)
+    pub licm_vals: Vec<(Value, licm::Entry)>,
+    /// in an inlined method: the remembered instance variables of its receiver (licm.rs)
+    pub inl_self: Vec<licm::Entry>,
+    /// compiling the plain call of a `define_method` that `def_from_block` handles
+    pub no_block_def: bool,
+    /// `env_v` starts as 0 and is made by the first closure (scopes.rs `lazy_env`)
+    pub lazy_env: bool,
+    /// true/false values made from an i8 condition (`bool_v`): `truthy` of one is that
+    /// condition
+    pub bools: HashMap<Value, Value>,
 }
 
 pub struct Compiler<M: Module> {
@@ -187,6 +208,10 @@ pub struct Compiler<M: Module> {
     pub(crate) inline_defs: HashMap<(PathBuf, usize), std::rc::Rc<statics::InlineDef>>,
     /// statics.rs: the inlined methods being compiled, innermost last
     pub(crate) inline_ctx: Vec<statics::InlineFrame>,
+    /// inlined method bodies with a literal block to yield to (statics.rs `inline_yield`)
+    pub(crate) yield_targets: Vec<statics::YieldTarget>,
+    /// the next literal block (`block_proc`) is a `define_method` body
+    pub(crate) bmethod_next: bool,
     /// (file, offset) of the `def`s whose bodies are being compiled
     pub(crate) def_stack: Vec<(PathBuf, usize)>,
     /// (file, offset) of a compiled `def` -> the cache slot of its constant scope (cref)
@@ -491,6 +516,8 @@ impl<M: Module> Compiler<M> {
             def_lex: HashMap::new(),
             inline_defs: HashMap::new(),
             inline_ctx: Vec::new(),
+            yield_targets: Vec::new(),
+            bmethod_next: false,
             def_stack: Vec::new(),
             def_cref: HashMap::new(),
             class_getters: HashMap::new(),
@@ -778,6 +805,10 @@ impl<M: Module> Compiler<M> {
     pub(crate) fn call(&mut self, fx: &mut Fx, name: &'static str, args: &[Value]) -> Value {
         let f = self.rt_ref(fx, name);
         let inst = fx.b.ins().call(f, args);
+        // (these run no Ruby code and write no instance variable)
+        if !matches!(name, "kn_float_box" | "kn_float_unbox" | "kn_is_float" | "kn_float_lit") {
+            self.licm_kill(fx);
+        }
         match fx.b.inst_results(inst).first() {
             Some(&v) => v,
             None => fx.b.ins().iconst(I64, 0),
@@ -857,13 +888,19 @@ impl<M: Module> Compiler<M> {
     }
     /// i8 condition: Ruby truthiness (not nil, not false).
     pub(crate) fn truthy(&mut self, fx: &mut Fx, v: Value) -> Value {
+        // a comparison's result: the condition it was made from
+        if let Some(&c) = fx.bools.get(&v) {
+            return c;
+        }
         let m = fx.b.ins().band_imm_s(v, !QNIL);
         fx.b.ins().icmp_imm_s(IntCC::NotEqual, m, 0)
     }
     pub(crate) fn bool_v(&mut self, fx: &mut Fx, c: Value) -> Value {
         let t = fx.b.ins().iconst(I64, QTRUE);
         let f = fx.b.ins().iconst(I64, QFALSE);
-        fx.b.ins().select(c, t, f)
+        let v = fx.b.ins().select(c, t, f);
+        fx.bools.insert(v, c);
+        v
     }
     pub(crate) fn cref(&mut self, fx: &mut Fx) -> Value {
         let p = self.slot_ptr(fx, fx.cref_slot);
