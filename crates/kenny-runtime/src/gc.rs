@@ -11,7 +11,7 @@
 
 use crate::core::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 pub const FL_MARK: u32 = 4;
 /// An old object already in the remembered set (cleared when a collection consumes it), so
@@ -442,8 +442,10 @@ fn lazy_sweep(pg: &mut Page) {
                 pg.alloc[wi] &= !(1u64 << b);
                 freed += 1;
                 if !matches!(hd.kind, Kind::String | Kind::Array | Kind::Hash | Kind::Object | Kind::Env) {
-                    // these keep instance variables in the shared table
-                    if let Some(t) = crate::core::GENERIC_IVARS.get().as_mut() {
+                    // these keep instance variables in the shared table (its lock without
+                    // stopping: a collection must not find this page half swept; its holders
+                    // never stop while holding it, see core.rs)
+                    if let Some(t) = crate::core::GENERIC_IVARS.get_unstoppable().as_mut() {
                         t.remove(&p);
                     }
                 }
@@ -1020,14 +1022,46 @@ struct ScanFilter {
     code_hi: usize,
     envs: bool,
     classes: bool,
+    /// objects may move: a word pointing into one pins it (`Marker::word`)
+    compacting: bool,
 }
-static SCAN_FILTER: G<ScanFilter> = G::new(ScanFilter { page_lo: 0, page_hi: 0, retired_lo: 1, retired_hi: 0, code_lo: 1, code_hi: 0, envs: false, classes: false });
+static SCAN_FILTER: G<ScanFilter> = G::new(ScanFilter { page_lo: 0, page_hi: 0, retired_lo: 1, retired_hi: 0, code_lo: 1, code_hi: 0, envs: false, classes: false, compacting: false });
 static SCAN_RANGES: G<Vec<(usize, usize)>> = G::new(Vec::new());
 static SCAN_ACTIVE: AtomicBool = AtomicBool::new(false);
-static SCAN_NEXT: AtomicUsize = AtomicUsize::new(0);
+/// The scan job's chunks, claimed one at a time (`claim`).
+static SCAN_CLAIM: AtomicU64 = AtomicU64::new(0);
 static SCAN_PENDING: AtomicUsize = AtomicUsize::new(0);
 static SCAN_OUT: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 const SCAN_CHUNK_WORDS: usize = 4096;
+
+// A job's chunks are claimed through one word: job number (16 bits), chunk count (24),
+// next chunk (24). A stopped thread can be held up between deciding to help and claiming a
+// chunk until a later collection; tied to the job, its claim then fails instead of taking a
+// chunk of a job still being set up (or reading the old job's freed data).
+const CLAIM_BITS: u32 = 24;
+const CLAIM_MASK: u64 = (1 << CLAIM_BITS) - 1;
+
+/// Start a job of `chunks` chunks (after its data and pending count are set).
+fn publish_job(a: &AtomicU64, chunks: usize) {
+    assert!((chunks as u64) <= CLAIM_MASK, "gc: too many chunks");
+    let job = ((a.load(Ordering::Relaxed) >> (2 * CLAIM_BITS)) + 1) & 0xffff;
+    a.store(job << (2 * CLAIM_BITS) | (chunks as u64) << CLAIM_BITS, Ordering::SeqCst);
+}
+
+/// The next unclaimed chunk of the current job, if any.
+fn claim(a: &AtomicU64) -> Option<usize> {
+    let mut cur = a.load(Ordering::Acquire);
+    loop {
+        let (n, next) = ((cur >> CLAIM_BITS) & CLAIM_MASK, cur & CLAIM_MASK);
+        if next >= n {
+            return None;
+        }
+        match a.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(next as usize),
+            Err(c) => cur = c,
+        }
+    }
+}
 
 #[inline]
 fn scan_candidate(f: &ScanFilter, w: usize) -> bool {
@@ -1040,7 +1074,7 @@ fn scan_candidate(f: &ScanFilter, w: usize) -> bool {
     if w & 7 != 0 || w < 4096 {
         return false;
     }
-    if w >= f.page_lo && w < f.page_hi + 16 && (is_object(w) || is_object(w - 16)) {
+    if w >= f.page_lo && w < f.page_hi + 16 && (f.compacting || is_object(w) || is_object(w - 16)) {
         return true;
     }
     (f.envs && heap().envs.contains_key(&w)) || (f.classes && heap().class_set.contains(&w))
@@ -1051,17 +1085,13 @@ fn scan_help() -> bool {
     if !SCAN_ACTIVE.load(Ordering::Acquire) {
         return false;
     }
-    let ranges = SCAN_RANGES.get();
-    let f = SCAN_FILTER.get();
     let mut out = Vec::new();
     let mut worked = false;
-    loop {
-        let i = SCAN_NEXT.fetch_add(1, Ordering::AcqRel);
-        if i >= ranges.len() {
-            break;
-        }
+    while let Some(i) = claim(&SCAN_CLAIM) {
+        // (the job's data is read only once one of its chunks is ours)
+        let f = SCAN_FILTER.get();
+        let (lo, hi) = SCAN_RANGES.get()[i];
         worked = true;
-        let (lo, hi) = ranges[i];
         let mut p = lo;
         while p + 8 <= hi {
             let w = unsafe { *(p as *const usize) };
@@ -1092,6 +1122,7 @@ fn scan_ranges_parallel(m: &mut Marker, ranges: &[(usize, usize)]) {
         code_hi: m.code_hi,
         envs: !h.envs.is_empty(),
         classes: m.major,
+        compacting: m.compacting,
     };
     let chunks = SCAN_RANGES.get();
     chunks.clear();
@@ -1108,8 +1139,8 @@ fn scan_ranges_parallel(m: &mut Marker, ranges: &[(usize, usize)]) {
         }
         SCANNED_WORDS.fetch_add(hi.saturating_sub(lo) / 8, Ordering::Relaxed);
     }
-    SCAN_NEXT.store(0, Ordering::Relaxed);
     SCAN_PENDING.store(chunks.len(), Ordering::SeqCst);
+    publish_job(&SCAN_CLAIM, chunks.len());
     SCAN_ACTIVE.store(true, Ordering::SeqCst);
     STW_CV.notify_all();
     scan_help();
@@ -1139,7 +1170,8 @@ struct SweepJob {
 }
 static SWEEP_JOB: G<SweepJob> = G::new(SweepJob { pages: std::ptr::null_mut(), idx: std::ptr::null(), n: 0 });
 static SWEEP_ACTIVE: AtomicBool = AtomicBool::new(false);
-static SWEEP_NEXT: AtomicUsize = AtomicUsize::new(0);
+/// The sweep job's chunks, claimed one at a time (`claim`).
+static SWEEP_CLAIM: AtomicU64 = AtomicU64::new(0);
 static SWEEP_PENDING: AtomicUsize = AtomicUsize::new(0);
 static SWEEP_LIVE: AtomicUsize = AtomicUsize::new(0);
 static SWEEP_FREED: AtomicUsize = AtomicUsize::new(0);
@@ -1157,18 +1189,15 @@ fn sweep_help() -> bool {
         return false;
     }
     let mut worked = false;
-    let job = SWEEP_JOB.get();
-    let (pages, idx, n) = (job.pages, job.idx, job.n);
-    let gen_tbl = crate::core::GENERIC_IVARS.raw().as_ref().filter(|t| !t.is_empty());
     let mut live = 0usize;
     let mut freed = 0usize;
     let mut deferred = Vec::new();
-    loop {
-        let c = SWEEP_NEXT.fetch_add(1, Ordering::AcqRel);
+    while let Some(c) = claim(&SWEEP_CLAIM) {
+        // (the job's data is read only once one of its chunks is ours)
+        let job = SWEEP_JOB.get();
+        let (pages, idx, n) = (job.pages, job.idx, job.n);
+        let gen_tbl = crate::core::GENERIC_IVARS.raw().as_ref().filter(|t| !t.is_empty());
         let start = c * SWEEP_CHUNK;
-        if start >= n {
-            break;
-        }
         worked = true;
         for k in start..(start + SWEEP_CHUNK).min(n) {
             let pg = unsafe { &mut **pages.add(*idx.add(k)) };
@@ -1256,8 +1285,10 @@ fn park() {
 
 /// Called by a thread spinning on a runtime lock: stop here if a collection is waiting.
 pub fn park_if_stopping() {
-    // (the collector itself never spins on a runtime lock while it waits or collects)
-    if crate::mt::multi() && KN_GC_PENDING.load(Ordering::SeqCst) & STW_BIT != 0 {
+    // (the collector itself never spins on a runtime lock while it waits or collects; nor
+    // does a thread that runs no Ruby code stop: the background sweeper has no P state to
+    // park with, and holds no Ruby object a collection would scan)
+    if crate::mt::multi() && KN_GC_PENDING.load(Ordering::SeqCst) & STW_BIT != 0 && crate::core::pst_opt().is_some() {
         park();
     }
 }
@@ -2171,10 +2202,10 @@ fn collect_locked() {
         *SWEEP_JOB.get() = SweepJob { pages: h.pages.as_mut_ptr(), idx: sweep_pages.as_ptr(), n };
         SWEEP_LIVE.store(0, Ordering::Relaxed);
         SWEEP_FREED.store(0, Ordering::Relaxed);
-        SWEEP_NEXT.store(0, Ordering::Relaxed);
         SWEEP_PENDING.store(n.div_ceil(SWEEP_CHUNK), Ordering::SeqCst);
         SWEEP_COLLECTOR.store(crate::core::pst() as *mut PState as usize, Ordering::Relaxed);
         SWEEP_HELPED.store(0, Ordering::Relaxed);
+        publish_job(&SWEEP_CLAIM, n.div_ceil(SWEEP_CHUNK));
         SWEEP_ACTIVE.store(true, Ordering::SeqCst);
         STW_CV.notify_all();
         let _ = sweep_help();

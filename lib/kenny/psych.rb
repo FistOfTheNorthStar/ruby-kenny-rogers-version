@@ -241,7 +241,7 @@ module Psych
     end
 
     if VERSION.to_i < 4
-      # psych 3: `load` revives any class and allows aliases (what e.g. Rails 5.2 expects of
+      # psych 3: `load` revives any class and allows aliases (what older gems expect, e.g. of
       # database.yml with `<<: *default`); `safe_load` also takes its options positionally.
       def load(yaml, legacy_filename = nil, filename: nil, fallback: false, symbolize_names: false, freeze: false, **)
         unsafe_load(yaml, filename: filename || legacy_filename, fallback: fallback, symbolize_names: symbolize_names, freeze: freeze)
