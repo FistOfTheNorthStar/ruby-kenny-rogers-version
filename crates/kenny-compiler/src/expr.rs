@@ -979,22 +979,26 @@ impl<M: Module> Compiler<M> {
         !fx.loops.is_empty() || !self.in_dependency()
     }
 
+    /// A String with interpolation: built in a buffer sized for the literal parts plus 16
+    /// bytes per embedded value, which only this code sees until it is done (kenny-runtime
+    /// abi.rs `kn_str_interp`).
     fn interpolate(&mut self, fx: &mut Fx, parts: &NodeList) -> Value {
-        let (p, l) = self.str_ptr(fx, b"");
-        let s = self.call(fx, "kn_str_new", &[p, l]);
+        let cap: usize = parts.iter().map(|p| p.as_string_node().map_or(16, |sn| sn.unescaped().len())).sum();
+        let cap = self.iconst(fx, cap.min(1 << 16) as i64);
+        let s = self.call(fx, "kn_str_buf", &[cap]);
         for part in parts.iter() {
             if let Some(sn) = part.as_string_node() {
                 let (p, l) = self.str_ptr(fx, &sn.unescaped().to_vec());
-                self.call(fx, "kn_str_append_raw", &[s, p, l]);
+                self.call(fx, "kn_str_interp_raw", &[s, p, l]);
             } else if let Some(es) = part.as_embedded_statements_node() {
                 let v = self.stmts(fx, es.statements());
-                self.callc(fx, "kn_str_append", &[s, v]);
+                self.callc(fx, "kn_str_interp", &[s, v]);
             } else if let Some(ev) = part.as_embedded_variable_node() {
                 let v = self.expr(fx, &ev.variable());
-                self.callc(fx, "kn_str_append", &[s, v]);
+                self.callc(fx, "kn_str_interp", &[s, v]);
             } else {
                 let v = self.expr(fx, &part);
-                self.callc(fx, "kn_str_append", &[s, v]);
+                self.callc(fx, "kn_str_interp", &[s, v]);
             }
         }
         s

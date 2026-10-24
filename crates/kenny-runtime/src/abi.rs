@@ -444,6 +444,63 @@ pub unsafe extern "C" fn kn_str_append_raw(s: V, ptr: *const u8, len: u64) -> V 
     rstr(s).b.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, len as usize) });
     s
 }
+/// A String literal with interpolation starts as this: empty, room for `cap` bytes (see
+/// `kn_str_interp_raw`, `kn_str_interp`).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_str_buf(cap: u64) -> V {
+    str_new(Vec::with_capacity(cap as usize))
+}
+/// A literal part of an interpolation into `s` (from `kn_str_buf`, seen by no other code
+/// until done, so `extend_private`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_str_interp_raw(s: V, ptr: *const u8, len: u64) -> V {
+    rstr(s).b.extend_private(unsafe { std::slice::from_raw_parts(ptr, len as usize) });
+    s
+}
+/// "#{v}" into `s` (as `kn_str_interp_raw`): appends v.to_s, Strings, Integers, Symbols
+/// and nil without a copy in between.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_str_interp(s: V, v: V) -> V {
+    let b = &mut rstr(s).b;
+    if is_fix(v) {
+        let mut buf = [0u8; 24];
+        let mut i = buf.len();
+        let n = fix(v);
+        let mut m = n.unsigned_abs();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (m % 10) as u8;
+            m /= 10;
+            if m == 0 {
+                break;
+            }
+        }
+        if n < 0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        b.extend_private(&buf[i..]);
+        return s;
+    }
+    if v == QNIL {
+        return s;
+    }
+    if is_sym(v) {
+        b.extend_private(sym_name(sym_id(v)));
+        return s;
+    }
+    if kind(v) == Some(Kind::String) {
+        b.extend_private(rstr(v).b.as_slice());
+        return s;
+    }
+    match crate::fmt::to_s(v) {
+        Ok(x) => {
+            rstr(s).b.extend_private(&x);
+            s
+        }
+        Err(()) => UNDEF,
+    }
+}
 /// "#{v}" — appends v.to_s
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_str_append(s: V, v: V) -> V {

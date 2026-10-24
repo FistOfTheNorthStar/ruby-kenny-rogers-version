@@ -95,7 +95,8 @@ pub extern "C" fn kn_str_append_own(s: V, e: V, own: u64) -> V {
             let h = hdr(s);
             h.flags = (h.flags & !ENC_MASK) | (hdr(e).flags & ENC_MASK);
         }
-        b(s).extend_from_slice(add);
+        // (no one else can see `s`: a replaced buffer can be freed now)
+        b(s).extend_private(add);
         return s;
     }
     str_plus(s, &rstr(e).b, e)

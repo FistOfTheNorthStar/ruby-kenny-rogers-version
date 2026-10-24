@@ -20,7 +20,22 @@ pub type CallCFunc = unsafe extern "C" fn(*const c_void, c_int, V, c_int, *const
 pub static CFUNC_CALLER: G<Option<CallCFunc>> = G::new(None);
 static EXTS: G<Vec<(String, unsafe extern "C" fn())>> = G::new(Vec::new());
 static LOADED_EXTS: crate::mt::L<Vec<String>> = crate::mt::L::new(Vec::new());
-static ALLOC_FUNCS: crate::mt::L<Option<HashMap<usize, unsafe extern "C" fn(V) -> V>>> = crate::mt::L::new(None);
+type AllocMap = HashMap<usize, unsafe extern "C" fn(V) -> V>;
+/// Classes' allocators from C extensions (`rb_define_alloc_func`). Read on every object
+/// allocation from any thread, so readers take no lock: a change publishes a new map
+/// (under `ALLOC_FUNCS_W`) and keeps the old one, which a reader may still be using.
+/// Null while there are none.
+static ALLOC_FUNCS: std::sync::atomic::AtomicPtr<AllocMap> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static ALLOC_FUNCS_W: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn alloc_funcs_change(f: impl FnOnce(&mut AllocMap)) {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _g = ALLOC_FUNCS_W.lock().unwrap_or_else(|e| e.into_inner());
+    let old = ALLOC_FUNCS.load(Acquire);
+    let mut m = if old.is_null() { AllocMap::new() } else { unsafe { (*old).clone() } };
+    f(&mut m);
+    let new = if m.is_empty() { std::ptr::null_mut() } else { Box::into_raw(Box::new(m)) };
+    ALLOC_FUNCS.store(new, Release);
+}
 static GLOBAL_ROOTS: crate::mt::L<Vec<*const V>> = crate::mt::L::new(Vec::new());
 
 #[unsafe(no_mangle)]
@@ -50,11 +65,11 @@ pub fn require_ext(name: &str) -> Option<V> {
 }
 
 pub fn alloc_func(c: *mut Class) -> Option<unsafe extern "C" fn(V) -> V> {
-    let g = ALLOC_FUNCS.get();
-    let m = g.as_ref()?;
-    if m.is_empty() {
+    let p = ALLOC_FUNCS.load(std::sync::atomic::Ordering::Acquire);
+    if p.is_null() {
         return None;
     }
+    let m = unsafe { &*p };
     // allocators belong to classes, so the superclass chain is enough (no ancestors list)
     let mut k = c;
     while !k.is_null() {
@@ -244,13 +259,15 @@ pub extern "C" fn rb_define_global_const(name: *const c_char, v: V) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_define_alloc_func(klass: V, f: unsafe extern "C" fn(V) -> V) {
-    ALLOC_FUNCS.get().get_or_insert_with(HashMap::new).insert(klass as usize, f);
+    alloc_funcs_change(|m| {
+        m.insert(klass as usize, f);
+    });
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_undef_alloc_func(klass: V) {
-    if let Some(m) = ALLOC_FUNCS.get().as_mut() {
+    alloc_funcs_change(|m| {
         m.remove(&(klass as usize));
-    }
+    });
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_include_module(klass: V, m: V) {

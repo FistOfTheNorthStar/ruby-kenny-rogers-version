@@ -566,10 +566,26 @@ fn embed_files(o: &Opts, opts: &kenny_compiler::Options, out: &Path, work: &Path
 }
 
 fn link(objs: &[PathBuf], rt: &Path, out: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("KENNY_LINK_UMBRELLA").is_none() {
+        if let Some(stubs) = macos::system_lib_stubs() {
+            if link_with(objs, rt, out, &stubs).is_ok() && macos::direct_binds_ok(out) {
+                return Ok(());
+            }
+        }
+    }
+    link_with(objs, rt, out, &[])
+}
+
+/// Link, binding libSystem's symbols to these sub-library stubs (macOS, `macos`).
+fn link_with(objs: &[PathBuf], rt: &Path, out: &Path, stubs: &[PathBuf]) -> Result<(), String> {
     let mut c = cc();
     c.arg("-o").arg(out).args(objs).arg(rt);
     if cfg!(target_os = "macos") {
         c.args(["-Wl,-dead_strip", "-lm"]);
+        for s in stubs {
+            c.arg(format!("-Wl,{}", s.display()));
+        }
     } else {
         c.args(["-Wl,--gc-sections", "-lm", "-lpthread", "-ldl"]);
     }
@@ -578,6 +594,86 @@ fn link(objs: &[PathBuf], rt: &Path, out: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("linking failed:\n{}", String::from_utf8_lossy(&o.stderr)))
+    }
+}
+
+/// Faster program start on macOS. A program's imports from libSystem are bound when it starts;
+/// through the umbrella each one is looked up in its ~40 re-exported libraries in turn (tens of
+/// thousands of instructions each: 0.6 ms of an empty program's 3.2 ms). Linked against the
+/// sub-libraries that define them (libsystem_c, libsystem_kernel, ...), each is found directly.
+/// Apple only promises where symbols are at the umbrella level, so after linking each import is
+/// checked against the running system (`dlsym`); a mismatch, or no SDK stubs, links the usual
+/// way. `KENNY_LINK_UMBRELLA=1` always does.
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const SUB_LIBS: &[&str] = &[
+        "libsystem_kernel",
+        "libsystem_c",
+        "libsystem_pthread",
+        "libsystem_m",
+        "libsystem_malloc",
+        "libsystem_platform",
+        "libunwind",
+        "libdyld",
+        "libsystem_info",
+        "libdispatch",
+        "libcommonCrypto",
+    ];
+
+    /// The SDK's stubs for the sub-libraries, if it has them all.
+    pub fn system_lib_stubs() -> Option<Vec<PathBuf>> {
+        let sdk = match std::env::var("SDKROOT") {
+            Ok(s) if !s.is_empty() => PathBuf::from(s),
+            _ => {
+                let o = Command::new("xcrun").arg("--show-sdk-path").output().ok()?;
+                if !o.status.success() {
+                    return None;
+                }
+                PathBuf::from(String::from_utf8(o.stdout).ok()?.trim())
+            }
+        };
+        SUB_LIBS.iter().map(|l| Some(sdk.join(format!("usr/lib/system/{l}.tbd"))).filter(|p| p.is_file())).collect()
+    }
+
+    unsafe extern "C" {
+        fn dlopen(path: *const std::ffi::c_char, mode: i32) -> *mut std::ffi::c_void;
+        fn dlsym(handle: *mut std::ffi::c_void, name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+    }
+    const RTLD_LAZY: i32 = 0x1;
+    const RTLD_NOLOAD: i32 = 0x10;
+    /// lookups through the handle search that library only (with what it re-exports), as a
+    /// two-level bind to it does
+    const RTLD_FIRST: i32 = 0x100;
+
+    /// Every import bound to a sub-library is found in that library on this system.
+    pub fn direct_binds_ok(bin: &Path) -> bool {
+        let mut handles = std::collections::HashMap::new();
+        let Ok(o) = Command::new("nm").args(["-m", "-u"]).arg(bin).output() else { return false };
+        if !o.status.success() {
+            return false;
+        }
+        let text = String::from_utf8_lossy(&o.stdout);
+        for line in text.lines() {
+            // "(undefined) external _abort (from libsystem_c)"
+            let Some((head, from)) = line.rsplit_once(" (from ") else { continue };
+            let lib = from.trim_end_matches(')');
+            if !SUB_LIBS.contains(&lib) {
+                continue;
+            }
+            let Some(sym) = head.split_whitespace().last().and_then(|s| s.strip_prefix('_')) else { return false };
+            let Ok(c) = std::ffi::CString::new(sym) else { return false };
+            let h = *handles.entry(lib).or_insert_with(|| {
+                let path = std::ffi::CString::new(format!("/usr/lib/system/{lib}.dylib")).unwrap();
+                unsafe { dlopen(path.as_ptr(), RTLD_LAZY | RTLD_NOLOAD | RTLD_FIRST) }
+            });
+            if h.is_null() || unsafe { dlsym(h, c.as_ptr()) }.is_null() {
+                return false;
+            }
+        }
+        true
     }
 }
 

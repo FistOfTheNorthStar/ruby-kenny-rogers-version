@@ -196,8 +196,9 @@ impl<T: Copy> SVec<T> {
     }
 
     /// Replace the buffer with one of capacity `newcap` holding the first `n` elements
-    /// followed by `extra`. Called with the lock held; unlocks.
-    fn grow_with(&self, oldcap: usize, n: usize, newcap: usize, extra: &[T]) {
+    /// followed by `extra`. Called with the lock held; unlocks. `private`: no other thread
+    /// can be reading the old buffer, so it is freed now (see `extend_private`).
+    fn grow_with(&self, oldcap: usize, n: usize, newcap: usize, extra: &[T], private: bool) {
         let old = self.ptr.load(Relaxed);
         let w0 = self.cap.load(Relaxed);
         let (old_start, old_alloc) = Self::alloc_start(old, oldcap | (w0 & SHIFT));
@@ -218,7 +219,11 @@ impl<T: Copy> SVec<T> {
         let flags = self.cap.load(Relaxed) & FLAGS;
         self.cap.store(ncap | flags, Release);
         if w0 & EMBED == 0 {
-            retire_buf(old_start, old_alloc);
+            if private {
+                free_buf(old_start, old_alloc);
+            } else {
+                retire_buf(old_start, old_alloc);
+            }
         }
     }
 
@@ -234,7 +239,7 @@ impl<T: Copy> SVec<T> {
             self.len.store(n + 1, Release);
             self.unlock(cap);
         } else {
-            self.grow_with(cap, n, (cap * 2).max(4), &[x]);
+            self.grow_with(cap, n, (cap * 2).max(4), &[x], false);
         }
     }
     pub fn pop(&mut self) -> Option<T> {
@@ -305,7 +310,7 @@ impl<T: Copy> SVec<T> {
             let mut tail = Vec::with_capacity(n - i + 1);
             tail.push(x);
             tail.extend_from_slice(unsafe { std::slice::from_raw_parts(self.ptr.load(Relaxed).add(i), n - i) });
-            self.grow_with(cap, i, (cap * 2).max(4), &tail);
+            self.grow_with(cap, i, (cap * 2).max(4), &tail, false);
         }
     }
     pub fn remove(&mut self, i: usize) -> T {
@@ -345,7 +350,24 @@ impl<T: Copy> SVec<T> {
             self.len.store(n + xs.len(), Release);
             self.unlock(cap);
         } else {
-            self.grow_with(cap, n, (cap * 2).max(n + xs.len()).max(8), xs);
+            self.grow_with(cap, n, (cap * 2).max(n + xs.len()).max(8), xs, false);
+        }
+    }
+    /// `extend_from_slice` for a buffer no other thread can see yet (a String being built
+    /// by string interpolation): a replaced buffer is freed now rather than at the next GC.
+    pub fn extend_private(&mut self, xs: &[T]) {
+        if xs.is_empty() {
+            return;
+        }
+        self.wb();
+        let cap = self.lock();
+        let n = self.len.load(Relaxed).min(cap);
+        if n + xs.len() <= cap {
+            unsafe { std::ptr::copy(xs.as_ptr(), self.ptr.load(Relaxed).add(n), xs.len()) };
+            self.len.store(n + xs.len(), Release);
+            self.unlock(cap);
+        } else {
+            self.grow_with(cap, n, (cap * 2).max(n + xs.len()).max(8), xs, true);
         }
     }
     #[allow(clippy::should_implement_trait)]
@@ -363,7 +385,7 @@ impl<T: Copy> SVec<T> {
         if n + extra <= cap {
             self.unlock(cap);
         } else {
-            self.grow_with(cap, n, (n + extra).max(cap * 2), &[]);
+            self.grow_with(cap, n, (n + extra).max(cap * 2), &[], false);
         }
     }
     pub fn resize(&mut self, k: usize, fill: T) {
@@ -412,7 +434,7 @@ impl<T: Copy> SVec<T> {
             self.len.store(v.len(), Release);
             self.unlock(cap);
         } else {
-            self.grow_with(cap, 0, v.len(), &v);
+            self.grow_with(cap, 0, v.len(), &v, false);
         }
     }
     pub fn set_from_slice(&mut self, v: &[T]) {
@@ -423,7 +445,7 @@ impl<T: Copy> SVec<T> {
             self.len.store(v.len(), Release);
             self.unlock(cap);
         } else {
-            self.grow_with(cap, 0, v.len(), v);
+            self.grow_with(cap, 0, v.len(), v, false);
         }
     }
     /// Take the contents out, leaving the buffer empty.
@@ -472,6 +494,12 @@ fn zero_tail<T>(p: *mut T, from: usize, cap: usize) {
     }
 }
 
+fn free_buf<T>(p: *mut T, cap: usize) {
+    if cap == 0 || std::mem::size_of::<T>() == 0 {
+        return;
+    }
+    mt::free_buf(p as usize, cap * std::mem::size_of::<T>(), std::mem::align_of::<T>());
+}
 fn retire_buf<T>(p: *mut T, cap: usize) {
     if cap == 0 || std::mem::size_of::<T>() == 0 {
         return;
