@@ -248,7 +248,7 @@ impl<'pr> Walk<'pr> {
 }
 
 /// The class of `n` given the known/guessed types of locals.
-fn class(n: &Node, env: &HashMap<Vec<u8>, Ty>) -> G {
+fn class(n: &Node, env: &HashMap<Vec<u8>, Ty>, fa: &HashSet<Vec<u8>>) -> G {
     if n.as_integer_node().is_some() {
         return G::Int;
     }
@@ -278,9 +278,9 @@ fn class(n: &Node, env: &HashMap<Vec<u8>, Ty>) -> G {
         return match b.as_statements_node() {
             Some(s) => {
                 let v: Vec<Node> = s.body().iter().collect();
-                if v.len() == 1 { class(&v[0], env) } else { G::Unknown }
+                if v.len() == 1 { class(&v[0], env, fa) } else { G::Unknown }
             }
-            None => class(&b, env),
+            None => class(&b, env, fa),
         };
     }
     let Some(c) = n.as_call_node() else { return G::Unknown };
@@ -290,27 +290,33 @@ fn class(n: &Node, env: &HashMap<Vec<u8>, Ty>) -> G {
     if let Some(nc) = crate::fastpath::num_call_of(&c) {
         return match nc {
             crate::fastpath::NumCall::Math(..) | crate::fastpath::NumCall::ToF(_) => G::FloatG,
-            crate::fastpath::NumCall::Pow(r, _) => match class(&r, env) {
+            crate::fastpath::NumCall::Pow(r, _) => match class(&r, env, fa) {
                 G::Float | G::FloatG => G::FloatG,
                 _ => G::Unknown,
             },
-            crate::fastpath::NumCall::Neg(r) => match class(&r, env) {
+            crate::fastpath::NumCall::Neg(r) => match class(&r, env, fa) {
                 G::Float | G::FloatG => G::FloatG,
                 G::Int | G::IntG => G::IntG,
                 _ => G::Unknown,
             },
-            crate::fastpath::NumCall::Shift(r, _, _) => match class(&r, env) {
+            crate::fastpath::NumCall::Shift(r, _, _) => match class(&r, env, fa) {
                 G::Int | G::IntG => G::IntG,
                 _ => G::Unknown,
             },
         };
     }
     let name = c.name().as_slice();
+    // an element of an Array of Floats (analysis.rs `float_arrays`)
+    if name == b"[]" && c.arguments().is_some_and(|a| a.arguments().iter().count() == 1) {
+        if c.receiver().as_ref().and_then(bare_read).is_some_and(|(r, _)| fa.contains(&r)) {
+            return G::FloatG;
+        }
+    }
     if matches!(name, b"+" | b"-" | b"*" | b"/" | b"%" | b"&" | b"|" | b"^") {
         if let (Some(r), Some(a)) = (c.receiver(), c.arguments()) {
             let args: Vec<Node> = a.arguments().iter().collect();
             if args.len() == 1 {
-                let (x, y) = (class(&r, env), class(&args[0], env));
+                let (x, y) = (class(&r, env, fa), class(&args[0], env, fa));
                 let sure = |g: G| match g {
                     G::Int | G::IntG => Some(Ty::Int),
                     G::Float | G::FloatG => Some(Ty::Float),
@@ -412,8 +418,8 @@ pub fn plan(lp: &Node, typed: &crate::analysis::Typed, register: &dyn Fn(&[u8]) 
         for name in &cands {
             for (k, _) in w.writes.get(name).into_iter().flatten() {
                 let g = match k {
-                    WriteK::Set(v) => class(v, &env),
-                    WriteK::Op(op, v) => match (env.get(name), class(v, &env)) {
+                    WriteK::Set(v) => class(v, &env, &typed.float_arrays),
+                    WriteK::Op(op, v) => match (env.get(name), class(v, &env, &typed.float_arrays)) {
                         (Some(&t), g @ (G::Int | G::IntG | G::Float | G::FloatG)) => {
                             let b = if matches!(g, G::Int | G::IntG) { Ty::Int } else { Ty::Float };
                             match crate::analysis::ty_op(op, t, b) {
@@ -451,10 +457,28 @@ pub fn plan(lp: &Node, typed: &crate::analysis::Typed, register: &dyn Fn(&[u8]) 
             for (x, y) in [(a, b), (b, a)] {
                 if let Some((name, _)) = bare_read(x) {
                     if cands.contains(&name) {
-                        match class(y, &env) {
+                        match class(y, &env, &typed.float_arrays) {
                             G::Float | G::FloatG => vote(&name, Ty::Float, level, &mut votes),
                             G::Int | G::IntG => vote(&name, Ty::Int, level, &mut votes),
                             _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        // the locals in arithmetic added to (or multiplied with...) a Float: Floats too
+        // (`c[i] + a * b[j]` with `c` an Array of Floats)
+        for (op, a, b) in &w.ops {
+            if !matches!(op.as_slice(), b"+" | b"-" | b"*" | b"/") {
+                continue;
+            }
+            for (x, y) in [(a, b), (b, a)] {
+                if matches!(class(x, &env, &typed.float_arrays), G::Float | G::FloatG) && bare_read(y).is_none() {
+                    let mut leaves = Vec::new();
+                    arith_leaves(y, &mut leaves);
+                    for l in leaves {
+                        if cands.contains(&l) {
+                            vote(&l, Ty::Float, 0, &mut votes);
                         }
                     }
                 }
@@ -513,8 +537,8 @@ pub fn plan(lp: &Node, typed: &crate::analysis::Typed, register: &dyn Fn(&[u8]) 
             .filter(|(name, t)| {
                 w.writes.get(*name).into_iter().flatten().any(|(k, _)| {
                     let g = match k {
-                        WriteK::Set(v) => class(v, &env),
-                        WriteK::Op(_, v) => match class(v, &env) {
+                        WriteK::Set(v) => class(v, &env, &typed.float_arrays),
+                        WriteK::Op(_, v) => match class(v, &env, &typed.float_arrays) {
                             G::Other => G::Other,
                             _ => G::Unknown,
                         },

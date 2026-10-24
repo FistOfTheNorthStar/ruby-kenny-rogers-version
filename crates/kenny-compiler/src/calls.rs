@@ -93,6 +93,19 @@ impl<M: Module> Compiler<M> {
             Some(a) => self.call(fx, "kn_send_splat", &[cache, recv, mid, a, blk]),
             None => {
                 let no_blk = blk_given.is_none();
+                if no_blk {
+                    // (3+ arguments; fewer go through `send_simple`)
+                    let vals = args.vals.clone();
+                    let stub = if explicit { crate::fastpath::STUB_SEND_PUB_N } else { crate::fastpath::STUB_SEND_N };
+                    let dynamic = |c: &mut Self, fx: &mut Fx| {
+                        let n = c.iconst(fx, vals.len() as i64);
+                        let buf = c.args_buf(fx, &vals);
+                        c.call_stub(fx, stub, &[cache, recv, mid, n, buf, blk])
+                    };
+                    if let Some(r) = self.inline_call(fx, recv, name, mid, &args.vals, explicit, dynamic) {
+                        return r;
+                    }
+                }
                 if !explicit && no_blk {
                     // (the argument buffer only on the way that uses it)
                     let vals = args.vals.clone();

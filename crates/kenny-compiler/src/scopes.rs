@@ -125,6 +125,9 @@ impl<M: Module> Compiler<M> {
         let prog = node.as_program_node().unwrap();
         let stmts = prog.statements().as_node();
         let slot = self.cache_alloc(2);
+        if kind == ScopeKind::Top {
+            self.cfold_scan(slot, &prog);
+        }
         let spec = FnSpec {
             kind,
             lambda: false,
@@ -1449,21 +1452,60 @@ impl<M: Module> Compiler<M> {
         }
     }
 
+    /// This frame's env for a closure made here.
+    fn frame_env(&mut self, fx: &mut Fx) -> Value {
+        match fx.env_v {
+            Some(_) if fx.lazy_env => self.lazy_env(fx),
+            Some(e) => fx.b.use_var(e),
+            None => self.iconst(fx, 0),
+        }
+    }
+
+    /// In inlined block bodies (`fx.inline_levels`): one environment per body, holding a
+    /// copy of its variables, chained onto this frame's; their scopes are pushed for the
+    /// closure being compiled (the caller pops them). Copies are enough: inline.rs `Check`
+    /// lets a nested block use only variables the body never assigns.
+    fn inline_envs(&mut self, fx: &mut Fx) -> Option<Value> {
+        if fx.inline_levels.is_empty() {
+            return None;
+        }
+        let mut env = self.frame_env(fx);
+        let nil = self.nil(fx);
+        for li in 0..fx.inline_levels.len() {
+            let mut names: Vec<(Vec<u8>, Variable)> = fx.inline_levels[li].iter().map(|(n, v)| (n.clone(), *v)).collect();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
+            let n = self.iconst(fx, names.len() as i64);
+            env = self.call(fx, "kn_env_new", &[env, nil, n]);
+            let mut env_slots = HashMap::new();
+            for (i, (name, var)) in names.into_iter().enumerate() {
+                let v = fx.b.use_var(var);
+                fx.b.ins().store(mem(), v, env, ENV_SLOTS + 8 * i as i32);
+                env_slots.insert(name, i);
+            }
+            self.scopes.push(ScopeInfo { env_slots });
+        }
+        Some(env)
+    }
+
     /// Compile a block or lambda literal into a Proc value.
     pub(crate) fn block_proc(&mut self, fx: &mut Fx, params: Option<Node>, body: Option<Node>, locals: Vec<Vec<u8>>, lambda: bool) -> Value {
         // (only this literal: the blocks in its body are ordinary)
         let bmethod = std::mem::take(&mut self.bmethod_next);
+        // made in an inlined block body (inline.rs `Check`): its variables copied into
+        // environments of their own, between this frame's and the closure's
+        let inl = self.inline_envs(fx);
+        let k = fx.inline_levels.len() as u32;
         // what its `return` returns from: this frame when it is a lambda or a method body
         // block (its env, one hop up), else whatever this frame's own returns from
         let ret_hops = match fx.kind {
-            ScopeKind::Block if fx.ret_here => Some(0),
-            ScopeKind::Block => fx.ret_hops.map(|h| h + 1),
+            ScopeKind::Block if fx.ret_here => Some(k),
+            ScopeKind::Block => fx.ret_hops.map(|h| h + 1 + k),
             _ => None,
         };
         let method = fx.method.as_ref().map(|m| MethodCtx {
             hops: Some(match m.hops {
-                None => 0,
-                Some(h) => h + 1,
+                None => k,
+                Some(h) => h + 1 + k,
             }),
             params: if m.hops.is_none() { fx.zsuper.clone() } else { m.params.clone() },
             ..m.clone()
@@ -1505,11 +1547,13 @@ impl<M: Module> Compiler<M> {
                 }
             })
         };
+        for _ in 0..k {
+            self.scopes.pop();
+        }
         let addr = self.fn_addr(fx, fid);
-        let env = match fx.env_v {
-            Some(_) if fx.lazy_env => self.lazy_env(fx),
-            Some(e) => fx.b.use_var(e),
-            None => self.iconst(fx, 0),
+        let env = match inl {
+            Some(e) => e,
+            None => self.frame_env(fx),
         };
         let s = self.self_val(fx);
         let min = self.iconst(fx, arity.min);
@@ -1607,7 +1651,7 @@ pub(crate) fn typed_setup(
     let info = std::rc::Rc::new(if typed && std::env::var_os("KENNY_NO_TYPED").is_none() {
         analysis::typed_locals(nodes)
     } else {
-        analysis::Typed { types: HashMap::new(), boxed: HashSet::new(), refs: HashMap::new(), bad: HashSet::new(), seed: HashMap::new() }
+        analysis::Typed { types: HashMap::new(), boxed: HashSet::new(), refs: HashMap::new(), bad: HashSet::new(), seed: HashMap::new(), float_arrays: HashSet::new() }
     });
     let (types, boxed) = (&info.types, &info.boxed);
     if std::env::var_os("KENNY_DEBUG_TYPED").is_some() {

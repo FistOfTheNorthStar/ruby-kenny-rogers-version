@@ -1722,6 +1722,7 @@ pub fn init() {
     defn(md, "remove_const", 1, 1, |s, a, _| {
         let id = tryr!(sym_arg(a[0]));
         bump_const_serial();
+        crate::abi::cfold_invalidate(id);
         match rclass(s).consts.remove(&id) {
             Some(v) => {
                 bump_serial();

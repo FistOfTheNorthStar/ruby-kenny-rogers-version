@@ -15,6 +15,7 @@
 
 use crate::*;
 use ruby_prism::*;
+use std::collections::HashSet;
 
 /// Largest block body (in source bytes) that is inlined.
 const MAX_INLINE_BODY: usize = 400;
@@ -78,14 +79,75 @@ fn kind_of(name: &[u8], argc: usize) -> Option<Kind> {
 }
 
 /// Rejects block bodies that can't run inside the caller's frame.
+///
+/// A block nested in the body (`nested`) is fine when it uses none of the body's own
+/// variables that the body assigns: when that block is made into a closure (it isn't inlined
+/// itself, or its call's guard fails) it gets a copy of the inlined body's variables in an
+/// environment of its own (scopes.rs `block_proc`), which is then exactly what it would see.
 struct Check {
     ok: bool,
     /// `return` is fine (a block inlined at a `yield`: it returns from the same frame)
     allow_return: bool,
+    nested: bool,
+    /// how many blocks deep in the body the visit is
+    depth: u32,
+    /// the body's variables used from nested blocks / assigned anywhere
+    captured: HashSet<Vec<u8>>,
+    written: HashSet<Vec<u8>>,
+}
+impl Check {
+    fn new(allow_return: bool, nested: bool) -> Self {
+        Check { ok: true, allow_return, nested, depth: 0, captured: HashSet::new(), written: HashSet::new() }
+    }
+    fn local(&mut self, name: &[u8], depth: u32, write: bool) {
+        if depth != self.depth {
+            return;
+        }
+        if self.depth > 0 {
+            self.captured.insert(name.to_vec());
+        }
+        if write {
+            self.written.insert(name.to_vec());
+        }
+    }
+    fn done(&self) -> bool {
+        self.ok && self.captured.is_disjoint(&self.written)
+    }
 }
 impl<'pr> Visit<'pr> for Check {
-    fn visit_block_node(&mut self, _: &BlockNode<'pr>) {
-        self.ok = false;
+    fn visit_block_node(&mut self, node: &BlockNode<'pr>) {
+        if !self.nested {
+            self.ok = false;
+            return;
+        }
+        // (a `return` in it would leave the method from a closure)
+        let ar = std::mem::replace(&mut self.allow_return, false);
+        self.depth += 1;
+        visit_block_node(self, node);
+        self.depth -= 1;
+        self.allow_return = ar;
+    }
+    fn visit_local_variable_read_node(&mut self, node: &LocalVariableReadNode<'pr>) {
+        self.local(node.name().as_slice(), node.depth(), false);
+    }
+    fn visit_local_variable_write_node(&mut self, node: &LocalVariableWriteNode<'pr>) {
+        self.local(node.name().as_slice(), node.depth(), true);
+        visit_local_variable_write_node(self, node);
+    }
+    fn visit_local_variable_target_node(&mut self, node: &LocalVariableTargetNode<'pr>) {
+        self.local(node.name().as_slice(), node.depth(), true);
+    }
+    fn visit_local_variable_operator_write_node(&mut self, node: &LocalVariableOperatorWriteNode<'pr>) {
+        self.local(node.name().as_slice(), node.depth(), true);
+        visit_local_variable_operator_write_node(self, node);
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &LocalVariableOrWriteNode<'pr>) {
+        self.local(node.name().as_slice(), node.depth(), true);
+        visit_local_variable_or_write_node(self, node);
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &LocalVariableAndWriteNode<'pr>) {
+        self.local(node.name().as_slice(), node.depth(), true);
+        visit_local_variable_and_write_node(self, node);
     }
     fn visit_lambda_node(&mut self, _: &LambdaNode<'pr>) {
         self.ok = false;
@@ -167,7 +229,7 @@ impl<'pr> Visit<'pr> for Check {
 /// Can `bn`'s body be compiled in its caller's frame at a `yield` (statics.rs
 /// `inline_yield`): small, and nothing that needs a frame of its own.
 pub(crate) fn yield_inlinable(bn: &BlockNode, allow_return: bool) -> bool {
-    let mut chk = Check { ok: true, allow_return };
+    let mut chk = Check::new(allow_return, false);
     if let Some(b) = bn.body() {
         let l = b.location();
         if l.end_offset() - l.start_offset() > MAX_INLINE_BODY {
@@ -175,7 +237,7 @@ pub(crate) fn yield_inlinable(bn: &BlockNode, allow_return: bool) -> bool {
         }
         chk.visit(&b);
     }
-    chk.ok
+    chk.done()
 }
 
 /// The names of a block's parameters when they are all plain required ones (`|a, b|`).
@@ -216,7 +278,7 @@ impl<M: Module> Compiler<M> {
         }
         let kind = kind_of(c.name().as_slice(), args.len())?;
         let params = simple_params(bn.parameters())?;
-        let mut chk = Check { ok: true, allow_return: false };
+        let mut chk = Check::new(false, std::env::var_os("KENNY_NO_NESTED_INLINE").is_none());
         if let Some(b) = bn.body() {
             // the body is compiled twice (loop + fallback closure): only small ones, where the
             // per-iteration call overhead matters most
@@ -226,7 +288,7 @@ impl<M: Module> Compiler<M> {
             }
             chk.visit(&b);
         }
-        if !chk.ok {
+        if !chk.done() {
             return None;
         }
         let name = c.name().as_slice().to_vec();
@@ -384,13 +446,20 @@ impl<M: Module> Compiler<M> {
                 let lo = self.call(fx, "kn_range_first", &[recv]);
                 (fx.b.ins().sshr_imm_s(lo, 1), None)
             }
-            Kind::Map | Kind::Select | Kind::Reject | Kind::Sum => (zero, Some(self.call(fx, "kn_ary_new", &[zero, zero]))),
+            Kind::Map | Kind::Select | Kind::Reject => (zero, Some(self.call(fx, "kn_ary_new", &[zero, zero]))),
             _ => (zero, None),
         };
         fx.b.def_var(i, start);
         // count's tally (untagged)
         let hits = fx.b.declare_var(I64);
         fx.b.def_var(hits, zero);
+        // sum's: a Fixnum total while the values are Fixnums, else (from the first other
+        // value or overflow on) the total and the values in an Array, summed at the end as
+        // Array#sum does (exact Integer sums first, then Kahan-Babuska for Floats)
+        let (sum_acc, sum_spill) = (fx.b.declare_var(I64), fx.b.declare_var(I64));
+        let fix0 = self.iconst(fx, 1);
+        fx.b.def_var(sum_acc, fix0);
+        fx.b.def_var(sum_spill, zero);
         // loop bound for the integer loops (untagged, inclusive except for times)
         let bound = match kind {
             Kind::Times => Some(fx.b.ins().sshr_imm_s(recv, 1)),
@@ -461,8 +530,47 @@ impl<M: Module> Compiler<M> {
             // the element again: `elem` is defined in the header, which dominates `step`
             let x = elem.unwrap();
             match kind {
-                Kind::Map | Kind::Sum => {
+                Kind::Map => {
                     self.call(fx, "kn_ary_push", &[out.unwrap(), r]);
+                }
+                Kind::Sum => {
+                    let sp = fx.b.use_var(sum_spill);
+                    let acc = fx.b.use_var(sum_acc);
+                    let fixr = fx.b.ins().band_imm_s(r, 1);
+                    let plain = fx.b.ins().icmp_imm_s(IntCC::Equal, sp, 0);
+                    let plain = fx.b.ins().uextend(I64, plain);
+                    let fast = fx.b.ins().band(fixr, plain);
+                    let add_b = fx.b.create_block();
+                    let slow = fx.b.create_block();
+                    let cont = fx.b.create_block();
+                    fx.b.set_cold_block(slow);
+                    fx.b.ins().brif(fast, add_b, &[], slow, &[]);
+                    fx.b.switch_to_block(add_b);
+                    let rm = fx.b.ins().iadd_imm_s(r, -1);
+                    let (t, of) = fx.b.ins().sadd_overflow(acc, rm);
+                    let ok_b = fx.b.create_block();
+                    fx.b.ins().brif(of, slow, &[], ok_b, &[]);
+                    fx.b.switch_to_block(ok_b);
+                    fx.b.def_var(sum_acc, t);
+                    fx.b.ins().jump(cont, &[]);
+                    fx.b.switch_to_block(slow);
+                    let sp = fx.b.use_var(sum_spill);
+                    let has = fx.b.create_block();
+                    let mk = fx.b.create_block();
+                    fx.b.append_block_param(has, I64);
+                    fx.b.ins().brif(sp, has, &[sp.into()], mk, &[]);
+                    fx.b.switch_to_block(mk);
+                    let z = self.iconst(fx, 0);
+                    let a = self.call(fx, "kn_ary_new", &[z, z]);
+                    let acc = fx.b.use_var(sum_acc);
+                    self.call(fx, "kn_ary_push", &[a, acc]);
+                    fx.b.def_var(sum_spill, a);
+                    fx.b.ins().jump(has, &[a.into()]);
+                    fx.b.switch_to_block(has);
+                    let a = fx.b.block_params(has)[0];
+                    self.call(fx, "kn_ary_push", &[a, r]);
+                    fx.b.ins().jump(cont, &[]);
+                    fx.b.switch_to_block(cont);
                 }
                 Kind::Count => {
                     let t = self.truthy(fx, r);
@@ -523,7 +631,17 @@ impl<M: Module> Compiler<M> {
                     let t = fx.b.ins().ishl_imm_s(h, 1);
                     fx.b.ins().iadd_imm_s(t, 1)
                 } else {
-                    self.callc(fx, "kn_ary_sum_vals", &[out.unwrap()])
+                    let sp = fx.b.use_var(sum_spill);
+                    let acc = fx.b.use_var(sum_acc);
+                    let spilled = fx.b.create_block();
+                    let fin = fx.b.create_block();
+                    fx.b.append_block_param(fin, I64);
+                    fx.b.ins().brif(sp, spilled, &[], fin, &[acc.into()]);
+                    fx.b.switch_to_block(spilled);
+                    let r = self.callc(fx, "kn_ary_sum_vals", &[sp]);
+                    fx.b.ins().jump(fin, &[r.into()]);
+                    fx.b.switch_to_block(fin);
+                    fx.b.block_params(fin)[0]
                 };
                 fx.b.ins().jump(join, &[r.into()]);
                 fx.b.switch_to_block(join);

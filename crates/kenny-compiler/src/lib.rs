@@ -20,6 +20,7 @@ mod vobj;
 mod licm;
 mod owned;
 mod ispec;
+mod cfold;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -211,6 +212,8 @@ pub struct Compiler<M: Module> {
     pub(crate) static_defined: HashSet<FuncId>,
     /// statics.rs `claim_word`: a def's word for its calls to itself
     pub(crate) claim_words: HashMap<FuncId, DataId>,
+    /// folded constants (cfold.rs) by (top-level cref slot, name)
+    pub(crate) cfold: HashMap<(usize, Vec<u8>), crate::cfold::CFold>,
     pub(crate) static_counter: usize,
     /// (file, offset) of every `def` scanned -> its enclosing class/module names
     pub(crate) def_lex: HashMap<(PathBuf, usize), Vec<Vec<u8>>>,
@@ -353,6 +356,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_static_fill", &[I64, I64, I64, I64], &[I64]),
     ("kn_entry_slow", &[], &[I64]),
     ("kn_ispec_poll", &[], &[I64]),
+    ("kn_const_fold", &[I64, I64, I64, I64], &[I64]),
     ("kn_new_fill", &[I64, I64, I64], &[I64]),
     ("kn_obj_alloc", &[I64], &[I64]),
     ("kn_math1", &[I64, ir::types::F64], &[ir::types::F64]),
@@ -535,6 +539,7 @@ impl<M: Module> Compiler<M> {
             kw_defs: HashMap::new(),
             static_defined: HashSet::new(),
             claim_words: HashMap::new(),
+            cfold: HashMap::new(),
             static_counter: 0,
             def_lex: HashMap::new(),
             inline_defs: HashMap::new(),

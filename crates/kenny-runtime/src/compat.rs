@@ -415,6 +415,7 @@ pub fn init() {
     defn(c.module, "remove_const", 1, 1, |s, a, _| match crate::kernel::sym_arg(a[0]) {
         Ok(id) => {
             bump_const_serial();
+            crate::abi::cfold_invalidate(id);
             rclass(s).consts.remove(&id).unwrap_or(QNIL)
         }
         Err(e) => e,

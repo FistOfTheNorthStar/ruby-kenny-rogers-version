@@ -728,6 +728,41 @@ pub extern "C" fn kn_ispec_poll() -> V {
     }
     0
 }
+/// Folded constants (kenny-compiler cfold.rs): (constant name, its word), while valid.
+static CFOLD: std::sync::Mutex<Vec<(u32, usize)>> = std::sync::Mutex::new(Vec::new());
+static CFOLD_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// After a folded constant's assignment at the top level: when Object's constant `id` is
+/// `v`, the folded value `expect`, mark its `word` valid.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_const_fold(word: *mut u64, id: V, expect: V, v: V) -> V {
+    let id = sym_id(id);
+    let obj = rt().c.object;
+    if v != expect || unsafe { (*obj).consts.get(&id) } != Some(&v) {
+        return QNIL;
+    }
+    let mut l = CFOLD.lock().unwrap();
+    if !l.iter().any(|&(i, w)| i == id && w == word as usize) {
+        l.push((id, word as usize));
+    }
+    CFOLD_ANY.store(true, std::sync::atomic::Ordering::SeqCst);
+    unsafe { std::ptr::write_volatile(word, 1) };
+    QNIL
+}
+/// A constant named `id` set or removed anywhere: its folded reads take the lookup again.
+pub fn cfold_invalidate(id: u32) {
+    if !CFOLD_ANY.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let mut l = CFOLD.lock().unwrap();
+    l.retain(|&(i, w)| {
+        if i == id {
+            unsafe { std::ptr::write_volatile(w as *mut u64, 0) };
+            false
+        } else {
+            true
+        }
+    });
+}
 /// For an inlined `C.new` (kenny-compiler statics.rs `inline_new`): fill `slot` with
 /// [C, method serial] if C makes plain objects, its `new` is the builtin Class#new and its
 /// `initialize` has the fast entry `expect`.

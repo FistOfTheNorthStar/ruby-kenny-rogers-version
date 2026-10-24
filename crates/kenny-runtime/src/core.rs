@@ -2248,6 +2248,7 @@ pub fn const_set(c: *mut Class, id: u32, v: V) {
         }
         (*c).consts.insert(id, v);
     }
+    crate::abi::cfold_invalidate(id);
     bump_const_serial();
 }
 pub fn set_global_const(name: &str, v: V) {

@@ -645,6 +645,14 @@ impl<M: Module> Compiler<M> {
             }
             Node::ConstantReadNode { .. } => {
                 let n = node.as_constant_read_node().unwrap();
+                if let Some(v) = self.cfold_read(fx, n.name().as_slice(), |c, fx| {
+                    let crefp = c.slot_ptr(fx, fx.cref_slot);
+                    let s = c.sym_val(fx, n.name().as_slice());
+                    let cache = c.owned_cache_ptr(fx, OWNED_CONST);
+                    c.const_cached(fx, cache, crefp, s)
+                }) {
+                    return v;
+                }
                 let crefp = self.slot_ptr(fx, fx.cref_slot);
                 let s = self.sym_val(fx, n.name().as_slice());
                 let cache = self.owned_cache_ptr(fx, OWNED_CONST);
@@ -671,7 +679,9 @@ impl<M: Module> Compiler<M> {
                 let v = self.expr(fx, &n.value());
                 let cref = self.cref(fx);
                 let s = self.sym_val(fx, n.name().as_slice());
-                self.callc(fx, "kn_const_set", &[cref, s, v])
+                let r = self.callc(fx, "kn_const_set", &[cref, s, v]);
+                self.cfold_assigned(fx, n.name().as_slice(), node.location().start_offset(), s, v);
+                r
             }
             Node::ConstantPathWriteNode { .. } => {
                 let n = node.as_constant_path_write_node().unwrap();

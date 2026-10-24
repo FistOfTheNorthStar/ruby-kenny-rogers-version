@@ -70,6 +70,7 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_static_fill", kenny_runtime::abi::kn_static_fill as *const u8),
         ("kn_entry_slow", kenny_runtime::abi::kn_entry_slow as *const u8),
         ("kn_ispec_poll", kenny_runtime::abi::kn_ispec_poll as *const u8),
+        ("kn_const_fold", kenny_runtime::abi::kn_const_fold as *const u8),
         ("kn_new_fill", kenny_runtime::abi::kn_new_fill as *const u8),
         ("kn_obj_alloc", kenny_runtime::abi::kn_obj_alloc as *const u8),
         ("kn_math1", kenny_runtime::abi::kn_math1 as *const u8),
