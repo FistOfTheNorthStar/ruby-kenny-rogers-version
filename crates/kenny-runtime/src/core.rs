@@ -1129,6 +1129,10 @@ pub const DIRECT_INT_ITER: u64 = 8192;
 /// Every object's nil? is the builtin one, public (`NIL_P_TOUCHED` unset): `x.nil?` is
 /// `x == nil` (kenny-compiler fastpath.rs).
 pub const DIRECT_NIL_P_ALL: u64 = 16384;
+/// Array#size, #length, #empty?, #first, #last, #push, #<<, #pop and #shift of Array itself
+/// are the public builtin ones (compiled code runs them inline or calls `kn_ary_push1`,
+/// `kn_ary_pop0`, `kn_ary_shift0` directly).
+pub const DIRECT_ARY_BASIC: u64 = 32768;
 /// Set once the builtin methods are tagged (opt.rs `init`).
 pub static DIRECT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// `KN_DIRECT.flags` is 0 until recomputed (methods changed): on the next inline cache
@@ -1205,6 +1209,20 @@ pub fn update_direct_flags() {
         ];
         if ary.iter().all(|&(n, o)| public(c.array, n, o)) {
             flags |= DIRECT_ARY_ITER;
+        }
+        let basic = [
+            ("size", OPT_ARY_SIZE),
+            ("length", OPT_ARY_SIZE),
+            ("empty?", OPT_ARY_EMPTY),
+            ("first", OPT_ARY_FIRST),
+            ("last", OPT_ARY_LAST),
+            ("push", OPT_ARY_PUSH),
+            ("<<", OPT_ARY_PUSH),
+            ("pop", OPT_ARY_POP),
+            ("shift", OPT_ARY_SHIFT),
+        ];
+        if basic.iter().all(|&(n, o)| public(c.array, n, o)) {
+            flags |= DIRECT_ARY_BASIC;
         }
         if public(c.integer, "times", OPT_INT_TIMES) && public(c.integer, "upto", OPT_INT_UPTO) && public(c.integer, "downto", OPT_INT_DOWNTO) {
             flags |= DIRECT_INT_ITER;

@@ -68,6 +68,9 @@ pub const OPT_STR_AREF: u8 = 42;
 pub const OPT_STR_LENGTH: u8 = 43;
 /// BasicObject#!= (`!(self == other)`).
 pub const OPT_NEQ: u8 = 44;
+/// Array#pop / Array#shift (`DIRECT_ARY_BASIC`).
+pub const OPT_ARY_POP: u8 = 45;
+pub const OPT_ARY_SHIFT: u8 = 46;
 /// The Math functions compiled code may compute inline, in the order of `kn_math1`'s
 /// `which` (kenny-compiler fastpath.rs `MATH_FNS` must match).
 pub const MATH_FNS: [&str; 15] = ["sqrt", "sin", "cos", "tan", "atan", "exp", "log", "log2", "log10", "cbrt", "sinh", "cosh", "tanh", "asin", "acos"];
@@ -94,6 +97,8 @@ pub fn init() {
     tag(c.array, "empty?", OPT_ARY_EMPTY);
     tag(c.array, "first", OPT_ARY_FIRST);
     tag(c.array, "last", OPT_ARY_LAST);
+    tag(c.array, "pop", OPT_ARY_POP);
+    tag(c.array, "shift", OPT_ARY_SHIFT);
     tag(c.array, "each", OPT_ARY_EACH);
     tag(c.array, "each_with_index", OPT_ARY_EACH_WITH_INDEX);
     tag(c.array, "each_index", OPT_ARY_EACH_INDEX);
@@ -410,6 +415,33 @@ pub unsafe extern "C" fn kn_opt_check(cache: *mut CallCache, recv: V, mid: V, wa
         _ => is_ary(recv),
     };
     ok as u64
+}
+
+/// `a.push(v)` / `a << v` on a plain Array whose methods are the builtins (compiled code
+/// checked `DIRECT_ARY_BASIC` and the class): no method lookup.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_ary_push1(a: V, v: V) -> V {
+    if is_frozen(a) {
+        return check_frozen(a);
+    }
+    rary(a).v.push(v);
+    a
+}
+/// `a.pop` (as `kn_ary_push1`).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_ary_pop0(a: V) -> V {
+    if is_frozen(a) {
+        return check_frozen(a);
+    }
+    rary(a).v.pop().unwrap_or(QNIL)
+}
+/// `a.shift` (as `kn_ary_push1`).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_ary_shift0(a: V) -> V {
+    if is_frozen(a) {
+        return check_frozen(a);
+    }
+    rary(a).v.shift().unwrap_or(QNIL)
 }
 
 /// Element `i` of an Array, or UNDEF when `i` is past the end (loops re-check the length on

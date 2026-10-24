@@ -345,7 +345,11 @@ impl<M: Module> Compiler<M> {
                 let t = self.truthy(fx, v);
                 let tr = self.iconst(fx, QTRUE);
                 let fa = self.iconst(fx, QFALSE);
-                return fx.b.ins().select(t, fa, tr);
+                let r = fx.b.ins().select(t, fa, tr);
+                // (an `if` on it branches on the inverted condition)
+                let nt = fx.b.ins().icmp_imm_s(IntCC::Equal, t, 0);
+                fx.bools.insert(r, nt);
+                return r;
             }
         }
 

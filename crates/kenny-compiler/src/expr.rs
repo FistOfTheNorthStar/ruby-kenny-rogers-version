@@ -4,7 +4,7 @@ use crate::*;
 use cranelift_codegen::ir::{condcodes::IntCC, types::I64, InstBuilder};
 use ruby_prism::*;
 
-fn int_value(n: &IntegerNode) -> Option<i64> {
+pub(crate) fn int_value(n: &IntegerNode) -> Option<i64> {
     let value = n.value();
     let (neg, digits) = value.to_u32_digits();
     if digits.len() > 2 {

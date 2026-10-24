@@ -769,13 +769,29 @@ impl<M: Module> Compiler<M> {
     /// Flonum/Fixnum/unboxed mixes, else a call. Arithmetic results stay unboxed
     /// (`Num::Lazy`) until something needs the tagged value.
     pub(crate) fn binop_num(&mut self, fx: &mut Fx, op: &[u8], a: Num, b: Num, lazy: bool) -> Num {
+        self.binop_core(fx, op, a, b, lazy, None).expect("binop without branch targets")
+    }
+
+    /// Comparison `a op b` as a branch to `t` (true) or `e` (control.rs `cond_br`): the
+    /// inline paths branch on their condition, no Ruby true/false made.
+    pub(crate) fn binop_branch(&mut self, fx: &mut Fx, op: &[u8], a: Num, b: Num, t: Block, e: Block) {
+        if let Some(n) = self.binop_core(fx, op, a, b, false, Some((t, e))) {
+            let v = self.materialize(fx, n);
+            let c = self.truthy_br(fx, v);
+            fx.b.ins().brif(c, t, &[], e, &[]);
+        }
+    }
+
+    /// `binop_num`, or with `br` (a comparison only) a branch to its blocks: None when it
+    /// branched (the current block is then terminated).
+    fn binop_core(&mut self, fx: &mut Fx, op: &[u8], a: Num, b: Num, lazy: bool, br: Option<(Block, Block)>) -> Option<Num> {
         if self.refine_scope.is_none()
             && matches!(op, b"+" | b"-" | b"*" | b"/" | b"<" | b"<=" | b">" | b">=" | b"==" | b"!=")
             && (matches!(a, Num::F64(_)) || matches!(b, Num::F64(_)) || (a.static_f64().is_some() && b.static_f64().is_some()))
             && (a.static_f64().is_some() || a.is_sure_int(fx))
             && (b.static_f64().is_some() || b.is_sure_int(fx))
         {
-            return self.typed_float_op(fx, op, a, b);
+            return Some(self.typed_float_op(fx, op, a, b));
         }
         let a = self.lazy(fx, a);
         let b = self.lazy(fx, b);
@@ -787,20 +803,20 @@ impl<M: Module> Compiler<M> {
             match op {
                 b"<" | b"<=" | b">" | b">=" | b"==" | b"!=" => {
                     let c = fx.b.ins().icmp(int_cc(op), x, y);
-                    return Num::Boxed(self.bool_v(fx, c));
+                    return Some(Num::Boxed(self.bool_v(fx, c)));
                 }
                 b"&" | b"|" => {
                     let r = if op == b"&" { fx.b.ins().band(x, y) } else { fx.b.ins().bor(x, y) };
                     fx.sure_fix.insert(r);
                     fx.sure_ints.insert(r);
-                    return Num::Boxed(r);
+                    return Some(Num::Boxed(r));
                 }
                 b"^" => {
                     let t = fx.b.ins().bxor(x, y);
                     let r = fx.b.ins().bor_imm_s(t, 1);
                     fx.sure_fix.insert(r);
                     fx.sure_ints.insert(r);
-                    return Num::Boxed(r);
+                    return Some(Num::Boxed(r));
                 }
                 _ => {}
             }
@@ -808,11 +824,13 @@ impl<M: Module> Compiler<M> {
         if !is_fast_op(op) {
             let av = self.materialize(fx, a);
             let bv = self.materialize(fx, b);
-            return Num::Boxed(self.send(fx, av, op, &[bv], None));
+            return Some(Num::Boxed(self.send(fx, av, op, &[bv], None)));
         }
         let arith = matches!(op, b"+" | b"-" | b"*" | b"/");
         // the result stays unboxed (done gets raw f64 + kind parameters)
         let unboxed = arith && lazy;
+        // a comparison: done also gets the condition (lib.rs `bool_merge`)
+        let cmp = !arith && matches!(op, b"<" | b"<=" | b">" | b">=" | b"==" | b"!=");
         // a literal operand tells which path is the likely one
         let lit_float = a.is_float_lit(fx) || b.is_float_lit(fx);
         let lit_int = a.is_int_hint(fx) || b.is_int_hint(fx);
@@ -837,6 +855,9 @@ impl<M: Module> Compiler<M> {
         } else {
             vec![]
         };
+        if cmp {
+            fx.b.append_block_param(done, I8);
+        }
         let fchk = if int_only { slow } else { fx.b.create_block() };
         let (ab, bb) = (a.boxed(), b.boxed());
         if lit_float && !int_only {
@@ -898,8 +919,11 @@ impl<M: Module> Compiler<M> {
                 let yz = fx.b.ins().icmp_imm_s(IntCC::Equal, y, 0);
                 fx.b.ins().brif(yz, slow, &[], nz, &[]);
                 fx.b.switch_to_block(nz);
+                // one division: the remainder from the quotient (an unused `sdiv` would stay,
+                // as it may trap)
                 let q = fx.b.ins().sdiv(x, y);
-                let rem = fx.b.ins().srem(x, y);
+                let qy = fx.b.ins().imul(q, y);
+                let rem = fx.b.ins().isub(x, qy);
                 // floor semantics: adjust when remainder is non-zero and signs differ
                 let rnz = fx.b.ins().icmp_imm_s(IntCC::NotEqual, rem, 0);
                 let sx = fx.b.ins().bxor(rem, y);
@@ -934,22 +958,40 @@ impl<M: Module> Compiler<M> {
             _ => {
                 let cc = int_cc(op);
                 let c = fx.b.ins().icmp(cc, a1, b1);
-                let r = self.bool_v(fx, c);
-                jump_int(fx, None, r);
+                match br {
+                    Some((t, e)) => {
+                        fx.b.ins().brif(c, t, &[], e, &[]);
+                    }
+                    None => self.bool_jump(fx, done, c),
+                }
             }
         }
         if !int_only {
-            self.float_binop(fx, op, &a, &b, fchk, slow, done, unboxed);
+            self.float_binop(fx, op, &a, &b, fchk, slow, done, unboxed, br);
         }
         fx.b.switch_to_block(slow);
         let av = self.materialize(fx, a);
         let bv = self.materialize(fx, b);
         let r = self.send(fx, av, op, &[bv], None);
+        if let Some((t, e)) = br {
+            let c = self.truthy_br(fx, r);
+            fx.b.ins().brif(c, t, &[], e, &[]);
+            return None;
+        }
         let mut args: Vec<cranelift_codegen::ir::BlockArg> = vec![r.into()];
         args.extend(extra.iter().map(|v| cranelift_codegen::ir::BlockArg::from(*v)));
+        if cmp {
+            // (send checked r already)
+            let c = self.truthy(fx, r);
+            args.push(c.into());
+        }
         fx.b.ins().jump(done, &args);
         fx.b.switch_to_block(done);
         let p = fx.b.block_params(done).to_vec();
+        if cmp {
+            fx.bools.insert(p[0], p[1]);
+            fx.checked.insert(p[0]);
+        }
         if both_int && matches!(op, b"+" | b"-" | b"*" | b"/" | b"%" | b"&" | b"|" | b"^") {
             fx.int_vals.insert(p[0]);
             if both_sure {
@@ -957,9 +999,9 @@ impl<M: Module> Compiler<M> {
             }
         }
         if unboxed {
-            Num::Lazy { boxed: p[0], raw: p[1], kind: p[2], lit: false }
+            Some(Num::Lazy { boxed: p[0], raw: p[1], kind: p[2], lit: false })
         } else {
-            Num::Boxed(p[0])
+            Some(Num::Boxed(p[0]))
         }
     }
 
@@ -967,7 +1009,7 @@ impl<M: Module> Compiler<M> {
     /// Fixnums: unboxed Floats, Flonums and Fixnums are computed inline; heap Floats (values
     /// beyond ~1e±77, -0.0, Infinity, NaN), Bignums and everything else go to `slow`.
     #[allow(clippy::too_many_arguments)]
-    fn float_binop(&mut self, fx: &mut Fx, op: &[u8], a: &Num, b: &Num, fchk: Block, slow: Block, done: Block, unboxed: bool) {
+    fn float_binop(&mut self, fx: &mut Fx, op: &[u8], a: &Num, b: &Num, fchk: Block, slow: Block, done: Block, unboxed: bool, br: Option<(Block, Block)>) {
         let arith = matches!(op, b"+" | b"-" | b"*" | b"/");
         let cold = fx.b.func.layout.is_cold(fchk);
         fx.b.switch_to_block(fchk);
@@ -1023,8 +1065,12 @@ impl<M: Module> Compiler<M> {
                 _ => FloatCC::NotEqual,
             };
             let c = fx.b.ins().fcmp(cc, fa, fb);
-            let r = self.bool_v(fx, c);
-            fx.b.ins().jump(done, &[r.into()]);
+            match br {
+                Some((t, e)) => {
+                    fx.b.ins().brif(c, t, &[], e, &[]);
+                }
+                None => self.bool_jump(fx, done, c),
+            }
         }
     }
 
@@ -1191,6 +1237,16 @@ impl<M: Module> Compiler<M> {
                     let (i, v) = (*i, *v);
                     return self.ary_index_fast(fx, recv, i, Some(v), |c, fx| plain(c, fx, "kn_send2", &[cache, recv, mid, i, v, e]));
                 }
+                (b"size" | b"length" | b"empty?" | b"first" | b"last" | b"pop" | b"shift", []) | (b"push" | b"<<", [_]) => {
+                    let vs2 = vals.to_vec();
+                    let rt = if vals.is_empty() { "kn_send0" } else { "kn_send1" };
+                    return self.ary_basic_fast(fx, recv, name, vals, |c, fx| {
+                        let mut a = vec![cache, recv, mid];
+                        a.extend_from_slice(&vs2);
+                        a.push(e);
+                        plain(c, fx, rt, &a)
+                    });
+                }
                 (b"getbyte", [i]) => {
                     let i = *i;
                     return self.str_byte_fast(fx, recv, i, None, |c, fx| plain(c, fx, "kn_send1", &[cache, recv, mid, i, e]));
@@ -1212,21 +1268,16 @@ impl<M: Module> Compiler<M> {
                 let bit = fx.b.ins().band_imm_s(flags, DIRECT_NIL_P_ALL);
                 let fast = fx.b.create_block();
                 let slow = fx.b.create_block();
-                let done = fx.b.create_block();
-                fx.b.append_block_param(done, I64);
+                let done = self.bool_merge(fx);
                 fx.b.set_cold_block(slow);
                 fx.b.ins().brif(bit, fast, &[], slow, &[]);
                 fx.b.switch_to_block(fast);
                 let is_nil = fx.b.ins().icmp_imm_s(IntCC::Equal, recv, QNIL);
-                let t = fx.b.ins().iconst(I64, QTRUE);
-                let fl = fx.b.ins().iconst(I64, QFALSE);
-                let r = fx.b.ins().select(is_nil, t, fl);
-                fx.b.ins().jump(done, &[r.into()]);
+                self.bool_jump(fx, done, is_nil);
                 fx.b.switch_to_block(slow);
                 let r = self.call_stub(fx, STUB_NIL_P, &[cache, recv, mid, e]);
-                fx.b.ins().jump(done, &[r.into()]);
-                fx.b.switch_to_block(done);
-                return fx.b.block_params(done)[0];
+                self.bool_jump_value(fx, done, r);
+                return self.bool_result(fx, done);
             }
             (b"is_a?" | b"kind_of?", [a]) => return self.call_stub(fx, STUB_IS_A, &[cache, recv, mid, *a, e]),
             _ => {}
@@ -1524,6 +1575,148 @@ impl<M: Module> Compiler<M> {
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(done);
         fx.b.block_params(done)[0]
+    }
+
+    /// `a.size` / `length` / `empty?` / `first` / `last` inline, and `a.push(v)` / `a << v` /
+    /// `a.pop` / `a.shift` as direct runtime calls (no method lookup), when `recv` is a plain
+    /// Array whose methods of these names are the public builtins (kenny-runtime core.rs
+    /// `DIRECT_ARY_BASIC`); else `slow`.
+    pub(crate) fn ary_basic_fast(&mut self, fx: &mut Fx, recv: Value, name: &[u8], vals: &[Value], slow: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
+        let f = mem();
+        let slow_b = fx.b.create_block();
+        fx.b.set_cold_block(slow_b);
+        let dir = self.ary_basic_guard(fx, recv, slow_b);
+        if name == b"empty?" {
+            // (a condition: an `if` on it branches on the length)
+            let done = self.bool_merge(fx);
+            let n = self.ary_len_snap(fx, recv);
+            let z = fx.b.ins().icmp_imm_s(IntCC::Equal, n, 0);
+            self.bool_jump(fx, done, z);
+            fx.b.switch_to_block(slow_b);
+            let r = slow(self, fx);
+            self.bool_jump_value(fx, done, r);
+            return self.bool_result(fx, done);
+        }
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        match name {
+            b"push" | b"<<" | b"pop" => {
+                // inline while one OS thread runs Ruby code (`KN_DIRECT.entry_limit` nonzero:
+                // no buffer lock), the Array isn't frozen and, for a push, has room and owes
+                // no write barrier (svec.rs `push` / `pop`); else the runtime function
+                let push = name != b"pop";
+                let cap_addr = fx.b.ins().iadd_imm_s(recv, ARY_CAP as i64);
+                let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
+                let len = fx.b.ins().load(I64, f, recv, ARY_LEN);
+                let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
+                let n = fx.b.ins().umin(len, capn);
+                let lim = fx.b.ins().load(I64, f, dir, crate::KN_DIRECT_ENTRY_LIMIT);
+                let multi = fx.b.ins().icmp_imm_s(IntCC::Equal, lim, 0);
+                let fl = fx.b.ins().uload32(f, recv, OBJ_FLAGS);
+                let frozen = fx.b.ins().band_imm_s(fl, FL_FROZEN);
+                let frozen = fx.b.ins().icmp_imm_s(IntCC::NotEqual, frozen, 0);
+                let no = if push {
+                    let full = fx.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, n, capn);
+                    let gcb = fx.b.ins().band_imm_s(cap, SVEC_FLAGS);
+                    let wb = fx.b.ins().icmp_imm_s(IntCC::Equal, gcb, SVEC_OLD);
+                    let a = fx.b.ins().bor(full, wb);
+                    fx.b.ins().bor(a, multi)
+                } else {
+                    let empty = fx.b.ins().icmp_imm_s(IntCC::Equal, n, 0);
+                    fx.b.ins().bor(empty, multi)
+                };
+                let no = fx.b.ins().bor(no, frozen);
+                let fast = fx.b.create_block();
+                let call_b = fx.b.create_block();
+                fx.b.set_cold_block(call_b);
+                fx.b.ins().brif(no, call_b, &[], fast, &[]);
+                fx.b.switch_to_block(fast);
+                let ptr = fx.b.ins().load(I64, f, recv, ARY_PTR);
+                // (plain stores: no other OS thread runs Ruby code)
+                let len_addr = recv;
+                if push {
+                    let off = fx.b.ins().ishl_imm_u(n, 3);
+                    let addr = fx.b.ins().iadd(ptr, off);
+                    fx.b.ins().store(f, vals[0], addr, 0);
+                    let n1 = fx.b.ins().iadd_imm_s(n, 1);
+                    fx.b.ins().store(f, n1, len_addr, ARY_LEN);
+                    fx.b.ins().jump(done, &[recv.into()]);
+                } else {
+                    let n1 = fx.b.ins().iadd_imm_s(n, -1);
+                    let off = fx.b.ins().ishl_imm_u(n1, 3);
+                    let addr = fx.b.ins().iadd(ptr, off);
+                    let v = fx.b.ins().load(I64, f, addr, 0);
+                    fx.b.ins().store(f, n1, len_addr, ARY_LEN);
+                    fx.b.ins().jump(done, &[v.into()]);
+                }
+                fx.b.switch_to_block(call_b);
+                let r = if push { self.call(fx, "kn_ary_push1", &[recv, vals[0]]) } else { self.call(fx, "kn_ary_pop0", &[recv]) };
+                fx.b.ins().jump(done, &[r.into()]);
+            }
+            b"shift" => {
+                let r = self.call(fx, "kn_ary_shift0", &[recv]);
+                fx.b.ins().jump(done, &[r.into()]);
+            }
+            _ => {
+                let n = self.ary_len_snap(fx, recv);
+                match name {
+                    b"size" | b"length" => {
+                        let t = fx.b.ins().ishl_imm_u(n, 1);
+                        let r = fx.b.ins().bor_imm_s(t, 1);
+                        fx.b.ins().jump(done, &[r.into()]);
+                    }
+                    _ => {
+                        // first / last: nil when empty
+                        let some = fx.b.create_block();
+                        let nil = fx.b.ins().iconst(I64, QNIL);
+                        fx.b.ins().brif(n, some, &[], done, &[nil.into()]);
+                        fx.b.switch_to_block(some);
+                        let ptr = fx.b.ins().load(I64, f, recv, ARY_PTR);
+                        let addr = if name == b"last" {
+                            let off = fx.b.ins().ishl_imm_u(n, 3);
+                            let a = fx.b.ins().iadd(ptr, off);
+                            fx.b.ins().iadd_imm_s(a, -8)
+                        } else {
+                            ptr
+                        };
+                        let v = fx.b.ins().load(I64, f, addr, 0);
+                        fx.b.ins().jump(done, &[v.into()]);
+                    }
+                }
+            }
+        }
+        fx.b.switch_to_block(slow_b);
+        let r = slow(self, fx);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
+    /// Falls through when `recv` is a plain Array whose basic methods are the builtins
+    /// (`ary_basic_fast`), else to `slow_b`; gives KN_DIRECT's address.
+    fn ary_basic_guard(&mut self, fx: &mut Fx, recv: Value, slow_b: Block) -> Value {
+        let f = mem();
+        self.require_heap(fx, recv, slow_b);
+        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+        let dir = fx.b.ins().symbol_value(I64, gv);
+        let k = fx.b.ins().load(I64, f, recv, 0);
+        let ak = fx.b.ins().load(I64, f, dir, KD_ARRAY_CLASS);
+        let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
+        let bits = fx.b.ins().band_imm_s(flags, DIRECT_ARY_BASIC);
+        let no_bits = fx.b.ins().bxor_imm_s(bits, DIRECT_ARY_BASIC);
+        let other = fx.b.ins().bxor(k, ak);
+        let bad = fx.b.ins().bor(other, no_bits);
+        self.require_zero(fx, bad, slow_b);
+        dir
+    }
+    /// An Array's length (capacity first, as SVec::snap does).
+    fn ary_len_snap(&mut self, fx: &mut Fx, recv: Value) -> Value {
+        let f = mem();
+        let cap_addr = fx.b.ins().iadd_imm_s(recv, ARY_CAP as i64);
+        let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
+        let len = fx.b.ins().load(I64, f, recv, ARY_LEN);
+        let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
+        fx.b.ins().umin(len, capn)
     }
 
     /// The checks of an inline Array index path, falling through when they pass, else to
@@ -2571,6 +2764,8 @@ const DIRECT_SYM_EQ: i64 = 1;
 const DIRECT_NIL_P: i64 = 2;
 /// kenny-runtime core.rs `DIRECT_NIL_P_ALL`
 const DIRECT_NIL_P_ALL: i64 = 16384;
+/// kenny-runtime core.rs `DIRECT_ARY_BASIC`
+const DIRECT_ARY_BASIC: i64 = 32768;
 const DIRECT_IS_A: i64 = 4;
 /// kenny-runtime core.rs `ATTR_NIL_P`, `ATTR_IS_A`.
 const ATTR_NIL_P: i64 = 8;
@@ -2613,7 +2808,7 @@ fn int_cc(op: &[u8]) -> IntCC {
 }
 
 /// `s[i] == "x"` / `s[i] != "x"`: (s, i, the literal).
-fn str_idx_eq_parts<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<(Node<'pr>, Node<'pr>, ruby_prism::StringNode<'pr>)> {
+pub(crate) fn str_idx_eq_parts<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<(Node<'pr>, Node<'pr>, ruby_prism::StringNode<'pr>)> {
     if !matches!(c.name().as_slice(), b"==" | b"!=") || c.block().is_some() || c.is_safe_navigation() {
         return None;
     }

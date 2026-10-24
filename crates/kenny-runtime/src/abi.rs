@@ -715,6 +715,19 @@ pub extern "C" fn kn_entry_slow() -> V {
     }
     QNIL
 }
+/// On entry to an integer copy of a method (kenny-compiler ispec.rs) with the stack below
+/// `KN_DIRECT.entry_limit` or a collection pending: 1 to give up on the copy (the normal
+/// method then runs and reports a deep stack), UNDEF for an exception delivered, else 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_ispec_poll() -> V {
+    if crate::core::approx_sp() < crate::core::KN_DIRECT.entry_limit.load(std::sync::atomic::Ordering::Relaxed) {
+        return 1;
+    }
+    if crate::gc::safepoint() {
+        return UNDEF;
+    }
+    0
+}
 /// For an inlined `C.new` (kenny-compiler statics.rs `inline_new`): fill `slot` with
 /// [C, method serial] if C makes plain objects, its `new` is the builtin Class#new and its
 /// `initialize` has the fast entry `expect`.

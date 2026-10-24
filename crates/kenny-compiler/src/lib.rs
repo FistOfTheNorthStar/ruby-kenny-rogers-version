@@ -19,6 +19,7 @@ mod spec;
 mod vobj;
 mod licm;
 mod owned;
+mod ispec;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -351,6 +352,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_def_claim", &[I64, I64, I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_static_fill", &[I64, I64, I64, I64], &[I64]),
     ("kn_entry_slow", &[], &[I64]),
+    ("kn_ispec_poll", &[], &[I64]),
     ("kn_new_fill", &[I64, I64, I64], &[I64]),
     ("kn_obj_alloc", &[I64], &[I64]),
     ("kn_math1", &[I64, ir::types::F64], &[ir::types::F64]),
@@ -430,6 +432,9 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_attr_set", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_opt_check", &[I64, I64, I64, I64], &[I64]),
     ("kn_ary_at", &[I64, I64], &[I64]),
+    ("kn_ary_push1", &[I64, I64], &[I64]),
+    ("kn_ary_pop0", &[I64], &[I64]),
+    ("kn_ary_shift0", &[I64], &[I64]),
     ("kn_autosplat", &[I64], &[I64]),
     ("kn_range_first", &[I64], &[I64]),
     ("kn_range_last", &[I64], &[I64]),
@@ -929,6 +934,32 @@ impl<M: Module> Compiler<M> {
         let v = fx.b.ins().select(c, t, f);
         fx.bools.insert(v, c);
         v
+    }
+    /// The merge block of a Ruby boolean computed by fast paths as a condition (`bool_jump`)
+    /// and by slow paths as any value (`bool_jump_value`): parameters (value, i8 condition),
+    /// so an `if` on the result branches on the condition (`bool_result`).
+    pub(crate) fn bool_merge(&mut self, fx: &mut Fx) -> Block {
+        let d = fx.b.create_block();
+        fx.b.append_block_param(d, I64);
+        fx.b.append_block_param(d, cranelift_codegen::ir::types::I8);
+        d
+    }
+    pub(crate) fn bool_jump(&mut self, fx: &mut Fx, done: Block, c: Value) {
+        let v = self.bool_v(fx, c);
+        fx.b.ins().jump(done, &[v.into(), c.into()]);
+    }
+    /// (`v` is checked for an exception first: the merged value never is UNDEF)
+    pub(crate) fn bool_jump_value(&mut self, fx: &mut Fx, done: Block, v: Value) {
+        self.check(fx, v);
+        let c = self.truthy(fx, v);
+        fx.b.ins().jump(done, &[v.into(), c.into()]);
+    }
+    pub(crate) fn bool_result(&mut self, fx: &mut Fx, done: Block) -> Value {
+        fx.b.switch_to_block(done);
+        let p = fx.b.block_params(done).to_vec();
+        fx.bools.insert(p[0], p[1]);
+        fx.checked.insert(p[0]);
+        p[0]
     }
     pub(crate) fn cref(&mut self, fx: &mut Fx) -> Value {
         let p = self.slot_ptr(fx, fx.cref_slot);

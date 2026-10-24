@@ -1395,6 +1395,11 @@ impl<M: Module> Compiler<M> {
             }
             _ => None,
         };
+        // a small integer method calling itself: an integer copy too (ispec.rs)
+        let ispec = match (spec.predeclared, &claim, &body) {
+            (Some(fid), Some(_), Some(b)) => crate::ispec::eligible(&name, &params, b).map(|ps| (fid, self.ispec_build(fid, &name, &ps, b))),
+            _ => None,
+        };
         let def_line = self.line_of(offset) as u32;
         // (code inlined into this body is compiled with no inline context of its own)
         let saved_ctx = std::mem::take(&mut self.inline_ctx);
@@ -1402,6 +1407,10 @@ impl<M: Module> Compiler<M> {
         self.def_cref.insert((self.file.clone(), offset), fx.cref_slot);
         let fid = self.build_fn(spec, |c, fx| {
             c.bind_method_params(fx, params);
+            if let Some((fid, copy)) = ispec {
+                let args = fx.fast_args.clone().unwrap_or_default();
+                c.ispec_enter(fx, fid, copy, &args);
+            }
             match &body {
                 Some(b) => c.expr(fx, b),
                 None => c.nil(fx),
