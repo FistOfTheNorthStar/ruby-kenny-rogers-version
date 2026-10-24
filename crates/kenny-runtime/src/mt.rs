@@ -137,6 +137,30 @@ impl<T> L<T> {
         self.depth.store(1, Ordering::Relaxed);
         LGuard { l: self, locked: true }
     }
+    /// `get` that never stops for a collection while it waits: for a thread in the middle of
+    /// work a collection must not see half done (sweeping a page). Only for locks whose
+    /// holders can't be stopped while holding them (no safepoint, no other lock inside).
+    pub fn get_unstoppable(&self) -> LGuard<'_, T> {
+        if !multi() {
+            return LGuard { l: self, locked: false };
+        }
+        let me = my_token();
+        if self.owner.load(Ordering::Relaxed) == me {
+            self.depth.fetch_add(1, Ordering::Relaxed);
+            return LGuard { l: self, locked: true };
+        }
+        let mut spins = 0u32;
+        while self.owner.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        self.depth.store(1, Ordering::Relaxed);
+        LGuard { l: self, locked: true }
+    }
     /// Unlocked access, for the GC while every other thread is stopped.
     #[allow(clippy::mut_from_ref)]
     pub fn raw(&self) -> &mut T {

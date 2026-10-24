@@ -2071,6 +2071,8 @@ pub fn ivar_list(v: V) -> Vec<(u32, V)> {
 
 // Instance variables of objects other than plain Objects and classes: on the object for
 // String/Array/Hash, otherwise in a global table keyed by address.
+/// (Holders do plain table work only, never anything that could stop the thread: gc.rs
+/// `lazy_sweep` waits for it without stopping.)
 pub static GENERIC_IVARS: crate::mt::L<Option<HashMap<usize, CMap<u32, V>, FxBuild>>> = crate::mt::L::new(None);
 fn gen_slot(v: V) -> Option<&'static GenIv> {
     match kind(v) {
