@@ -11,34 +11,14 @@ cargo build --release
 ./target/release/kenny run examples/hello.rb
 ./target/release/kenny build examples/hello_rack/config.ru -o server && ./server
 
-# a Rails (ActionPack 5.2) JSON API as one native binary with its own HTTP server
-./target/release/kenny build examples/rails_api/config.ru -o rails_api \
-    $(ruby tools/gem-paths.rb actionpack 5.2.8.1) && PORT=3000 ./rails_api
-
-# the same with ActiveRecord on SQLite
-./target/release/kenny build examples/rails_api_ar/config.ru -o rails_api_ar \
-    $(ruby tools/gem-paths.rb actionpack 5.2.8.1) $(ruby tools/gem-paths.rb activerecord 5.2.8.1) \
-    $(ruby tools/gem-paths.rb sqlite3 1.7.3) && ./rails_api_ar
-
-# a whole generated Rails 5.2 app (`rails new` + a scaffold); its gems come from its Gemfile.lock.
-# `kenny build` also precompiles its assets (Sass, CoffeeScript, Uglifier) into public/assets,
-# then embeds the app's files (views, config, public/) in the binary
-(cd examples/blog && RAILS_ENV=production SECRET_KEY_BASE=x bundle exec rails db:migrate)
-./target/release/kenny build examples/blog/config.ru -o blog
-(cd examples/blog && RAILS_ENV=production RAILS_SERVE_STATIC_FILES=1 SECRET_KEY_BASE=$(openssl rand -hex 64) ../../blog)
-ruby examples/blog/compare.rb blog   # the same session against Puma and the binary: identical
-
 # a Rails 8.1 app (Zeitwerk, Solid Cache/Queue/Cable on SQLite, Propshaft, importmap, Turbo),
-# built with Ruby 3.3+ and the app's gems installed; its assets are precompiled with Ruby
+# built with Ruby 3.3+ and the app's gems installed; its gems come from its Gemfile.lock, and
+# `kenny build` embeds the app's files (views, config, public/) in the binary. Its assets are
+# precompiled with Ruby
 (cd examples/blog8 && RAILS_ENV=production SECRET_KEY_BASE=x bin/rails db:prepare assets:precompile)
 ./target/release/kenny build examples/blog8/config.ru -o blog8
 (cd examples/blog8 && RAILS_ENV=production SECRET_KEY_BASE=$(openssl rand -hex 64) ../../blog8)
 ruby examples/blog8/compare.rb blog8   # 45 requests against Puma and the binary: identical
-
-# development mode: code reloading, live Sass/CoffeeScript, Rails' error pages, Action Cable
-(cd examples/blog && bundle exec rails db:migrate)
-BUNDLE_WITHOUT=test ./target/release/kenny build examples/blog/config.ru -o blog-dev
-(cd examples/blog && RAILS_ENV=development ../../blog-dev)
 ```
 
 When the program has a `Gemfile.lock` next to it (or in a parent directory), `kenny build`
@@ -51,14 +31,14 @@ dependencies. Every file in those directories is compiled into the binary.
 
 A Rack app's binary is self-contained: `kenny build` also embeds the app's directory (views,
 `config/`, locales, `public/` with the precompiled assets) and every compiled gem's directory,
-compressed (4 MB for `examples/blog`). Runtime data is left out: `log/`, `tmp/`,
+compressed (6.5 MB for `examples/blog8`). Runtime data is left out: `log/`, `tmp/`,
 `node_modules/`, `storage/`, SQLite databases, and `config/master.key` (give it as
 `RAILS_MASTER_KEY` or a file on the server). To deploy, copy the binary and start it in the
 directory that holds its data:
 
 ```
-mkdir -p /srv/blog/db && cp blog /srv/blog/ && cp examples/blog/db/production.sqlite3 /srv/blog/db/
-cd /srv/blog && RAILS_ENV=production RAILS_SERVE_STATIC_FILES=1 SECRET_KEY_BASE=... ./blog
+mkdir -p /srv/blog8/storage && cp blog8 /srv/blog8/ && cp examples/blog8/storage/production*.sqlite3 /srv/blog8/storage/
+cd /srv/blog8 && RAILS_ENV=production SECRET_KEY_BASE=... ./blog8
 ```
 
 Embedded files are always read from the binary, as they were at build time. Everything else
@@ -160,25 +140,10 @@ Working:
   ([QuickJS](https://github.com/quickjs-ng/quickjs)), so `uglifier` and `coffee-script` work
   in-process. `kenny build` of a Rails app with app/assets precompiles its assets (what
   `rails assets:precompile` does, run by the new binary itself) when public/assets has no
-  manifest or the assets changed; `KENNY_PRECOMPILE=1` forces it, `=0` skips it. The blog's
-  JavaScript comes out byte-identical to Ruby's; its CSS differs only in whitespace. Both are
+  manifest or the assets changed; `KENNY_PRECOMPILE=1` forces it, `=0` skips it. Both are
   linked only into programs that use those gems.
-- **Rails:** a whole generated Rails 5.2 application boots and serves production traffic:
-  `examples/blog` is `rails new` plus a scaffold, unchanged (Railties boot, Bundler, every
-  framework of `rails/all`, initializers, eager loading of `app/`, the scaffold's HTML forms with
-  CSRF protection, its jbuilder JSON views, sessions, flash, the 404/422/500 pages and
-  its assets, precompiled by Kenny and served by ActionDispatch::Static). `examples/blog/compare.rb` runs the same
-  24-request session against Puma and the binary: the responses are identical. Smaller examples,
-  with output identical to Ruby's:
-  `examples/rails_api` (ActionController::API, routing, params, JSON),
-  `examples/rails_html` (ActionController::Base with ERB layouts, partials and view helpers;
-  templates are embedded in the binary, read at runtime and compiled once by the embedded JIT), and
-  `examples/rails_api_ar` (below).
-  ActiveRecord 5.2 works with the SQLite adapter (migrations/schema, associations, validations,
-  scopes, transactions, eager loading): `examples/rails_api_ar` is a JSON API backed by it.
-  Rack 2.2 and Rack 3 apps run, and all 1,456 source files of Rails 5.2, ActiveSupport 7.1
-  and their dependencies compile.
-  Rails 8.1 runs too: `examples/blog8` is `rails new` (8.1.4) plus two scaffolds (posts, and
+- **Rails:** a whole generated Rails 8.1 application boots and serves production traffic:
+  `examples/blog8` is `rails new` (8.1.4) plus two scaffolds (posts, and
   comments that belong to them), with Zeitwerk eager loading, Solid Cache, Solid Queue and
   Solid Cable on SQLite, Propshaft, importmap, Turbo and Stimulus, Active Storage (libvips
   isn't installed, so it falls back as under Ruby) and jbuilder. `examples/blog8/compare.rb`
@@ -186,23 +151,8 @@ Working:
   create, deletes, 404/422 pages, the import map's assets) against Puma and the binary: the
   responses are identical. Its assets are precompiled with Ruby (`rails assets:precompile`)
   before `kenny build`, since the build-time precompile above runs only for apps that use the
-  sassc or ExecJS gems.
-- **Rails development mode and Action Cable** (shown on the Rails 5.2 `examples/blog`): a
-  binary built with the development gems (`BUNDLE_WITHOUT=test`) and run with
-  `RAILS_ENV=development` reloads code like `rails server`: `load` (which the classic autoloader, the routes reloader and initializers use)
-  compiles a file with the embedded JIT when it differs from the copy compiled into the binary
-  or is new, so edited controllers, models, routes and views, and newly added files, take
-  effect on the next request. `listen` watches the files through FSEvents. Sprockets compiles
-  Sass and CoffeeScript live. Exceptions and routing errors show Rails' development error
-  pages. The server supports Rack hijacking (full and partial), so Action Cable's WebSockets
-  work, on nio4r's pure-Ruby selector and websocket-driver's Ruby masking, in development and
-  in production (async adapter). `examples/blog/dev_session.rb` (edits a running app's view,
-  stylesheet, CoffeeScript, controller, model and routes, adds a file, raises) and
-  `examples/blog/cable_session.rb` (two WebSocket clients subscribe, broadcast from a channel
-  action and from a request, unsubscribe) pass against the binary and against Puma alike.
-  Development mode runs Ruby threads on one core by default: Rails' classic autoloader counts
-  on a GVL (two requests autoloading one module at once each define their own);
-  `KENNY_THREADS` overrides it.
+  sassc or ExecJS gems. Rack 2.2 and Rack 3 apps run, and the server supports Rack
+  hijacking (full and partial), so WebSockets work.
 - **Reflection:** method visibility (`private`/`protected`, enforced on explicit receivers),
   `Method`/`UnboundMethod`, `Module#dup`, `Rational`/`Complex`.
 - **Backtraces:** full `caller`, `caller_locations` and `Exception#backtrace`, at no cost to
@@ -253,11 +203,7 @@ Web (the machine was also running other work, so treat these as rough; `ab -c 10
 
 | App | One thread | All 12 cores, one process | Puma |
 |---|---|---|---|
-| Rails 5.2 API route + JSON (`examples/rails_api`) | 17.2k req/s, 39 MB | 26.1k req/s, 74 MB | 5.6k req/s, 39 MB (1 thread) |
-| Rails 5.2 HTML page with layout and partials (`examples/rails_html`) | 10.4k req/s, 42 MB | 23.1k req/s, 83 MB | 4.5k req/s, 44 MB (1 thread) |
-| Rails 5.2 + ActiveRecord/SQLite read (`examples/rails_api_ar`) | 5.7k req/s, 51 MB | 16.7k req/s, 100 MB | 3.0k req/s, 44 MB (1 thread) |
-| Whole Rails 5.2 app (`examples/blog`), scaffold index | 2.7k req/s, 83 MB | 8.7k req/s, 144 MB (125 MB once idle) | 1.5k req/s, 108 MB (1 thread); 4.1k req/s, 1,058 MB (12 workers) |
-| Whole Rails 8.1 app (`examples/blog8`, SQLite, Solid Cache/Queue), scaffold index | 1.9k req/s, 113 MB | 7.7k req/s, 187 MB | 1.1k req/s (1 thread, Ruby 3.3); 4.9k req/s, about 1.1 GB (12 workers) |
+| Whole Rails 8.1 app (`examples/blog8`, SQLite, Solid Cache/Queue), scaffold index | 2.2k req/s, 119 MB | 6.7k req/s, 195 MB | 1.3k req/s, 71 MB (1 thread, Ruby 3.3); 4.8k req/s, 1,040 MB (12 workers) |
 
 Run them yourself: `bench/run.sh`. Tests: `tests/run.sh`. Compile-check a file without linking: `kenny check file.rb`.
 
@@ -278,7 +224,8 @@ caps how much the young generation grows with the number of cores (less memory, 
 default `auto` uses mimalloc while one core runs Ruby code and the system allocator once
 several do (it keeps far less memory resident when threads free each other's objects); elsewhere
 mimalloc. `KENNY_EVAL_CACHE` (default 2000) sizes the cache of `eval`'d code. `KENNY_THREADS`
-sets how many OS threads run Ruby threads (default: one per core); `WEB_CONCURRENCY=n`
+sets how many OS threads run Ruby threads (default: one per core, or one with
+`RAILS_ENV=development`, whose code reloading counts on a GVL); `WEB_CONCURRENCY=n`
 additionally forks n server processes (default 1). `KENNY_SCHED_STATS=1` prints how often
 threads moved between cores (`KENNY_NO_STEAL=1` keeps them where they started, to compare); `KENNY_CRASH_TRACE=1` prints a native backtrace on a crash. `KENNY_NO_INLINE=1 kenny build ...` compiles without block inlining (to compare, or
 to rule it out when debugging). Debugging: `KENNY_DEBUG_RAISE=1` logs every exception raised

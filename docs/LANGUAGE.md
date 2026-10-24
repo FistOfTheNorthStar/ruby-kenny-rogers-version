@@ -52,10 +52,10 @@ which call sites come after it, and only those sites use a refinement-aware look
   server. `require "bootsnap/setup"` does nothing (there is nothing to cache).
 - **`YAML.load` follows the psych of the Ruby the program is built against** (or of a psych
   gem in the lock file): with psych 3 (Ruby ≤ 3.0) it is a full load that accepts aliases and
-  any class, as Rails 5.2 expects; with psych 4+ it is a safe load.
+  any class, as older gems expect; with psych 4+ it is a safe load.
 - **Ruby 2 keyword arguments in dependencies.** Methods and blocks defined in files found via
   load paths (gems, the stdlib) and in `eval`'d strings take a trailing positional Hash with
-  Symbol keys as their keywords, as Ruby 2.x did — gems such as Rails 5.2 rely on it. The app's
+  Symbol keys as their keywords, as Ruby 2.x did — gems written for Ruby 2 rely on it. The app's
   own code keeps Ruby 3 semantics (except that a Hash which would otherwise be one positional
   argument too many is taken as keywords instead of raising ArgumentError).
 

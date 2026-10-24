@@ -1,5 +1,5 @@
 # Print `-I <dir>` flags for a gem and its runtime dependencies (using installed gems).
-# usage: ruby tools/gem-paths.rb rails 5.2.8.1
+# usage: ruby tools/gem-paths.rb rack 3.1.8
 name, version = ARGV
 seen = {}
 add = lambda do |n, req|

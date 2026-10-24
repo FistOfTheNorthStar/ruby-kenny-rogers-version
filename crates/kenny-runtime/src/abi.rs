@@ -1620,7 +1620,7 @@ pub extern "C" fn kn_is_kwhash(v: V) -> u64 {
     (is_hash(v) && hdr(v).flags & FL_KWHASH != 0) as u64
 }
 /// The last argument of a call to a method with keyword parameters is its keywords: a keyword
-/// hash, or (Ruby 2.x compatibility, needed by Rails 5.2) a plain Hash that would otherwise be
+/// hash, or (Ruby 2.x compatibility, for gems written for it) a plain Hash that would otherwise be
 /// one positional argument too many (`maxpos` = positional capacity, -1 with a rest param).
 /// CRuby 3 raises ArgumentError in that second case, so this only turns errors into 2.7 behavior.
 #[unsafe(no_mangle)]
@@ -1630,8 +1630,8 @@ pub extern "C" fn kn_take_kwhash(v: V, argc: u64, maxpos: i64) -> u64 {
     }
     (hdr(v).flags & FL_KWHASH != 0 || (maxpos >= 0 && argc as i64 > maxpos)) as u64
 }
-/// Ruby 2 keyword semantics, used for methods and blocks defined in dependencies (gems such as
-/// Rails 5.2 were written for them): a trailing positional Hash with Symbol keys becomes the
+/// Ruby 2 keyword semantics, used for methods and blocks defined in dependencies (gems written
+/// for Ruby 2): a trailing positional Hash with Symbol keys becomes the
 /// keywords when it isn't needed for a required positional (`t.string :key, opts` calling
 /// `def string(*args, **options)`).
 #[unsafe(no_mangle)]

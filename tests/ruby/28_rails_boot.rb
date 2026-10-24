@@ -1,4 +1,4 @@
-# Runtime behaviours a whole Rails 5.2 app (railties boot) depends on.
+# Runtime behaviours a whole Rails app (railties boot) depends on.
 # kenny-run-flags: -I tests/ruby/28_rails_boot
 
 # symbols with NUL bytes don't shift the compiled-in symbol table
