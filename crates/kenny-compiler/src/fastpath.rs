@@ -1203,15 +1203,39 @@ impl<M: Module> Compiler<M> {
             }
         }
         match (name, vals) {
-            (b"nil?", []) => return self.call_stub(fx, STUB_NIL_P, &[cache, recv, mid, e]),
+            (b"nil?", []) => {
+                // every object's nil? the builtin one: a comparison; else the stub
+                let f = mem();
+                let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+                let dir = fx.b.ins().symbol_value(I64, gv);
+                let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
+                let bit = fx.b.ins().band_imm_s(flags, DIRECT_NIL_P_ALL);
+                let fast = fx.b.create_block();
+                let slow = fx.b.create_block();
+                let done = fx.b.create_block();
+                fx.b.append_block_param(done, I64);
+                fx.b.set_cold_block(slow);
+                fx.b.ins().brif(bit, fast, &[], slow, &[]);
+                fx.b.switch_to_block(fast);
+                let is_nil = fx.b.ins().icmp_imm_s(IntCC::Equal, recv, QNIL);
+                let t = fx.b.ins().iconst(I64, QTRUE);
+                let fl = fx.b.ins().iconst(I64, QFALSE);
+                let r = fx.b.ins().select(is_nil, t, fl);
+                fx.b.ins().jump(done, &[r.into()]);
+                fx.b.switch_to_block(slow);
+                let r = self.call_stub(fx, STUB_NIL_P, &[cache, recv, mid, e]);
+                fx.b.ins().jump(done, &[r.into()]);
+                fx.b.switch_to_block(done);
+                return fx.b.block_params(done)[0];
+            }
             (b"is_a?" | b"kind_of?", [a]) => return self.call_stub(fx, STUB_IS_A, &[cache, recv, mid, *a, e]),
             _ => {}
         }
         match vals {
             // (not names that are mostly core methods: `words.size` is a plain call)
-            [] if in_loop && attr_name(name) && may_be_ruby_method(name) => self.attr_fast(fx, cache, recv, None, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, e])),
+            [] if (in_loop || !self.in_dependency()) && attr_name(name) && may_be_ruby_method(name) => self.attr_fast(fx, cache, recv, None, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, e])),
             [] => plain(self, fx, "kn_send0", &[cache, recv, mid, e]),
-            [a] if in_loop && name.last() == Some(&b'=') && attr_name(&name[..name.len() - 1]) => {
+            [a] if (in_loop || !self.in_dependency()) && name.last() == Some(&b'=') && attr_name(&name[..name.len() - 1]) => {
                 let a = *a;
                 self.attr_fast(fx, cache, recv, Some(a), |c, fx| plain(c, fx, "kn_attr_set", &[cache, recv, mid, a, e]))
             }
@@ -2545,6 +2569,8 @@ const CE_METHOD: i32 = 48;
 const METHOD_FAST: i32 = 0;
 const DIRECT_SYM_EQ: i64 = 1;
 const DIRECT_NIL_P: i64 = 2;
+/// kenny-runtime core.rs `DIRECT_NIL_P_ALL`
+const DIRECT_NIL_P_ALL: i64 = 16384;
 const DIRECT_IS_A: i64 = 4;
 /// kenny-runtime core.rs `ATTR_NIL_P`, `ATTR_IS_A`.
 const ATTR_NIL_P: i64 = 8;

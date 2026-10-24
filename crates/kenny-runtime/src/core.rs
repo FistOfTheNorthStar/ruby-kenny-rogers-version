@@ -1126,6 +1126,9 @@ pub const DIRECT_STR_IDX_EQ: u64 = 2048;
 pub const DIRECT_ARY_ITER: u64 = 4096;
 /// Integer#times, #upto and #downto are the public builtin ones.
 pub const DIRECT_INT_ITER: u64 = 8192;
+/// Every object's nil? is the builtin one, public (`NIL_P_TOUCHED` unset): `x.nil?` is
+/// `x == nil` (kenny-compiler fastpath.rs).
+pub const DIRECT_NIL_P_ALL: u64 = 16384;
 /// Set once the builtin methods are tagged (opt.rs `init`).
 pub static DIRECT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// `KN_DIRECT.flags` is 0 until recomputed (methods changed): on the next inline cache
@@ -1239,6 +1242,9 @@ pub fn update_direct_flags() {
     if !IS_A_TOUCHED.load(SeqCst) {
         flags |= DIRECT_IS_A_HEAP;
     }
+    if !NIL_P_TOUCHED.load(SeqCst) && flags & DIRECT_NIL_P != 0 && is(c.object, nil_p, crate::opt::OPT_NIL_P) {
+        flags |= DIRECT_NIL_P_ALL;
+    }
     if !EQQ_TOUCHED.load(SeqCst) && is(c.module, sym("==="), crate::opt::OPT_MOD_EQQ) {
         flags |= DIRECT_MOD_EQQ_ALL;
     }
@@ -1246,6 +1252,9 @@ pub fn update_direct_flags() {
     // (set meanwhile)
     if IS_A_TOUCHED.load(SeqCst) {
         KN_DIRECT.flags.fetch_and(!DIRECT_IS_A_HEAP, SeqCst);
+    }
+    if NIL_P_TOUCHED.load(SeqCst) {
+        KN_DIRECT.flags.fetch_and(!DIRECT_NIL_P_ALL, SeqCst);
     }
     if EQQ_TOUCHED.load(SeqCst) {
         KN_DIRECT.flags.fetch_and(!DIRECT_MOD_EQQ_ALL, SeqCst);
@@ -1293,8 +1302,9 @@ pub fn init_runtime_at(stack_base: usize) {
 
 pub fn new_class_raw(name: &str, superclass: *mut Class, is_module: bool) -> *mut Class {
     if !superclass.is_null() && DIRECT_READY.load(std::sync::atomic::Ordering::SeqCst) && superclass == rt().c.basic_object {
-        // (its instances have no is_a?)
+        // (its instances have no is_a? or nil?)
         is_a_touched();
+        nil_p_touched();
     }
     let alloc_kind = if superclass.is_null() { Kind::Object } else { unsafe { (*superclass).alloc } };
     let c = Box::into_raw(Box::new(Class {
@@ -1444,7 +1454,7 @@ pub fn class_name(c: *mut Class) -> String {
 
 /// How many method tables have an entry of each name: never too low (every new entry
 /// counts; a freed table's entries are not taken off). For `claim`.
-static METHOD_NAMES: std::sync::Mutex<Option<std::collections::HashMap<u32, u32>>> = std::sync::Mutex::new(None);
+static METHOD_NAMES: std::sync::Mutex<Option<rustc_hash::FxHashMap<u32, u32>>> = std::sync::Mutex::new(None);
 /// Set (for good) once a method named is_a? or kind_of? is defined, removed, undefined or
 /// made private/protected after startup, or a class inherits from BasicObject directly:
 /// until then every heap object's is_a?/kind_of? is the builtin one (abi.rs `kn_is_a_send`).
@@ -1460,10 +1470,12 @@ pub fn touch_method_name(c: *mut Class, mid: u32) {
     if !DIRECT_READY.load(SeqCst) {
         return;
     }
-    static IDS: std::sync::OnceLock<[u32; 3]> = std::sync::OnceLock::new();
-    let [is_a, kind_of, eqq] = *IDS.get_or_init(|| [sym("is_a?"), sym("kind_of?"), sym("===")]);
+    static IDS: std::sync::OnceLock<[u32; 4]> = std::sync::OnceLock::new();
+    let [is_a, kind_of, eqq, nil_p] = *IDS.get_or_init(|| [sym("is_a?"), sym("kind_of?"), sym("==="), sym("nil?")]);
     if mid == is_a || mid == kind_of {
         is_a_touched();
+    } else if mid == nil_p {
+        nil_p_touched();
     } else if mid == eqq && !c.is_null() {
         let k = unsafe { &*c };
         if k.is_singleton || k.is_module || c == rt().c.module || c == rt().c.class {
@@ -1478,6 +1490,14 @@ pub fn touch_mixin(target: *mut Class, m: *mut Class) {
     if DIRECT_READY.load(std::sync::atomic::Ordering::SeqCst) && !find_method(m, sym("===")).is_null() {
         touch_method_name(target, sym("==="));
     }
+}
+/// Some class's nil? was defined, removed or changed, or a class without Kernel exists
+/// (`DIRECT_NIL_P_ALL`; never unset).
+pub static NIL_P_TOUCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn nil_p_touched() {
+    use std::sync::atomic::Ordering::SeqCst;
+    NIL_P_TOUCHED.store(true, SeqCst);
+    KN_DIRECT.flags.fetch_and(!DIRECT_NIL_P_ALL, SeqCst);
 }
 pub fn is_a_touched() {
     use std::sync::atomic::Ordering::SeqCst;
@@ -1796,9 +1816,18 @@ pub fn add_method(c: *mut Class, mid: u32, body: Body) -> *const Method {
         method_name_count(mid, true);
     }
     touch_method_name(c, mid);
-    bump_serial();
+    if BOOTING.load(std::sync::atomic::Ordering::Relaxed) {
+        // (no compiled code has run yet: no claims, attr sites or direct flags to reset; the
+        // method caches still see the new serial)
+        let s = SERIAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        KN_DIRECT.serial.store(s, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        bump_serial();
+    }
     m
 }
+/// Set while `boot` defines the built-in classes and methods.
+pub static BOOTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Mark native methods as GC-transparent (see Method::gc_transparent).
 pub fn gc_transparent(c: *mut Class, names: &[&str]) {
     for n in names {

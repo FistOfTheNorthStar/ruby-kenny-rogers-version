@@ -24,6 +24,7 @@ fn module(name: &str) -> *mut Class {
 }
 
 pub fn boot() {
+    BOOTING.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::gc::init_stats();
     let r = rt();
     let null = std::ptr::null_mut();
@@ -161,4 +162,6 @@ pub fn boot() {
     crate::misc::blockless_enumerators();
     crate::opt::init();
     crate::gc::arm_malloc_limit();
+    BOOTING.store(false, std::sync::atomic::Ordering::Relaxed);
+    bump_serial();
 }
