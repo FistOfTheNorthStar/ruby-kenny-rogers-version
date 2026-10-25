@@ -4449,7 +4449,33 @@ pub fn init() {
         -1,
     );
     crate::abi::AT_EXIT.get().push(flusher);
+    init_file_test();
     init_stdlib_support();
+}
+
+/// FileTest: the File predicates as module functions (Logger's log rotation uses
+/// `FileTest.identical?`). Shares File's native implementations.
+fn init_file_test() {
+    let Some(file) = const_lookup(rt().c.object, sym("File")) else { return };
+    let ft = new_module("FileTest");
+    set_global_const("FileTest", ft as V);
+    let fmeta = singleton_class(file);
+    for name in [
+        "blockdev?", "chardev?", "directory?", "empty?", "executable?", "executable_real?", "exist?", "file?",
+        "grpowned?", "identical?", "owned?", "pipe?", "readable?", "readable_real?", "setgid?", "setuid?", "size",
+        "size?", "socket?", "sticky?", "symlink?", "world_readable?", "world_writable?", "writable?",
+        "writable_real?", "zero?",
+    ] {
+        let m = find_method(fmeta, sym(name));
+        if m.is_null() {
+            continue;
+        }
+        if let Body::Native(f, min, max) = unsafe { &(*m).body } {
+            defs(ft, name, *min, *max, *f);
+            defn(ft, name, *min, *max, *f);
+            unsafe { (*find_method(ft, sym(name)).cast_mut()).vis = VIS_PRIVATE };
+        }
+    }
 }
 
 /// Small core methods the pure-Ruby stdlib file helpers (fileutils, tmpdir, tempfile) rely on.
