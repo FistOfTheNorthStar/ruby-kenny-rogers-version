@@ -1060,7 +1060,7 @@ impl<M: Module> Compiler<M> {
 
     /// Take the trailing keyword-hash argument (if any) off the positional arguments.
     /// `maxpos`: positional capacity (-1 with a rest param); `nreq2`: required positionals,
-    /// for the Ruby 2 rule applied to code from dependencies (see kn_take_kwhash2).
+    /// for the trailing-Hash keyword rule applied to code from dependencies (see kn_take_kwhash2).
     /// `consume`: a copy whose keys `bind_keywords` removes (for a `**rest` parameter);
     /// otherwise the caller's hash itself, read only, or nil when none was passed.
     fn extract_kwhash(&mut self, fx: &mut Fx, npos_required: usize, maxpos: i64, nreq2: usize, consume: bool) -> Value {

@@ -186,18 +186,18 @@ Not yet:
   `KENNY_MALLOC`).
 - `ObjectSpace`, `TracePoint` (dropped by design).
 
-## Early numbers (Apple Silicon M-series, 12 cores, vs Ruby 2.7.8 interpreter, no YJIT)
+## Early numbers (Apple Silicon M-series, 12 cores, vs Ruby 3.4.11 interpreter, no YJIT)
 
 | Benchmark | Speedup |
 |---|---|
-| Integer loop (`bench/loop.rb`) | 10.5x |
-| Recursive `fib` | 2.2x |
-| Blocks and collections (`blocks.rb`, `collections.rb`) | 3.7x, 3.6x |
-| String building and hashes (`strings_hash.rb`) | 2.7x |
-| Float math: `mandelbrot.rb`, `spectral_norm.rb`, `nbody.rb` | 4.9x, 4.7x, 2.0x |
-| Method-call-heavy OO code (`methods.rb`) | 2.5x |
-| Object allocation with GC (`objects.rb`) | 1.7x |
-| 12 CPU-bound Ruby threads (`threads.rb`) | 24.5x (0.04 s vs 0.97 s: Ruby's GVL runs one at a time) |
+| Integer loop (`bench/loop.rb`) | 12.4x |
+| Recursive `fib` | 5.1x |
+| Blocks and collections (`blocks.rb`, `collections.rb`) | 4.1x, 5.2x |
+| String building and hashes (`strings_hash.rb`) | 3.4x |
+| Float math: `mandelbrot.rb`, `spectral_norm.rb`, `nbody.rb` | 20.8x, 8.0x, 4.8x |
+| Method-call-heavy OO code (`methods.rb`) | 6.4x |
+| Object allocation with GC (`objects.rb`) | 5.7x |
+| 12 CPU-bound Ruby threads (`threads.rb`) | 24x (0.03 s vs 0.80 s: Ruby's GVL runs one at a time) |
 
 Web (the machine was also running other work, so treat these as rough; `ab -c 10`/`-c 32`):
 

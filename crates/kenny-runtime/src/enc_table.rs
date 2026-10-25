@@ -1,6 +1,6 @@
 //! Every encoding CRuby defines besides UTF-8, ASCII-8BIT and US-ASCII (generated from
-//! Ruby 2.7.8): Kenny strings never carry them, but code compares against them, looks
-//! them up and asks `dummy?`. Fields: name, aliases, constants, dummy?, ascii_compatible?.
+//! CRuby's encoding list): code compares against them, looks them up and asks `dummy?`;
+//! `String#encode` and `force_encoding` tag Strings with them (see transcode.rs). Fields: name, aliases, constants, dummy?, ascii_compatible?.
 
 pub const ENCODINGS: &[(&str, &[&str], &[&str], bool, bool)] = &[
     ("UTF-16BE", &["UCS-2BE"], &["UCS_2BE", "UTF_16BE"], false, false),
