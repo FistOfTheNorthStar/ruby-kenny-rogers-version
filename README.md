@@ -147,8 +147,8 @@ Working:
 - **Asset pipeline without Ruby or Node:** the `sassc` gem's API runs on a native Sass
   compiler ([grass](https://github.com/connorskees/grass)), with Sass functions such as
   `asset-path` calling back into Ruby, and ExecJS runs on an embedded JavaScript engine
-  ([QuickJS](https://github.com/quickjs-ng/quickjs)), so `uglifier` and `coffee-script` work
-  in-process. `kenny build` of a Rails app with app/assets precompiles its assets (what
+  ([QuickJS](https://github.com/quickjs-ng/quickjs)), so ExecJS users such as `uglifier` and
+  `terser` work in-process. `kenny build` of a Rails app with app/assets precompiles its assets (what
   `rails assets:precompile` does, run by the new binary itself) when public/assets has no
   manifest or the assets changed; `KENNY_PRECOMPILE=1` forces it, `=0` skips it. Both are
   linked only into programs that use those gems.

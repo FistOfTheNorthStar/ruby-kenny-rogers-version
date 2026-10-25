@@ -4,7 +4,7 @@
 //!   sassc gem's Ruby API (lib/kenny/sassc.rb). Custom functions (sprockets' `asset-path`,
 //!   `image-url`, ...) call back into Ruby.
 //! - `Kenny::JS`: a QuickJS engine per context, behind an ExecJS runtime
-//!   (lib/kenny/execjs.rb), so uglifier and coffee-script run in-process.
+//!   (lib/kenny/execjs.rb), so ExecJS users such as uglifier and terser run in-process.
 //!
 //! Linked only into programs whose gems include sassc or execjs: `kenny build` then registers
 //! `Init_kenny_assets` (as the extension "kenny_assets"); other binaries don't carry grass or
@@ -396,7 +396,7 @@ fn js_eval(c: V, src: V) -> V {
         // QuickJS measures its stack limit from where the runtime was created; each Kenny
         // thread runs on its own stack, so start from this one (rquickjs only does this with
         // its "parallel" feature). Otherwise any thread but the first gets "RangeError:
-        // Maximum call stack size exceeded" (CoffeeScript compiled in a request, development)
+        // Maximum call stack size exceeded" (e.g. a JavaScript compressor run in a request)
         unsafe { rquickjs::qjs::JS_UpdateStackTop(rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr())) };
         // sloppy-mode global code, as in the browser and Node (rquickjs defaults to strict)
         let mut opts = rquickjs::context::EvalOptions::default();

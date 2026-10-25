@@ -1,10 +1,9 @@
-# kenny-run-flags: -I "$(ruby -e 'print Gem::Specification.find_by_name("sassc", "2.4.0").gem_dir')/lib" -I "$(ruby -e 'print Gem::Specification.find_by_name("execjs", "2.10.0").gem_dir')/lib" -I "$(ruby -e 'print Gem::Specification.find_by_name("coffee-script", "2.4.1").gem_dir')/lib" -I "$(ruby -e 'print Gem::Specification.find_by_name("coffee-script-source", "1.12.2").gem_dir')/lib"
+# kenny-run-flags: -I "$(ruby -e 'print Gem::Specification.find_by_name("sassc", "2.4.0").gem_dir')/lib" -I "$(ruby -e 'print Gem::Specification.find_by_name("execjs", "2.10.0").gem_dir')/lib"
 # The asset pipeline's compilers without libsass or Node: the sassc gem's API on the runtime's
 # Sass compiler (grass), with a custom function calling back into Ruby, and ExecJS on the
-# runtime's JavaScript engine (QuickJS), running the CoffeeScript compiler.
+# runtime's JavaScript engine (QuickJS).
 require "sassc"
 require "execjs"
-require "coffee-script"
 
 module SassC::Script::Functions
   def asset_path(path, options = {})
@@ -46,4 +45,7 @@ begin
 rescue ExecJS::RuntimeError => e
   puts "ExecJS::RuntimeError"
 end
-puts CoffeeScript.compile("square = (x) -> x * x\nconsole.log square 3", bare: true)
+# a context made on one thread and called from others, recursing deeply: QuickJS's stack
+# limit has to follow the thread it runs on
+deep = ExecJS.compile("function depth(n) { return n == 0 ? 0 : 1 + depth(n - 1) }")
+p 3.times.map { Thread.new { deep.call("depth", 2000) } }.map(&:value)

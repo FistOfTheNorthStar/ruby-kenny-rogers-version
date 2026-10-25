@@ -2,7 +2,7 @@
 
 # ExecJS in a Kenny binary: the execjs gem, plus a JavaScript runtime that runs in-process
 # (QuickJS, in the runtime: crates/kenny-runtime/src/assets.rs), chosen ahead of the gem's
-# runtimes, so uglifier, coffee-script and other ExecJS users need no Node. EXECJS_RUNTIME still
+# runtimes, so uglifier, terser and other ExecJS users need no Node. EXECJS_RUNTIME still
 # picks another runtime (e.g. EXECJS_RUNTIME=Node).
 require "execjs/module"
 require "execjs/runtimes"

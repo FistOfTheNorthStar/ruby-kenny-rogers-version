@@ -19,10 +19,4 @@ nil
 "HÉLLO"
 ExecJS::ProgramError: ReferenceError: nope is not defined
 ExecJS::RuntimeError
-var square;
-
-square = function(x) {
-  return x * x;
-};
-
-console.log(square(3));
+[2000, 2000, 2000]
