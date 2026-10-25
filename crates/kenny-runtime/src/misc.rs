@@ -1149,24 +1149,52 @@ pub fn init() {
     // ---- Process ----
     let pr = new_module("Process");
     set_global_const("Process", pr as V);
-    const_set(pr, sym("CLOCK_REALTIME"), mkfix(0));
-    const_set(pr, sym("CLOCK_MONOTONIC"), mkfix(1));
-    const_set(pr, sym("CLOCK_PROCESS_CPUTIME_ID"), mkfix(2));
-    static ORIGIN: G<Option<std::time::Instant>> = G::new(None);
-    *ORIGIN.get() = Some(std::time::Instant::now());
+    // the platform's clock ids (as CRuby defines them), read with clock_gettime(2)
+    let clocks: &[(&str, libc::clockid_t)] = &[
+        ("CLOCK_REALTIME", libc::CLOCK_REALTIME),
+        ("CLOCK_MONOTONIC", libc::CLOCK_MONOTONIC),
+        ("CLOCK_PROCESS_CPUTIME_ID", libc::CLOCK_PROCESS_CPUTIME_ID),
+        ("CLOCK_THREAD_CPUTIME_ID", libc::CLOCK_THREAD_CPUTIME_ID),
+        #[cfg(target_os = "macos")]
+        ("CLOCK_MONOTONIC_RAW", libc::CLOCK_MONOTONIC_RAW),
+        #[cfg(target_os = "macos")]
+        ("CLOCK_MONOTONIC_RAW_APPROX", libc::CLOCK_MONOTONIC_RAW_APPROX),
+        #[cfg(target_os = "macos")]
+        ("CLOCK_UPTIME_RAW", libc::CLOCK_UPTIME_RAW),
+        #[cfg(target_os = "macos")]
+        ("CLOCK_UPTIME_RAW_APPROX", libc::CLOCK_UPTIME_RAW_APPROX),
+        #[cfg(target_os = "linux")]
+        ("CLOCK_MONOTONIC_RAW", libc::CLOCK_MONOTONIC_RAW),
+        #[cfg(target_os = "linux")]
+        ("CLOCK_BOOTTIME", libc::CLOCK_BOOTTIME),
+        #[cfg(target_os = "linux")]
+        ("CLOCK_REALTIME_COARSE", libc::CLOCK_REALTIME_COARSE),
+        #[cfg(target_os = "linux")]
+        ("CLOCK_MONOTONIC_COARSE", libc::CLOCK_MONOTONIC_COARSE),
+    ];
+    for &(n, id) in clocks {
+        const_set(pr, sym(n), mkfix(id as i64));
+    }
     defs(pr, "clock_gettime", 1, 2, |_, a, _| {
-        let secs = if is_fix(a[0]) && fix(a[0]) == 0 {
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64()
-        } else {
-            ORIGIN.get().unwrap().elapsed().as_secs_f64() + 1000.0
-        };
+        if !is_fix(a[0]) {
+            return type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(a[0]))));
+        }
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { libc::clock_gettime(fix(a[0]) as libc::clockid_t, &mut ts) } != 0 {
+            return raise(crate::io::errno_class(libc::EINVAL), "Invalid argument - clock_gettime");
+        }
+        let ns = ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128;
+        let secs = ns as f64 / 1e9;
         match a.get(1).filter(|u| is_sym(**u)).map(|u| sym_str(sym_id(*u))) {
-            Some(u) if u == "millisecond" => mkfix((secs * 1e3) as i64),
-            Some(u) if u == "microsecond" => mkfix((secs * 1e6) as i64),
-            Some(u) if u == "nanosecond" => mkfix((secs * 1e9) as i64),
-            Some(u) if u == "float_millisecond" => float_new(secs * 1e3),
-            Some(u) if u == "second" => mkfix(secs as i64),
-            _ => float_new(secs),
+            Some(u) if u == "millisecond" => mkfix((ns / 1_000_000) as i64),
+            Some(u) if u == "microsecond" => mkfix((ns / 1_000) as i64),
+            Some(u) if u == "nanosecond" => mkfix(ns as i64),
+            Some(u) if u == "second" => mkfix((ns / 1_000_000_000) as i64),
+            Some(u) if u == "float_millisecond" => float_new(ns as f64 / 1e6),
+            Some(u) if u == "float_microsecond" => float_new(ns as f64 / 1e3),
+            Some(u) if u == "float_second" => float_new(secs),
+            Some(u) => arg_error(&format!("unexpected unit: {u}")),
+            None => float_new(secs),
         }
     });
     defs(pr, "pid", 0, 0, |_, _, _| mkfix(std::process::id() as i64));

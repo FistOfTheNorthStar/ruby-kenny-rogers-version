@@ -10,6 +10,30 @@ static UNBOUND: G<*mut Class> = G::new(std::ptr::null_mut());
 fn mptr(v: V) -> *const Method {
     fix(ivar_get(v, sym("@__m"))) as usize as *const Method
 }
+/// `Method#super_method` / `UnboundMethod#super_method`: the method `super` would call from
+/// this one (the next definition after its owner in the receiver's ancestors), or nil.
+fn super_method(s: V) -> V {
+    let m = mptr(s);
+    if m.is_null() {
+        return QNIL;
+    }
+    let owner = unsafe { (*m).owner };
+    let name = unsafe { (*m).name };
+    let bound = real_class(s) == *METHOD.get();
+    let recv = ivar_get(s, sym("@__recv"));
+    let anc = if bound { ancestors(class_of(recv)) } else { ancestors(owner) };
+    let Some(pos) = anc.iter().position(|&k| k == owner) else { return QNIL };
+    for &k in &anc[pos + 1..] {
+        if let Some(&sm) = unsafe { (*k).methods.get(&name) } {
+            if matches!(unsafe { &(*sm).body }, Body::Undefined) {
+                return QNIL;
+            }
+            return wrap(if bound { *METHOD.get() } else { *UNBOUND.get() }, if bound { recv } else { QNIL }, sm, sym_id(ivar_get(s, sym("@__name"))));
+        }
+    }
+    QNIL
+}
+
 fn wrap(class: *mut Class, recv: V, m: *const Method, name: u32) -> V {
     let o = object_new(class);
     ivar_set(o, sym("@__m"), mkfix(m as i64));
@@ -300,7 +324,7 @@ pub fn init() {
         defn(c, "arity", 0, 0, |s, _, _| mkfix(arity(mptr(s))));
         defn(c, "parameters", 0, 0, |s, _, _| parameters(mptr(s)));
         defn(c, "source_location", 0, 0, |_, _, _| QNIL);
-        defn(c, "super_method", 0, 0, |_, _, _| QNIL);
+        defn(c, "super_method", 0, 0, |s, _, _| super_method(s));
         defn(c, "original_name", 0, 0, |s, _, _| {
             let m = mptr(s);
             if m.is_null() { ivar_get(s, sym("@__name")) } else { mksym(unsafe { (*m).name }) }

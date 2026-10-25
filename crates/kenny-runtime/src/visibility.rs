@@ -98,9 +98,6 @@ fn list(c: *mut Class, inherit: bool, want: &dyn Fn(u8) -> bool) -> V {
     let mut seen: Vec<u32> = Vec::new();
     let mut out = Vec::new();
     for k in classes {
-        if inherit && k != c && (k == rt().c.object || k == rt().c.kernel || k == rt().c.basic_object) {
-            continue;
-        }
         for (&id, &m) in unsafe { (*k).methods.iter() } {
             if seen.contains(&id) {
                 continue;
@@ -116,6 +113,33 @@ fn list(c: *mut Class, inherit: bool, want: &dyn Fn(u8) -> bool) -> V {
         }
     }
     ary_new(out)
+}
+
+/// After every native class is set up: what CRuby keeps private on Object, Kernel and
+/// BasicObject but the runtime defines elsewhere (or later than `init`), so that
+/// `obj.methods` / `Foo.instance_methods` list what CRuby lists.
+pub fn finish_boot() {
+    let c = rt().c;
+    let names: &[(*mut Class, &[&str])] = &[
+        (
+            c.kernel,
+            &[
+                "Rational", "Complex", "gem_original_require", "test", "ruby2_keywords", "using", "syscall", "trace_var",
+                "untrace_var", "autoload?", "__callee__", "__kenny_openssl_init",
+                // config.ru's Rack::Builder DSL (`run App` at the top level)
+                "run", "use",
+            ],
+        ),
+        (c.object, &["ruby2_keywords", "using"]),
+        (c.basic_object, &["method_missing", "singleton_method_added", "singleton_method_removed", "singleton_method_undefined"]),
+    ];
+    for &(k, list) in names {
+        for name in list {
+            if let Some(&m) = unsafe { (*k).methods.get(&sym(name)) } {
+                unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
+            }
+        }
+    }
 }
 
 pub fn init() {
@@ -194,6 +218,13 @@ pub fn init() {
     defn(k, "private_methods", 0, 1, |s, _, _| list(class_of(s), true, &|v| v == VIS_PRIVATE));
     defn(k, "protected_methods", 0, 1, |s, _, _| list(class_of(s), true, &|v| v == VIS_PROTECTED));
     defn(k, "public_methods", 0, 1, |s, _, _| list(class_of(s), true, &|v| v == VIS_PUBLIC));
+    // public and protected, as in CRuby (`methods(false)`: the singleton methods)
+    defn(k, "methods", 0, 1, |s, a, _| {
+        if a.first().is_some_and(|x| !truthy(*x)) {
+            return send0(s, "singleton_methods");
+        }
+        list(class_of(s), true, &|v| v != VIS_PRIVATE)
+    });
 
     // Kernel's "global functions" are private in Ruby (`obj.puts` is a NoMethodError).
     for name in [

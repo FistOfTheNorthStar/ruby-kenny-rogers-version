@@ -95,18 +95,23 @@ fn mutate(s: V) -> Result<&'static mut SVec<u8>, V> {
     Ok(b(s))
 }
 
-const ENC_MASK: u32 = crate::compat::FL_BINARY | (crate::compat::FL_BINARY << 1);
 /// String#+ of `s` and the bytes `o` of `arg`.
 fn str_plus(s: V, o: &[u8], arg: V) -> V {
+    // the result's encoding: CRuby's rules for mixing two (see transcode::concat_enc)
+    let enc = if is_str(arg) && crate::transcode::same_native(s, arg) {
+        None
+    } else {
+        let xe = if is_str(arg) { crate::transcode::enc_of(arg) } else { crate::transcode::UTF8 };
+        match crate::transcode::concat_enc(s, o, xe) {
+            Ok(e) => e,
+            Err(e) => return e,
+        }
+    };
     let mut v = Vec::with_capacity(rstr(s).b.len() + o.len());
     v.extend_from_slice(&rstr(s).b);
     v.extend_from_slice(o);
-    // result keeps the receiver's encoding (binary + binary stays ASCII-8BIT),
-    // unless the receiver is ASCII-only and the argument is not
-    let src = if !o.is_ascii() && rstr(s).b.is_ascii() && is_str(arg) { arg } else { s };
-    let flags = hdr(src).flags & ENC_MASK;
     let r = str_new(v);
-    hdr(r).flags |= flags;
+    crate::transcode::set_enc(r, enc.unwrap_or_else(|| crate::transcode::enc_of(s)));
     r
 }
 
@@ -122,9 +127,12 @@ pub extern "C" fn kn_str_append_own(s: V, e: V, own: u64) -> V {
     }
     if own != 0 && s != e && hdr(s).klass == rt().c.string && !is_frozen(s) {
         let add: &[u8] = &rstr(e).b;
-        if !add.is_ascii() && rstr(s).b.is_ascii() {
-            let h = hdr(s);
-            h.flags = (h.flags & !ENC_MASK) | (hdr(e).flags & ENC_MASK);
+        if !crate::transcode::same_native(s, e) {
+            match crate::transcode::concat_enc(s, add, crate::transcode::enc_of(e)) {
+                Ok(Some(ne)) => crate::transcode::set_enc(s, ne),
+                Ok(None) => {}
+                Err(x) => return x,
+            }
         }
         // (no one else can see `s`: a replaced buffer can be freed now)
         b(s).extend_private(add);
@@ -594,13 +602,49 @@ pub fn init() {
             Err(e) => e,
         }
     });
+    /// `<<` / `concat`, with CRuby's encoding rules (an ASCII-only receiver takes the
+    /// argument's encoding; incompatible ones raise Encoding::CompatibilityError).
     fn append(s: V, a: &[V]) -> V {
+        if let Err(e) = mutate(s) {
+            return e;
+        }
+        // (`concat` with several arguments checks them all before appending any)
+        let mut parts: Vec<(Vec<u8>, Option<crate::transcode::Enc>)> = Vec::with_capacity(a.len());
+        for &x in a {
+            if is_fix(x) {
+                match crate::transcode::codepoint_bytes(s, fix(x)) {
+                    Ok(p) => parts.push(p),
+                    Err(e) => return e,
+                }
+            } else if is_str(x) && crate::transcode::same_native(s, x) {
+                parts.push((rstr(x).b.to_vec(), None));
+            } else {
+                let o = match want_str(x) {
+                    Ok(o) => o,
+                    Err(e) => return e,
+                };
+                let xe = if is_str(x) { crate::transcode::enc_of(x) } else { crate::transcode::UTF8 };
+                match crate::transcode::concat_enc(s, &o, xe) {
+                    Ok(ne) => parts.push((o, ne)),
+                    Err(e) => return e,
+                }
+            }
+        }
+        for (bytes, ne) in parts {
+            if let Some(ne) = ne {
+                crate::transcode::set_enc(s, ne);
+            }
+            b(s).extend_from_slice(&bytes);
+        }
+        s
+    }
+    defn(c, "<<", 1, 1, |s, a, _| append(s, a));
+    defn(c, "concat", 0, -1, |s, a, _| append(s, a));
+    // (bytes as they are: the receiver keeps its encoding)
+    defn(c, "append_as_bytes", 0, -1, |s, a, _| {
         for &x in a {
             let add = if is_fix(x) {
-                match char::from_u32(fix(x) as u32) {
-                    Some(c) => c.to_string().into_bytes(),
-                    None => return raise(rt().c.range_error, "out of char range"),
-                }
+                vec![(fix(x) & 0xFF) as u8]
             } else {
                 match want_str(x) {
                     Ok(o) => o,
@@ -613,10 +657,7 @@ pub fn init() {
             }
         }
         s
-    }
-    defn(c, "<<", 1, 1, |s, a, _| append(s, a));
-    defn(c, "concat", 0, -1, |s, a, _| append(s, a));
-    defn(c, "append_as_bytes", 0, -1, |s, a, _| append(s, a));
+    });
     defn(c, "prepend", 0, -1, |s, a, _| {
         let mut pre = Vec::new();
         for &x in a {

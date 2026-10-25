@@ -140,7 +140,7 @@ const ERRNOS: &[(&str, i32)] = &[
 fn strerror(e: i32) -> String {
     unsafe { CStr::from_ptr(libc::strerror(e)) }.to_string_lossy().into_owned()
 }
-fn errno_class(e: i32) -> *mut Class {
+pub(crate) fn errno_class(e: i32) -> *mut Class {
     ERRNO_MAP.get().iter().find(|(n, _)| *n == e).map(|(_, c)| *c).unwrap_or(*C_SCE.get())
 }
 /// Raise the Errno exception for `e`: "No such file or directory @ func - detail".

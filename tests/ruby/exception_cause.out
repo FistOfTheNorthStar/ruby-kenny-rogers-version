@@ -1,0 +1,34 @@
+#<ArgumentError: low>
+nil
+nil
+nil
+#<RuntimeError: c0>
+true
+"first"
+nil
+"only cause is given with no arguments"
+RuntimeError
+"p"
+nil
+ArgumentError
+NoMethodError
+[:frist, [1], false]
+[:helo, "main"]
+[:Zork, Object]
+[:Zork, Comparable]
+nil
+nil
+nil
+nil
+nil
+nil
+nil
+nil
+ArgumentError
+nil
+:ok
+nil
+["m1", "m2"]
+nil
+["deep", ArgumentError]
+nil

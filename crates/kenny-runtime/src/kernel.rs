@@ -85,16 +85,15 @@ pub fn dup(v: V, keep_frozen: bool) -> V {
         None => return v,
         Some(Kind::String) => {
             let n = str_new(rstr(v).b.clone());
-            hdr(n).flags |= hdr(v).flags & FL_BINARY;
+            crate::transcode::set_enc(n, crate::transcode::enc_of(v));
             n
         }
         Some(Kind::Array) => ary_new(rary(v).v.clone()),
         Some(Kind::Hash) => {
             let h = hash_new();
             let (src, dst) = (rhash(v), rhash(h));
-            for (k, x) in src.m.iter() {
-                dst.m.insert(HKey(k.0), *x);
-            }
+            // (a copy of the table: keeps compare_by_identity and calls no `hash`)
+            dst.m.assign(src.m.clone());
             dst.default = src.default; // (h is new: young, no barrier)
             dst.default_proc = src.default_proc;
             h
@@ -582,6 +581,49 @@ pub fn init() {
     defn(k, "require_relative", 1, 1, |_, _, _| QFALSE);
     fn raise_impl(a: &[V]) -> V {
         let r = rt();
+        // `cause:` (raise's only keyword)
+        let mut cause = None;
+        let mut av = a.to_vec();
+        if let Some(&h) = av.last() {
+            if is_hash(h) && hdr(h).flags & FL_KWHASH != 0 {
+                if let Some(&c) = rhash(h).m.get(&HKey(mksym(sym("cause")))) {
+                    cause = Some(c);
+                    if rhash(h).m.len() == 1 {
+                        av.pop();
+                    }
+                }
+            }
+        }
+        let a = &av[..];
+        if a.is_empty() && cause.is_some() {
+            return arg_error("only cause is given with no arguments");
+        }
+        let e = tri!(raise_new(r, a));
+        if !is_a(e, r.c.exception) {
+            return type_error("exception object expected");
+        }
+        if let Some(c) = cause {
+            if c != QNIL && !is_a(c, r.c.exception) {
+                return type_error("exception object expected");
+            }
+            if c != e {
+                // (CRuby's check: a cause chain that leads back to `e`)
+                let mut x = ivar_get(c, sym("@__cause"));
+                let mut n = 0;
+                while is_heap(x) && n < 10_000 {
+                    if x == e {
+                        return arg_error("circular causes");
+                    }
+                    x = ivar_get(x, sym("@__cause"));
+                    n += 1;
+                }
+                ivar_set(e, sym("@__cause"), c);
+                ivar_set(e, sym("@__cause_set"), QTRUE);
+            }
+        }
+        raise_exc(e)
+    }
+    fn raise_new(r: &Runtime, a: &[V]) -> V {
         let e = if a.is_empty() {
             if pst().errinfo != QNIL { pst().errinfo } else { exc_new(r.c.runtime_error, "unhandled exception") }
         } else if is_str(a[0]) {
@@ -600,13 +642,10 @@ pub fn init() {
         } else {
             return type_error("exception class/object expected");
         };
-        if !is_a(e, r.c.exception) {
-            return type_error("exception object expected");
-        }
-        raise_exc(e)
+        e
     }
-    defn(k, "raise", 0, 3, |_, a, _| raise_impl(a));
-    defn(k, "fail", 0, 3, |_, a, _| raise_impl(a));
+    defn(k, "raise", 0, 4, |_, a, _| raise_impl(a));
+    defn(k, "fail", 0, 4, |_, a, _| raise_impl(a));
     defn(k, "loop", 0, 0, |s, _, b| {
         if !is_proc(b) {
             return crate::misc::enum_for(s, "loop", &[]);
@@ -960,17 +999,6 @@ pub fn init() {
         let p = proc_new_native_rooted(Box::new(move |_, args, blk| send(s, id, args, blk)), 0, -1, vec![s]);
         rproc(p).lambda = true;
         p
-    });
-    defn(k, "methods", 0, 1, |s, _, _| {
-        let mut out = RVec::new();
-        for c in ancestors(class_of(s)) {
-            for &id in unsafe { (*c).methods.keys() } {
-                if !out.contains(&mksym(id)) {
-                    out.push(mksym(id));
-                }
-            }
-        }
-        ary_new(out.take())
     });
     defn(k, "enum_for", 0, -1, |s, a, b| {
         let m = a.first().copied().unwrap_or(mksym(sym("each")));
@@ -1386,7 +1414,10 @@ pub fn init() {
     defn(md, "constants", 0, 1, |s, _, _| ary_new(rclass(s).consts.keys().map(|&k| mksym(k)).collect()));
     defn(md, "const_missing", 1, 1, |s, a, _| {
         let prefix = if s as *mut Class == rt().c.object { String::new() } else { format!("{}::", class_name(s as *mut Class)) };
-        raise(rt().c.name_error, &format!("uninitialized constant {}{}", prefix, sym_str(sym_id(a[0]))))
+        let e = exc_new(rt().c.name_error, &format!("uninitialized constant {}{}", prefix, sym_str(sym_id(a[0]))));
+        ivar_set(e, sym("@name"), a[0]);
+        ivar_set(e, sym("@receiver"), s);
+        raise_exc(e)
     });
     fn class_eval(s: V, a: &[V], b: V) -> V {
         if !is_proc(b) {
@@ -1561,11 +1592,22 @@ pub fn init() {
     }
     defn(ex, "to_s", 0, 0, |s, _, _| exc_to_s(s));
     defn(ex, "message", 0, 0, |s, _, _| send0(s, "to_s"));
-    defn(ex, "detailed_message", 0, 1, |s, _, _| send0(s, "message"));
-    defn(ex, "full_message", 0, 1, |s, _, _| {
+    defn(ex, "detailed_message", 0, 1, |s, a, _| {
+        let hl = kw_arg(a, "highlight").is_some_and(truthy);
         let m = tri!(send0(s, "message"));
-        let m = String::from_utf8_lossy(&rstr(m).b).into_owned();
-        new_str_v(format!("{} ({})", m, class_name(real_class(s))))
+        let m = if is_str(m) { rstr(m).b.clone() } else { Vec::new() };
+        str_new(decorate_message(&m, &class_name(real_class(s)), real_class(s) == rt().c.runtime_error, hl))
+    });
+    defn(ex, "full_message", 0, 1, |s, a, _| {
+        let hl = match kw_arg(a, "highlight") {
+            Some(v) if v != QNIL => truthy(v),
+            _ => (unsafe { libc::isatty(2) }) == 1,
+        };
+        let bottom = kw_arg(a, "order").is_some_and(|o| o == mksym(sym("bottom")));
+        match full_message(s, hl, bottom) {
+            Some(m) => str_new(m),
+            None => UNDEF,
+        }
     });
     defn(ex, "inspect", 0, 0, |s, _, _| {
         let m = tri!(send0(s, "to_s"));
@@ -1618,6 +1660,9 @@ pub fn init() {
     }
     defn(c.name_error, "initialize", 0, -1, |s, a, _| name_error_init(s, a));
     defn(c.name_error, "receiver", 0, 0, |s, _, _| ivar_get(s, sym("@receiver")));
+    // (CRuby: the locals where it was raised, for DidYouMean; locals aren't visible here)
+    defn(c.name_error, "local_variables", 0, 0, |_, _, _| ary_new(vec![]));
+    defn(c.no_method_error, "private_call?", 0, 0, |s, _, _| bool_v(truthy(ivar_get(s, sym("@__private_call")))));
     defn(c.no_method_error, "args", 0, 0, |s, _, _| {
         let v = ivar_get(s, sym("@args"));
         if v == QNIL { ary_new(vec![]) } else { v }
@@ -1686,3 +1731,118 @@ pub fn clone_body(b: &Body) -> Body {
     }
 }
 
+
+/// A keyword argument a native method received (`highlight:` ...), from a trailing Hash.
+pub fn kw_arg(a: &[V], name: &str) -> Option<V> {
+    let h = *a.last()?;
+    if !is_hash(h) {
+        return None;
+    }
+    rhash(h).m.get(&HKey(mksym(sym(name)))).copied()
+}
+
+/// CRuby's `Exception#detailed_message`: "first line (Class)" then the other lines;
+/// an empty message is the class name ("unhandled exception" for RuntimeError).
+/// `highlight`: bold, with the class name underlined, as on a terminal.
+pub fn decorate_message(m: &[u8], class: &str, runtime_error: bool, highlight: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if m.is_empty() {
+        let t = if runtime_error { "unhandled exception" } else { class };
+        if highlight {
+            out.extend_from_slice(b"\x1b[1;4m");
+            out.extend_from_slice(t.as_bytes());
+            out.extend_from_slice(b"\x1b[m");
+        } else {
+            out.extend_from_slice(t.as_bytes());
+        }
+        return out;
+    }
+    let (first, rest) = match m.iter().position(|&c| c == b'\n') {
+        Some(i) => (&m[..i], Some(&m[i + 1..])),
+        None => (m, None),
+    };
+    if highlight {
+        out.extend_from_slice(b"\x1b[1m");
+        out.extend_from_slice(first);
+        out.extend_from_slice(format!(" (\x1b[1;4m{class}\x1b[m\x1b[1m)\x1b[m").as_bytes());
+        if let Some(rest) = rest {
+            for line in rest.split(|&c| c == b'\n') {
+                out.extend_from_slice(b"\n\x1b[1m");
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\x1b[m");
+            }
+        }
+    } else {
+        out.extend_from_slice(first);
+        out.extend_from_slice(format!(" ({class})").as_bytes());
+        if let Some(rest) = rest {
+            out.push(b'\n');
+            out.extend_from_slice(rest);
+        }
+    }
+    out
+}
+
+/// `e.detailed_message(highlight:)`, through Ruby so overrides (DidYouMean, gems) apply.
+fn detailed_of(e: V, highlight: bool) -> Option<Vec<u8>> {
+    let kw = hash_new();
+    crate::hash::hset(kw, mksym(sym("highlight")), bool_v(highlight));
+    hdr(kw).flags |= FL_KWHASH;
+    let m = send(e, sym("detailed_message"), &[kw], QNIL);
+    if m == UNDEF {
+        return None;
+    }
+    let m = if is_str(m) { rstr(m).b.clone() } else { tri_none!(crate::fmt::to_s(m)) };
+    Some(m)
+}
+macro_rules! tri_none {
+    ($e:expr) => {
+        match $e {
+            Ok(x) => x,
+            Err(_) => return None,
+        }
+    };
+}
+use tri_none;
+
+/// CRuby's `Exception#full_message` (and the report of an uncaught exception): the location,
+/// the detailed message, the backtrace, then each cause the same way. None if Ruby raised.
+pub fn full_message(e: V, highlight: bool, bottom: bool) -> Option<Vec<u8>> {
+    let mut chain = vec![e];
+    let mut c = ivar_get(e, sym("@__cause"));
+    while is_heap(c) && is_a(c, rt().c.exception) && !chain.contains(&c) {
+        chain.push(c);
+        c = ivar_get(c, sym("@__cause"));
+    }
+    let mut out = Vec::new();
+    if bottom {
+        out.extend_from_slice(b"Traceback (most recent call last):\n");
+        chain.reverse();
+    }
+    for &x in &chain {
+        let bt = crate::backtrace::exc_backtrace(x);
+        let lines: Vec<Vec<u8>> = if is_ary(bt) { rary(bt).v.iter().filter(|l| is_str(**l)).map(|l| rstr(*l).b.clone()).collect() } else { vec![] };
+        let loc = lines.first().cloned().unwrap_or_else(|| rt().script_name.clone().into_bytes());
+        let mut head = loc;
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(&detailed_of(x, highlight)?);
+        head.push(b'\n');
+        if bottom {
+            let n = lines.len().saturating_sub(1);
+            for (i, l) in lines.iter().skip(1).rev().enumerate() {
+                out.extend_from_slice(format!("\t{}: from ", n - i).as_bytes());
+                out.extend_from_slice(l);
+                out.push(b'\n');
+            }
+            out.extend_from_slice(&head);
+        } else {
+            out.extend_from_slice(&head);
+            for l in lines.iter().skip(1) {
+                out.extend_from_slice(b"\tfrom ");
+                out.extend_from_slice(l);
+                out.push(b'\n');
+            }
+        }
+    }
+    Some(out)
+}

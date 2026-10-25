@@ -357,6 +357,10 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, 
     if let Some(set_rb) = stdlib.as_ref().map(|d| d.join("set.rb")).filter(|p| p.is_file()) {
         embed_files.push(set_rb);
     }
+    // `DidYouMean` too (loaded on first use, or to report an uncaught NameError)
+    if let Some(dym) = stdlib.as_ref().map(|d| d.join("did_you_mean.rb")).filter(|p| p.is_file()) {
+        embed_files.push(dym);
+    }
     let mut load_paths = vec![overlay.to_path_buf()];
     load_paths.extend(gem_paths);
     load_paths.extend(stdlib);

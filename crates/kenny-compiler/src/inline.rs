@@ -515,7 +515,7 @@ impl<M: Module> Compiler<M> {
             Kind::EachWithIndex => (vec![elem.unwrap(), idx], false),
             _ => (vec![elem.unwrap()], true),
         };
-        fx.loops.push(LoopCtx { next: step, exit, redo: body_b, next_val: collects });
+        fx.loops.push(LoopCtx { next: step, exit, redo: body_b, next_val: collects, rescue_depth: fx.rescue_prev.len() });
         let v = self.inline_body(fx, bn, params, locals, &vals, splat, collects);
         fx.loops.pop();
         if collects {

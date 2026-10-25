@@ -14,6 +14,29 @@
 //! * Deleting marks the entry; tables are compacted when they grow.
 
 use crate::core::{HKey, V, eql, hash_of};
+
+/// Hash of a key in a `compare_by_identity` table: the value itself (Floats by value, as
+/// CRuby's flonums are). An object hashed by address must never move (gc::FL_ID).
+fn ident_hash(k: V) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    if crate::core::kind(k) == Some(crate::core::Kind::Float) {
+        crate::core::float_val(k).to_bits().hash(&mut h);
+    } else {
+        if crate::core::is_heap(k) {
+            crate::core::hdr(k).flags |= crate::gc::FL_ID;
+        }
+        k.hash(&mut h);
+    }
+    h.finish()
+}
+/// Key equality in a `compare_by_identity` table.
+fn ident_eq(a: V, b: V) -> bool {
+    a == b
+        || (crate::core::kind(a) == Some(crate::core::Kind::Float)
+            && crate::core::kind(b) == Some(crate::core::Kind::Float)
+            && crate::core::float_val(a).to_bits() == crate::core::float_val(b).to_bits())
+}
 use crate::mt;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 
@@ -84,15 +107,15 @@ impl Table {
         let x = (h ^ (h >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         (x >> 32) as usize & self.mask
     }
-    /// Entry index of `key`, or None. May call Ruby (`eql?`).
-    fn find(&self, h: u64, key: V) -> Option<usize> {
+    /// Entry index of `key`, or None. May call Ruby (`eql?`) unless `ident`.
+    fn find(&self, h: u64, key: V, ident: bool) -> Option<usize> {
         let n = self.used();
         if self.mask == 0 {
             for i in 0..n {
                 let e = self.entry(i);
                 if e.hash.load(Relaxed) == h {
                     let k = e.key.load(Relaxed);
-                    if k != DELETED && (k == key || eql(k, key)) {
+                    if k != DELETED && (k == key || if ident { ident_eq(k, key) } else { eql(k, key) }) {
                         return Some(i);
                     }
                 }
@@ -110,7 +133,7 @@ impl Table {
                 let e = self.entry(i);
                 if e.hash.load(Relaxed) == h {
                     let k = e.key.load(Relaxed);
-                    if k != DELETED && (k == key || eql(k, key)) {
+                    if k != DELETED && (k == key || if ident { ident_eq(k, key) } else { eql(k, key) }) {
                         return Some(i);
                     }
                 }
@@ -148,6 +171,8 @@ pub struct KMap {
     lock: AtomicU8,
     /// Generational GC: OLD (the owning hash is old), REM (in the remembered set).
     gc_gen: AtomicU8,
+    /// `compare_by_identity`: keys hashed and compared by identity.
+    ident: AtomicU8,
 }
 const G_OLD: u8 = 1;
 const G_REM: u8 = 2;
@@ -170,12 +195,47 @@ impl Default for KMap {
 
 impl KMap {
     pub const fn new() -> Self {
-        KMap { tab: AtomicPtr::new(std::ptr::null_mut()), live: AtomicUsize::new(0), lock: AtomicU8::new(0), gc_gen: AtomicU8::new(0) }
+        KMap { tab: AtomicPtr::new(std::ptr::null_mut()), live: AtomicUsize::new(0), lock: AtomicU8::new(0), gc_gen: AtomicU8::new(0), ident: AtomicU8::new(0) }
     }
     #[inline]
     fn table(&self) -> Option<&Table> {
         let t = self.tab.load(Acquire);
         if t.is_null() { None } else { Some(unsafe { &*t }) }
+    }
+    pub fn is_ident(&self) -> bool {
+        self.ident.load(Relaxed) != 0
+    }
+    /// The hash of `k` under this table's comparison.
+    #[inline]
+    fn kh(&self, k: V) -> u64 {
+        if self.is_ident() { ident_hash(k) } else { hash_of(k) }
+    }
+    /// `compare_by_identity`: rehash the entries by identity (keys equal by value but distinct
+    /// objects were already separate entries, so none merge). Never calls Ruby.
+    pub fn set_ident(&mut self) {
+        if self.is_ident() {
+            return;
+        }
+        self.wb();
+        self.lock();
+        self.ident.store(1, Relaxed);
+        let old = self.tab.load(Relaxed);
+        if !old.is_null() {
+            let t = unsafe { &*old };
+            let pairs: Vec<(V, V)> = (0..t.used())
+                .map(|i| t.entry(i))
+                .filter(|e| e.key.load(Relaxed) != DELETED)
+                .map(|e| (e.key.load(Relaxed), e.val.load(Relaxed)))
+                .collect();
+            let nt = Table::alloc((pairs.len() * 2).max(4));
+            for &(k, v) in &pairs {
+                unsafe { (*nt).push(ident_hash(k), k, v) };
+            }
+            self.live.store(pairs.len(), Relaxed);
+            self.tab.store(nt, Release);
+            retire_table(old);
+        }
+        self.unlock();
     }
     fn lock(&self) {
         if !mt::multi() {
@@ -248,7 +308,7 @@ impl KMap {
     }
     pub fn get(&self, k: &HKey) -> Option<&V> {
         let t = self.table()?;
-        let i = t.find(hash_of(k.0), k.0)?;
+        let i = t.find(self.kh(k.0), k.0, self.is_ident())?;
         Some(unsafe { &*(t.entry(i).val.as_ptr() as *const V) })
     }
     /// `get` for a key equal only to itself (a Symbol): small tables compare keys directly.
@@ -267,7 +327,7 @@ impl KMap {
     }
     pub fn get_key_value(&self, k: &HKey) -> Option<(&HKey, &V)> {
         let t = self.table()?;
-        let i = t.find(hash_of(k.0), k.0)?;
+        let i = t.find(self.kh(k.0), k.0, self.is_ident())?;
         let e = t.entry(i);
         Some(unsafe { (&*(e.key.as_ptr() as *const HKey), &*(e.val.as_ptr() as *const V)) })
     }
@@ -305,6 +365,7 @@ impl KMap {
     #[allow(clippy::should_implement_trait)]
     pub fn clone(&self) -> KMap {
         let m = KMap::new();
+        m.ident.store(self.ident.load(Relaxed), Relaxed);
         let pairs: Vec<(u64, V, V)> = match self.table() {
             Some(t) => (0..t.used())
                 .filter_map(|i| {
@@ -368,18 +429,18 @@ impl KMap {
     pub fn push_distinct(&mut self, k: V, v: V) {
         let t = self.tab.load(Relaxed);
         debug_assert!(!t.is_null() && unsafe { (*t).n.load(Relaxed) < (*t).cap });
-        unsafe { (*t).push(hash_of(k), k, v) };
+        unsafe { (*t).push(self.kh(k), k, v) };
         self.live.fetch_add(1, Relaxed);
     }
 
     pub fn insert(&mut self, k: HKey, v: V) -> Option<V> {
         self.wb();
         let key = k.0;
-        let h = hash_of(key);
+        let h = self.kh(key);
         loop {
             let t = self.tab.load(Acquire);
             let n0 = if t.is_null() { 0 } else { unsafe { (*t).n.load(Acquire) } };
-            let found = if t.is_null() { None } else { unsafe { (*t).find(h, key) } };
+            let found = if t.is_null() { None } else { unsafe { (*t).find(h, key, self.is_ident()) } };
             self.lock();
             if self.tab.load(Relaxed) != t || (!t.is_null() && unsafe { (*t).n.load(Relaxed) } != n0) {
                 self.unlock();
@@ -412,13 +473,13 @@ impl KMap {
 
     pub fn shift_remove(&mut self, k: &HKey) -> Option<V> {
         let key = k.0;
-        let h = hash_of(key);
+        let h = self.kh(key);
         loop {
             let t = self.tab.load(Acquire);
             if t.is_null() {
                 return None;
             }
-            let i = unsafe { (*t).find(h, key) }?;
+            let i = unsafe { (*t).find(h, key, self.is_ident()) }?;
             self.lock();
             if self.tab.load(Relaxed) != t {
                 self.unlock();
@@ -499,9 +560,10 @@ impl KMap {
         }
         self.unlock();
     }
-    /// Replace the contents with `other`'s (taking its table).
+    /// Replace the contents with `other`'s (taking its table and its comparison).
     pub fn assign(&mut self, other: KMap) {
         self.wb();
+        self.ident.store(other.ident.load(Relaxed), Relaxed);
         let nt = other.tab.swap(std::ptr::null_mut(), AcqRel);
         let live = other.live.load(Relaxed);
         self.lock();
@@ -517,7 +579,7 @@ impl KMap {
     fn slot_of(&self, k: V) -> Option<&mut V> {
         self.wb();
         let t = self.table()?;
-        let i = t.find(hash_of(k), k)?;
+        let i = t.find(self.kh(k), k, self.is_ident())?;
         Some(unsafe { &mut *(t.entry(i).val.as_ptr() as *mut V) })
     }
 }

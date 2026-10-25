@@ -77,6 +77,9 @@ pub(crate) struct LoopCtx {
     pub redo: Block,
     /// `next` passes its value to `next` (inlined `map`/`select` blocks).
     pub next_val: bool,
+    /// `fx.rescue_prev.len()` where the loop starts: `break`/`next` restore `$!` of the
+    /// rescue bodies they leave.
+    pub rescue_depth: usize,
 }
 
 #[derive(Clone)]
@@ -118,6 +121,9 @@ pub(crate) struct Fx<'a> {
     pub locals: HashMap<Vec<u8>, Local>,
     pub unwind: Vec<Block>,
     pub ensure_depth: usize,
+    /// `$!` from before each rescue body being compiled (outermost first): jumping out of
+    /// one (`return`, `next`, `break`, `retry`) restores it, as leaving it normally does.
+    pub rescue_prev: Vec<Value>,
     pub loops: Vec<LoopCtx>,
     pub retry: Vec<Block>,
     pub caches: Value,

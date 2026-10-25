@@ -22,19 +22,9 @@ fn init_encoding() {
             _ => {}
         }
     }
-    defn(st, "encode", 0, -1, |s, a, _| {
-        let n = str_new(rstr(s).b.clone());
-        if let Some(&e) = a.first().filter(|x| !is_hash(**x)) {
-            set_enc(n, e);
-        }
-        n
-    });
-    defn(st, "encode!", 0, -1, |s, a, _| {
-        if let Some(&e) = a.first().filter(|x| !is_hash(**x)) {
-            set_enc(s, e);
-        }
-        s
-    });
+    let _ = set_enc;
+    defn(st, "encode", 0, -1, |s, a, _| crate::transcode::encode(s, a, false));
+    defn(st, "encode!", 0, -1, |s, a, _| crate::transcode::encode(s, a, true));
 }
 
 fn urandom(n: usize) -> Vec<u8> {

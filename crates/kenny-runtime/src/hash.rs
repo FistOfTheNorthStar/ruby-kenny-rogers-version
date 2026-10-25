@@ -39,8 +39,13 @@ pub fn hset(h: V, k: V, v: V) -> V {
     if is_frozen(h) {
         return check_frozen(h);
     }
-    rhash(h).m.insert(HKey(key_dup(k)), v);
+    rhash(h).m.insert(HKey(store_key(h, k)), v);
     v
+}
+/// The key a store into `h` keeps: String keys copied and frozen, except in a
+/// `compare_by_identity` hash (there the key is that very object).
+fn store_key(h: V, k: V) -> V {
+    if rhash(h).m.is_ident() { k } else { key_dup(k) }
 }
 fn mutate(h: V) -> Result<(), V> {
     if is_frozen(h) { Err(check_frozen(h)) } else { Ok(()) }
@@ -52,8 +57,14 @@ macro_rules! mutchk {
         }
     };
 }
-fn new_like(_h: V) -> V {
-    hash_new()
+/// A new Hash comparing keys as `h` does (CRuby keeps `compare_by_identity` in
+/// select/reject/merge/slice/except/transform_values/compact).
+fn new_like(h: V) -> V {
+    let n = hash_new();
+    if rhash(h).m.is_ident() {
+        rhash(n).m.set_ident();
+    }
+    n
 }
 /// A Hash argument, converted with `to_hash` like CRuby's implicit conversion.
 fn want_hash(v: V) -> Result<V, V> {
@@ -82,7 +93,7 @@ fn merge_into(dst: V, src: V, b: V) -> V {
         } else {
             v
         };
-        rhash(dst).m.insert(HKey(key_dup(k)), nv);
+        rhash(dst).m.insert(HKey(store_key(dst, k)), nv);
     }
     dst
 }
@@ -280,7 +291,7 @@ pub fn init() {
         Err(()) => UNDEF,
     });
     defn(c, "merge", 0, -1, |s, a, b| {
-        let out = hash_new();
+        let out = new_like(s);
         merge_into(out, s, QNIL);
         crate::gc::wb_obj(out);
         rhash(out).default = rhash(s).default;
@@ -308,7 +319,7 @@ pub fn init() {
     defn(c, "merge!", 0, -1, update);
     defn(c, "update", 0, -1, update);
     defn(c, "transform_values", 0, 0, |s, _, b| {
-        let out = hash_new();
+        let out = new_like(s);
         for (k, v) in pairs(s) {
             rhash(out).m.insert(HKey(k), tri!(call_block(b, &[v])));
         }
@@ -323,7 +334,9 @@ pub fn init() {
         s
     });
     fn transform_keys(s: V, a: &[V], b: V) -> V {
-        let out = hash_new();
+        transform_keys_into(s, a, b, hash_new())
+    }
+    fn transform_keys_into(s: V, a: &[V], b: V, out: V) -> V {
         for (k, v) in pairs(s) {
             let nk = if let Some(&m) = a.first().filter(|m| is_hash(**m)) {
                 match rhash(m).m.get(&HKey(k)) {
@@ -341,7 +354,7 @@ pub fn init() {
     defn(c, "transform_keys", 0, 1, transform_keys);
     defn(c, "transform_keys!", 0, 1, |s, a, b| {
         mutchk!(s);
-        let r = tri!(transform_keys(s, a, b));
+        let r = tri!(transform_keys_into(s, a, b, new_like(s)));
         rhash(s).m.assign(std::mem::take(&mut rhash(r).m));
         s
     });
@@ -353,7 +366,7 @@ pub fn init() {
         out
     });
     defn(c, "slice", 0, -1, |s, a, _| {
-        let out = hash_new();
+        let out = new_like(s);
         for &k in a {
             if let Some(v) = rhash(s).m.get(&HKey(k)) {
                 rhash(out).m.insert(HKey(k), *v);
@@ -362,11 +375,10 @@ pub fn init() {
         out
     });
     defn(c, "except", 0, -1, |s, a, _| {
-        let out = hash_new();
-        for (k, v) in pairs(s) {
-            if !a.iter().any(|x| eql(*x, k)) {
-                rhash(out).m.insert(HKey(k), v);
-            }
+        let out = new_like(s);
+        rhash(out).m.assign(rhash(s).m.clone());
+        for &x in a {
+            rhash(out).m.shift_remove(&HKey(x));
         }
         out
     });
@@ -381,7 +393,7 @@ pub fn init() {
         ary_new(out.take())
     });
     defn(c, "compact", 0, 0, |s, _, _| {
-        let out = hash_new();
+        let out = new_like(s);
         for (k, v) in pairs(s) {
             if v != QNIL {
                 rhash(out).m.insert(HKey(k), v);
@@ -434,8 +446,20 @@ pub fn init() {
     });
     defn(c, "replace", 1, 1, |s, a, _| {
         mutchk!(s);
-        rhash(s).m.clear();
-        merge_into(s, a[0], QNIL)
+        let o = match want_hash(a[0]) {
+            Ok(o) => o,
+            Err(e) => return e,
+        };
+        if o == s {
+            return s;
+        }
+        // the copy compares keys as the source does
+        let mut fresh = HMap::new();
+        if rhash(o).m.is_ident() {
+            fresh.set_ident();
+        }
+        rhash(s).m.assign(fresh);
+        merge_into(s, o, QNIL)
     });
     defn(c, "shift", 0, 0, |s, _, _| {
         mutchk!(s);
@@ -456,7 +480,7 @@ pub fn init() {
         None => QNIL,
     });
     defn(c, "==", 1, 1, |s, a, _| {
-        if !is_hash(a[0]) || rhash(s).m.len() != rhash(a[0]).m.len() {
+        if !is_hash(a[0]) || rhash(s).m.len() != rhash(a[0]).m.len() || rhash(s).m.is_ident() != rhash(a[0]).m.is_ident() {
             return QFALSE;
         }
         for (k, v) in pairs(s) {
@@ -479,7 +503,6 @@ pub fn init() {
         }
         mkfix((h >> 2) as i64)
     });
-    defn(c, "compare_by_identity", 0, 0, |s, _, _| s);
     defn(c, "freeze", 0, 0, |s, _, _| {
         hdr(s).flags |= FL_FROZEN;
         s

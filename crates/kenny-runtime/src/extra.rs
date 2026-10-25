@@ -1051,21 +1051,30 @@ fn init_encoding(st: *mut Class, enc: *mut Class) {
     const FL_ASCII: u32 = FL_BINARY << 1;
     defn(st, "encoding", 0, 0, |s, _, _| {
         let f = hdr(s).flags;
+        if f & FL_BINARY != 0 {
+            let e = crate::transcode::enc_of(s);
+            if e.codec != crate::transcode::Codec::Binary {
+                return crate::transcode::encoding_obj(e);
+            }
+        }
         encoding(if f & FL_BINARY != 0 { "BINARY" } else if f & FL_ASCII != 0 { "US-ASCII" } else { "UTF-8" })
     });
     defn(st, "force_encoding", 1, 1, |s, a, _| {
         let Some(n) = enc_name_of(a[0]) else { return no_conv(a[0], "String") };
+        let Some(e) = crate::transcode::lookup(&n) else { return arg_error(&format!("unknown encoding name - {n}")) };
         // applies to frozen strings too: Kenny freezes literals that CRuby code expects to be mutable
-        let h = hdr(s);
-        h.flags &= !(FL_BINARY | FL_ASCII);
-        match n.to_ascii_uppercase().as_str() {
-            "ASCII-8BIT" | "BINARY" => h.flags |= FL_BINARY,
-            "US-ASCII" | "ASCII" => h.flags |= FL_ASCII,
-            _ => {}
-        }
+        crate::transcode::set_enc(s, e);
         s
     });
-    defn(st, "valid_encoding?", 0, 0, |s, _, _| bool_v(is_bin(s) || std::str::from_utf8(&rstr(s).b).is_ok()));
+    defn(st, "valid_encoding?", 0, 0, |s, _, _| {
+        if is_bin(s) {
+            return bool_v(crate::transcode::valid_foreign(s).unwrap_or(true));
+        }
+        if hdr(s).flags & FL_ASCII != 0 {
+            return bool_v(rstr(s).b.is_ascii());
+        }
+        bool_v(std::str::from_utf8(&rstr(s).b).is_ok())
+    });
     let us = object_new(enc);
     ivar_set(us, sym("@__name"), str_from("US-ASCII"));
     const_set(enc, sym("US_ASCII"), us);
@@ -1601,11 +1610,13 @@ pub fn init() {
         if rhash(s).m.len() == before { QNIL } else { s }
     });
     defn(hs, "compare_by_identity", 0, 0, |s, _, _| {
-        tri!(check_frozen(s));
-        ivar_set(s, sym("@__by_identity"), QTRUE);
+        if !rhash(s).m.is_ident() {
+            tri!(check_frozen(s));
+            rhash(s).m.set_ident();
+        }
         s
     });
-    defn(hs, "compare_by_identity?", 0, 0, |s, _, _| bool_v(truthy(ivar_get(s, sym("@__by_identity")))));
+    defn(hs, "compare_by_identity?", 0, 0, |s, _, _| bool_v(rhash(s).m.is_ident()));
     defn(hs, "default_proc=", 1, 1, |s, a, _| {
         tri!(check_frozen(s));
         let p = a[0];
@@ -1958,17 +1969,6 @@ pub fn init() {
     defn(st, "unicode_normalize!", 0, 1, |s, a, b| bang(s, "unicode_normalize", a, b, true));
     defn(st, "succ!", 0, 0, |s, a, b| bang(s, "succ", a, b, true));
     defn(st, "next!", 0, 0, |s, a, b| bang(s, "succ", a, b, true));
-    defn(st, "encode!", 0, -1, |s, a, _| {
-        tri!(check_frozen(s));
-        if let Some(n) = a.first().and_then(|e| enc_name_of(*e)) {
-            if n == "ASCII-8BIT" || n == "BINARY" {
-                hdr(s).flags |= FL_BINARY;
-            } else {
-                hdr(s).flags &= !FL_BINARY;
-            }
-        }
-        s
-    });
     defn(st, "tr_s", 2, 2, |s, a, _| {
         if !is_str(a[0]) {
             return no_conv(a[0], "String");

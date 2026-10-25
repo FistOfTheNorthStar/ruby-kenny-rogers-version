@@ -1962,13 +1962,18 @@ pub fn method_missing(recv: V, mid: u32, args: &[V], blk: V, vcall: bool) -> V {
 }
 pub fn no_method_error(recv: V, mid: u32, vcall: bool) -> V {
     let name = sym_str(mid);
+    let e = if vcall {
+        exc_new(rt().c.name_error, &format!("undefined local variable or method '{}' for {}", name, describe_recv(recv)))
+    } else {
+        exc_new(rt().c.no_method_error, &format!("undefined method '{}' for {}", name, describe_recv(recv)))
+    };
+    // what NameError#name / #receiver / NoMethodError#private_call? report (DidYouMean uses them)
+    ivar_set(e, sym("@name"), mksym(mid));
+    ivar_set(e, sym("@receiver"), recv);
     if vcall {
-        return raise(
-            rt().c.name_error,
-            &format!("undefined local variable or method '{}' for {}", name, describe_recv(recv)),
-        );
+        ivar_set(e, sym("@__private_call"), QTRUE);
     }
-    raise(rt().c.no_method_error, &format!("undefined method '{}' for {}", name, describe_recv(recv)))
+    raise_exc(e)
 }
 pub fn describe_recv(v: V) -> String {
     if v == QNIL {
@@ -1978,7 +1983,7 @@ pub fn describe_recv(v: V) -> String {
     } else if v == QFALSE {
         "false".into()
     } else if v == rt().main_obj {
-        "main:Object".into()
+        "main".into()
     } else if is_class(v) {
         let c = rclass(v);
         if c.is_module { format!("module {}", c.name) } else { format!("class {}", class_name(v as *mut Class)) }
@@ -2280,6 +2285,14 @@ pub fn raise_exc(e: V) -> V {
         let m = ivar_get(e, sym("@__message"));
         let msg = if is_str(m) { String::from_utf8_lossy(&rstr(m).b).into_owned() } else { String::new() };
         eprintln!("[raise] {}: {} (at {})", class_name(real_class(e)), msg, current_loc().unwrap_or_default());
+    }
+    // the exception being handled (`$!`) becomes the cause of one raised meanwhile, once
+    if is_heap(e) && ivar_get(e, sym("@__cause_set")) != QTRUE {
+        let cur = pst().errinfo;
+        if cur != e && is_heap(cur) {
+            ivar_set(e, sym("@__cause"), cur);
+        }
+        ivar_set(e, sym("@__cause_set"), QTRUE);
     }
     if is_heap(e) && !ivar_defined(e, sym("@__backtrace")) && !ivar_defined(e, sym("@__bt_raw")) {
         // the return addresses now; "file:line:in 'label'" strings only if `backtrace` is asked
