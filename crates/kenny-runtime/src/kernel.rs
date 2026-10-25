@@ -111,10 +111,15 @@ pub fn dup(v: V, keep_frozen: bool) -> V {
     hdr(r).klass = real_class(v);
     gen_ivar_copy(v, r);
     // dup calls initialize_dup, clone initialize_clone; both default to initialize_copy
+    // (Kernel's are no-ops: skipped; a native class's own, Random's say, is called)
     let hook = if keep_frozen { "initialize_clone" } else { "initialize_dup" };
-    if is_user_method(r, hook) {
+    let own = |name: &str| {
+        let m = find_method(class_of(r), sym(name));
+        !m.is_null() && unsafe { (*m).owner } != rt().c.kernel
+    };
+    if own(hook) {
         tri!(send(r, sym(hook), &[v], QNIL));
-    } else if is_user_method(r, "initialize_copy") {
+    } else if own("initialize_copy") {
         tri!(send(r, sym("initialize_copy"), &[v], QNIL));
     }
     if keep_frozen && is_frozen(v) {
@@ -317,6 +322,196 @@ pub fn parse_int(b: &[u8], strict: bool) -> Option<V> {
     Some(int_from_big(if neg { -n } else { n }))
 }
 
+/// Integer() of a String: CRuby's strict parse (surrounding whitespace, a sign, a radix
+/// prefix that fits `base` (0: any, a leading 0 meaning octal), underscores only between digits).
+pub fn strict_int(b: &[u8], base: u32) -> Option<num_bigint::BigInt> {
+    let s = std::str::from_utf8(b).ok()?.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (neg, s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let lower = s.to_ascii_lowercase();
+    let pre = |p: &str| lower.starts_with(p) && lower.len() > 2;
+    let (radix, digits) = match base {
+        0 | 16 if pre("0x") => (16, &s[2..]),
+        0 | 2 if pre("0b") => (2, &s[2..]),
+        0 | 8 if pre("0o") => (8, &s[2..]),
+        0 | 10 if pre("0d") => (10, &s[2..]),
+        0 if s.len() > 1 && s.starts_with('0') => (8, &s[1..]),
+        0 => (10, s),
+        b => (b, s),
+    };
+    if !(2..=36).contains(&radix) || digits.is_empty() {
+        return None;
+    }
+    let db = digits.as_bytes();
+    if db[0] == b'_' || db[db.len() - 1] == b'_' || digits.contains("__") {
+        return None;
+    }
+    let clean: String = digits.chars().filter(|&c| c != '_').collect();
+    if !clean.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    let n = num_bigint::BigInt::parse_bytes(clean.as_bytes(), radix)?;
+    Some(if neg { -n } else { n })
+}
+
+/// Float() of a String: decimal (underscores between digits) or hexadecimal ("0x1.8p1").
+pub fn strict_float(b: &[u8]) -> Option<f64> {
+    let s = std::str::from_utf8(b).ok()?.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (neg, body) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    // digits with single underscores between them; returns the digits and the rest
+    fn digits(s: &str, hex: bool) -> Option<(String, &str)> {
+        let mut out = String::new();
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i] as char;
+            if c.is_ascii_digit() || (hex && c.is_ascii_hexdigit()) {
+                out.push(c);
+            } else if c == '_' && !out.is_empty() && i + 1 < b.len() && ((b[i + 1] as char).is_ascii_digit() || (hex && (b[i + 1] as char).is_ascii_hexdigit())) {
+            } else {
+                break;
+            }
+            i += 1;
+        }
+        Some((out, &s[i..]))
+    }
+    let v = if body.len() > 2 && body[..2].eq_ignore_ascii_case("0x") {
+        let (int, rest) = digits(&body[2..], true)?;
+        let (frac, rest) = match rest.strip_prefix('.') {
+            Some(r) => digits(r, true)?,
+            None => (String::new(), rest),
+        };
+        if int.is_empty() && frac.is_empty() {
+            return None;
+        }
+        let mut v = 0f64;
+        for c in int.chars() {
+            v = v * 16.0 + c.to_digit(16)? as f64;
+        }
+        let mut scale = 1.0 / 16.0;
+        for c in frac.chars() {
+            v += c.to_digit(16)? as f64 * scale;
+            scale /= 16.0;
+        }
+        let rest = if let Some(r) = rest.strip_prefix(['p', 'P']) {
+            let (sign, r) = match r.as_bytes().first() {
+                Some(b'-') => (-1, &r[1..]),
+                Some(b'+') => (1, &r[1..]),
+                _ => (1, r),
+            };
+            let (e, r) = digits(r, false)?;
+            if e.is_empty() {
+                return None;
+            }
+            v *= 2f64.powi(sign * e.parse::<i32>().ok()?);
+            r
+        } else {
+            rest
+        };
+        if !rest.is_empty() {
+            return None;
+        }
+        v
+    } else {
+        let (int, rest) = digits(body, false)?;
+        let (frac, rest) = match rest.strip_prefix('.') {
+            Some(r) if !r.starts_with('_') => digits(r, false)?,
+            Some(_) => return None,
+            None => (String::new(), rest),
+        };
+        if int.is_empty() && frac.is_empty() {
+            return None;
+        }
+        let mut txt = format!("{}.{}", if int.is_empty() { "0" } else { &int }, if frac.is_empty() { "0" } else { &frac });
+        let rest = if let Some(r) = rest.strip_prefix(['e', 'E']) {
+            let (sign, r) = match r.as_bytes().first() {
+                Some(b'-') => ("-", &r[1..]),
+                Some(b'+') => ("", &r[1..]),
+                _ => ("", r),
+            };
+            let (e, r) = digits(r, false)?;
+            if e.is_empty() {
+                return None;
+            }
+            txt = format!("{txt}e{sign}{e}");
+            r
+        } else {
+            rest
+        };
+        if !rest.is_empty() {
+            return None;
+        }
+        txt.parse::<f64>().ok()?
+    };
+    Some(if neg { -v } else { v })
+}
+
+fn kernel_integer(v: V, base: V) -> V {
+    if base != QNIL && !is_str(v) {
+        return arg_error("base specified for non string value");
+    }
+    if is_int(v) {
+        v
+    } else if is_float(v) {
+        let f = float_val(v);
+        if !f.is_finite() {
+            return raise(rt().c.float_domain_error, &float_to_s(f));
+        }
+        int_from_big(num_bigint::BigInt::from(f.trunc() as i128))
+    } else if is_str(v) {
+        let b = rstr(v).b.clone();
+        if b.contains(&0) {
+            return arg_error("string contains null byte");
+        }
+        let base = if is_fix(base) { fix(base).unsigned_abs() as u32 } else { 0 };
+        match strict_int(&b, base) {
+            Some(n) => int_from_big(n),
+            None => arg_error(&format!("invalid value for Integer(): {}", inspect_lossy(v))),
+        }
+    } else if v == QNIL {
+        type_error("can't convert nil into Integer")
+    } else if respond_to(v, sym("to_int")) {
+        send0(v, "to_int")
+    } else if respond_to(v, sym("to_i")) {
+        send0(v, "to_i")
+    } else {
+        type_error(&format!("can't convert {} into Integer", class_name(real_class(v))))
+    }
+}
+
+fn kernel_float(v: V) -> V {
+    if let Some(f) = num_to_f(v) {
+        return float_new(f);
+    }
+    if is_str(v) {
+        let b = rstr(v).b.clone();
+        if b.contains(&0) {
+            return arg_error("string for Float contains null byte");
+        }
+        return match strict_float(&b) {
+            Some(f) => float_new(f),
+            None => arg_error(&format!("invalid value for Float(): {}", inspect_lossy(v))),
+        };
+    }
+    if v == QNIL || v == QTRUE || v == QFALSE || is_sym(v) || !respond_to(v, sym("to_f")) {
+        let name = match v {
+            QNIL => "nil".to_string(),
+            QTRUE => "true".to_string(),
+            QFALSE => "false".to_string(),
+            _ => class_name(real_class(v)),
+        };
+        return type_error(&format!("can't convert {name} into Float"));
+    }
+    send0(v, "to_f")
+}
+
 pub fn init() {
     let c = rt().c;
     let k = c.kernel;
@@ -498,43 +693,40 @@ pub fn init() {
         out(&rstr(s).b.clone());
         QNIL
     });
-    defn(k, "Integer", 1, 2, |_, a, _| {
-        let v = a[0];
-        if is_int(v) {
-            v
-        } else if is_float(v) {
-            let f = float_val(v);
-            if !f.is_finite() {
-                return raise(rt().c.float_domain_error, &float_to_s(f));
+    // Integer(x, base = nil, exception: true), Float(x, exception: true)
+    fn exc_kw(a: &[V]) -> (Vec<V>, bool) {
+        let mut a = a.to_vec();
+        let mut raise = true;
+        if a.len() > 1 {
+            if let Some(&h) = a.last().filter(|h| is_hash(**h)) {
+                a.pop();
+                if hash_has(h, "exception") {
+                    raise = truthy(crate::hash::hget(h, mksym(sym("exception"))));
+                }
             }
-            int_from_big(num_bigint::BigInt::from(f.trunc() as i128))
-        } else if is_str(v) {
-            match parse_int(&rstr(v).b.clone(), true) {
-                Some(i) => i,
-                None => arg_error(&format!("invalid value for Integer(): {}", inspect_lossy(v))),
-            }
-        } else if v == QNIL {
-            type_error("can't convert nil into Integer")
-        } else {
-            send0(v, "to_i")
         }
+        (a, raise)
+    }
+    fn hash_has(h: V, k: &str) -> bool {
+        rhash(h).m.iter().any(|(key, _)| key.0 == mksym(sym(k)))
+    }
+    defn(k, "Integer", 1, 3, |_, a, _| {
+        let (a, raise) = exc_kw(a);
+        let r = kernel_integer(a[0], a.get(1).copied().unwrap_or(QNIL));
+        if r == UNDEF && !raise {
+            pst().pending = Throw::None;
+            return QNIL;
+        }
+        r
     });
-    defn(k, "Float", 1, 1, |_, a, _| {
-        let v = a[0];
-        if let Some(f) = num_to_f(v) {
-            return float_new(f);
+    defn(k, "Float", 1, 2, |_, a, _| {
+        let (a, raise) = exc_kw(a);
+        let r = kernel_float(a[0]);
+        if r == UNDEF && !raise {
+            pst().pending = Throw::None;
+            return QNIL;
         }
-        if is_str(v) {
-            let s = String::from_utf8_lossy(&rstr(v).b).trim().replace('_', "");
-            return match s.parse::<f64>() {
-                Ok(f) => float_new(f),
-                Err(_) => arg_error(&format!("invalid value for Float(): {}", inspect_lossy(v))),
-            };
-        }
-        if v == QNIL {
-            return type_error("can't convert nil into Float");
-        }
-        send0(v, "to_f")
+        r
     });
     defn(k, "String", 1, 1, |_, a, _| match to_s(a[0]) {
         Ok(b) => str_new(b),
@@ -641,7 +833,7 @@ pub fn init() {
             _ => eql(s, o),
         })
     });
-    defn(k, "hash", 0, 0, |s, _, _| mkfix((hash_of(s) >> 2) as i64));
+    defn(k, "hash", 0, 0, |s, _, _| mkfix((hash_self(s) >> 2) as i64));
     defn(k, "object_id", 0, 0, |s, _, _| mkfix(object_id_of(s)));
     defn(k, "to_s", 0, 0, |s, _, _| {
         if s == rt().main_obj {
@@ -780,13 +972,23 @@ pub fn init() {
         }
         ary_new(out.take())
     });
-    defn(k, "enum_for", 0, -1, |s, a, _| {
+    defn(k, "enum_for", 0, -1, |s, a, b| {
         let m = a.first().copied().unwrap_or(mksym(sym("each")));
-        crate::misc::enum_for(s, &sym_str(sym_id(m)), a.get(1..).unwrap_or(&[]))
+        let e = crate::misc::enum_for(s, &sym_str(sym_id(m)), a.get(1..).unwrap_or(&[]));
+        if is_proc(b) {
+            // the size block (Enumerator#size calls it with the arguments)
+            ivar_set(e, sym("@__size"), b);
+        }
+        e
     });
-    defn(k, "to_enum", 0, -1, |s, a, _| {
+    defn(k, "to_enum", 0, -1, |s, a, b| {
         let m = a.first().copied().unwrap_or(mksym(sym("each")));
-        crate::misc::enum_for(s, &sym_str(sym_id(m)), a.get(1..).unwrap_or(&[]))
+        let e = crate::misc::enum_for(s, &sym_str(sym_id(m)), a.get(1..).unwrap_or(&[]));
+        if is_proc(b) {
+            // the size block (Enumerator#size calls it with the arguments)
+            ivar_set(e, sym("@__size"), b);
+        }
+        e
     });
     defn(k, "display", 0, 0, |s, _, _| match to_s(s) {
         Ok(b) => {
@@ -938,7 +1140,17 @@ pub fn init() {
         if !is_proc(body) {
             return arg_error("tried to create Proc object without a block");
         }
-        add_method(s as *mut Class, id, Body::Proc(body));
+        let cls = s as *mut Class;
+        let m = add_method(cls, id, Body::Proc(body));
+        // like a def here: the class body's default visibility, and module_function's copy
+        if !crate::core::always_private(id) {
+            unsafe { (*(m as *mut Method)).vis = (*cls).default_vis };
+        }
+        if unsafe { (*cls).module_function } {
+            unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
+            let m2 = add_method(singleton_class(s), id, Body::Proc(body));
+            unsafe { (*(m2 as *mut Method)).vis = VIS_PUBLIC };
+        }
         mksym(id)
     });
     defn(md, "alias_method", 2, 2, |s, a, _| {

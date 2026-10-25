@@ -92,6 +92,62 @@ pub fn enum_for(recv: V, meth: &str, args: &[V]) -> V {
     ivar_set(e, sym("@__args"), ary_new(args.to_vec()));
     e
 }
+/// Enumerator#size of `recv.m(*args)` without a given size.
+fn enum_size(recv: V, m: &str, args: &[V]) -> V {
+    let inf = || float_new(f64::INFINITY);
+    // the receiver's size, nil when it has none (or it raises)
+    let size = || -> V {
+        if !respond_to(recv, sym("size")) {
+            return QNIL;
+        }
+        if is_range(recv) && !is_fix(rrange(recv).lo) {
+            return QNIL;
+        }
+        let r = send(recv, sym("size"), &[], QNIL);
+        if r == UNDEF {
+            pst().pending = Throw::None;
+            return QNIL;
+        }
+        r
+    };
+    let n_arg = |i: usize| args.get(i).filter(|x| is_fix(**x)).map(|x| fix(*x));
+    match m {
+        "loop" => inf(),
+        "each" | "map" | "collect" | "flat_map" | "collect_concat" | "select" | "filter" | "filter_map" | "reject"
+        | "each_with_index" | "each_entry" | "sort_by" | "min_by" | "max_by" | "minmax_by" | "group_by" | "partition"
+        | "each_with_object" | "with_index" | "with_object" | "each_index" | "reverse_each" | "each_key" | "each_value"
+        | "each_pair" | "delete_if" | "keep_if" | "select!" | "filter!" | "reject!" | "map!" | "collect!" | "each_char"
+        | "chars" | "each_codepoint" | "codepoints" | "each_grapheme_cluster" | "transform_values" | "transform_keys"
+        | "transform_values!" | "transform_keys!" | "filter_map!" | "sum" | "uniq" | "to_h" | "each_child" => {
+            size()
+        }
+        "each_byte" | "bytes" => send(recv, sym("bytesize"), &[], QNIL),
+        "times" if is_fix(recv) => mkfix(fix(recv).max(0)),
+        "upto" if is_fix(recv) => n_arg(0).map(|t| mkfix((t - fix(recv) + 1).max(0))).unwrap_or(QNIL),
+        "downto" if is_fix(recv) => n_arg(0).map(|t| mkfix((fix(recv) - t + 1).max(0))).unwrap_or(QNIL),
+        "each_slice" | "each_cons" => {
+            let (Some(k), sz) = (n_arg(0), size()) else { return QNIL };
+            if !is_fix(sz) || k <= 0 {
+                return QNIL;
+            }
+            let n = fix(sz);
+            mkfix(if m == "each_slice" { (n + k - 1) / k } else { (n - k + 1).max(0) })
+        }
+        "cycle" => {
+            let sz = size();
+            if !is_fix(sz) {
+                return QNIL;
+            }
+            match args.first() {
+                None => if fix(sz) == 0 { mkfix(0) } else { inf() },
+                Some(&x) if x == QNIL => if fix(sz) == 0 { mkfix(0) } else { inf() },
+                Some(&x) if is_fix(x) => mkfix(fix(sz) * fix(x).max(0)),
+                _ => QNIL,
+            }
+        }
+        _ => QNIL,
+    }
+}
 fn enum_parts(e: V) -> (V, u32, Vec<V>) {
     let args = ivar_get(e, sym("@__args"));
     (
@@ -555,7 +611,7 @@ pub fn init() {
     defn(rg, "inspect", 0, 0, |s, _, _| range_to_s(s, true));
     defn(rg, "==", 1, 1, |s, a, _| bool_v(is_range(a[0]) && eql(s, a[0])));
     defn(rg, "eql?", 1, 1, |s, a, _| bool_v(is_range(a[0]) && eql(s, a[0])));
-    defn(rg, "hash", 0, 0, |s, _, _| mkfix((hash_of(s) >> 2) as i64));
+    defn(rg, "hash", 0, 0, |s, _, _| mkfix((hash_self(s) >> 2) as i64));
     defn(rg, "dup", 0, 0, |s, _, _| s);
 
     // ---- Proc ----
@@ -575,7 +631,11 @@ pub fn init() {
         let p = rproc(s);
         if p.max < 0 || (p.min != p.max && p.lambda) { mkfix(-(p.min as i64) - 1) } else { mkfix(p.min as i64) }
     });
-    defn(pc, "parameters", 0, 0, |_, _, _| ary_new(vec![]));
+    defn(pc, "parameters", 0, 1, |s, a, _| {
+        // parameters(lambda: true/false)
+        let lambda = a.first().filter(|h| is_hash(**h)).map(|h| crate::hash::hget(*h, mksym(sym("lambda")))).filter(|v| *v != QNIL).map(truthy);
+        crate::methodobj::proc_parameters(s, lambda)
+    });
     defn(pc, "curry", 0, 1, |s, a, _| {
         let p = rproc(s);
         let n = a.first().map(|x| fix(*x) as usize).unwrap_or(p.min.max(0) as usize);
@@ -843,9 +903,25 @@ pub fn init() {
         tri!(send(recv, m, &args, nb));
         memo
     });
-    defn(er, "size", 0, 0, |s, _, _| match each_to_vec(s) {
-        Ok(v) => mkfix(v.len() as i64),
-        Err(e) => e,
+    // the size without enumerating (CRuby's size functions): given (Enumerator.new(n), a
+    // to_enum block), from the receiver for the methods it determines, else nil
+    defn(er, "size", 0, 0, |s, _, _| {
+        let given = ivar_get(s, sym("@__size"));
+        let (recv, m, args) = enum_parts(s);
+        if given != QNIL {
+            if is_proc(given) {
+                let args = crate::gc::Rooted::of(args);
+                return call_block(given, &args);
+            }
+            if respond_to(given, sym("call")) {
+                return send(given, sym("call"), &[], QNIL);
+            }
+            return given;
+        }
+        if ivar_get(s, sym("@__gen")) != QNIL {
+            return QNIL;
+        }
+        enum_size(recv, &sym_str(m), &args)
     });
     // Enumerator.new { |yielder| ... }
     let yc = new_class("Enumerator::Yielder", rt().c.object);
@@ -858,12 +934,15 @@ pub fn init() {
             s
         });
     }
-    defs(er, "new", 0, 1, |s, _, b| {
+    defs(er, "new", 0, 1, |s, a, b| {
         if !is_proc(b) {
             return arg_error("no block given");
         }
         let e = object_new(s as *mut Class);
         ivar_set(e, sym("@__gen"), b);
+        if let Some(&n) = a.first() {
+            ivar_set(e, sym("@__size"), n);
+        }
         e
     });
     defn(er, "next", 0, 0, |s, _, _| crate::thread::enum_next(s, false));

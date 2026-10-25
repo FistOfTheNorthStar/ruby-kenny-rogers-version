@@ -39,6 +39,7 @@ const OVERLAY: &[(&str, &str)] = &[
     ("json/common.rb", include_str!("../../../lib/kenny/json/common.rb")),
     ("digest.rb", include_str!("../../../lib/kenny/digest.rb")),
     ("tempfile.rb", include_str!("../../../lib/kenny/tempfile.rb")),
+    ("stringio.rb", include_str!("../../../lib/kenny/stringio.rb")),
     ("pathname.so", include_str!("../../../lib/kenny/pathname_ext.rb")),
     ("ripper.so", include_str!("../../../lib/kenny/ripper_ext.rb")),
     ("kenny/gem.rb", include_str!("../../../lib/kenny/kenny/gem.rb")),

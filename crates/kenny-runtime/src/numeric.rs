@@ -447,14 +447,37 @@ pub fn init() {
         defn(c, "to_f", 0, 0, |s, _, _| float_new(flt(&num(s).unwrap())));
         defn(c, "to_c", 0, 0, |s, _, _| s);
         defn(c, "integer?", 0, 0, |s, _, _| bool_v(is_int(s)));
-        defn(c, "step", 1, 2, |s, a, b| {
+        // step(limit = nil, step = 1), step(by:, to:); no limit: endless
+        defn(c, "step", 0, 3, |s, a, b| {
             if !is_proc(b) {
                 return crate::misc::enum_for(s, "step", a);
             }
-            let step = a.get(1).copied().unwrap_or(mkfix(1));
-            let limit = a[0];
+            let (mut pos, mut kw) = (a.to_vec(), None);
+            if pos.last().is_some_and(|h| is_hash(*h)) {
+                kw = pos.pop();
+            }
+            let mut limit = pos.first().copied().unwrap_or(QNIL);
+            let mut step = pos.get(1).copied().unwrap_or(mkfix(1));
+            if let Some(h) = kw {
+                for (k, v) in crate::hash::pairs(h) {
+                    match sym_str(sym_id(k)).as_str() {
+                        "by" => step = v,
+                        "to" => limit = v,
+                        _ => {}
+                    }
+                }
+            }
+            if step == mkfix(0) && !is_float(step) {
+                return arg_error("step can't be 0");
+            }
             let up = num_cmp(step, mkfix(0)) != Some(std::cmp::Ordering::Less);
             let mut i = s;
+            if limit == QNIL {
+                loop {
+                    tri!(call_block(b, &[i]));
+                    i = tri!(arith(Op::Add, i, step));
+                }
+            }
             if is_float(s) || is_float(step) || is_float(limit) {
                 let (st, sp, lm) = (flt(&num(s).unwrap()), flt(&num(step).unwrap()), flt(&num(limit).unwrap()));
                 let n = ((lm - st) / sp + 1e-9).floor() as i64;
@@ -495,7 +518,7 @@ pub fn init() {
         new_str_v(int_to_s_radix(s, radix))
     });
     defn(int, "inspect", 0, 0, |s, _, _| new_str_v(int_to_s(s)));
-    defn(int, "hash", 0, 0, |s, _, _| mkfix((hash_of(s) >> 2) as i64));
+    defn(int, "hash", 0, 0, |s, _, _| mkfix((hash_self(s) >> 2) as i64));
     defn(int, "eql?", 1, 1, |s, a, _| bool_v(is_int(a[0]) && eql(s, a[0])));
     defn(int, "to_i", 0, 0, |s, _, _| s);
     defn(int, "to_int", 0, 0, |s, _, _| s);
@@ -673,7 +696,7 @@ pub fn init() {
     // ---- Float ----
     defn(flo, "to_s", 0, 0, |s, _, _| new_str_v(float_to_s(float_val(s))));
     defn(flo, "inspect", 0, 0, |s, _, _| new_str_v(float_to_s(float_val(s))));
-    defn(flo, "hash", 0, 0, |s, _, _| mkfix((hash_of(s) >> 2) as i64));
+    defn(flo, "hash", 0, 0, |s, _, _| mkfix((hash_self(s) >> 2) as i64));
     defn(flo, "eql?", 1, 1, |s, a, _| bool_v(is_float(a[0]) && float_val(s) == float_val(a[0])));
     defn(flo, "to_i", 0, 0, |s, _, _| float_round(float_val(s), 0, f64::trunc));
     defn(flo, "to_int", 0, 0, |s, _, _| float_round(float_val(s), 0, f64::trunc));

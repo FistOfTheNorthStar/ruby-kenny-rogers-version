@@ -1850,6 +1850,23 @@ pub extern "C" fn kn_ary_post_ref(a: V, pre: u64, posts: u64, k: u64) -> V {
     kn_ary_ref(a, idx as i64)
 }
 
+/// Post-required block parameter `k` (of `posts`) from the block's arguments `a`: after
+/// `nreq` required, the optionals that got arguments (`nopt` low 32 bits) and the rest (bit
+/// 32: has one). Too few arguments: right after the required ones (nil when missing).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_block_post_ref(a: V, nreq: u64, nopt: u64, posts: u64, k: u64) -> V {
+    let n = rary(a).v.len() as u64;
+    let (opt, rest) = (nopt & 0xffff_ffff, nopt >> 32 != 0);
+    let start = if n < nreq + posts {
+        nreq
+    } else if rest || n <= nreq + opt + posts {
+        n - posts
+    } else {
+        nreq + opt
+    };
+    kn_ary_ref(a, (start + k) as i64)
+}
+
 // ---------- exceptions & non-local control flow ----------
 
 #[unsafe(no_mangle)]

@@ -24,6 +24,69 @@ fn wrap(class: *mut Class, recv: V, m: *const Method, name: u32) -> V {
     o
 }
 
+/// Parameters from a descriptor ("req:a,opt:b,rest:c,..."); `proc_style`: required ones
+/// are optional (a proc that isn't a lambda).
+pub fn desc_parameters(d: &str, proc_style: bool) -> V {
+    let mut out = Vec::new();
+    for part in d.split(',').filter(|p| !p.is_empty()) {
+        let (kind, name) = part.split_once(':').unwrap_or((part, ""));
+        let kind = if proc_style && kind == "req" { "opt" } else { kind };
+        let mut e = vec![mksym(sym(kind))];
+        if !name.is_empty() && !matches!(name, "*" | "**" | "&") {
+            e.push(mksym(sym(name)));
+        } else if proc_style && kind == "opt" {
+            e.push(QNIL); // a destructuring or `it` parameter: [:opt, nil]
+        }
+        out.push(ary_new(e));
+    }
+    ary_new(out)
+}
+
+/// Block functions' parameter descriptors (compiled code registers them at startup).
+static BLOCK_PARAMS: std::sync::RwLock<Option<std::collections::HashMap<usize, usize>>> = std::sync::RwLock::new(None);
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_register_block_params(table: *const u64, n: u64, strs: *const u8) {
+    let mut t = BLOCK_PARAMS.write().unwrap();
+    let m = t.get_or_insert_with(std::collections::HashMap::new);
+    for i in 0..n as usize {
+        let (f, off) = unsafe { (*table.add(2 * i), *table.add(2 * i + 1)) };
+        m.insert(f as usize, strs as usize + off as usize);
+    }
+}
+
+/// A compiled block's descriptor.
+fn block_desc(p: V) -> Option<String> {
+    let pr = rproc(p);
+    if !pr.native.is_null() {
+        return None;
+    }
+    let t = BLOCK_PARAMS.read().unwrap();
+    let a = *t.as_ref()?.get(&(pr.func as usize))?;
+    Some(unsafe { std::ffi::CStr::from_ptr(a as *const std::ffi::c_char) }.to_string_lossy().into_owned())
+}
+
+/// Proc#parameters (`lambda`: as for a lambda, or as for a proc; else as the proc is).
+pub fn proc_parameters(p: V, lambda: Option<bool>) -> V {
+    let pr = rproc(p);
+    let as_lambda = lambda.unwrap_or(pr.lambda);
+    if let Some(d) = block_desc(p) {
+        return desc_parameters(&d, !as_lambda);
+    }
+    if pr.native.is_null() && pr.min == 0 && pr.max == 0 {
+        return ary_new(vec![]);
+    }
+    // a native proc (a Method's or Symbol's to_proc, say): from the arity
+    let mut out = Vec::new();
+    for _ in 0..pr.min.max(0) {
+        out.push(ary_new(vec![mksym(sym(if as_lambda { "req" } else { "opt" }))]));
+    }
+    if pr.max < 0 {
+        out.push(ary_new(vec![mksym(sym("rest"))]));
+    }
+    ary_new(out)
+}
+
 /// [[:req, :a], [:opt, :b], ...] from a compiled method's descriptor, or from arity.
 pub fn parameters(m: *const Method) -> V {
     if m.is_null() {
@@ -32,16 +95,11 @@ pub fn parameters(m: *const Method) -> V {
     let mm = unsafe { &*m };
     if !mm.params.is_null() {
         let d = unsafe { std::ffi::CStr::from_ptr(mm.params as *const std::ffi::c_char) }.to_string_lossy().into_owned();
-        let mut out = Vec::new();
-        for part in d.split(',').filter(|p| !p.is_empty()) {
-            let (kind, name) = part.split_once(':').unwrap_or((part, ""));
-            let mut e = vec![mksym(sym(kind))];
-            if !name.is_empty() && !matches!(name, "*" | "**" | "&") {
-                e.push(mksym(sym(name)));
-            }
-            out.push(ary_new(e));
-        }
-        return ary_new(out);
+        return desc_parameters(&d, false);
+    }
+    if let Body::Proc(p) = &mm.body {
+        // define_method: the block's parameters, as for a lambda
+        return proc_parameters(*p, Some(true));
     }
     let a = arity(m);
     let mut out = Vec::new();

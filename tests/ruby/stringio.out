@@ -1,0 +1,45 @@
+"line1\n"
+1
+"lin"
+"e"
+nil
+"Z2\nline3"
+true
+17
+["line1\n", "linZ2\n", "line3"]
+17
+"ab12\n3\n007xy"
+12
+12
+["abc"]
+"a,"
+"a"
+["h", "é", "l", "l", "o"]
+nil
+#<Encoding:UTF-8>
+#<Encoding:BINARY (ASCII-8BIT)>
+"heXYo"
+"heX"
+true
+true
+["q", "w"]
+"abc"
+"def"
+EOFError
+"abc"
+nil
+""
+[97, 98]
+2
+2
+"ab"
+#<Encoding:BINARY (ASCII-8BIT)>
+nil
+false
+true
+0
+"a,\"b,c\"\n1,\n"
+[{"a" => "1", "b" => "2"}]
+["x", "y,z"]
+"q,2\n"
+["a", "b"]

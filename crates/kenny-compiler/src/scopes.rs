@@ -100,6 +100,19 @@ pub(crate) fn params_desc(p: Option<ParametersNode>) -> String {
     out.join(",")
 }
 
+/// Proc#parameters descriptor of a block (as for a lambda: Proc#parameters makes a proc's
+/// required parameters optional).
+fn block_params_desc(params: Option<&Node>) -> String {
+    let Some(pn) = params else { return String::new() };
+    if let Some(np) = pn.as_numbered_parameters_node() {
+        return (1..=np.maximum()).map(|i| format!("req:_{i}")).collect::<Vec<_>>().join(",");
+    }
+    if pn.as_it_parameters_node().is_some() {
+        return "req:".into();
+    }
+    pn.as_block_parameters_node().map(|bp| params_desc(bp.parameters())).unwrap_or_default()
+}
+
 fn names(list: &ConstantList) -> Vec<Vec<u8>> {
     list.iter().map(|c| c.as_slice().to_vec()).collect()
 }
@@ -851,9 +864,14 @@ impl<M: Module> Compiler<M> {
         fx.b.block_params(done)[0]
     }
     /// Assign the default value of an optional parameter unless an argument was passed.
-    fn optional_param(&mut self, fx: &mut Fx, name: &[u8], idx: usize, default: &Node, from_ary: Option<Value>) {
-        let argc = fx.b.use_var(fx.argc_v);
-        let has = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, argc, idx as i64);
+    /// Optional parameter `idx` gets an argument only when there are more than `idx`
+    /// plus the `posts` required after it (those are filled first).
+    fn optional_param(&mut self, fx: &mut Fx, name: &[u8], idx: usize, posts: usize, default: &Node, from_ary: Option<Value>) {
+        let argc = match from_ary {
+            Some(a) => self.call(fx, "kn_ary_len", &[a]),
+            None => fx.b.use_var(fx.argc_v),
+        };
+        let has = fx.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, argc, (idx + posts) as i64);
         let yes = fx.b.create_block();
         let no = fx.b.create_block();
         let done = fx.b.create_block();
@@ -999,7 +1017,7 @@ impl<M: Module> Compiler<M> {
         }
         for (j, o) in opts.iter().enumerate() {
             let o = o.as_optional_parameter_node().unwrap();
-            self.optional_param(fx, o.name().as_slice(), nreq + j, &o.value(), None);
+            self.optional_param(fx, o.name().as_slice(), nreq + j, npost, &o.value(), None);
         }
         let rest_name: Option<Vec<u8>> = match rest.as_ref().and_then(|r| r.as_rest_parameter_node()) {
             Some(rp) => Some(rp.name().map(|n| n.as_slice().to_vec()).unwrap_or(b"*".to_vec())),
@@ -1236,7 +1254,7 @@ impl<M: Module> Compiler<M> {
             }
             for (j, o) in opts.iter().enumerate() {
                 let o = o.as_optional_parameter_node().unwrap();
-                self.optional_param(fx, o.name().as_slice(), nreq + j, &o.value(), None);
+                self.optional_param(fx, o.name().as_slice(), nreq + j, 0, &o.value(), None);
             }
         } else {
             let argc = fx.b.use_var(fx.argc_v);
@@ -1249,7 +1267,7 @@ impl<M: Module> Compiler<M> {
             }
             for (j, o) in opts.iter().enumerate() {
                 let o = o.as_optional_parameter_node().unwrap();
-                self.optional_param(fx, o.name().as_slice(), nreq + j, &o.value(), Some(ary));
+                self.optional_param(fx, o.name().as_slice(), nreq + j, npost, &o.value(), Some(ary));
             }
             if let Some(rp) = rest.as_ref().and_then(|r| r.as_rest_parameter_node()) {
                 if let Some(n) = rp.name() {
@@ -1260,10 +1278,11 @@ impl<M: Module> Compiler<M> {
                 }
             }
             for (k, pn) in posts.iter().enumerate() {
-                let pre = self.iconst(fx, (nreq + nopt) as i64);
+                let rq = self.iconst(fx, nreq as i64);
+                let op = self.iconst(fx, (nopt | if has_rest { 1 << 32 } else { 0 }) as i64);
                 let po = self.iconst(fx, npost as i64);
                 let kk = self.iconst(fx, k as i64);
-                let v = self.call(fx, "kn_ary_post_ref", &[ary, pre, po, kk]);
+                let v = self.call(fx, "kn_block_post_ref", &[ary, rq, op, po, kk]);
                 self.bind_param_target(fx, pn, v);
             }
         }
@@ -1554,6 +1573,10 @@ impl<M: Module> Compiler<M> {
                 }
             })
         };
+        let desc = block_params_desc(params.as_ref());
+        if !desc.is_empty() && !self.eval_unit {
+            self.block_params.push((fid, desc));
+        }
         for _ in 0..k {
             self.scopes.pop();
         }

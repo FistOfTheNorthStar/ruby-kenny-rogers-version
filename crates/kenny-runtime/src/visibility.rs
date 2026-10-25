@@ -75,6 +75,8 @@ fn set_vis(c: *mut Class, names: &[u32], vis: u8) -> V {
 fn vis_call(s: V, a: &[V], vis: u8) -> V {
     if a.is_empty() {
         rclass(s).default_vis = vis;
+        // (ends a `module_function` section too)
+        rclass(s).module_function = false;
         return QNIL;
     }
     let names = match names_of(a) {

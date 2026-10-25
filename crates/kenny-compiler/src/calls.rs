@@ -257,7 +257,9 @@ impl<M: Module> Compiler<M> {
                     let c = fx.b.ins().icmp_imm_s(IntCC::NotEqual, b, QNIL);
                     return self.bool_v(fx, c);
                 }
-                b"__method__" if arg_nodes.is_empty() => {
+                // `__callee__` (the alias a method was called by) as `__method__`: Rails uses
+                // it to name the method in an error message
+                b"__method__" | b"__callee__" if arg_nodes.is_empty() => {
                     return match fx.method.clone() {
                         Some(m) => self.sym_val(fx, &m.name),
                         None => self.nil(fx),
@@ -877,7 +879,8 @@ impl<M: Module> Compiler<M> {
             }
         }
         if let Some(h) = kw {
-            self.call(fx, "kn_ary_push", &[ary, h]);
+            // (an empty `**kw` passes nothing)
+            self.call(fx, "kn_ary_push_kw", &[ary, h]);
         }
         let blk = match s.block() {
             Some(b) => self.block_arg(fx, Some(b.as_node()), false).0,

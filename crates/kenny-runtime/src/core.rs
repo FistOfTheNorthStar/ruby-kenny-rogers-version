@@ -2371,6 +2371,14 @@ fn own_method(v: V, name: &str) -> Option<*const Method> {
 }
 
 pub fn hash_of(v: V) -> u64 {
+    hash_impl(v, true)
+}
+/// The default `hash` of `v` itself (Kernel#hash and the core classes' own), without asking
+/// `v`'s `hash` method: a `def hash = ... super` would come back here forever.
+pub fn hash_self(v: V) -> u64 {
+    hash_impl(v, false)
+}
+fn hash_impl(v: V, dispatch: bool) -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     match kind(v) {
         None => v.hash(&mut h),
@@ -2382,8 +2390,13 @@ pub fn hash_of(v: V) -> u64 {
         }
         Some(Kind::Bignum) => rbig(v).n.hash(&mut h),
         Some(Kind::Array) => {
-            for &x in &rary(v).v {
+            // By index, reading the Array again each time: an element's `hash` may run Ruby
+            // code that changes it, or collects (when nothing else refers to `v`, a
+            // reference into its buffer wouldn't keep it alive).
+            let mut i = 0;
+            while let Some(&x) = rary(v).v.as_slice().get(i) {
                 hash_of(x).hash(&mut h);
+                i += 1;
             }
         }
         Some(Kind::Range) => {
@@ -2391,7 +2404,7 @@ pub fn hash_of(v: V) -> u64 {
             hash_of(rrange(v).hi).hash(&mut h);
         }
         _ => {
-            if let Some(m) = own_method(v, "hash") {
+            if let Some(m) = own_method(v, "hash").filter(|_| dispatch) {
                 let r = invoke(m, v, &[], QNIL);
                 if is_fix(r) {
                     return r;
@@ -2418,8 +2431,19 @@ pub fn eql(a: V, b: V) -> bool {
         (Some(Kind::Float), Some(Kind::Float)) => float_val(a) == float_val(b),
         (Some(Kind::Bignum), Some(Kind::Bignum)) => rbig(a).n == rbig(b).n,
         (Some(Kind::Array), Some(Kind::Array)) => {
-            let (x, y) = (&rary(a).v, &rary(b).v);
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| eql(*p, *q))
+            // by index, as in `hash_of`: an element's `eql?` may change or collect them
+            let mut i = 0;
+            loop {
+                let (x, y) = (rary(a).v.as_slice(), rary(b).v.as_slice());
+                if x.len() != y.len() {
+                    return false;
+                }
+                let Some((&p, &q)) = x.get(i).zip(y.get(i)) else { return true };
+                if !eql(p, q) {
+                    return false;
+                }
+                i += 1;
+            }
         }
         (Some(Kind::Range), Some(Kind::Range)) => {
             let (x, y) = (rrange(a), rrange(b));

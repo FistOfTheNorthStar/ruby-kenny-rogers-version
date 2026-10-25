@@ -151,6 +151,7 @@ pub fn boot() {
     crate::nokogiri::init();
     crate::pack::init();
     crate::extra::init();
+    crate::mtrand::init();
     crate::methodobj::init();
     crate::visibility::init();
     crate::rational::init();

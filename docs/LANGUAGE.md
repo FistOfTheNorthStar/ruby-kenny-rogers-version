@@ -58,6 +58,10 @@ which call sites come after it, and only those sites use a refinement-aware look
   Symbol keys as their keywords, as Ruby 2.x did — gems written for Ruby 2 rely on it. The app's
   own code keeps Ruby 3 semantics (except that a Hash which would otherwise be one positional
   argument too many is taken as keywords instead of raising ArgumentError).
+- **Every `*args` method forwards keywords as if marked `ruby2_keywords`.** Keywords collected
+  into a rest parameter stay flagged (`Hash.ruby2_keywords_hash?` is true), so `m(*args)` passes
+  them on as keywords; in CRuby that needs `ruby2_keywords(:name)`, without it they become a
+  positional Hash.
 
 ## Rule 4: concurrency is fixed with the APIs Ruby already has
 

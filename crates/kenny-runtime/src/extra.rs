@@ -1673,8 +1673,15 @@ pub fn init() {
             QNIL
         }
     });
-    defs(hs, "ruby2_keywords_hash?", 1, 1, |_, a, _| if is_hash(a[0]) { QFALSE } else { no_conv(a[0], "Hash") });
-    defs(hs, "ruby2_keywords_hash", 1, 1, |_, a, _| if is_hash(a[0]) { crate::kernel::dup(a[0], false) } else { no_conv(a[0], "Hash") });
+    defs(hs, "ruby2_keywords_hash?", 1, 1, |_, a, _| if is_hash(a[0]) { bool_v(hdr(a[0]).flags & FL_KWHASH != 0) } else { no_conv(a[0], "Hash") });
+    defs(hs, "ruby2_keywords_hash", 1, 1, |_, a, _| {
+        if !is_hash(a[0]) {
+            return no_conv(a[0], "Hash");
+        }
+        let h = crate::kernel::dup(a[0], false);
+        hdr(h).flags |= FL_KWHASH;
+        h
+    });
 
     // ===== Module =====
     let md = c.module;
@@ -2034,7 +2041,32 @@ pub fn init() {
         rstr(s).b.drain(bs..be);
         removed
     });
-    defn(st, "unicode_normalized?", 0, 1, |_, _, _| QTRUE);
+    // unicode_normalize(form = :nfc): :nfc, :nfd, :nfkc, :nfkd
+    fn normalize(s: V, a: &[V]) -> Result<String, V> {
+        use unicode_normalization::UnicodeNormalization;
+        if hdr(s).flags & crate::compat::FL_BINARY != 0 && !rstr(s).b.is_ascii() {
+            let c = const_lookup(rt().c.object, sym("Encoding")).and_then(|e| const_lookup(e as *mut Class, sym("CompatibilityError")));
+            let c = c.map(|c| c as *mut Class).unwrap_or(rt().c.argument_error);
+            return Err(raise(c, "Unicode Normalization not appropriate for ASCII-8BIT"));
+        }
+        let form = a.first().filter(|f| is_sym(**f)).map(|f| sym_str(sym_id(*f))).unwrap_or_else(|| "nfc".into());
+        let t = String::from_utf8_lossy(&rstr(s).b).into_owned();
+        Ok(match form.as_str() {
+            "nfc" => t.nfc().collect(),
+            "nfd" => t.nfd().collect(),
+            "nfkc" => t.nfkc().collect(),
+            "nfkd" => t.nfkd().collect(),
+            f => return Err(arg_error(&format!("Invalid normalization form {f}."))),
+        })
+    }
+    defn(st, "unicode_normalize", 0, 1, |s, a, _| match normalize(s, a) {
+        Ok(t) => new_like(s, t.into_bytes()),
+        Err(e) => e,
+    });
+    defn(st, "unicode_normalized?", 0, 1, |s, a, _| match normalize(s, a) {
+        Ok(t) => bool_v(t.as_bytes() == rstr(s).b.as_slice()),
+        Err(e) => e,
+    });
     defn(st, "undump", 0, 0, |s, _, _| match undump(&rstr(s).b.clone()) {
         Ok(b) => str_new(b),
         Err(e) => e,

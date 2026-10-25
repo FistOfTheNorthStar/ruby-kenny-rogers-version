@@ -170,7 +170,12 @@ pub fn str_inspect_enc(b: &[u8], binary: bool) -> String {
             };
             if len > 0 && i + len <= b.len() {
                 if let Ok(s) = std::str::from_utf8(&b[i..i + len]) {
-                    out.push_str(s);
+                    let ch = s.chars().next().unwrap() as u32;
+                    if crate::unprint::unprintable(ch) {
+                        if ch > 0xFFFF { out.push_str(&format!("\\u{{{:X}}}", ch)) } else { out.push_str(&format!("\\u{:04X}", ch)) }
+                    } else {
+                        out.push_str(s);
+                    }
                     i += len;
                     continue;
                 }

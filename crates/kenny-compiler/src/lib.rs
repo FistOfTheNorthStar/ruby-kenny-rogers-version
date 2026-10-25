@@ -285,6 +285,8 @@ pub struct Compiler<M: Module> {
     pub(crate) fn_labels: Vec<String>,
     /// Per compiled function: return-address offsets of its calls and their source locations.
     pub(crate) debug_fns: Vec<DebugFn>,
+    /// Proc#parameters descriptors of the blocks compiled (`scopes::params_desc` form).
+    pub(crate) block_params: Vec<(FuncId, String)>,
     /// Start offset of every line of the current source (for `line_of`), keyed by the source.
     line_index: (PathBuf, usize, usize, Vec<usize>),
 }
@@ -336,12 +338,14 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_ary_sum_vals", &[I64], &[I64]),
     ("kn_ary_concat_splat", &[I64, I64], &[I64]),
     ("kn_ary_len", &[I64], &[I64]),
+    ("kn_block_post_ref", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_ary_ptr", &[I64], &[I64]),
     ("kn_hash_new", &[I64, I64, I64], &[I64]),
     ("kn_hash_new_syms", &[I64, I64, I64], &[I64]),
     ("kn_hash_merge_splat", &[I64, I64], &[I64]),
     ("kn_range_new", &[I64, I64, I64], &[I64]),
     ("kn_proc_new", &[I64, I64, I64, I64, I64, I64], &[I64]),
+    ("kn_register_block_params", &[I64, I64, I64], &[]),
     ("kn_env_new", &[I64, I64, I64], &[I64]),
     ("kn_to_proc", &[I64], &[I64]),
     ("kn_ivar_get", &[I64, I64, I64], &[I64]),
@@ -589,6 +593,7 @@ impl<M: Module> Compiler<M> {
             fn_labels: Vec::new(),
             cref_parents: HashMap::new(),
             debug_fns: Vec::new(),
+            block_params: Vec::new(),
             line_index: (PathBuf::new(), 0, 0, Vec::new()),
         })
     }
@@ -637,6 +642,30 @@ impl Compiler<ObjectModule> {
                 let fl = b.ins().iadd_imm_s(caches_base, (flag * 8) as i64);
                 let h = b.ins().iconst(I64, hash as i64);
                 b.ins().call(reg, &[kp, kl, fa, fl, h]);
+            }
+            // Proc#parameters: (block function, descriptor) pairs
+            {
+                let bp = std::mem::take(&mut self.block_params);
+                let id = self.module.declare_data("__kn_block_params", Linkage::Local, false, false).map_err(e)?;
+                let mut d = DataDescription::new();
+                let mut bytes = Vec::with_capacity(bp.len() * 16);
+                for (i, (fid, desc)) in bp.iter().enumerate() {
+                    let fr = self.module.declare_func_in_data(*fid, &mut d);
+                    d.write_function_addr((i * 16) as u32, fr);
+                    let mut c = desc.as_bytes().to_vec();
+                    c.push(0);
+                    bytes.extend_from_slice(&0u64.to_le_bytes());
+                    bytes.extend_from_slice(&(self.str_offset(&c) as u64).to_le_bytes());
+                }
+                bytes.resize(bytes.len().max(16), 0);
+                d.define(bytes.into_boxed_slice());
+                d.set_align(8);
+                self.module.define_data(id, &d).map_err(e)?;
+                let reg = self.rt_id("kn_register_block_params");
+                let reg = self.module.declare_func_in_func(reg, b.func);
+                let tp = gv(&mut self.module, &mut b, id);
+                let n = b.ins().iconst(I64, bp.len() as i64);
+                b.ins().call(reg, &[tp, n, strs_base]);
             }
             // backtrace tables: functions (address, size, label, calls) and their call sites
             {
