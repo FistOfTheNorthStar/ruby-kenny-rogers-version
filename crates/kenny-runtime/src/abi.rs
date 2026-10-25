@@ -1091,6 +1091,8 @@ fn implicit_const(id: u32) -> Option<&'static str> {
         "set"
     } else if id == sym("DidYouMean") {
         "did_you_mean"
+    } else if id == sym("ARGF") {
+        "kenny/argf"
     } else {
         return None;
     };
@@ -1405,8 +1407,7 @@ pub extern "C" fn kn_const_get_under(parent: V, id: V) -> V {
     }
 }
 
-/// `Mod::Name`: Mod and its ancestors, but (since Ruby 2.5) not Object's constants unless
-/// Mod is Object itself.
+/// `Mod::Name`: Mod and its ancestors, but not Object's constants unless Mod is Object itself.
 pub fn const_get_scoped(c: *mut Class, id: u32) -> Option<V> {
     let object = rt().c.object;
     if c == object {
@@ -1735,9 +1736,9 @@ pub extern "C" fn kn_is_kwhash(v: V) -> u64 {
     (is_hash(v) && hdr(v).flags & FL_KWHASH != 0) as u64
 }
 /// The last argument of a call to a method with keyword parameters is its keywords: a keyword
-/// hash, or (Ruby 2.x compatibility, for gems written for it) a plain Hash that would otherwise be
-/// one positional argument too many (`maxpos` = positional capacity, -1 with a rest param).
-/// CRuby 3 raises ArgumentError in that second case, so this only turns errors into 2.7 behavior.
+/// hash, or (for older gems that pass options that way) a plain Hash that would otherwise be one
+/// positional argument too many (`maxpos` = positional capacity, -1 with a rest param). CRuby
+/// raises ArgumentError in that second case, so this only turns errors into working calls.
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_take_kwhash(v: V, argc: u64, maxpos: i64) -> u64 {
     if !is_hash(v) {
@@ -1745,8 +1746,8 @@ pub extern "C" fn kn_take_kwhash(v: V, argc: u64, maxpos: i64) -> u64 {
     }
     (hdr(v).flags & FL_KWHASH != 0 || (maxpos >= 0 && argc as i64 > maxpos)) as u64
 }
-/// Ruby 2 keyword semantics, used for methods and blocks defined in dependencies (gems written
-/// for Ruby 2): a trailing positional Hash with Symbol keys becomes the
+/// Trailing-Hash keywords, used for methods and blocks defined in dependencies (older gems pass
+/// options this way): a trailing positional Hash with Symbol keys becomes the
 /// keywords when it isn't needed for a required positional (`t.string :key, opts` calling
 /// `def string(*args, **options)`).
 #[unsafe(no_mangle)]

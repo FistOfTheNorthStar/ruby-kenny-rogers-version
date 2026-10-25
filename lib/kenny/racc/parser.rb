@@ -191,8 +191,7 @@ module Racc
     Racc_Runtime_Version = ::Racc::VERSION
     Racc_Runtime_Core_Version_R = ::Racc::VERSION
 
-    # Kenny: racc's C core (cparse) isn't available; use the Ruby core directly
-    # (Ruby 2.7's stdlib copy of this file also printed the LoadError to stdout).
+    # Kenny: racc's C core (cparse) isn't available; use the Ruby core directly.
     Racc_Main_Parsing_Routine    = :_racc_do_parse_rb
     Racc_YY_Parse_Method         = :_racc_yyparse_rb
     Racc_Runtime_Core_Version    = Racc_Runtime_Core_Version_R

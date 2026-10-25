@@ -1,6 +1,6 @@
 [3, 9, 1]
-[["28_rails_boot.rb", 8, "inner"], ["28_rails_boot.rb", 9, "outer"], ["28_rails_boot.rb", 10, "<main>"]]
-["28_rails_boot.rb:11:in 'boom'", "28_rails_boot.rb:13:in '<main>'"]
+[["28_rails_boot.rb", 8, "Object#inner"], ["28_rails_boot.rb", 9, "block in Object#outer"]]
+["28_rails_boot.rb:11:in 'Object#boom'", "28_rails_boot.rb:13:in '<main>'"]
 true
 :engine_root
 :mgmt

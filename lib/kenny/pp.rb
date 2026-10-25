@@ -1,4 +1,4 @@
-# Kenny's pp: the standard library's pp.rb (Ruby 2.7) without the pretty-printing support for
+# Kenny's pp: the standard library's pp.rb without the pretty-printing support for
 # RubyVM::AbstractSyntaxTree::Node (RubyVM is a CRuby internal that Kenny drops, docs/LANGUAGE.md).
 
 # frozen_string_literal: true

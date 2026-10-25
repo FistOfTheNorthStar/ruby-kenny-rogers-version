@@ -4,6 +4,7 @@
 //!   kenny run app.rb [args...]
 
 mod bundle;
+mod ruby;
 mod embed;
 
 use std::path::{Path, PathBuf};
@@ -44,6 +45,7 @@ const OVERLAY: &[(&str, &str)] = &[
     ("ripper.so", include_str!("../../../lib/kenny/ripper_ext.rb")),
     ("kenny/gem.rb", include_str!("../../../lib/kenny/kenny/gem.rb")),
     ("kenny/data.rb", include_str!("../../../lib/kenny/kenny/data.rb")),
+    ("kenny/argf.rb", include_str!("../../../lib/kenny/kenny/argf.rb")),
     ("bundler.rb", include_str!("../../../lib/kenny/bundler.rb")),
     ("bundler/setup.rb", include_str!("../../../lib/kenny/bundler/setup.rb")),
     ("bootsnap/setup.rb", include_str!("../../../lib/kenny/bootsnap/setup.rb")),
@@ -143,9 +145,7 @@ fn system_stdlib() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("KENNY_STDLIB") {
         return Some(PathBuf::from(p));
     }
-    let out = Command::new("ruby").args(["-e", "print RbConfig::CONFIG['rubylibdir']"]).output().ok()?;
-    let p = PathBuf::from(String::from_utf8(out.stdout).ok()?);
-    p.is_dir().then_some(p)
+    ruby::get()?.libdir.clone()
 }
 
 struct Opts {
@@ -303,6 +303,7 @@ fn build_exts(exts: &[PathBuf], work: &Path) -> Result<Vec<PathBuf>, String> {
 /// Write the overlay files into `overlay` and work out the compiler options: the overlay,
 /// the -I dirs, the locked gems of a Bundler project, then the standard library.
 fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, String> {
+    ruby::select(&o.src);
     std::fs::create_dir_all(overlay).map_err(|e| e.to_string())?;
     for (name, src) in OVERLAY {
         let path = overlay.join(name);
@@ -352,7 +353,8 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, 
         .unwrap_or_else(|| "5.2.2".into());
     std::fs::write(overlay.join("kenny/psych_version.rb"), format!("module Psych\n  VERSION = \"{psych}\"\nend\n")).map_err(|e| e.to_string())?;
     let gem_rb = overlay.join("kenny/gem.rb");
-    let mut embed_files = vec![gem_rb, overlay.join("kenny/data.rb")];
+    // (ARGF too, loaded on first use: kenny-runtime's const_missing)
+    let mut embed_files = vec![gem_rb, overlay.join("kenny/data.rb"), overlay.join("kenny/argf.rb")];
     // `Set` is loaded on first use, as Ruby 3.2+ does (kenny-runtime's const_missing)
     if let Some(set_rb) = stdlib.as_ref().map(|d| d.join("set.rb")).filter(|p| p.is_file()) {
         embed_files.push(set_rb);
@@ -364,6 +366,12 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, 
     let mut load_paths = vec![overlay.to_path_buf()];
     load_paths.extend(gem_paths);
     load_paths.extend(stdlib);
+    // then the gems that left the standard library (csv, bigdecimal ... in Ruby 3.4), which
+    // Ruby lets you require without a Gemfile (with one, as with Bundler, they must be in it)
+    let bundled = bundle::find_lockfile(&o.src).is_none();
+    if bundled && std::env::var_os("KENNY_NO_SYSTEM_STDLIB").is_none() && std::env::var_os("KENNY_STDLIB").is_none() {
+        load_paths.extend(ruby::get().map(|r| r.bundled_gem_libs()).unwrap_or_default());
+    }
     // every file of the -I dirs goes in (runtime-computed requires/autoloads, e.g. Rails)
     Ok(kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs })
 }

@@ -9,6 +9,13 @@ use crate::tri;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+/// The Ruby release Kenny matches (the one the tests' expected output and the builds' standard
+/// library come from; the repository's .ruby-version).
+pub const RUBY_VERSION: &str = "3.4.12";
+const RUBY_TEENY: &str = "12";
+const RUBY_PATCHLEVEL: &str = "148";
+const RUBY_RELEASE_DATE: &str = "2026-10-23";
+
 // ---------- iteration helpers ----------
 
 fn yielded(args: &[V]) -> V {
@@ -1361,7 +1368,8 @@ pub fn init() {
         ("ruby_version", "3.4.0"),
         ("MAJOR", "3"),
         ("MINOR", "4"),
-        ("TEENY", "0"),
+        ("TEENY", RUBY_TEENY),
+        ("PATCHLEVEL", RUBY_PATCHLEVEL),
         ("host_cpu", if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" }),
         ("arch", if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" }),
         ("EXEEXT", ""),
@@ -1378,14 +1386,14 @@ pub fn init() {
     // CRuby's has the unexpanded Makefile values; Kenny's values have nothing to expand
     const_set(rbc, sym("MAKEFILE_CONFIG"), cfg);
     defs(rbc, "ruby", 0, 0, |_, _, _| str_from("ruby"));
-    set_global_const("RUBY_VERSION", str_from("3.4.0"));
+    set_global_const("RUBY_VERSION", str_from(RUBY_VERSION));
     set_global_const("RUBY_PLATFORM", str_from(if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" }));
     set_global_const("RUBY_ENGINE", str_from("kenny"));
-    set_global_const("RUBY_PATCHLEVEL", mkfix(0));
-    set_global_const("RUBY_RELEASE_DATE", str_from("2026-10-19"));
+    set_global_const("RUBY_PATCHLEVEL", mkfix(RUBY_PATCHLEVEL.parse().unwrap_or(0)));
+    set_global_const("RUBY_RELEASE_DATE", str_from(RUBY_RELEASE_DATE));
     set_global_const("RUBY_COPYRIGHT", str_from("Kenny Ruby"));
     let platform = if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" };
-    set_global_const("RUBY_DESCRIPTION", str_from(&format!("kenny (ruby 3.4.0 compatible) [{platform}]")));
+    set_global_const("RUBY_DESCRIPTION", str_from(&format!("kenny (ruby {RUBY_VERSION} compatible) [{platform}]")));
 }
 
 /// Major version of the running kernel (`uname -r`: "24.6.0" -> 24).

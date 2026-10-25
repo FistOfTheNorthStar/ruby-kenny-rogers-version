@@ -23,9 +23,15 @@ cargo build --release
 ruby examples/blog8/compare.rb blog8   # 45 requests against Puma and the binary: identical
 ```
 
+Kenny targets Ruby 3.4 (3.4.12: the repository's `.ruby-version`) and builds against an
+installed Ruby: the one `KENNY_RUBY` names, else the version in the program's `.ruby-version`
+(or `.tool-versions`, next to it or above) found among rvm, rbenv, asdf, chruby and mise
+installs, else `ruby` on PATH. That Ruby's standard library and gems are what goes into the
+binary.
+
 When the program has a `Gemfile.lock` next to it (or in a parent directory), `kenny build`
-resolves the locked gems itself from the installed gem directories (`GEM_HOME`/`GEM_PATH`, the
-system Ruby's `Gem.path`, `~/.gem`, rvm, rbenv) and compiles them in; groups listed in
+resolves the locked gems itself from the installed gem directories (that Ruby's first, then
+`GEM_HOME`/`GEM_PATH`, `~/.gem`, rvm, rbenv) and compiles them in; groups listed in
 `BUNDLE_WITHOUT` (default `development:test`) are left out, and `require "bundler/setup"` /
 `Bundler.require(*Rails.groups)` work in the binary. Without a lock file, `-I` adds load paths:
 `tools/gem-paths.rb NAME VERSION` prints the `-I` flags for an installed gem and its
@@ -128,7 +134,9 @@ Working:
   locals), so `ERB#result(binding)` works.
 - **C extensions:** a CRuby-compatible `ruby.h` and C API, built with `kenny build --ext dir`.
 - **Libraries:** `require` / `require_relative` / `autoload` / `load` compile gems and the stdlib
-  into the binary (`-I dir`; the stdlib of an installed Ruby is found automatically).
+  into the binary (`-I dir`; the stdlib of the Ruby built against is found automatically, and
+  without a Gemfile so are the gems that Ruby bundles in place of former stdlib parts, such as
+  `csv` and `bigdecimal` in 3.4).
 - **Native stdlib extensions** (Rust instead of C): date, json, yaml (Psych API), bigdecimal,
   strscan, digest, zlib, openssl (digests, HMAC, ciphers), Marshal (byte-compatible format 4.8),
   cgi/escape, erb/escape (Rails' `html_escape`), plus `Gem::Version`/`Gem::Requirement`.
@@ -188,18 +196,18 @@ Not yet:
   `KENNY_MALLOC`).
 - `ObjectSpace`, `TracePoint` (dropped by design).
 
-## Early numbers (Apple Silicon M-series, 12 cores, vs Ruby 2.7.8 interpreter, no YJIT)
+## Early numbers (Apple Silicon M-series, 12 cores, vs Ruby 3.4.12 interpreter, no YJIT)
 
 | Benchmark | Speedup |
 |---|---|
-| Integer loop (`bench/loop.rb`) | 10.5x |
-| Recursive `fib` | 2.2x |
-| Blocks and collections (`blocks.rb`, `collections.rb`) | 3.7x, 3.6x |
-| String building and hashes (`strings_hash.rb`) | 2.7x |
-| Float math: `mandelbrot.rb`, `spectral_norm.rb`, `nbody.rb` | 4.9x, 4.7x, 2.0x |
-| Method-call-heavy OO code (`methods.rb`) | 2.5x |
-| Object allocation with GC (`objects.rb`) | 1.7x |
-| 12 CPU-bound Ruby threads (`threads.rb`) | 24.5x (0.04 s vs 0.97 s: Ruby's GVL runs one at a time) |
+| Integer loop (`bench/loop.rb`) | 12.4x |
+| Recursive `fib` | 5.2x |
+| Blocks and collections (`blocks.rb`, `collections.rb`) | 4.4x, 4.9x |
+| String building and hashes (`strings_hash.rb`) | 3.4x |
+| Float math: `mandelbrot.rb`, `spectral_norm.rb`, `nbody.rb` | 22.8x, 8.0x, 4.8x |
+| Method-call-heavy OO code (`methods.rb`) | 6.1x |
+| Object allocation with GC (`objects.rb`) | 5.5x |
+| 12 CPU-bound Ruby threads (`threads.rb`) | 25x (0.03 s vs 0.83 s: Ruby's GVL runs one at a time) |
 
 Web (the machine was also running other work, so treat these as rough; `ab -c 10`/`-c 32`):
 

@@ -130,9 +130,21 @@ fn init_locations() {
     defn(loc, "absolute_path", 0, 0, |s, _, _| str_from(&parts(s).0));
     defn(loc, "lineno", 0, 0, |s, _, _| mkfix(parts(s).1));
     defn(loc, "label", 0, 0, |s, _, _| label(s));
+    // the method's own name: "block in Foo#bar" -> "bar", "Foo.baz" -> "baz"
     defn(loc, "base_label", 0, 0, |s, _, _| {
         let l = String::from_utf8_lossy(&rstr(label(s)).b).into_owned();
-        str_from(l.rsplit("block in ").next().unwrap_or(&l))
+        let l = l.rsplit("block in ").next().unwrap_or(&l);
+        if l.starts_with('<') || l.contains(' ') {
+            return str_from(l);
+        }
+        let base = match l.split_once('#') {
+            Some((_, m)) => m,
+            None => match l.split_once('.') {
+                Some((c, m)) if c.starts_with(|ch: char| ch.is_ascii_uppercase()) => m,
+                _ => l,
+            },
+        };
+        str_from(base)
     });
     defn(loc, "to_s", 0, 0, |s, _, _| to_s(s));
     defn(loc, "inspect", 0, 0, |s, _, _| crate::kernel::new_str_v(crate::fmt::str_inspect(&rstr(to_s(s)).b)));

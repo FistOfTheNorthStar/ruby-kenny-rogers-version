@@ -295,12 +295,16 @@ impl<M: Module> Compiler<M> {
             ScopeKind::Top if self.fn_labels.is_empty() && self.file == self.main_file => "<main>".to_string(),
             ScopeKind::Top => "<top (required)>".to_string(),
             ScopeKind::Block => {
-                let parent = self.fn_labels.last().map(|l| l.trim_start_matches("block in ").to_string()).unwrap_or_else(|| "<main>".into());
-                format!("block in {parent}")
+                // (a block inside inlined code: that code's frame is its parent)
+                let parent = self.dbg_frames.last().map(|f| f.label.clone()).or_else(|| self.fn_labels.last().cloned()).unwrap_or_else(|| "<main>".into());
+                crate::statics::block_label(&parent)
             }
             _ => spec.label.clone(),
         };
         self.fn_labels.push(bt_label.clone());
+        // (a function of its own: its call sites aren't inside the enclosing inlined code)
+        let saved_dbg = std::mem::take(&mut self.dbg_frames);
+        let saved_parent = self.block_parent.take();
         self.fn_counter += 1;
         let label: String = spec.label.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
         let name = format!("__kn_{}_{}", self.fn_counter, label);
@@ -534,6 +538,8 @@ impl<M: Module> Compiler<M> {
             self.scopes.pop();
         }
         self.fn_labels.pop();
+        self.dbg_frames = saved_dbg;
+        self.block_parent = saved_parent;
         let mut ctx = cranelift_codegen::Context::for_function(func);
         if let Err(e) = self.module.define_function(id, &mut ctx) {
             self.errors.push(format!("internal codegen error in {name}: {e:?}"));
@@ -1060,7 +1066,7 @@ impl<M: Module> Compiler<M> {
 
     /// Take the trailing keyword-hash argument (if any) off the positional arguments.
     /// `maxpos`: positional capacity (-1 with a rest param); `nreq2`: required positionals,
-    /// for the Ruby 2 rule applied to code from dependencies (see kn_take_kwhash2).
+    /// for the trailing-Hash keyword rule applied to code from dependencies (see kn_take_kwhash2).
     /// `consume`: a copy whose keys `bind_keywords` removes (for a `**rest` parameter);
     /// otherwise the caller's hash itself, read only, or nil when none was passed.
     fn extract_kwhash(&mut self, fx: &mut Fx, npos_required: usize, maxpos: i64, nreq2: usize, consume: bool) -> Value {
@@ -1320,6 +1326,7 @@ impl<M: Module> Compiler<M> {
                 (s, k)
             }
         };
+        let bt_label = self.method_label(fx, &name, d.receiver().as_ref());
         let parts = DefParts {
             name,
             target,
@@ -1329,7 +1336,7 @@ impl<M: Module> Compiler<M> {
             locals: names(&d.locals()),
             offset: d.location().start_offset(),
             singleton: d.receiver().is_some(),
-            bt_label: None,
+            bt_label,
         };
         self.def_parts(fx, parts)
     }
@@ -1342,7 +1349,7 @@ impl<M: Module> Compiler<M> {
             return None;
         }
         let (name, params, blk) = crate::statics::block_def(c)?;
-        let parent = self.fn_labels.last().map(|l| l.trim_start_matches("block in ").to_string()).unwrap_or_else(|| "<main>".into());
+        let parent = self.fn_labels.last().cloned().unwrap_or_else(|| "<main>".into());
         let target = self.self_val(fx);
         let parts = DefParts {
             name,
@@ -1353,7 +1360,7 @@ impl<M: Module> Compiler<M> {
             locals: names(&blk.locals()),
             offset: c.location().start_offset(),
             singleton: false,
-            bt_label: Some(format!("block in {parent}")),
+            bt_label: Some(crate::statics::block_label(&parent)),
         };
         let r = self.def_parts(fx, parts);
         // 0: `define_method` isn't the builtin one here
@@ -1652,20 +1659,85 @@ impl<M: Module> Compiler<M> {
         };
         let s = self.sym_val(fx, &name);
         let cls = self.callc(fx, "kn_define_class", &[outer, s, sup]);
-        self.class_body(fx, cls, &format!("<class:{}>", String::from_utf8_lossy(&name)), names(&c.locals()), c.body())
+        let lex = self.lex_class_name(&c.constant_path());
+        self.lex_classes.push(lex.map(|n| (n, false)));
+        let r = self.class_body(fx, cls, &format!("<class:{}>", String::from_utf8_lossy(&name)), names(&c.locals()), c.body());
+        self.lex_classes.pop();
+        r
     }
     pub(crate) fn module_node(&mut self, fx: &mut Fx, m: &ModuleNode) -> Value {
         let (outer, name) = self.const_target(fx, &m.constant_path());
         let s = self.sym_val(fx, &name);
         let md = self.callc(fx, "kn_define_module", &[outer, s]);
-        self.class_body(fx, md, &format!("<module:{}>", String::from_utf8_lossy(&name)), names(&m.locals()), m.body())
+        let lex = self.lex_class_name(&m.constant_path());
+        self.lex_classes.push(lex.map(|n| (n, false)));
+        let r = self.class_body(fx, md, &format!("<module:{}>", String::from_utf8_lossy(&name)), names(&m.locals()), m.body());
+        self.lex_classes.pop();
+        r
     }
     pub(crate) fn sclass_node(&mut self, fx: &mut Fx, s: &SingletonClassNode) -> Value {
         let target = self.expr(fx, &s.expression());
         let sc = self.callc(fx, "kn_singleton_class_for", &[target]);
         let cref = self.cref(fx);
         self.call(fx, "kn_set_lexical_parent", &[sc, cref]);
-        self.class_body(fx, sc, "singleton class", names(&s.locals()), s.body())
+        // `class << self` in a class body: its methods are that class's singleton methods
+        let lex = match self.lex_classes.last() {
+            Some(Some((n, false))) if s.expression().as_self_node().is_some() && fx.kind == ScopeKind::Class => Some((n.clone(), true)),
+            _ => None,
+        };
+        self.lex_classes.push(lex);
+        let r = self.class_body(fx, sc, "singleton class", names(&s.locals()), s.body());
+        self.lex_classes.pop();
+        r
+    }
+
+    /// The name of the class a `class` / `module` statement opens, as CRuby would name it:
+    /// `Foo::Bar` inside `module A` is `A::Foo::Bar`, `::Foo` is `Foo`.
+    fn lex_class_name(&self, path: &Node) -> Option<String> {
+        fn written(n: &Node) -> Option<(String, bool)> {
+            if let Some(r) = n.as_constant_read_node() {
+                return Some((String::from_utf8_lossy(r.name().as_slice()).into_owned(), false));
+            }
+            let cp = n.as_constant_path_node()?;
+            let name = String::from_utf8_lossy(cp.name()?.as_slice()).into_owned();
+            match cp.parent() {
+                None => Some((name, true)),
+                Some(p) => {
+                    let (outer, abs) = written(&p)?;
+                    Some((format!("{outer}::{name}"), abs))
+                }
+            }
+        }
+        let (w, absolute) = written(path)?;
+        if absolute {
+            return Some(w);
+        }
+        match self.lex_classes.last() {
+            Some(Some((outer, false))) if outer != "Object" => Some(format!("{outer}::{w}")),
+            Some(Some((_, false))) | None => Some(w),
+            _ => None,
+        }
+    }
+
+    /// CRuby 3.4's backtrace label of a method `def`d here: `C#m`, `C.m` (`def self.m`, or
+    /// in `class << self`), `Object#m` at the top level; None (just `m`) where the class
+    /// isn't known statically.
+    fn method_label(&self, fx: &Fx, name: &[u8], receiver: Option<&Node>) -> Option<String> {
+        let m = String::from_utf8_lossy(name);
+        let top = fx.kind == ScopeKind::Top && (!self.eval_unit || self.file_unit) && self.lex_classes.is_empty();
+        match (receiver, fx.kind) {
+            (Some(r), ScopeKind::Class) if r.as_self_node().is_some() => match self.lex_classes.last() {
+                Some(Some((c, false))) => Some(format!("{c}.{m}")),
+                _ => None,
+            },
+            (None, ScopeKind::Class) => match self.lex_classes.last() {
+                Some(Some((c, false))) => Some(format!("{c}#{m}")),
+                Some(Some((c, true))) => Some(format!("{c}.{m}")),
+                _ => None,
+            },
+            (None, ScopeKind::Top) if top => Some(format!("Object#{m}")),
+            _ => None,
+        }
     }
 }
 

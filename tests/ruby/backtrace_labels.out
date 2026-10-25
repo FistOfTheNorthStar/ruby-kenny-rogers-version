@@ -1,0 +1,13 @@
+["Object#top_m", "top_m"]
+["Outer::Inner#inst", "inst"]
+["Outer::Inner.cls", "cls"]
+["Outer::Inner.sc", "sc"]
+["block in Outer::Inner#with_proc", "with_proc"]
+["Outer.mod_m", "mod_m"]
+["Outer::Path#m", "m"]
+["TopLevel#m", "m"]
+["single", "single"]
+["anon", "anon"]
+["<main>", "<main>"]
+'Object#boom'
+'<main>'

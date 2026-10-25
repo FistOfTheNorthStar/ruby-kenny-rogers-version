@@ -374,6 +374,18 @@ impl<M: Module> Compiler<M> {
     /// autosplat of a single Array value when the block takes several parameters), body.
     #[allow(clippy::too_many_arguments)]
     fn inline_body(&mut self, fx: &mut Fx, bn: &BlockNode, params: &[Vec<u8>], locals: &[Vec<u8>], vals: &[Value], splat: bool, value_used: bool) -> Value {
+        // backtraces inside show the block's own frame, as if it weren't inlined
+        let parent = self.block_parent.take().or_else(|| self.dbg_frames.last().map(|f| f.label.clone())).or_else(|| self.fn_labels.last().cloned()).unwrap_or_else(|| "<main>".into());
+        let call_loc = self.loc_bits();
+        let file = self.file.clone();
+        self.push_dbg_frame(crate::statics::block_label(&parent), &file, call_loc);
+        let v = self.inline_body_frame(fx, bn, params, locals, vals, splat, value_used);
+        self.dbg_frames.pop();
+        v
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inline_body_frame(&mut self, fx: &mut Fx, bn: &BlockNode, params: &[Vec<u8>], locals: &[Vec<u8>], vals: &[Value], splat: bool, value_used: bool) -> Value {
         let nil = self.nil(fx);
         let mut level = HashMap::new();
         for n in locals {
