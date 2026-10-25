@@ -1129,6 +1129,10 @@ pub const DIRECT_INT_ITER: u64 = 8192;
 /// Every object's nil? is the builtin one, public (`NIL_P_TOUCHED` unset): `x.nil?` is
 /// `x == nil` (kenny-compiler fastpath.rs).
 pub const DIRECT_NIL_P_ALL: u64 = 16384;
+/// Array#size, #length, #empty?, #first, #last, #push, #<<, #pop and #shift of Array itself
+/// are the public builtin ones (compiled code runs them inline or calls `kn_ary_push1`,
+/// `kn_ary_pop0`, `kn_ary_shift0` directly).
+pub const DIRECT_ARY_BASIC: u64 = 32768;
 /// Set once the builtin methods are tagged (opt.rs `init`).
 pub static DIRECT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// `KN_DIRECT.flags` is 0 until recomputed (methods changed): on the next inline cache
@@ -1205,6 +1209,20 @@ pub fn update_direct_flags() {
         ];
         if ary.iter().all(|&(n, o)| public(c.array, n, o)) {
             flags |= DIRECT_ARY_ITER;
+        }
+        let basic = [
+            ("size", OPT_ARY_SIZE),
+            ("length", OPT_ARY_SIZE),
+            ("empty?", OPT_ARY_EMPTY),
+            ("first", OPT_ARY_FIRST),
+            ("last", OPT_ARY_LAST),
+            ("push", OPT_ARY_PUSH),
+            ("<<", OPT_ARY_PUSH),
+            ("pop", OPT_ARY_POP),
+            ("shift", OPT_ARY_SHIFT),
+        ];
+        if basic.iter().all(|&(n, o)| public(c.array, n, o)) {
+            flags |= DIRECT_ARY_BASIC;
         }
         if public(c.integer, "times", OPT_INT_TIMES) && public(c.integer, "upto", OPT_INT_UPTO) && public(c.integer, "downto", OPT_INT_DOWNTO) {
             flags |= DIRECT_INT_ITER;
@@ -1944,13 +1962,18 @@ pub fn method_missing(recv: V, mid: u32, args: &[V], blk: V, vcall: bool) -> V {
 }
 pub fn no_method_error(recv: V, mid: u32, vcall: bool) -> V {
     let name = sym_str(mid);
+    let e = if vcall {
+        exc_new(rt().c.name_error, &format!("undefined local variable or method '{}' for {}", name, describe_recv(recv)))
+    } else {
+        exc_new(rt().c.no_method_error, &format!("undefined method '{}' for {}", name, describe_recv(recv)))
+    };
+    // what NameError#name / #receiver / NoMethodError#private_call? report (DidYouMean uses them)
+    ivar_set(e, sym("@name"), mksym(mid));
+    ivar_set(e, sym("@receiver"), recv);
     if vcall {
-        return raise(
-            rt().c.name_error,
-            &format!("undefined local variable or method '{}' for {}", name, describe_recv(recv)),
-        );
+        ivar_set(e, sym("@__private_call"), QTRUE);
     }
-    raise(rt().c.no_method_error, &format!("undefined method '{}' for {}", name, describe_recv(recv)))
+    raise_exc(e)
 }
 pub fn describe_recv(v: V) -> String {
     if v == QNIL {
@@ -1960,7 +1983,7 @@ pub fn describe_recv(v: V) -> String {
     } else if v == QFALSE {
         "false".into()
     } else if v == rt().main_obj {
-        "main:Object".into()
+        "main".into()
     } else if is_class(v) {
         let c = rclass(v);
         if c.is_module { format!("module {}", c.name) } else { format!("class {}", class_name(v as *mut Class)) }
@@ -2230,6 +2253,7 @@ pub fn const_set(c: *mut Class, id: u32, v: V) {
         }
         (*c).consts.insert(id, v);
     }
+    crate::abi::cfold_invalidate(id);
     bump_const_serial();
 }
 pub fn set_global_const(name: &str, v: V) {
@@ -2261,6 +2285,14 @@ pub fn raise_exc(e: V) -> V {
         let m = ivar_get(e, sym("@__message"));
         let msg = if is_str(m) { String::from_utf8_lossy(&rstr(m).b).into_owned() } else { String::new() };
         eprintln!("[raise] {}: {} (at {})", class_name(real_class(e)), msg, current_loc().unwrap_or_default());
+    }
+    // the exception being handled (`$!`) becomes the cause of one raised meanwhile, once
+    if is_heap(e) && ivar_get(e, sym("@__cause_set")) != QTRUE {
+        let cur = pst().errinfo;
+        if cur != e && is_heap(cur) {
+            ivar_set(e, sym("@__cause"), cur);
+        }
+        ivar_set(e, sym("@__cause_set"), QTRUE);
     }
     if is_heap(e) && !ivar_defined(e, sym("@__backtrace")) && !ivar_defined(e, sym("@__bt_raw")) {
         // the return addresses now; "file:line:in 'label'" strings only if `backtrace` is asked
@@ -2352,6 +2384,14 @@ fn own_method(v: V, name: &str) -> Option<*const Method> {
 }
 
 pub fn hash_of(v: V) -> u64 {
+    hash_impl(v, true)
+}
+/// The default `hash` of `v` itself (Kernel#hash and the core classes' own), without asking
+/// `v`'s `hash` method: a `def hash = ... super` would come back here forever.
+pub fn hash_self(v: V) -> u64 {
+    hash_impl(v, false)
+}
+fn hash_impl(v: V, dispatch: bool) -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     match kind(v) {
         None => v.hash(&mut h),
@@ -2363,8 +2403,13 @@ pub fn hash_of(v: V) -> u64 {
         }
         Some(Kind::Bignum) => rbig(v).n.hash(&mut h),
         Some(Kind::Array) => {
-            for &x in &rary(v).v {
+            // By index, reading the Array again each time: an element's `hash` may run Ruby
+            // code that changes it, or collects (when nothing else refers to `v`, a
+            // reference into its buffer wouldn't keep it alive).
+            let mut i = 0;
+            while let Some(&x) = rary(v).v.as_slice().get(i) {
                 hash_of(x).hash(&mut h);
+                i += 1;
             }
         }
         Some(Kind::Range) => {
@@ -2372,7 +2417,7 @@ pub fn hash_of(v: V) -> u64 {
             hash_of(rrange(v).hi).hash(&mut h);
         }
         _ => {
-            if let Some(m) = own_method(v, "hash") {
+            if let Some(m) = own_method(v, "hash").filter(|_| dispatch) {
                 let r = invoke(m, v, &[], QNIL);
                 if is_fix(r) {
                     return r;
@@ -2399,8 +2444,19 @@ pub fn eql(a: V, b: V) -> bool {
         (Some(Kind::Float), Some(Kind::Float)) => float_val(a) == float_val(b),
         (Some(Kind::Bignum), Some(Kind::Bignum)) => rbig(a).n == rbig(b).n,
         (Some(Kind::Array), Some(Kind::Array)) => {
-            let (x, y) = (&rary(a).v, &rary(b).v);
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| eql(*p, *q))
+            // by index, as in `hash_of`: an element's `eql?` may change or collect them
+            let mut i = 0;
+            loop {
+                let (x, y) = (rary(a).v.as_slice(), rary(b).v.as_slice());
+                if x.len() != y.len() {
+                    return false;
+                }
+                let Some((&p, &q)) = x.get(i).zip(y.get(i)) else { return true };
+                if !eql(p, q) {
+                    return false;
+                }
+                i += 1;
+            }
         }
         (Some(Kind::Range), Some(Kind::Range)) => {
             let (x, y) = (rrange(a), rrange(b));

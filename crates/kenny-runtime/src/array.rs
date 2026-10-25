@@ -16,9 +16,10 @@ fn snapshot(v: V) -> crate::gc::Rooted<V> {
     crate::gc::Rooted::of(rary(v).v.clone())
 }
 /// An Array argument: an Array, or an object converted with `to_ary` (implicit conversion).
-pub fn ary_arg(v: V) -> Result<Vec<V>, V> {
+/// (Rooted: callers compare the items with `eql?`/`==`, which may run Ruby code.)
+pub fn ary_arg(v: V) -> Result<crate::gc::Rooted<V>, V> {
     if is_ary(v) {
-        return Ok(snapshot(v).into_vec());
+        return Ok(snapshot(v));
     }
     if respond_to(v, sym("to_ary")) {
         let r = send0(v, "to_ary");
@@ -26,7 +27,7 @@ pub fn ary_arg(v: V) -> Result<Vec<V>, V> {
             return Err(UNDEF);
         }
         if is_ary(r) {
-            return Ok(snapshot(r).into_vec());
+            return Ok(snapshot(r));
         }
     }
     Err(type_error(&format!("no implicit conversion of {} into Array", class_name(real_class(v)))))
@@ -902,7 +903,7 @@ pub fn init() {
         }
         h
     });
-    defn(c, "hash", 0, 0, |s, _, _| mkfix((hash_of(s) >> 2) as i64));
+    defn(c, "hash", 0, 0, |s, _, _| mkfix((hash_self(s) >> 2) as i64));
     defn(c, "eql?", 1, 1, |s, a, _| bool_v(eql(s, a[0])));
     defn(c, "==", 1, 1, |s, a, _| {
         if !is_ary(a[0]) {
@@ -978,6 +979,8 @@ pub fn init() {
         ary_new(snapshot(s).repeat(n as usize))
     });
     fn uniq(v: Vec<V>) -> Vec<V> {
+        // rooted: `hash`/`eql?` may run Ruby code (and collect) while `v` holds the items
+        let v = crate::gc::Rooted::of(v);
         let mut seen = indexmap::IndexSet::new();
         let mut out = RVec::new();
         for x in v {
@@ -1157,7 +1160,26 @@ pub fn init() {
         ary_new(items[i..].to_vec())
     });
     defn(c, "zip", 0, -1, |s, a, b| {
-        let others: Vec<Vec<V>> = a.iter().map(|o| if is_ary(*o) { snapshot(*o).into_vec() } else { vec![] }).collect();
+        // other arguments: Arrays, `to_ary`, else their first elements by `each` (`take`,
+        // which stops early: an endless Enumerator is fine)
+        let n = av(s).len();
+        let mut others: Vec<crate::gc::Rooted<V>> = Vec::with_capacity(a.len());
+        for &o in a {
+            if is_ary(o) {
+                others.push(snapshot(o));
+            } else if respond_to(o, sym("to_ary")) {
+                let r = tri!(send0(o, "to_ary"));
+                if !is_ary(r) {
+                    return type_error(&format!("can't convert {} to Array", class_name(real_class(o))));
+                }
+                others.push(snapshot(r));
+            } else if respond_to(o, sym("each")) {
+                let r = tri!(send1(o, "take", mkfix(n as i64)));
+                others.push(if is_ary(r) { snapshot(r) } else { crate::gc::Rooted::of(vec![]) });
+            } else {
+                return type_error(&format!("wrong argument type {} (must respond to :each)", class_name(real_class(o))));
+            }
+        }
         let mut out = RVec::new();
         for (i, x) in snapshot(s).into_iter().enumerate() {
             let mut row = vec![x];
@@ -1331,7 +1353,7 @@ pub fn init() {
             Ok(n) => n,
             Err(e) => return e,
         };
-        mutv!(s).set(n);
+        mutv!(s).set(n.into_vec());
         s
     });
     defn(c, "delete", 1, 1, |s, a, b| {

@@ -36,6 +36,37 @@ fn nil_name(v: V) -> String {
 fn chars(v: V) -> Vec<String> {
     s_of(v).chars().map(|c| c.to_string()).collect()
 }
+/// Characters in UTF-8 bytes (invalid bytes count one each, as `from_utf8_lossy` gives).
+fn char_count(b: &[u8]) -> usize {
+    if b.is_ascii() { b.len() } else { String::from_utf8_lossy(b).chars().count() }
+}
+/// The byte offset of character `n` (the end when there are fewer).
+fn char_byte(b: &[u8], n: usize) -> usize {
+    if b.is_ascii() {
+        return n.min(b.len());
+    }
+    let mut i = 0;
+    for _ in 0..n {
+        if i >= b.len() {
+            break;
+        }
+        let len = match b[i] {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => 1,
+        };
+        i = (i + len).min(b.len());
+    }
+    i
+}
+/// An Integer position argument.
+fn int_arg(v: V) -> Result<i64, V> {
+    if is_fix(v) {
+        return Ok(fix(v));
+    }
+    Err(type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(v)))))
+}
 pub(crate) fn char_len(v: V) -> usize {
     let bytes = &rstr(v).b;
     if ascii_only(v) || is_binary(v) { bytes.len() } else { String::from_utf8_lossy(bytes).chars().count() }
@@ -64,18 +95,23 @@ fn mutate(s: V) -> Result<&'static mut SVec<u8>, V> {
     Ok(b(s))
 }
 
-const ENC_MASK: u32 = crate::compat::FL_BINARY | (crate::compat::FL_BINARY << 1);
 /// String#+ of `s` and the bytes `o` of `arg`.
 fn str_plus(s: V, o: &[u8], arg: V) -> V {
+    // the result's encoding: CRuby's rules for mixing two (see transcode::concat_enc)
+    let enc = if is_str(arg) && crate::transcode::same_native(s, arg) {
+        None
+    } else {
+        let xe = if is_str(arg) { crate::transcode::enc_of(arg) } else { crate::transcode::UTF8 };
+        match crate::transcode::concat_enc(s, o, xe) {
+            Ok(e) => e,
+            Err(e) => return e,
+        }
+    };
     let mut v = Vec::with_capacity(rstr(s).b.len() + o.len());
     v.extend_from_slice(&rstr(s).b);
     v.extend_from_slice(o);
-    // result keeps the receiver's encoding (binary + binary stays ASCII-8BIT),
-    // unless the receiver is ASCII-only and the argument is not
-    let src = if !o.is_ascii() && rstr(s).b.is_ascii() && is_str(arg) { arg } else { s };
-    let flags = hdr(src).flags & ENC_MASK;
     let r = str_new(v);
-    hdr(r).flags |= flags;
+    crate::transcode::set_enc(r, enc.unwrap_or_else(|| crate::transcode::enc_of(s)));
     r
 }
 
@@ -91,9 +127,12 @@ pub extern "C" fn kn_str_append_own(s: V, e: V, own: u64) -> V {
     }
     if own != 0 && s != e && hdr(s).klass == rt().c.string && !is_frozen(s) {
         let add: &[u8] = &rstr(e).b;
-        if !add.is_ascii() && rstr(s).b.is_ascii() {
-            let h = hdr(s);
-            h.flags = (h.flags & !ENC_MASK) | (hdr(e).flags & ENC_MASK);
+        if !crate::transcode::same_native(s, e) {
+            match crate::transcode::concat_enc(s, add, crate::transcode::enc_of(e)) {
+                Ok(Some(ne)) => crate::transcode::set_enc(s, ne),
+                Ok(None) => {}
+                Err(x) => return x,
+            }
         }
         // (no one else can see `s`: a replaced buffer can be freed now)
         b(s).extend_private(add);
@@ -504,7 +543,7 @@ pub fn init() {
     defn(c, "to_str", 0, 0, |s, _, _| plain(s));
     defn(c, "inspect", 0, 0, |s, _, _| new_str_v(str_inspect_v(s)));
     defn(c, "dump", 0, 0, |s, _, _| new_str_v(str_inspect(&rstr(s).b)));
-    defn(c, "hash", 0, 0, |s, _, _| mkfix((hash_of(s) >> 2) as i64));
+    defn(c, "hash", 0, 0, |s, _, _| mkfix((hash_self(s) >> 2) as i64));
     defn(c, "==", 1, 1, |s, a, _| bool_v(is_str(a[0]) && rstr(s).b == rstr(a[0]).b));
     defn(c, "===", 1, 1, |s, a, _| bool_v(is_str(a[0]) && rstr(s).b == rstr(a[0]).b));
     defn(c, "eql?", 1, 1, |s, a, _| bool_v(is_str(a[0]) && rstr(s).b == rstr(a[0]).b));
@@ -563,13 +602,49 @@ pub fn init() {
             Err(e) => e,
         }
     });
+    /// `<<` / `concat`, with CRuby's encoding rules (an ASCII-only receiver takes the
+    /// argument's encoding; incompatible ones raise Encoding::CompatibilityError).
     fn append(s: V, a: &[V]) -> V {
+        if let Err(e) = mutate(s) {
+            return e;
+        }
+        // (`concat` with several arguments checks them all before appending any)
+        let mut parts: Vec<(Vec<u8>, Option<crate::transcode::Enc>)> = Vec::with_capacity(a.len());
+        for &x in a {
+            if is_fix(x) {
+                match crate::transcode::codepoint_bytes(s, fix(x)) {
+                    Ok(p) => parts.push(p),
+                    Err(e) => return e,
+                }
+            } else if is_str(x) && crate::transcode::same_native(s, x) {
+                parts.push((rstr(x).b.to_vec(), None));
+            } else {
+                let o = match want_str(x) {
+                    Ok(o) => o,
+                    Err(e) => return e,
+                };
+                let xe = if is_str(x) { crate::transcode::enc_of(x) } else { crate::transcode::UTF8 };
+                match crate::transcode::concat_enc(s, &o, xe) {
+                    Ok(ne) => parts.push((o, ne)),
+                    Err(e) => return e,
+                }
+            }
+        }
+        for (bytes, ne) in parts {
+            if let Some(ne) = ne {
+                crate::transcode::set_enc(s, ne);
+            }
+            b(s).extend_from_slice(&bytes);
+        }
+        s
+    }
+    defn(c, "<<", 1, 1, |s, a, _| append(s, a));
+    defn(c, "concat", 0, -1, |s, a, _| append(s, a));
+    // (bytes as they are: the receiver keeps its encoding)
+    defn(c, "append_as_bytes", 0, -1, |s, a, _| {
         for &x in a {
             let add = if is_fix(x) {
-                match char::from_u32(fix(x) as u32) {
-                    Some(c) => c.to_string().into_bytes(),
-                    None => return raise(rt().c.range_error, "out of char range"),
-                }
+                vec![(fix(x) & 0xFF) as u8]
             } else {
                 match want_str(x) {
                     Ok(o) => o,
@@ -582,10 +657,7 @@ pub fn init() {
             }
         }
         s
-    }
-    defn(c, "<<", 1, 1, |s, a, _| append(s, a));
-    defn(c, "concat", 0, -1, |s, a, _| append(s, a));
-    defn(c, "append_as_bytes", 0, -1, |s, a, _| append(s, a));
+    });
     defn(c, "prepend", 0, -1, |s, a, _| {
         let mut pre = Vec::new();
         for &x in a {
@@ -792,29 +864,184 @@ pub fn init() {
         QFALSE
     });
     defn(c, "end_with?", 0, -1, |s, a, _| bool_v(a.iter().any(|p| is_str(*p) && rstr(s).b.ends_with(&rstr(*p).b))));
+    // index/rindex positions count characters; a negative one from the end
     defn(c, "index", 1, 2, |s, a, _| {
+        let n = char_len(s) as i64;
+        let mut from = match a.get(1) {
+            Some(x) => match int_arg(*x) {
+                Ok(i) => i,
+                Err(e) => return e,
+            },
+            None => 0,
+        };
+        if from < 0 {
+            from += n;
+        }
+        if from < 0 || from > n {
+            if crate::regex::is_regexp(a[0]) {
+                crate::regex::set_last(QNIL);
+            }
+            return QNIL;
+        }
         if crate::regex::is_regexp(a[0]) {
-            return crate::regex::str_index(s, a[0], a.get(1).map(|x| fix(*x).max(0) as usize).unwrap_or(0));
+            return crate::regex::str_index(s, a[0], from as usize);
         }
         let o = match want_str(a[0]) {
             Ok(o) => o,
             Err(e) => return e,
         };
-        let from = a.get(1).map(|x| fix(*x).max(0) as usize).unwrap_or(0);
-        match find(&rstr(s).b, &o, from) {
-            Some(i) => mkfix(String::from_utf8_lossy(&rstr(s).b[..i]).chars().count() as i64),
+        let b = &rstr(s).b;
+        match find(b, &o, char_byte(b, from as usize)) {
+            Some(i) => mkfix(char_count(&b[..i]) as i64),
             None => QNIL,
         }
     });
     defn(c, "rindex", 1, 2, |s, a, _| {
+        let n = char_len(s) as i64;
+        let mut pos = match a.get(1) {
+            Some(x) => match int_arg(*x) {
+                Ok(i) => i,
+                Err(e) => return e,
+            },
+            None => n,
+        };
+        if pos < 0 {
+            pos += n;
+        }
+        if pos < 0 {
+            if crate::regex::is_regexp(a[0]) {
+                crate::regex::set_last(QNIL);
+            }
+            return QNIL;
+        }
+        let pos = pos.min(n) as usize;
+        if crate::regex::is_regexp(a[0]) {
+            return crate::regex::str_rindex(s, a[0], pos);
+        }
         let o = match want_str(a[0]) {
             Ok(o) => o,
             Err(e) => return e,
         };
-        match rfind(&rstr(s).b, &o) {
-            Some(i) => mkfix(String::from_utf8_lossy(&rstr(s).b[..i]).chars().count() as i64),
+        let b = &rstr(s).b;
+        // the last occurrence starting at character `pos` or before
+        let end = (char_byte(b, pos) + o.len()).min(b.len());
+        match rfind(&b[..end], &o) {
+            Some(i) => mkfix(char_count(&b[..i]) as i64),
             None => QNIL,
         }
+    });
+    // byteindex/byterindex: byte offsets (an offset inside a character is an IndexError)
+    fn byte_off(s: V, a: &[V], dflt: i64) -> Result<Option<usize>, V> {
+        let b = &rstr(s).b;
+        let n = b.len() as i64;
+        let mut off = match a.get(1) {
+            Some(x) => int_arg(*x)?,
+            None => dflt,
+        };
+        if off < 0 {
+            off += n;
+        }
+        if off < 0 || off > n {
+            return Ok(None);
+        }
+        let o = off as usize;
+        if o < b.len() && (b[o] & 0xc0) == 0x80 && !is_binary(s) {
+            return Err(raise(rt().c.index_error, &format!("offset {off} does not land on character boundary")));
+        }
+        Ok(Some(o))
+    }
+    defn(c, "byteindex", 1, 2, |s, a, _| {
+        let from = match byte_off(s, a, 0) {
+            Ok(Some(o)) => o,
+            Ok(None) => return QNIL,
+            Err(e) => return e,
+        };
+        if crate::regex::is_regexp(a[0]) {
+            return crate::regex::str_byte_search(s, a[0], from, false);
+        }
+        let o = match want_str(a[0]) {
+            Ok(o) => o,
+            Err(e) => return e,
+        };
+        match find(&rstr(s).b, &o, from) {
+            Some(i) => mkfix(i as i64),
+            None => QNIL,
+        }
+    });
+    defn(c, "byterindex", 1, 2, |s, a, _| {
+        let n = rstr(s).b.len() as i64;
+        let from = match byte_off(s, a, n) {
+            Ok(Some(o)) => o,
+            Ok(None) => return QNIL,
+            Err(e) => return e,
+        };
+        if crate::regex::is_regexp(a[0]) {
+            return crate::regex::str_byte_search(s, a[0], from, true);
+        }
+        let o = match want_str(a[0]) {
+            Ok(o) => o,
+            Err(e) => return e,
+        };
+        let b = &rstr(s).b;
+        let end = (from + o.len()).min(b.len());
+        match rfind(&b[..end], &o) {
+            Some(i) => mkfix(i as i64),
+            None => QNIL,
+        }
+    });
+    // bytesplice(index, length, str [, str_index, str_length]) / (range, str [, str_range])
+    defn(c, "bytesplice", 2, 5, |s, a, _| {
+        if is_frozen(s) {
+            return check_frozen(s);
+        }
+        let n = rstr(s).b.len() as i64;
+        let span = |r: V, n: i64| -> Option<(usize, usize)> {
+            let (st, len) = range_bounds(r, n)?;
+            Some((st as usize, len.max(0) as usize))
+        };
+        let (start, len, rest) = if is_range(a[0]) {
+            match span(a[0], n) {
+                Some((st, l)) => (st, l, &a[1..]),
+                None => return raise(rt().c.range_error, "range out of string"),
+            }
+        } else {
+            let (Ok(mut st), Some(l)) = (int_arg(a[0]), a.get(1).map(|x| int_arg(*x))) else {
+                return type_error("wrong argument type (expected Integer or Range)");
+            };
+            let Ok(l) = l else { return type_error("no implicit conversion into Integer") };
+            if st < 0 {
+                st += n;
+            }
+            if st < 0 || st > n {
+                return raise(rt().c.index_error, &format!("index {} out of string", fix(a[0])));
+            }
+            (st as usize, (l.max(0) as usize).min((n - st) as usize), &a[2..])
+        };
+        let Some(&src) = rest.first().filter(|x| is_str(**x)) else {
+            return type_error("wrong argument type (expected String)");
+        };
+        let sb = rstr(src).b.clone();
+        let piece = if rest.len() == 1 {
+            sb
+        } else if is_range(rest[1]) {
+            match span(rest[1], sb.len() as i64) {
+                Some((st, l)) => sb[st..(st + l).min(sb.len())].to_vec(),
+                None => return raise(rt().c.range_error, "range out of string"),
+            }
+        } else {
+            let (Ok(st), Some(Ok(l))) = (int_arg(rest[1]), rest.get(2).map(|x| int_arg(*x))) else {
+                return type_error("wrong argument type");
+            };
+            let st = if st < 0 { st + sb.len() as i64 } else { st };
+            if st < 0 || st > sb.len() as i64 {
+                return raise(rt().c.index_error, "index out of string");
+            }
+            let st = st as usize;
+            sb[st..(st + l.max(0) as usize).min(sb.len())].to_vec()
+        };
+        let end = (start + len).min(n as usize);
+        rstr(s).b.splice(start..end, piece);
+        s
     });
     defn(c, "[]", 1, 2, |s, a, _| aref(s, a));
     defn(c, "slice", 1, 2, |s, a, _| aref(s, a));
@@ -1149,7 +1376,6 @@ pub fn init() {
     defn(c, "valid_encoding?", 0, 0, |s, _, _| bool_v(std::str::from_utf8(&rstr(s).b).is_ok()));
     defn(c, "force_encoding", 1, 1, |s, _, _| s);
     defn(c, "encode", 0, -1, |s, _, _| str_new(rstr(s).b.clone()));
-    defn(c, "unicode_normalize", 0, 1, |s, _, _| str_new(rstr(s).b.clone()));
     defn(c, "scrub", 0, 1, |s, _, _| new_str_v(s_of(s)));
     defn(c, "b", 0, 0, |s, _, _| str_new(rstr(s).b.clone()));
     defn(c, "encoding", 0, 0, |_, _, _| {
@@ -1201,7 +1427,7 @@ pub fn init() {
         mkfix(sym_name(sym_id(s)).cmp(sym_name(sym_id(a[0]))) as i64)
     });
     defn(y, "==", 1, 1, |s, a, _| bool_v(s == a[0]));
-    defn(y, "hash", 0, 0, |s, _, _| mkfix((hash_of(s) >> 2) as i64));
+    defn(y, "hash", 0, 0, |s, _, _| mkfix((hash_self(s) >> 2) as i64));
     defn(y, "upcase", 0, 0, |s, _, _| mksym(sym(&sym_str(sym_id(s)).to_uppercase())));
     defn(y, "downcase", 0, 0, |s, _, _| mksym(sym(&sym_str(sym_id(s)).to_lowercase())));
     defn(y, "capitalize", 0, 0, |s, _, _| {

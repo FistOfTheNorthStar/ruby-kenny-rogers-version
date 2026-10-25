@@ -19,6 +19,10 @@ mod spec;
 mod vobj;
 mod licm;
 mod owned;
+mod ispec;
+mod cfold;
+mod felem;
+mod hoist;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -73,6 +77,9 @@ pub(crate) struct LoopCtx {
     pub redo: Block,
     /// `next` passes its value to `next` (inlined `map`/`select` blocks).
     pub next_val: bool,
+    /// `fx.rescue_prev.len()` where the loop starts: `break`/`next` restore `$!` of the
+    /// rescue bodies they leave.
+    pub rescue_depth: usize,
 }
 
 #[derive(Clone)]
@@ -114,6 +121,9 @@ pub(crate) struct Fx<'a> {
     pub locals: HashMap<Vec<u8>, Local>,
     pub unwind: Vec<Block>,
     pub ensure_depth: usize,
+    /// `$!` from before each rescue body being compiled (outermost first): jumping out of
+    /// one (`return`, `next`, `break`, `retry`) restores it, as leaving it normally does.
+    pub rescue_prev: Vec<Value>,
     pub loops: Vec<LoopCtx>,
     pub retry: Vec<Block>,
     pub caches: Value,
@@ -166,6 +176,17 @@ pub(crate) struct Fx<'a> {
     pub resume: HashMap<usize, Block>,
     /// spec.rs: those places, as the fast copy asks for them
     pub resume_req: HashMap<usize, Block>,
+    /// felem.rs: the same for the places before a statement (no value), and the fast
+    /// copy's hand-over for the statement being compiled (and whether it is used)
+    pub resume_before: HashMap<usize, Block>,
+    pub resume_before_req: HashMap<usize, Block>,
+    pub spec_stmt: Option<Block>,
+    pub spec_stmt_used: bool,
+    /// hoist.rs: Integer operations computed before the loop being compiled, and in the
+    /// statement being compiled; the statement's offset
+    pub hoisted: HashMap<String, Value>,
+    pub stmt_memo: HashMap<String, fastpath::Num>,
+    pub stmt_at: usize,
     /// A method's fast entry (`FnSpec::fast_arity`): its argument values.
     pub fast_args: Option<Vec<Value>>,
     /// vobj.rs: locals that may hold a virtual object
@@ -210,6 +231,8 @@ pub struct Compiler<M: Module> {
     pub(crate) static_defined: HashSet<FuncId>,
     /// statics.rs `claim_word`: a def's word for its calls to itself
     pub(crate) claim_words: HashMap<FuncId, DataId>,
+    /// folded constants (cfold.rs) by (top-level cref slot, name)
+    pub(crate) cfold: HashMap<(usize, Vec<u8>), crate::cfold::CFold>,
     pub(crate) static_counter: usize,
     /// (file, offset) of every `def` scanned -> its enclosing class/module names
     pub(crate) def_lex: HashMap<(PathBuf, usize), Vec<Vec<u8>>>,
@@ -268,6 +291,8 @@ pub struct Compiler<M: Module> {
     pub(crate) fn_labels: Vec<String>,
     /// Per compiled function: return-address offsets of its calls and their source locations.
     pub(crate) debug_fns: Vec<DebugFn>,
+    /// Proc#parameters descriptors of the blocks compiled (`scopes::params_desc` form).
+    pub(crate) block_params: Vec<(FuncId, String)>,
     /// Start offset of every line of the current source (for `line_of`), keyed by the source.
     line_index: (PathBuf, usize, usize, Vec<usize>),
 }
@@ -319,12 +344,14 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_ary_sum_vals", &[I64], &[I64]),
     ("kn_ary_concat_splat", &[I64, I64], &[I64]),
     ("kn_ary_len", &[I64], &[I64]),
+    ("kn_block_post_ref", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_ary_ptr", &[I64], &[I64]),
     ("kn_hash_new", &[I64, I64, I64], &[I64]),
     ("kn_hash_new_syms", &[I64, I64, I64], &[I64]),
     ("kn_hash_merge_splat", &[I64, I64], &[I64]),
     ("kn_range_new", &[I64, I64, I64], &[I64]),
     ("kn_proc_new", &[I64, I64, I64, I64, I64, I64], &[I64]),
+    ("kn_register_block_params", &[I64, I64, I64], &[]),
     ("kn_env_new", &[I64, I64, I64], &[I64]),
     ("kn_to_proc", &[I64], &[I64]),
     ("kn_ivar_get", &[I64, I64, I64], &[I64]),
@@ -351,6 +378,8 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_def_claim", &[I64, I64, I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_static_fill", &[I64, I64, I64, I64], &[I64]),
     ("kn_entry_slow", &[], &[I64]),
+    ("kn_ispec_poll", &[], &[I64]),
+    ("kn_const_fold", &[I64, I64, I64, I64], &[I64]),
     ("kn_new_fill", &[I64, I64, I64], &[I64]),
     ("kn_obj_alloc", &[I64], &[I64]),
     ("kn_math1", &[I64, ir::types::F64], &[ir::types::F64]),
@@ -430,6 +459,9 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_attr_set", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_opt_check", &[I64, I64, I64, I64], &[I64]),
     ("kn_ary_at", &[I64, I64], &[I64]),
+    ("kn_ary_push1", &[I64, I64], &[I64]),
+    ("kn_ary_pop0", &[I64], &[I64]),
+    ("kn_ary_shift0", &[I64], &[I64]),
     ("kn_autosplat", &[I64], &[I64]),
     ("kn_range_first", &[I64], &[I64]),
     ("kn_range_last", &[I64], &[I64]),
@@ -530,6 +562,7 @@ impl<M: Module> Compiler<M> {
             kw_defs: HashMap::new(),
             static_defined: HashSet::new(),
             claim_words: HashMap::new(),
+            cfold: HashMap::new(),
             static_counter: 0,
             def_lex: HashMap::new(),
             inline_defs: HashMap::new(),
@@ -566,6 +599,7 @@ impl<M: Module> Compiler<M> {
             fn_labels: Vec::new(),
             cref_parents: HashMap::new(),
             debug_fns: Vec::new(),
+            block_params: Vec::new(),
             line_index: (PathBuf::new(), 0, 0, Vec::new()),
         })
     }
@@ -614,6 +648,30 @@ impl Compiler<ObjectModule> {
                 let fl = b.ins().iadd_imm_s(caches_base, (flag * 8) as i64);
                 let h = b.ins().iconst(I64, hash as i64);
                 b.ins().call(reg, &[kp, kl, fa, fl, h]);
+            }
+            // Proc#parameters: (block function, descriptor) pairs
+            {
+                let bp = std::mem::take(&mut self.block_params);
+                let id = self.module.declare_data("__kn_block_params", Linkage::Local, false, false).map_err(e)?;
+                let mut d = DataDescription::new();
+                let mut bytes = Vec::with_capacity(bp.len() * 16);
+                for (i, (fid, desc)) in bp.iter().enumerate() {
+                    let fr = self.module.declare_func_in_data(*fid, &mut d);
+                    d.write_function_addr((i * 16) as u32, fr);
+                    let mut c = desc.as_bytes().to_vec();
+                    c.push(0);
+                    bytes.extend_from_slice(&0u64.to_le_bytes());
+                    bytes.extend_from_slice(&(self.str_offset(&c) as u64).to_le_bytes());
+                }
+                bytes.resize(bytes.len().max(16), 0);
+                d.define(bytes.into_boxed_slice());
+                d.set_align(8);
+                self.module.define_data(id, &d).map_err(e)?;
+                let reg = self.rt_id("kn_register_block_params");
+                let reg = self.module.declare_func_in_func(reg, b.func);
+                let tp = gv(&mut self.module, &mut b, id);
+                let n = b.ins().iconst(I64, bp.len() as i64);
+                b.ins().call(reg, &[tp, n, strs_base]);
             }
             // backtrace tables: functions (address, size, label, calls) and their call sites
             {
@@ -929,6 +987,32 @@ impl<M: Module> Compiler<M> {
         let v = fx.b.ins().select(c, t, f);
         fx.bools.insert(v, c);
         v
+    }
+    /// The merge block of a Ruby boolean computed by fast paths as a condition (`bool_jump`)
+    /// and by slow paths as any value (`bool_jump_value`): parameters (value, i8 condition),
+    /// so an `if` on the result branches on the condition (`bool_result`).
+    pub(crate) fn bool_merge(&mut self, fx: &mut Fx) -> Block {
+        let d = fx.b.create_block();
+        fx.b.append_block_param(d, I64);
+        fx.b.append_block_param(d, cranelift_codegen::ir::types::I8);
+        d
+    }
+    pub(crate) fn bool_jump(&mut self, fx: &mut Fx, done: Block, c: Value) {
+        let v = self.bool_v(fx, c);
+        fx.b.ins().jump(done, &[v.into(), c.into()]);
+    }
+    /// (`v` is checked for an exception first: the merged value never is UNDEF)
+    pub(crate) fn bool_jump_value(&mut self, fx: &mut Fx, done: Block, v: Value) {
+        self.check(fx, v);
+        let c = self.truthy(fx, v);
+        fx.b.ins().jump(done, &[v.into(), c.into()]);
+    }
+    pub(crate) fn bool_result(&mut self, fx: &mut Fx, done: Block) -> Value {
+        fx.b.switch_to_block(done);
+        let p = fx.b.block_params(done).to_vec();
+        fx.bools.insert(p[0], p[1]);
+        fx.checked.insert(p[0]);
+        p[0]
     }
     pub(crate) fn cref(&mut self, fx: &mut Fx) -> Value {
         let p = self.slot_ptr(fx, fx.cref_slot);

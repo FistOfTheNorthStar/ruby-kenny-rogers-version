@@ -1,0 +1,47 @@
+2
+1
+2
+nil
+true
+[false, false]
+true
+true
+true
+true
+true
+true
+true
+true
+Array
+true
+true
+true
+nil
+2
+["x", "y"]
+true
+2
+1
+[["k", 1]]
+false
+[1, 2, nil, 4]
+false
+false
+Array
+FrozenError
+"{\"k\" => 1}"
+false
+false
+false
+5
+50
+7
+nil
+20
+3
+nil
+true
+19
+true
+true
+1

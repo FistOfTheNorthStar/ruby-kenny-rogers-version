@@ -1,0 +1,57 @@
+["1.5", 1.5, 1.5]
+[" 1.5 ", 1.5, 1.5]
+["1_000.5", 1000.5, 1000.5]
+["1__0", "ArgumentError: invalid value for Float(): \"1__0\"", nil]
+["_1", "ArgumentError: invalid value for Float(): \"_1\"", nil]
+["1_", "ArgumentError: invalid value for Float(): \"1_\"", nil]
+[".5", 0.5, 0.5]
+["1.", 1.0, 1.0]
+["1e5", 100000.0, 100000.0]
+["1E-2", 0.01, 0.01]
+["+3", 3.0, 3.0]
+["-3.0", -3.0, -3.0]
+["0x1A", 26.0, 26.0]
+["0x1.8p1", 3.0, 3.0]
+["inf", "ArgumentError: invalid value for Float(): \"inf\"", nil]
+["NaN", "ArgumentError: invalid value for Float(): \"NaN\"", nil]
+["Infinity", "ArgumentError: invalid value for Float(): \"Infinity\"", nil]
+["", "ArgumentError: invalid value for Float(): \"\"", nil]
+["  ", "ArgumentError: invalid value for Float(): \"  \"", nil]
+["1.5x", "ArgumentError: invalid value for Float(): \"1.5x\"", nil]
+["1e", "ArgumentError: invalid value for Float(): \"1e\"", nil]
+["0b11", "ArgumentError: invalid value for Float(): \"0b11\"", nil]
+["0o7", "ArgumentError: invalid value for Float(): \"0o7\"", nil]
+["07", 7.0, 7.0]
+["1\u0000", "ArgumentError: string for Float contains null byte", nil]
+["1,5", "ArgumentError: invalid value for Float(): \"1,5\"", nil]
+["\n2\n", 2.0, 2.0]
+["1._5", "ArgumentError: invalid value for Float(): \"1._5\"", nil]
+["1_.5", "ArgumentError: invalid value for Float(): \"1_.5\"", nil]
+["1e1_0", 10000000000.0, 10000000000.0]
+["-0x10", -16.0, -16.0]
+["0x", "ArgumentError: invalid value for Float(): \"0x\"", nil]
+["1.2.3", "ArgumentError: invalid value for Float(): \"1.2.3\"", nil]
+nil
+"can't convert nil into Float"
+3.0
+1.1805916207174113e+21
+0.5
+"can't convert Symbol into Float"
+nil
+"can't convert Object into Float"
+2.5
+12
+nil
+nil
+255
+31
+42
+"invalid value for Integer(): \"4 2\""
+3
+1000
+"invalid value for Integer(): \"1__0\""
+5
+-15
+15
+"invalid value for Integer(): \"09\""
+9
