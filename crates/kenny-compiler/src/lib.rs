@@ -21,6 +21,8 @@ mod licm;
 mod owned;
 mod ispec;
 mod cfold;
+mod felem;
+mod hoist;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -168,6 +170,17 @@ pub(crate) struct Fx<'a> {
     pub resume: HashMap<usize, Block>,
     /// spec.rs: those places, as the fast copy asks for them
     pub resume_req: HashMap<usize, Block>,
+    /// felem.rs: the same for the places before a statement (no value), and the fast
+    /// copy's hand-over for the statement being compiled (and whether it is used)
+    pub resume_before: HashMap<usize, Block>,
+    pub resume_before_req: HashMap<usize, Block>,
+    pub spec_stmt: Option<Block>,
+    pub spec_stmt_used: bool,
+    /// hoist.rs: Integer operations computed before the loop being compiled, and in the
+    /// statement being compiled; the statement's offset
+    pub hoisted: HashMap<String, Value>,
+    pub stmt_memo: HashMap<String, fastpath::Num>,
+    pub stmt_at: usize,
     /// A method's fast entry (`FnSpec::fast_arity`): its argument values.
     pub fast_args: Option<Vec<Value>>,
     /// vobj.rs: locals that may hold a virtual object

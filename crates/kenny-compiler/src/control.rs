@@ -157,7 +157,9 @@ impl<M: Module> Compiler<M> {
         }
         let exit = fx.b.create_block();
         fx.b.append_block_param(exit, I64);
+        let saved = self.hoist_enter(fx, lp);
         self.while_core(fx, pred, body, until, do_while, exit);
+        self.hoist_leave(fx, saved);
         fx.b.switch_to_block(exit);
         fx.b.block_params(exit)[0]
     }

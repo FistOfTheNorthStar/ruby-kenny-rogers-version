@@ -743,11 +743,13 @@ impl<M: Module> Compiler<M> {
         fx.b.switch_to_block(generic);
         let resume = std::mem::take(&mut fx.resume_req);
         fx.resume = resume.clone();
+        fx.resume_before = std::mem::take(&mut fx.resume_before_req);
         compile(self, fx, exit);
-        let placed = std::mem::take(&mut fx.resume);
+        let mut placed: Vec<Block> = std::mem::take(&mut fx.resume).into_values().collect();
+        placed.extend(std::mem::take(&mut fx.resume_before).into_values());
         fx.spec_depth -= 1;
         // (a place the generic copy didn't reach can't be entered either; never expected)
-        for (_, b) in placed {
+        for b in placed {
             fx.b.switch_to_block(b);
             fx.b.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
         }
