@@ -844,6 +844,10 @@ impl<M: Module> Compiler<M> {
             Node::RetryNode { .. } => {
                 match fx.retry.last().copied() {
                     Some(t) => {
+                        // back to the begin body: `$!` is what it was before
+                        if let Some(&prev) = fx.rescue_prev.last() {
+                            self.call(fx, "kn_errinfo_restore", &[prev]);
+                        }
                         fx.b.ins().jump(t, &[]);
                         self.dead_block(fx);
                     }

@@ -1,0 +1,10 @@
+[:CLOCK_MONOTONIC, :CLOCK_PROCESS_CPUTIME_ID, :CLOCK_REALTIME, :CLOCK_THREAD_CPUTIME_ID]
+true
+true
+true
+true
+true
+true
+true
+ArgumentError
+Errno::EINVAL

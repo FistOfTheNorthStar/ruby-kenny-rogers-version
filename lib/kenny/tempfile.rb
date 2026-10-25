@@ -82,4 +82,6 @@ class Tempfile < File
   def inspect
     "#<#{self.class}:#{@tmpname}#{closed? ? ' (closed)' : ''}>"
   end
+  # (Ruby 3.4: to_s is the inspect string too)
+  alias to_s inspect
 end

@@ -29,6 +29,7 @@ libsqlite3-sys = { version = "=0.38.2", features = ["bundled"] }
 # asset pipeline (src/assets.rs): Sass and a JavaScript engine for ExecJS
 grass_compiler = { version = "=0.13.4", default-features = false, features = ["custom-builtin-fns"] }
 rquickjs = "=0.14.0"
+unicode-normalization = "0.1.26"
 
 [lib]
 crate-type = ["staticlib", "rlib"]

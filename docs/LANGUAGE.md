@@ -20,7 +20,7 @@ Kenny compiles Ruby ahead of time to a single native binary, like Go.
 | Redefining Integer and Float operators (`Integer#+`, `Float#<`, `Integer#&`, ...: `+ - * / % < <= > >= == != & \| ^`) | Lets arithmetic and comparisons compile inline, on unboxed values, with no guards |
 | `ObjectSpace.each_object` (except for `Class`/`Module`), `ObjectSpace._id2ref` | Heap doesn't need to be walkable; GC can move objects. Classes are tracked anyway, so `each_object(Class)` works |
 | `TracePoint`, `set_trace_func` | No hooks on every call/line (a debug build flag replaces them) |
-| String encodings other than UTF-8, ASCII-8BIT (binary), US-ASCII | Strings skip per-operation encoding checks. CRuby's other encodings exist as `Encoding` objects (every constant, `Encoding.find`, `list`, `aliases`, `dummy?`) so code that compares against them or looks them up runs, but no string carries one |
+| String encodings other than UTF-8, ASCII-8BIT (binary), US-ASCII | Strings skip per-operation encoding checks. CRuby's other encodings exist as `Encoding` objects (every constant, `Encoding.find`, `list`, `aliases`, `dummy?`) so code that compares against them or looks them up runs. `String#encode` converts between UTF-8, UTF-16/32 (LE, BE, with a BOM), US-ASCII, binary, ISO-8859-1 and Windows-1252 (ASCII-only text to and from any ASCII-compatible encoding; other text raises `NotImplementedError`). A String in one of those other encodings (from `encode` or `force_encoding`) reports it from `encoding`, `encode` and `valid_encoding?`, but its other methods see bytes, as a binary String's do (`length` of a UTF-16 String is its byte count) |
 | `require` / `autoload` of a library by name (searched on `$LOAD_PATH`) that wasn't compiled in | Whole program is compiled together. `load` of a file, and `require` of an absolute path, that is new or changed since the build are compiled at runtime by the embedded JIT (Rails' code reloading in development) |
 | Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in with `--ext`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError`. As with the ffi gem, `ffi_lib` raises `LoadError` when the library isn't installed. The `sassc` gem (libsass through FFI) is replaced by a native Sass compiler |
 | `Thread#raise` / `Thread#kill` landing at arbitrary instructions | Delivered only at safe points (calls, loop back-edges, IO) |
@@ -58,6 +58,13 @@ which call sites come after it, and only those sites use a refinement-aware look
   Symbol keys as their keywords, as Ruby 2.x did — gems written for Ruby 2 rely on it. The app's
   own code keeps Ruby 3 semantics (except that a Hash which would otherwise be one positional
   argument too many is taken as keywords instead of raising ArgumentError).
+- **`DidYouMean` loads on first use** (CRuby loads it at startup): when code refers to it, as
+  Rails does, or to report an uncaught `NameError`. `ErrorHighlight.spot` returns nil (it needs
+  `RubyVM::AbstractSyntaxTree`), so error messages have no `^^^^` line under the code.
+- **Every `*args` method forwards keywords as if marked `ruby2_keywords`.** Keywords collected
+  into a rest parameter stay flagged (`Hash.ruby2_keywords_hash?` is true), so `m(*args)` passes
+  them on as keywords; in CRuby that needs `ruby2_keywords(:name)`, without it they become a
+  positional Hash.
 
 ## Rule 4: concurrency is fixed with the APIs Ruby already has
 
@@ -74,8 +81,10 @@ No GVL. No new concurrency API. The existing ones become lightweight:
   its core to the other threads; a file read or write, `fsync`, or SQLite query runs as a
   blocking call, during which the core's waiting threads are handed to an idle core (or a spare
   one when all are busy) and collections go ahead without waiting for it. Ruby's
-  `Fiber::Scheduler` behaviour, built in, no gem. *Status:* sockets and pipes are polled
-  rather than parked on an event loop (an epoll/kqueue-style poller is the next step).
+  `Fiber::Scheduler` behaviour, built in, no gem. A thread waiting on a socket, pipe or
+  terminal (`read`, `gets`, `IO.select`, `accept`, `connect`) is parked, and woken by an event
+  loop (kqueue on macOS and the BSDs, epoll on Linux) when the fd is ready; inside a `Fiber`
+  it polls instead. `KENNY_NO_POLLER=1` turns the event loop off.
 - **`Mutex`, `Queue`, `SizedQueue`, `ConditionVariable`, `Monitor`** work as documented, backed by
   the scheduler (parking, not OS blocking).
 - **`Fiber`** keeps its Ruby semantics (`Enumerator#next` etc.).

@@ -1,0 +1,18 @@
+"boom (RuntimeError)"
+"unhandled exception"
+"RuntimeError (RuntimeError)"
+"StandardError"
+"line1 (RuntimeError)\nline2"
+"\e[1mboom (\e[1;4mRuntimeError\e[m\e[1m)\e[m"
+"\e[1mline1 (\e[1;4mRuntimeError\e[m\e[1m)\e[m\n\e[1mline2\e[m"
+"\e[1;4munhandled exception\e[m"
+"x (ArgumentError)"
+"custom (MyErr)"
+"exception_message.rb:18:in '<main>': hi (E2)!!\n"
+1
+["exception_message.rb:N:in '<main>': a (RuntimeError)\n", "b\n"]
+"exception_message.rb:N:in '<main>': \e[1ma (\e[1;4mRuntimeError\e[m\e[1m)\e[m\n"
+"undefined local variable or method 'helo' for main"
+"undefined local variable or method 'zzz' for an instance of Object"
+"undefined method 'zork' for nil"
+"uninitialized constant Foo"

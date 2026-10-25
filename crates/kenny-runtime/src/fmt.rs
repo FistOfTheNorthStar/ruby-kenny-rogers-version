@@ -121,6 +121,22 @@ pub fn str_inspect(b: &[u8]) -> String {
 }
 /// `String#inspect` honouring the binary (ASCII-8BIT) flag.
 pub fn str_inspect_v(v: V) -> String {
+    if hdr(v).flags & FL_BINARY != 0 {
+        // a String in another encoding shows its characters (as CRuby's inspect does)
+        // (non-ASCII ones as \uXXXX, not being in the default external encoding)
+        if let Some(u) = crate::transcode::foreign_as_utf8(v) {
+            let shown = str_inspect_enc(&u, false);
+            let mut out = String::with_capacity(shown.len());
+            for c in shown.chars() {
+                match c as u32 {
+                    0..=0x7F => out.push(c),
+                    cp @ 0x80..=0xFFFF => out.push_str(&format!("\\u{cp:04X}")),
+                    cp => out.push_str(&format!("\\u{{{cp:X}}}")),
+                }
+            }
+            return out;
+        }
+    }
     str_inspect_enc(&rstr(v).b, hdr(v).flags & FL_BINARY != 0)
 }
 /// Ruby 3.4 `String#inspect`: UTF-8 strings escape control characters as `\uXXXX` and
@@ -170,7 +186,12 @@ pub fn str_inspect_enc(b: &[u8], binary: bool) -> String {
             };
             if len > 0 && i + len <= b.len() {
                 if let Ok(s) = std::str::from_utf8(&b[i..i + len]) {
-                    out.push_str(s);
+                    let ch = s.chars().next().unwrap() as u32;
+                    if crate::unprint::unprintable(ch) {
+                        if ch > 0xFFFF { out.push_str(&format!("\\u{{{:X}}}", ch)) } else { out.push_str(&format!("\\u{:04X}", ch)) }
+                    } else {
+                        out.push_str(s);
+                    }
                     i += len;
                     continue;
                 }

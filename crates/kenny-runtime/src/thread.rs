@@ -770,6 +770,48 @@ fn block_on(on: V, timeout: Option<Duration>) -> Wake {
     finish_block(on)
 }
 
+/// How `wait_io` ended.
+pub enum IoWake {
+    /// woken by the poller (the fds may be ready: poll them to see)
+    Ready,
+    Timeout,
+    /// a Thread#raise / kill is pending
+    Interrupted,
+    /// can't park here (no scheduler, inside a Fiber) or `register` failed: poll instead
+    Unsupported,
+}
+
+/// Park the current thread until `wake_io(key)` (from the poller) or the timeout. `register`
+/// arms the poller for `key`; it runs once the thread counts as blocked, so a wake that comes
+/// before the thread is off its stack isn't lost.
+pub fn wait_io(key: usize, timeout: Option<Duration>, register: impl FnOnce() -> bool) -> IoWake {
+    if !active() || !pt().fiber_stack.is_empty() {
+        return IoWake::Unsupported;
+    }
+    let on = key as V;
+    if let Some(i) = locked!(s => prepare_block(s, on, timeout)) {
+        pst().pending = i;
+        return IoWake::Interrupted;
+    }
+    let ok = register();
+    if !ok {
+        // (undo the block: runnable again, back as soon as it suspends)
+        wake_one(on);
+    }
+    suspend_current();
+    match finish_block(on) {
+        Wake::Interrupted => IoWake::Interrupted,
+        _ if !ok => IoWake::Unsupported,
+        Wake::Timeout => IoWake::Timeout,
+        Wake::Woken => IoWake::Ready,
+    }
+}
+
+/// Wake the thread parked in `wait_io(key)` (any OS thread may call it).
+pub fn wake_io(key: usize) {
+    wake_all(key as V);
+}
+
 /// Make thread `tid` runnable (lock held); returns the parker to poke if it is on another P.
 fn make_runnable(s: &mut Sched, tid: usize) -> Option<Arc<Parker>> {
     let t = &mut s.threads[tid];

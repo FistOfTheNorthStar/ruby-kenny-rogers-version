@@ -145,20 +145,22 @@ fn report_uncaught() -> i32 {
             if is_a(e, r.c.exception) && class_name(real_class(e)) == "SystemExit" {
                 return 0;
             }
-            let m = send0(e, "message");
-            let m = if is_str(m) { String::from_utf8_lossy(&rstr(m).b).into_owned() } else { String::new() };
-            let bt = crate::backtrace::exc_backtrace(e);
-            let lines: Vec<String> = if is_ary(bt) {
-                rary(bt).v.iter().filter(|x| is_str(**x)).map(|x| String::from_utf8_lossy(&rstr(*x).b).into_owned()).collect()
-            } else {
-                vec![]
-            };
-            let loc = lines.first().cloned().unwrap_or_else(|| r.script_name.clone());
-            let mut out = format!("{}: {} ({})\n", loc, m, class_name(real_class(e)));
-            for l in lines.iter().skip(1) {
-                out.push_str(&format!("\tfrom {l}\n"));
+            // CRuby loads did_you_mean at startup; here it loads when first needed, so an
+            // uncaught NameError still says "Did you mean?"
+            if is_a(e, r.c.name_error) || is_a(e, r.c.key_error) {
+                let _ = const_missing(r.c.object, sym("DidYouMean"));
+                pst().pending = Throw::None;
             }
-            out
+            let hl = unsafe { libc::isatty(2) } == 1;
+            let out = match crate::kernel::full_message(e, hl, false) {
+                Some(m) => m,
+                None => {
+                    pst().pending = Throw::None;
+                    format!("{}: {} ({})\n", r.script_name, "exception while reporting an exception", class_name(real_class(e))).into_bytes()
+                }
+            };
+            crate::kernel::err_out(&out);
+            return 1;
         }
         Throw::Throw { tag, .. } => {
             format!("{}: uncaught throw {} (UncaughtThrowError)\n", r.script_name, crate::fmt::inspect_lossy(tag))
@@ -1078,7 +1080,21 @@ fn autoloads() -> crate::mt::LGuard<'static, std::collections::HashMap<(usize, u
 /// A pending autoload for `id` directly in `k`.
 pub fn has_autoload(k: *mut Class, id: u32) -> bool {
     let a = autoloads();
-    !a.is_empty() && a.contains_key(&(k as usize, id))
+    (!a.is_empty() && a.contains_key(&(k as usize, id))) || (k == rt().c.object && implicit_const(id).is_some())
+}
+/// The compiled file that defines `id`, one of the constants CRuby has without a require
+/// (see `const_missing_in`), if it is in this program. Like an autoload on Object.
+fn implicit_const(id: u32) -> Option<&'static str> {
+    let file = if id == sym("Gem") {
+        "kenny/gem"
+    } else if id == sym("Set") {
+        "set"
+    } else if id == sym("DidYouMean") {
+        "did_you_mean"
+    } else {
+        return None;
+    };
+    crate::compat::compiled_entry(file).map(|_| file)
 }
 pub fn register_autoload(owner: *mut Class, id: u32, path: String, loader: Option<CompiledFn>, flag: *mut V) {
     bump_const_serial();
@@ -1216,15 +1232,9 @@ pub fn const_missing(c: *mut Class, id: u32) -> V {
 /// `owner`: where a pending autoload for `id` was found in the lexical scope, if known.
 fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
     // Constants CRuby has without a require are loaded on first use: `Gem` (RubyGems' API)
-    // from the embedded kenny/gem.rb, `Set` from the stdlib's set.rb (Ruby 3.2+ autoloads it)
-    let implicit = if id == sym("Gem") {
-        Some("kenny/gem")
-    } else if id == sym("Set") {
-        Some("set")
-    } else {
-        None
-    };
-    if let Some(file) = implicit {
+    // from the embedded kenny/gem.rb, `Set` from the stdlib's set.rb (Ruby 3.2+ autoloads it),
+    // `DidYouMean` from the stdlib (CRuby loads it at startup)
+    if let Some(file) = implicit_const(id) {
         if find_autoload(c)(id).is_none() && crate::compat::require_compiled(file).is_some() {
             if pst().pending_is_set() {
                 return UNDEF;
@@ -1848,6 +1858,23 @@ pub extern "C" fn kn_ary_post_ref(a: V, pre: u64, posts: u64, k: u64) -> V {
     let n = rary(a).v.len() as u64;
     let idx = if n >= pre + posts { n - posts + k } else { pre + k };
     kn_ary_ref(a, idx as i64)
+}
+
+/// Post-required block parameter `k` (of `posts`) from the block's arguments `a`: after
+/// `nreq` required, the optionals that got arguments (`nopt` low 32 bits) and the rest (bit
+/// 32: has one). Too few arguments: right after the required ones (nil when missing).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_block_post_ref(a: V, nreq: u64, nopt: u64, posts: u64, k: u64) -> V {
+    let n = rary(a).v.len() as u64;
+    let (opt, rest) = (nopt & 0xffff_ffff, nopt >> 32 != 0);
+    let start = if n < nreq + posts {
+        nreq
+    } else if rest || n <= nreq + opt + posts {
+        n - posts
+    } else {
+        nreq + opt
+    };
+    kn_ary_ref(a, (start + k) as i64)
 }
 
 // ---------- exceptions & non-local control flow ----------

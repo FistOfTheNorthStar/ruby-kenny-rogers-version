@@ -39,6 +39,7 @@ const OVERLAY: &[(&str, &str)] = &[
     ("json/common.rb", include_str!("../../../lib/kenny/json/common.rb")),
     ("digest.rb", include_str!("../../../lib/kenny/digest.rb")),
     ("tempfile.rb", include_str!("../../../lib/kenny/tempfile.rb")),
+    ("stringio.rb", include_str!("../../../lib/kenny/stringio.rb")),
     ("pathname.so", include_str!("../../../lib/kenny/pathname_ext.rb")),
     ("ripper.so", include_str!("../../../lib/kenny/ripper_ext.rb")),
     ("kenny/gem.rb", include_str!("../../../lib/kenny/kenny/gem.rb")),
@@ -355,6 +356,10 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, 
     // `Set` is loaded on first use, as Ruby 3.2+ does (kenny-runtime's const_missing)
     if let Some(set_rb) = stdlib.as_ref().map(|d| d.join("set.rb")).filter(|p| p.is_file()) {
         embed_files.push(set_rb);
+    }
+    // `DidYouMean` too (loaded on first use, or to report an uncaught NameError)
+    if let Some(dym) = stdlib.as_ref().map(|d| d.join("did_you_mean.rb")).filter(|p| p.is_file()) {
+        embed_files.push(dym);
     }
     let mut load_paths = vec![overlay.to_path_buf()];
     load_paths.extend(gem_paths);

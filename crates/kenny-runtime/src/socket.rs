@@ -172,10 +172,29 @@ fn init_socket() {
                 last = errno();
                 continue;
             }
-            if unsafe { libc::connect(fd, &ss as *const _ as *const libc::sockaddr, len) } == 0 {
+            // (non-blocking, so other threads run while the connection is made)
+            let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) };
+            let mut rc = unsafe { libc::connect(fd, &ss as *const _ as *const libc::sockaddr, len) };
+            if rc != 0 && matches!(errno(), libc::EINPROGRESS | libc::EINTR) {
+                if let Err(e) = crate::io::wait_fd(fd, libc::POLLOUT) {
+                    unsafe { libc::close(fd) };
+                    return e;
+                }
+                let mut err: libc::c_int = 0;
+                let mut elen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut _ as *mut libc::c_void, &mut elen) };
+                rc = if err == 0 { 0 } else { -1 };
+                if err != 0 {
+                    last = err;
+                }
+            } else if rc != 0 {
+                last = errno();
+            }
+            if rc == 0 {
+                unsafe { libc::fcntl(fd, libc::F_SETFL, fl) };
                 return mkfix(fd as i64);
             }
-            last = errno();
             unsafe { libc::close(fd) };
         }
         crate::io::raise_errno(last, Some("connect(2)"), format!("for \"{host}\" port {}", port.unwrap_or_default()).as_bytes())
@@ -210,6 +229,10 @@ fn init_socket() {
     defs(k, "accept", 1, 1, |_, a, _| {
         let fd = fix(a[0]) as i32;
         loop {
+            // (wait for a connection parked, not in accept(2): other threads keep running)
+            if let Err(e) = crate::io::wait_fd(fd, libc::POLLIN) {
+                return e;
+            }
             let c = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
             if c >= 0 {
                 return mkfix(c as i64);
