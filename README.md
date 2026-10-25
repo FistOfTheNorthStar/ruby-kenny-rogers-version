@@ -2,6 +2,8 @@
 
 # Kenny — Ruby, compiled
 
+DHH said go AI delerium, but you also like Ruby. This is in pre-alpha testing, DO NOT RUN THIS IN PRODUCTION, it needs serious work, that said please continue.
+
 Kenny compiles Ruby to a single native executable, like Go. You keep Ruby's syntax and drop
 a few rarely used runtime features (see [docs/LANGUAGE.md](docs/LANGUAGE.md)). The output
 runs without an interpreter or VM, and includes its own HTTP server.
