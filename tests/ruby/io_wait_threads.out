@@ -1,0 +1,11 @@
+"hello\n"
+499999500000
+nil
+true
+[1, 0, 0]
+"x"
+[0, 1, 0]
+true
+IOError
+["echo c0\n", "echo c1\n", "echo c2\n"]
+["c0", "c1", "c2"]

@@ -359,19 +359,53 @@ fn is_regular_file(fd: i32) -> bool {
     unsafe { libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFREG }
 }
 
-fn wait_fd(fd: i32, events: i16) -> Result<(), V> {
+pub(crate) fn wait_fd(fd: i32, events: i16) -> Result<(), V> {
     if is_regular_file(fd) {
         return Ok(());
     }
     poll_wait(&mut [libc::pollfd { fd, events, revents: 0 }], None).map(|_| ())
 }
 
-/// poll(2) on `pfds` until something is ready (returns poll's count) or `timeout` passes
-/// (Ok(0)), without holding up this P's other threads or a collection: while the P has
-/// other threads, poll without waiting and yield to them; alone, block in short slices
-/// (counted as stopped for the GC), so a thread that comes to this P meanwhile (woken up,
-/// or a sleeper whose time came) waits at most a slice.
+/// Wait until one of `pfds` is ready (returns poll(2)'s count, revents set) or `timeout`
+/// passes (Ok(0)), without holding up this P's other threads or a collection: the thread
+/// parks in the scheduler and the poller (kqueue / epoll) wakes it.
 fn poll_wait(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32, V> {
+    // (a parked wait wakes now and then to look again, should an fd never report: closed
+    // under it, or a kind the poller accepts but never signals)
+    const RECHECK: Duration = Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    let fds: Vec<(i32, bool)> = pfds.iter().filter(|p| p.fd >= 0).map(|p| (p.fd, p.events & libc::POLLOUT != 0)).collect();
+    loop {
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+        if n > 0 || (n < 0 && errno() != libc::EINTR) {
+            return Ok(n);
+        }
+        let remaining = timeout.map(|t| t.saturating_sub(start.elapsed()));
+        if remaining.is_some_and(|r| r.is_zero()) {
+            return Ok(0);
+        }
+        let key = crate::poller::next_key();
+        let mut registered = false;
+        let w = crate::thread::wait_io(key, Some(remaining.map_or(RECHECK, |r| r.min(RECHECK))), || {
+            registered = crate::poller::register(&fds, key);
+            registered
+        });
+        if registered {
+            crate::poller::deregister(&fds, key);
+        }
+        match w {
+            crate::thread::IoWake::Ready | crate::thread::IoWake::Timeout => {}
+            crate::thread::IoWake::Interrupted => return Err(UNDEF),
+            crate::thread::IoWake::Unsupported => return poll_slices(pfds, remaining),
+        }
+    }
+}
+
+/// `poll_wait` without the poller: while the P has other threads, poll without waiting and
+/// yield to them; alone, block in short slices (counted as stopped for the GC), so a thread
+/// that comes to this P meanwhile (woken up, or a sleeper whose time came) waits at most a
+/// slice.
+fn poll_slices(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32, V> {
     const SLICE_MS: i32 = 20;
     let start = std::time::Instant::now();
     loop {

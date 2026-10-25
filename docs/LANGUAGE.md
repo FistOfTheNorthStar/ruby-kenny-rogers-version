@@ -81,8 +81,10 @@ No GVL. No new concurrency API. The existing ones become lightweight:
   its core to the other threads; a file read or write, `fsync`, or SQLite query runs as a
   blocking call, during which the core's waiting threads are handed to an idle core (or a spare
   one when all are busy) and collections go ahead without waiting for it. Ruby's
-  `Fiber::Scheduler` behaviour, built in, no gem. *Status:* sockets and pipes are polled
-  rather than parked on an event loop (an epoll/kqueue-style poller is the next step).
+  `Fiber::Scheduler` behaviour, built in, no gem. A thread waiting on a socket, pipe or
+  terminal (`read`, `gets`, `IO.select`, `accept`, `connect`) is parked, and woken by an event
+  loop (kqueue on macOS and the BSDs, epoll on Linux) when the fd is ready; inside a `Fiber`
+  it polls instead. `KENNY_NO_POLLER=1` turns the event loop off.
 - **`Mutex`, `Queue`, `SizedQueue`, `ConditionVariable`, `Monitor`** work as documented, backed by
   the scheduler (parking, not OS blocking).
 - **`Fiber`** keeps its Ruby semantics (`Enumerator#next` etc.).
