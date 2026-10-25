@@ -1,0 +1,23 @@
+"ARGF.class"
+"ARGF"
+true
+2
+"one\n"
+"a.txt"
+1
+"two\n"
+true
+"three\n"
+"b.txt"
+3
+"four"
+nil
+[]
+["one", "two", "three", "four"]
+"one\ntw"
+"o\nthree\nfour"
+["three\n", "four"]
+EOFError
+"o"
+"n"
+"e\ntwo\n"

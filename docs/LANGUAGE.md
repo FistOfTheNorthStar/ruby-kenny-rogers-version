@@ -58,9 +58,13 @@ which call sites come after it, and only those sites use a refinement-aware look
   Symbol keys as their keywords — older gems still pass options that way. The app's own code
   keeps today's keyword semantics (except that a Hash which would otherwise be one positional
   argument too many is taken as keywords instead of raising ArgumentError).
-- **`DidYouMean` loads on first use** (CRuby loads it at startup): when code refers to it, as
-  Rails does, or to report an uncaught `NameError`. `ErrorHighlight.spot` returns nil (it needs
+- **`DidYouMean` and `ARGF` load on first use** (CRuby sets them up at startup): when code
+  refers to them (Rails refers to `DidYouMean`, csv to `ARGF`), or, for `DidYouMean`, to report
+  an uncaught `NameError`. `ErrorHighlight.spot` returns nil (it needs
   `RubyVM::AbstractSyntaxTree`), so error messages have no `^^^^` line under the code.
+- **Backtraces show only Ruby code.** Frames carry Ruby 3.4's labels (`Foo#bar`, `Foo.baz`,
+  `block in Foo#bar`, inlined methods and blocks included), but methods built into Kenny
+  (`Array#map`, `Kernel#require` ...) have no frame of their own, where CRuby lists them.
 - **Every `*args` method forwards keywords as if marked `ruby2_keywords`.** Keywords collected
   into a rest parameter stay flagged (`Hash.ruby2_keywords_hash?` is true), so `m(*args)` passes
   them on as keywords; in CRuby that needs `ruby2_keywords(:name)`, without it they become a

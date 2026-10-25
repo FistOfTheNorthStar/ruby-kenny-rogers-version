@@ -289,6 +289,16 @@ pub struct Compiler<M: Module> {
     pub(crate) cref_parents: HashMap<usize, usize>,
     /// Backtrace labels of the functions being compiled (innermost last).
     pub(crate) fn_labels: Vec<String>,
+    /// The class / module bodies being compiled (innermost last): the class's name as written
+    /// (with the enclosing ones'), and whether it is a `class << self` of that class. None:
+    /// a name not known statically. Gives methods CRuby 3.4's `C#m` / `C.m` labels.
+    pub(crate) lex_classes: Vec<Option<(String, bool)>>,
+    /// Frames of the inlined code being compiled (methods and blocks, innermost last): what
+    /// a backtrace taken inside them shows (`loc_bits`).
+    pub(crate) dbg_frames: Vec<statics::DbgFrame>,
+    /// The label a block inlined next is "block in" (when not the innermost frame's: a
+    /// yielded block's, which belongs to the caller)
+    pub(crate) block_parent: Option<String>,
     /// Per compiled function: return-address offsets of its calls and their source locations.
     pub(crate) debug_fns: Vec<DebugFn>,
     /// Proc#parameters descriptors of the blocks compiled (`scopes::params_desc` form).
@@ -597,6 +607,9 @@ impl<M: Module> Compiler<M> {
             refine_counter: 0,
             main_file: path.to_path_buf(),
             fn_labels: Vec::new(),
+            lex_classes: Vec::new(),
+            dbg_frames: Vec::new(),
+            block_parent: None,
             cref_parents: HashMap::new(),
             debug_fns: Vec::new(),
             block_params: Vec::new(),

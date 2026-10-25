@@ -1091,6 +1091,8 @@ fn implicit_const(id: u32) -> Option<&'static str> {
         "set"
     } else if id == sym("DidYouMean") {
         "did_you_mean"
+    } else if id == sym("ARGF") {
+        "kenny/argf"
     } else {
         return None;
     };

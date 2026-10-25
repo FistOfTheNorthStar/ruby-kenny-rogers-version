@@ -670,11 +670,31 @@ pub(crate) struct InlineDef {
 /// One inlined method being compiled (innermost last).
 pub(crate) struct InlineFrame {
     pub key: (PathBuf, usize),
+    pub lex: Vec<Vec<u8>>,
+}
+
+/// A frame of inlined code, for backtraces (see `Compiler::dbg_frames`).
+pub(crate) struct DbgFrame {
+    pub label: String,
     pub label_off: u32,
     pub file_off: u32,
     /// location of the call site (a line, or an inline record)
     pub call_loc: u32,
-    pub lex: Vec<Vec<u8>>,
+}
+
+/// CRuby's label of a block in a frame labelled `parent`: "block in X", "block (2 levels) in X".
+pub(crate) fn block_label(parent: &str) -> String {
+    if let Some(rest) = parent.strip_prefix("block in ") {
+        return format!("block (2 levels) in {rest}");
+    }
+    if let Some(rest) = parent.strip_prefix("block (") {
+        if let Some((n, tail)) = rest.split_once(" levels) in ") {
+            if let Ok(n) = n.parse::<u32>() {
+                return format!("block ({} levels) in {tail}", n + 1);
+            }
+        }
+    }
+    format!("block in {parent}")
 }
 
 /// Is a method body simple enough to inline: only expressions on locals, instance
@@ -821,13 +841,24 @@ impl<M: Module> Compiler<M> {
     /// inline record (kenny-runtime backtrace.rs).
     pub(crate) fn loc_bits(&mut self) -> u32 {
         let line = self.line_of(self.cur_offset) as u32;
-        let Some(fr) = self.inline_ctx.last() else { return line };
+        let Some(fr) = self.dbg_frames.last() else { return line };
         let (label, file, outer) = (fr.label_off, fr.file_off, fr.call_loc);
         let mut rec = Vec::with_capacity(16);
         for w in [line, label, file, outer] {
             rec.extend_from_slice(&w.to_le_bytes());
         }
         (1 << 31) | self.str_offset(&rec) as u32
+    }
+
+    /// Enter a frame of inlined code labelled `label`, called from `call_loc`.
+    pub(crate) fn push_dbg_frame(&mut self, label: String, file: &std::path::Path, call_loc: u32) {
+        let mut l = label.clone().into_bytes();
+        l.push(0);
+        let label_off = self.str_offset(&l) as u32;
+        let mut f = file.display().to_string().into_bytes();
+        f.push(0);
+        let file_off = self.str_offset(&f) as u32;
+        self.dbg_frames.push(DbgFrame { label, label_off, file_off, call_loc });
     }
 
     /// The lexical class path of the code being compiled, if known.
@@ -952,6 +983,12 @@ impl<M: Module> Compiler<M> {
         let at = self.cur_offset;
         let mut t = self.yield_targets.pop().unwrap();
         let frame = self.inline_ctx.pop().unwrap();
+        // the block is the caller's: "block in <the caller's label>", called from the yield
+        let n = self.dbg_frames.len();
+        self.block_parent = Some(match n {
+            0 | 1 => self.fn_labels.last().cloned().unwrap_or_else(|| "<main>".into()),
+            _ => self.dbg_frames[n - 2].label.clone(),
+        });
         let callee = ScopeState::take(fx);
         t.caller.take().expect("caller scope").put(fx);
         let next = fx.b.create_block();
@@ -981,12 +1018,12 @@ impl<M: Module> Compiler<M> {
     fn inline_method_body(&mut self, fx: &mut Fx, d: &InlineDef, recv: Value, vals: &[Value], kw: &[(Vec<u8>, Value)], yb: Option<(YieldBlock, Block)>) -> Value {
         let at = self.cur_offset;
         let call_loc = self.loc_bits();
-        let mut label = d.name.clone();
-        label.push(0);
-        let label_off = self.str_offset(&label) as u32;
-        let mut file = d.file.display().to_string().into_bytes();
-        file.push(0);
-        let file_off = self.str_offset(&file) as u32;
+        // (as CRuby 3.4 labels it: `Class#name`; inlined defs are receiver-less ones in class
+        // bodies or at the top level)
+        let name = String::from_utf8_lossy(&d.name);
+        let owner: Vec<String> = d.lex.iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+        let label = if owner.is_empty() { format!("Object#{name}") } else { format!("{}#{name}", owner.join("::")) };
+        self.push_dbg_frame(label, &d.file, call_loc);
         // the callee's scope
         let mut caller = Some(ScopeState::take(fx));
         fx.inl_self = self.licm_inl_self(fx, recv);
@@ -1036,7 +1073,7 @@ impl<M: Module> Compiler<M> {
         if let Some(&slot) = self.def_cref.get(&(d.file.clone(), d.offset)) {
             fx.cref_slot = slot;
         }
-        self.inline_ctx.push(InlineFrame { key: (d.file.clone(), d.offset), label_off, file_off, call_loc, lex: d.lex.clone() });
+        self.inline_ctx.push(InlineFrame { key: (d.file.clone(), d.offset), lex: d.lex.clone() });
         if let Some((yb, brk)) = yb {
             self.yield_targets.push(YieldTarget { yb, depth: self.inline_ctx.len(), brk, caller: caller.take() });
         }
@@ -1049,6 +1086,7 @@ impl<M: Module> Compiler<M> {
             None => self.yield_targets.pop().and_then(|t| t.caller).expect("yield target"),
         };
         self.inline_ctx.pop();
+        self.dbg_frames.pop();
         caller.put(fx);
         self.cur_offset = at;
         self.set_srcloc(fx);

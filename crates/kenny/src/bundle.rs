@@ -10,7 +10,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub struct Bundle {
     #[allow(dead_code)]
@@ -321,13 +320,15 @@ enum Located {
 
 fn gem_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
+    // the gems of the Ruby being built against (crate::ruby) come first
+    let ruby = crate::ruby::get();
+    if let Some(r) = ruby {
+        dirs.extend(r.gem_path.iter().cloned());
+    }
     for var in ["GEM_HOME", "GEM_PATH"] {
         if let Some(v) = std::env::var_os(var) {
             dirs.extend(std::env::split_paths(&v));
         }
-    }
-    if let Ok(out) = Command::new("ruby").args(["-e", "print Gem.path.join(\"\\n\")"]).output() {
-        dirs.extend(String::from_utf8_lossy(&out.stdout).lines().map(PathBuf::from));
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         for pat in [".gem/ruby", ".rvm/gems", ".local/share/gem/ruby"] {
@@ -347,6 +348,11 @@ fn gem_dirs() -> Vec<PathBuf> {
     }
     let mut seen = HashSet::new();
     dirs.retain(|d| d.join("gems").is_dir() && seen.insert(d.clone()));
+    // other Rubies' gems only after that Ruby's own (a gem installed for both resolves to its
+    // copy; one installed for another Ruby only is still found)
+    if let Some(r) = ruby {
+        dirs.sort_by_key(|d| !r.owns_gem_dir(d));
+    }
     dirs
 }
 
