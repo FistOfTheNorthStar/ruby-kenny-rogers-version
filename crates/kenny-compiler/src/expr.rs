@@ -143,12 +143,23 @@ impl<M: Module> Compiler<M> {
                             return Some(r);
                         }
                     }
+                    // (felem.rs: an element assigned to, or added to, a Float local)
+                    let felem = fx.spec_stmt.is_some() && fx.spec.as_ref().is_some_and(|s| s.fvars.contains_key(&name));
                     let v = if let Some(n) = node.as_local_variable_write_node() {
-                        self.num_expr(fx, &n.value(), true)
+                        if felem && crate::felem::elem_read(&n.value()).is_some() {
+                            self.felem_read(fx, &n.value(), false)
+                        } else {
+                            self.num_expr(fx, &n.value(), true)
+                        }
                     } else {
                         let n = node.as_local_variable_operator_write_node().unwrap();
                         let cur = self.local_get_num(fx, &name, 0);
-                        let rhs = self.num_expr(fx, &n.value(), true);
+                        let arith = matches!(n.binary_operator().as_slice(), b"+" | b"-" | b"*" | b"/");
+                        let rhs = if felem && arith && crate::felem::elem_read(&n.value()).is_some() {
+                            self.felem_read(fx, &n.value(), true)
+                        } else {
+                            self.num_expr(fx, &n.value(), true)
+                        };
                         self.cur_offset = at;
                         self.binop_num(fx, n.binary_operator().as_slice(), cur, rhs, true)
                     };
@@ -245,7 +256,9 @@ impl<M: Module> Compiler<M> {
     pub(crate) fn stmts_void(&mut self, fx: &mut Fx, s: Option<StatementsNode>) {
         if let Some(s) = s {
             for n in s.body().iter() {
+                let prev = self.felem_begin(fx, &n);
                 self.expr_void(fx, &n);
+                self.felem_end(fx, &n, prev);
             }
         }
     }
@@ -330,7 +343,9 @@ impl<M: Module> Compiler<M> {
                 let body: Vec<Node> = s.body().iter().collect();
                 let mut last = None;
                 for (i, n) in body.iter().enumerate() {
+                    let prev = self.felem_begin(fx, n);
                     last = Some(if i + 1 < body.len() { self.expr_void(fx, n) } else { self.expr(fx, n) });
+                    self.felem_end(fx, n, prev);
                 }
                 match last {
                     Some(v) => v,
@@ -645,6 +660,14 @@ impl<M: Module> Compiler<M> {
             }
             Node::ConstantReadNode { .. } => {
                 let n = node.as_constant_read_node().unwrap();
+                if let Some(v) = self.cfold_read(fx, n.name().as_slice(), |c, fx| {
+                    let crefp = c.slot_ptr(fx, fx.cref_slot);
+                    let s = c.sym_val(fx, n.name().as_slice());
+                    let cache = c.owned_cache_ptr(fx, OWNED_CONST);
+                    c.const_cached(fx, cache, crefp, s)
+                }) {
+                    return v;
+                }
                 let crefp = self.slot_ptr(fx, fx.cref_slot);
                 let s = self.sym_val(fx, n.name().as_slice());
                 let cache = self.owned_cache_ptr(fx, OWNED_CONST);
@@ -671,7 +694,9 @@ impl<M: Module> Compiler<M> {
                 let v = self.expr(fx, &n.value());
                 let cref = self.cref(fx);
                 let s = self.sym_val(fx, n.name().as_slice());
-                self.callc(fx, "kn_const_set", &[cref, s, v])
+                let r = self.callc(fx, "kn_const_set", &[cref, s, v]);
+                self.cfold_assigned(fx, n.name().as_slice(), node.location().start_offset(), s, v);
+                r
             }
             Node::ConstantPathWriteNode { .. } => {
                 let n = node.as_constant_path_write_node().unwrap();
@@ -819,6 +844,10 @@ impl<M: Module> Compiler<M> {
             Node::RetryNode { .. } => {
                 match fx.retry.last().copied() {
                     Some(t) => {
+                        // back to the begin body: `$!` is what it was before
+                        if let Some(&prev) = fx.rescue_prev.last() {
+                            self.call(fx, "kn_errinfo_restore", &[prev]);
+                        }
                         fx.b.ins().jump(t, &[]);
                         self.dead_block(fx);
                     }

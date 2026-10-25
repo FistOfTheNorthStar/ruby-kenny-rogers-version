@@ -1,0 +1,22 @@
+1
+true
+true
+1
+false
+true
+false
+nil
+[:[], :[]=, :clear, :delete, :getkey, :key?]
+2
+2
+true
+true
+false
+[:x, :y]
+true
+[true, true]
+[:x, :y]
+[:x, :y]
+2
+:x
+1

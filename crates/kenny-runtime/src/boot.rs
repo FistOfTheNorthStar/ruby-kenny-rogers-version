@@ -151,6 +151,8 @@ pub fn boot() {
     crate::nokogiri::init();
     crate::pack::init();
     crate::extra::init();
+    crate::transcode::init();
+    crate::mtrand::init();
     crate::methodobj::init();
     crate::visibility::init();
     crate::rational::init();
@@ -161,6 +163,7 @@ pub fn boot() {
     crate::socket::init();
     crate::misc::blockless_enumerators();
     crate::opt::init();
+    crate::visibility::finish_boot();
     crate::gc::arm_malloc_limit();
     BOOTING.store(false, std::sync::atomic::Ordering::Relaxed);
     bump_serial();

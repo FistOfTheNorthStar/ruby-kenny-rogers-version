@@ -627,6 +627,21 @@ pub struct Typed {
     /// operator, or copied to such a local): they keep their box, for a heap Float's
     /// identity. The others are only ever used unboxed.
     pub boxed: HashSet<Vec<u8>>,
+    /// locals only ever assigned Arrays of Floats (`Array.new(n, 0.0)`, `[1.0, 2.5]`): their
+    /// elements are most likely Floats (a hint for speculation, spec.rs)
+    pub float_arrays: HashSet<Vec<u8>>,
+}
+
+/// `Array.new(n, <Float>)` or a non-empty literal Array of Floats.
+fn float_array_expr(n: &Node) -> bool {
+    if let Some(a) = n.as_array_node() {
+        let mut it = a.elements().iter().peekable();
+        return it.peek().is_some() && it.all(|e| e.as_float_node().is_some());
+    }
+    let Some(c) = n.as_call_node() else { return false };
+    let recv_array = c.receiver().and_then(|r| r.as_constant_read_node()).is_some_and(|k| k.name().as_slice() == b"Array");
+    let args: Vec<Node> = c.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    recv_array && c.name().as_slice() == b"new" && c.block().is_none() && args.len() == 2 && args[1].as_float_node().is_some()
 }
 
 pub fn typed_locals<'pr>(nodes: &[&Node<'pr>]) -> Typed {
@@ -646,9 +661,15 @@ pub fn typed_locals<'pr>(nodes: &[&Node<'pr>]) -> Typed {
         v.visit(n);
     }
     if v.using {
-        return Typed { types: HashMap::new(), boxed: HashSet::new(), refs: HashMap::new(), bad: HashSet::new(), seed: HashMap::new() };
+        return Typed { types: HashMap::new(), boxed: HashSet::new(), refs: HashMap::new(), bad: HashSet::new(), seed: HashMap::new(), float_arrays: HashSet::new() };
     }
     let types = typed_env(&v);
+    let float_arrays = v
+        .writes
+        .iter()
+        .filter(|(n, ws)| !v.bad.contains(*n) && ws.iter().all(|w| matches!(w, TWrite::Set(x) if float_array_expr(x))))
+        .map(|(n, _)| n.clone())
+        .collect();
     let mut boxed: HashSet<Vec<u8>> = v.reads.iter().filter(|(_, at)| !v.num_reads.contains(at)).map(|(n, _)| n.clone()).collect();
     // a copy into a Float local that is boxed, or into any other local, needs the box
     loop {
@@ -677,7 +698,7 @@ pub fn typed_locals<'pr>(nodes: &[&Node<'pr>]) -> Typed {
             }
         }
     }
-    Typed { types, boxed, refs: v.refs, bad: v.bad, seed }
+    Typed { types, boxed, refs: v.refs, bad: v.bad, seed, float_arrays }
 }
 
 fn typed_env(v: &TypedW) -> HashMap<Vec<u8>, Ty> {

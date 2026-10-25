@@ -956,7 +956,7 @@ impl<M: Module> Compiler<M> {
         t.caller.take().expect("caller scope").put(fx);
         let next = fx.b.create_block();
         fx.b.append_block_param(next, I64);
-        fx.loops.push(LoopCtx { next, exit: t.brk, redo: next, next_val: true });
+        fx.loops.push(LoopCtx { next, exit: t.brk, redo: next, next_val: true, rescue_depth: fx.rescue_prev.len() });
         let v = self.inline_body_pub(fx, &t.yb.blk, &t.yb.params, &t.yb.locals, &vals, vals.len() == 1, true);
         fx.loops.pop();
         fx.b.ins().jump(next, &[v.into()]);

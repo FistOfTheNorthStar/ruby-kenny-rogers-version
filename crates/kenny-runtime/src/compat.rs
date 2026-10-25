@@ -22,19 +22,9 @@ fn init_encoding() {
             _ => {}
         }
     }
-    defn(st, "encode", 0, -1, |s, a, _| {
-        let n = str_new(rstr(s).b.clone());
-        if let Some(&e) = a.first().filter(|x| !is_hash(**x)) {
-            set_enc(n, e);
-        }
-        n
-    });
-    defn(st, "encode!", 0, -1, |s, a, _| {
-        if let Some(&e) = a.first().filter(|x| !is_hash(**x)) {
-            set_enc(s, e);
-        }
-        s
-    });
+    let _ = set_enc;
+    defn(st, "encode", 0, -1, |s, a, _| crate::transcode::encode(s, a, false));
+    defn(st, "encode!", 0, -1, |s, a, _| crate::transcode::encode(s, a, true));
 }
 
 fn urandom(n: usize) -> Vec<u8> {
@@ -341,13 +331,30 @@ fn init_objectspace() {
         defn(wm, "[]", 1, 1, |s, a, _| crate::hash::hget(ivar_get(s, sym("@__h")), a[0]));
         defn(wm, "[]=", 2, 2, |s, a, _| crate::hash::hset(ivar_get(s, sym("@__h")), a[0], a[1]));
         defn(wm, "key?", 1, 1, |s, a, _| bool_v(rhash(ivar_get(s, sym("@__h"))).m.contains_key(&HKey(a[0]))));
-        defn(wm, "include?", 1, 1, |s, a, _| bool_v(rhash(ivar_get(s, sym("@__h"))).m.contains_key(&HKey(a[0]))));
         defn(wm, "delete", 1, 1, |s, a, _| rhash(ivar_get(s, sym("@__h"))).m.shift_remove(&HKey(a[0])).unwrap_or(QNIL));
         defn(wm, "getkey", 1, 1, |s, a, _| rhash(ivar_get(s, sym("@__h"))).m.get_key_value(&HKey(a[0])).map(|(k, _)| k.0).unwrap_or(QNIL));
+        if name == "WeakKeyMap" {
+            // Rails' connection pool clears its WeakKeyMap of leases on disconnect
+            defn(wm, "clear", 0, 0, |s, _, _| {
+                ivar_set(s, sym("@__h"), hash_new());
+                s
+            });
+            continue;
+        }
+        defn(wm, "include?", 1, 1, |s, a, _| bool_v(rhash(ivar_get(s, sym("@__h"))).m.contains_key(&HKey(a[0]))));
+        defn(wm, "member?", 1, 1, |s, a, _| bool_v(rhash(ivar_get(s, sym("@__h"))).m.contains_key(&HKey(a[0]))));
         defn(wm, "size", 0, 0, |s, _, _| mkfix(rhash(ivar_get(s, sym("@__h"))).m.len() as i64));
+        defn(wm, "length", 0, 0, |s, _, _| mkfix(rhash(ivar_get(s, sym("@__h"))).m.len() as i64));
         defn(wm, "keys", 0, 0, |s, _, _| send0(ivar_get(s, sym("@__h")), "keys"));
         defn(wm, "values", 0, 0, |s, _, _| send0(ivar_get(s, sym("@__h")), "values"));
-        defn(wm, "each", 0, 0, |s, _, b| send(ivar_get(s, sym("@__h")), sym("each"), &[], b));
+        fn each_via(s: V, b: V, via: &str) -> V {
+            send(ivar_get(s, sym("@__h")), sym(via), &[], b);
+            s
+        }
+        defn(wm, "each", 0, 0, |s, _, b| each_via(s, b, "each"));
+        defn(wm, "each_pair", 0, 0, |s, _, b| each_via(s, b, "each_pair"));
+        defn(wm, "each_key", 0, 0, |s, _, b| each_via(s, b, "each_key"));
+        defn(wm, "each_value", 0, 0, |s, _, b| each_via(s, b, "each_value"));
     }
     // Class#subclasses (Ruby 3.1) / #attached_object (3.2)
     defn(rt().c.class, "subclasses", 0, 0, |s, _, _| {
@@ -371,6 +378,14 @@ fn init_objectspace() {
 }
 
 pub fn init() {
+    // ErrorHighlight, which CRuby loads at startup. It needs RubyVM::AbstractSyntaxTree to
+    // point at a column, so here `spot` always gives what CRuby gives when it can't: nil.
+    // Rails' debug exception page calls it for every backtrace line.
+    if const_lookup(rt().c.object, sym("ErrorHighlight")).is_none() {
+        let eh = new_module("ErrorHighlight");
+        set_global_const("ErrorHighlight", eh as V);
+        defs(eh, "spot", 0, -1, |_, _, _| QNIL);
+    }
     defn(rt().c.kernel, "load", 1, 2, |_, a, _| kernel_load(a));
     if let Some(le) = const_lookup(rt().c.object, sym("LoadError")) {
         defn(le as *mut Class, "path", 0, 0, |s, _, _| ivar_get(s, sym("@path")));
@@ -415,6 +430,7 @@ pub fn init() {
     defn(c.module, "remove_const", 1, 1, |s, a, _| match crate::kernel::sym_arg(a[0]) {
         Ok(id) => {
             bump_const_serial();
+            crate::abi::cfold_invalidate(id);
             rclass(s).consts.remove(&id).unwrap_or(QNIL)
         }
         Err(e) => e,

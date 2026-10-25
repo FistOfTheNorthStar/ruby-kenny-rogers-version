@@ -157,7 +157,9 @@ impl<M: Module> Compiler<M> {
         }
         let exit = fx.b.create_block();
         fx.b.append_block_param(exit, I64);
+        let saved = self.hoist_enter(fx, lp);
         self.while_core(fx, pred, body, until, do_while, exit);
+        self.hoist_leave(fx, saved);
         fx.b.switch_to_block(exit);
         fx.b.block_params(exit)[0]
     }
@@ -179,7 +181,7 @@ impl<M: Module> Compiler<M> {
         let nil = self.nil(fx);
         fx.b.ins().jump(exit, &[nil.into()]);
         fx.b.switch_to_block(body_b);
-        fx.loops.push(LoopCtx { next: header, exit, redo: body_b, next_val: false });
+        fx.loops.push(LoopCtx { next: header, exit, redo: body_b, next_val: false, rescue_depth: fx.rescue_prev.len() });
         self.stmts_void(fx, body);
         fx.loops.pop();
         self.safepoint(fx);
@@ -211,7 +213,7 @@ impl<M: Module> Compiler<M> {
         let body_start = fx.b.create_block();
         fx.b.ins().jump(body_start, &[]);
         fx.b.switch_to_block(body_start);
-        fx.loops.push(LoopCtx { next: incr, exit, redo: body_start, next_val: false });
+        fx.loops.push(LoopCtx { next: incr, exit, redo: body_start, next_val: false, rescue_depth: fx.rescue_prev.len() });
         self.stmts_void(fx, f.statements());
         fx.loops.pop();
         fx.b.ins().jump(incr, &[]);
@@ -380,14 +382,24 @@ impl<M: Module> Compiler<M> {
                     fx.b.switch_to_block(body_bb);
                     let prev = self.call(fx, "kn_errinfo", &[]);
                     self.call(fx, "kn_rescued", &[exc]);
+                    // an exception (or a throw) leaving the rescue body restores `$!` first
+                    let restore_bb = fx.b.create_block();
+                    fx.unwind.push(restore_bb);
+                    fx.rescue_prev.push(prev);
                     if let Some(reference) = r.reference() {
                         self.assign_target(fx, &reference, exc);
                     }
                     fx.retry.push(body_start);
                     let rv = self.stmts(fx, r.statements());
                     fx.retry.pop();
+                    fx.rescue_prev.pop();
+                    fx.unwind.pop();
                     self.call(fx, "kn_errinfo_restore", &[prev]);
                     fx.b.ins().jump(normal, &[rv.into()]);
+                    fx.b.switch_to_block(restore_bb);
+                    self.call(fx, "kn_errinfo_restore", &[prev]);
+                    let outer = *fx.unwind.last().unwrap();
+                    fx.b.ins().jump(outer, &[]);
                     fx.b.switch_to_block(nomatch);
                     clause = r.subsequent();
                 }
@@ -448,9 +460,18 @@ impl<M: Module> Compiler<M> {
         fx.b.switch_to_block(body_bb);
         let prev = self.call(fx, "kn_errinfo", &[]);
         self.call(fx, "kn_rescued", &[exc]);
+        let restore_bb = fx.b.create_block();
+        fx.unwind.push(restore_bb);
+        fx.rescue_prev.push(prev);
         let rv = self.expr(fx, &n.rescue_expression());
+        fx.rescue_prev.pop();
+        fx.unwind.pop();
         self.call(fx, "kn_errinfo_restore", &[prev]);
         fx.b.ins().jump(normal, &[rv.into()]);
+        fx.b.switch_to_block(restore_bb);
+        self.call(fx, "kn_errinfo_restore", &[prev]);
+        let outer = *fx.unwind.last().unwrap();
+        fx.b.ins().jump(outer, &[]);
         fx.b.switch_to_block(normal);
         fx.b.block_params(normal)[0]
     }
@@ -510,6 +531,7 @@ impl<M: Module> Compiler<M> {
                 self.jump_unwind(fx);
             }
             _ => {
+                self.restore_errinfo_to(fx, 0);
                 fx.b.ins().return_(&[v]);
                 self.dead_block(fx);
             }
@@ -517,14 +539,23 @@ impl<M: Module> Compiler<M> {
         self.nil(fx)
     }
 
+    /// Before a jump out of the rescue bodies entered since `depth`: restore `$!`.
+    pub(crate) fn restore_errinfo_to(&mut self, fx: &mut Fx, depth: usize) {
+        if let Some(&prev) = fx.rescue_prev.get(depth) {
+            self.call(fx, "kn_errinfo_restore", &[prev]);
+        }
+    }
+
     pub(crate) fn break_node(&mut self, fx: &mut Fx, args: Option<ArgumentsNode>, at: usize) -> Value {
         let v = self.jump_value(fx, args);
         if let Some(l) = fx.loops.last() {
-            let exit = l.exit;
+            let (exit, depth) = (l.exit, l.rescue_depth);
+            self.restore_errinfo_to(fx, depth);
             fx.b.ins().jump(exit, &[v.into()]);
             self.dead_block(fx);
         } else if fx.kind == ScopeKind::Block {
             if fx.lambda {
+                self.restore_errinfo_to(fx, 0);
                 fx.b.ins().return_(&[v]);
                 self.dead_block(fx);
             } else {
@@ -541,14 +572,16 @@ impl<M: Module> Compiler<M> {
     pub(crate) fn next_node(&mut self, fx: &mut Fx, args: Option<ArgumentsNode>, at: usize) -> Value {
         let v = self.jump_value(fx, args);
         if let Some(l) = fx.loops.last() {
-            let next = l.next;
-            if l.next_val {
+            let (next, depth, next_val) = (l.next, l.rescue_depth, l.next_val);
+            self.restore_errinfo_to(fx, depth);
+            if next_val {
                 fx.b.ins().jump(next, &[v.into()]);
             } else {
                 fx.b.ins().jump(next, &[]);
             }
             self.dead_block(fx);
         } else if fx.kind == ScopeKind::Block {
+            self.restore_errinfo_to(fx, 0);
             fx.b.ins().return_(&[v]);
             self.dead_block(fx);
         } else {

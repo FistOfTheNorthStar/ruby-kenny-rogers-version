@@ -310,7 +310,7 @@ pub fn matches(re: V, s: V, pos: i64) -> bool {
     }
 }
 
-fn set_last(m: V) {
+pub(crate) fn set_last(m: V) {
     pst().last_match = m;
 }
 pub fn last_match() -> V {
@@ -665,6 +665,50 @@ pub fn str_index(s: V, re: V, from: usize) -> V {
         return QNIL;
     }
     mkfix(char_index(&rstr(md_str(m)).b, md_pos(m)[0] as usize) as i64)
+}
+
+/// String#rindex(regexp, pos): the last match starting at character `pos` or before
+/// (a backward search, as CRuby's).
+pub fn str_rindex(s: V, re: V, pos: usize) -> V {
+    let t = text(s);
+    let start = byte_index(&t, pos);
+    let r = re_of(re);
+    let mut region = Region::new();
+    let found = if r.binary {
+        r.re.search_with_encoding(onig::EncodedBytes::ascii(t.as_bytes()), start, 0, SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some()
+    } else {
+        r.re.search_with_options(&t, start, 0, SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some()
+    };
+    if !found {
+        set_last(QNIL);
+        return QNIL;
+    }
+    let p = region_pos(&region);
+    let at = p[0] as usize;
+    set_last(matchdata_new(re, t.into_bytes(), p));
+    mkfix(char_index(&rstr(s).b, at) as i64)
+}
+
+/// byteindex/byterindex with a Regexp: the byte offset of the first match at `from` or
+/// after (`back`: the last one starting at `from` or before).
+pub fn str_byte_search(s: V, re: V, from: usize, back: bool) -> V {
+    let t = text(s);
+    let r = re_of(re);
+    let mut region = Region::new();
+    let range = if back { 0 } else { t.len() };
+    let found = if r.binary {
+        r.re.search_with_encoding(onig::EncodedBytes::ascii(t.as_bytes()), from, range, SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some()
+    } else {
+        r.re.search_with_options(&t, from, range, SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some()
+    };
+    if !found {
+        set_last(QNIL);
+        return QNIL;
+    }
+    let p = region_pos(&region);
+    let at = p[0];
+    set_last(matchdata_new(re, t.into_bytes(), p));
+    mkfix(at)
 }
 
 pub fn str_aref(s: V, re: V, cap: Option<V>) -> V {

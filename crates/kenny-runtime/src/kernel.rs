@@ -85,16 +85,15 @@ pub fn dup(v: V, keep_frozen: bool) -> V {
         None => return v,
         Some(Kind::String) => {
             let n = str_new(rstr(v).b.clone());
-            hdr(n).flags |= hdr(v).flags & FL_BINARY;
+            crate::transcode::set_enc(n, crate::transcode::enc_of(v));
             n
         }
         Some(Kind::Array) => ary_new(rary(v).v.clone()),
         Some(Kind::Hash) => {
             let h = hash_new();
             let (src, dst) = (rhash(v), rhash(h));
-            for (k, x) in src.m.iter() {
-                dst.m.insert(HKey(k.0), *x);
-            }
+            // (a copy of the table: keeps compare_by_identity and calls no `hash`)
+            dst.m.assign(src.m.clone());
             dst.default = src.default; // (h is new: young, no barrier)
             dst.default_proc = src.default_proc;
             h
@@ -111,10 +110,15 @@ pub fn dup(v: V, keep_frozen: bool) -> V {
     hdr(r).klass = real_class(v);
     gen_ivar_copy(v, r);
     // dup calls initialize_dup, clone initialize_clone; both default to initialize_copy
+    // (Kernel's are no-ops: skipped; a native class's own, Random's say, is called)
     let hook = if keep_frozen { "initialize_clone" } else { "initialize_dup" };
-    if is_user_method(r, hook) {
+    let own = |name: &str| {
+        let m = find_method(class_of(r), sym(name));
+        !m.is_null() && unsafe { (*m).owner } != rt().c.kernel
+    };
+    if own(hook) {
         tri!(send(r, sym(hook), &[v], QNIL));
-    } else if is_user_method(r, "initialize_copy") {
+    } else if own("initialize_copy") {
         tri!(send(r, sym("initialize_copy"), &[v], QNIL));
     }
     if keep_frozen && is_frozen(v) {
@@ -317,6 +321,196 @@ pub fn parse_int(b: &[u8], strict: bool) -> Option<V> {
     Some(int_from_big(if neg { -n } else { n }))
 }
 
+/// Integer() of a String: CRuby's strict parse (surrounding whitespace, a sign, a radix
+/// prefix that fits `base` (0: any, a leading 0 meaning octal), underscores only between digits).
+pub fn strict_int(b: &[u8], base: u32) -> Option<num_bigint::BigInt> {
+    let s = std::str::from_utf8(b).ok()?.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (neg, s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let lower = s.to_ascii_lowercase();
+    let pre = |p: &str| lower.starts_with(p) && lower.len() > 2;
+    let (radix, digits) = match base {
+        0 | 16 if pre("0x") => (16, &s[2..]),
+        0 | 2 if pre("0b") => (2, &s[2..]),
+        0 | 8 if pre("0o") => (8, &s[2..]),
+        0 | 10 if pre("0d") => (10, &s[2..]),
+        0 if s.len() > 1 && s.starts_with('0') => (8, &s[1..]),
+        0 => (10, s),
+        b => (b, s),
+    };
+    if !(2..=36).contains(&radix) || digits.is_empty() {
+        return None;
+    }
+    let db = digits.as_bytes();
+    if db[0] == b'_' || db[db.len() - 1] == b'_' || digits.contains("__") {
+        return None;
+    }
+    let clean: String = digits.chars().filter(|&c| c != '_').collect();
+    if !clean.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    let n = num_bigint::BigInt::parse_bytes(clean.as_bytes(), radix)?;
+    Some(if neg { -n } else { n })
+}
+
+/// Float() of a String: decimal (underscores between digits) or hexadecimal ("0x1.8p1").
+pub fn strict_float(b: &[u8]) -> Option<f64> {
+    let s = std::str::from_utf8(b).ok()?.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (neg, body) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    // digits with single underscores between them; returns the digits and the rest
+    fn digits(s: &str, hex: bool) -> Option<(String, &str)> {
+        let mut out = String::new();
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i] as char;
+            if c.is_ascii_digit() || (hex && c.is_ascii_hexdigit()) {
+                out.push(c);
+            } else if c == '_' && !out.is_empty() && i + 1 < b.len() && ((b[i + 1] as char).is_ascii_digit() || (hex && (b[i + 1] as char).is_ascii_hexdigit())) {
+            } else {
+                break;
+            }
+            i += 1;
+        }
+        Some((out, &s[i..]))
+    }
+    let v = if body.len() > 2 && body[..2].eq_ignore_ascii_case("0x") {
+        let (int, rest) = digits(&body[2..], true)?;
+        let (frac, rest) = match rest.strip_prefix('.') {
+            Some(r) => digits(r, true)?,
+            None => (String::new(), rest),
+        };
+        if int.is_empty() && frac.is_empty() {
+            return None;
+        }
+        let mut v = 0f64;
+        for c in int.chars() {
+            v = v * 16.0 + c.to_digit(16)? as f64;
+        }
+        let mut scale = 1.0 / 16.0;
+        for c in frac.chars() {
+            v += c.to_digit(16)? as f64 * scale;
+            scale /= 16.0;
+        }
+        let rest = if let Some(r) = rest.strip_prefix(['p', 'P']) {
+            let (sign, r) = match r.as_bytes().first() {
+                Some(b'-') => (-1, &r[1..]),
+                Some(b'+') => (1, &r[1..]),
+                _ => (1, r),
+            };
+            let (e, r) = digits(r, false)?;
+            if e.is_empty() {
+                return None;
+            }
+            v *= 2f64.powi(sign * e.parse::<i32>().ok()?);
+            r
+        } else {
+            rest
+        };
+        if !rest.is_empty() {
+            return None;
+        }
+        v
+    } else {
+        let (int, rest) = digits(body, false)?;
+        let (frac, rest) = match rest.strip_prefix('.') {
+            Some(r) if !r.starts_with('_') => digits(r, false)?,
+            Some(_) => return None,
+            None => (String::new(), rest),
+        };
+        if int.is_empty() && frac.is_empty() {
+            return None;
+        }
+        let mut txt = format!("{}.{}", if int.is_empty() { "0" } else { &int }, if frac.is_empty() { "0" } else { &frac });
+        let rest = if let Some(r) = rest.strip_prefix(['e', 'E']) {
+            let (sign, r) = match r.as_bytes().first() {
+                Some(b'-') => ("-", &r[1..]),
+                Some(b'+') => ("", &r[1..]),
+                _ => ("", r),
+            };
+            let (e, r) = digits(r, false)?;
+            if e.is_empty() {
+                return None;
+            }
+            txt = format!("{txt}e{sign}{e}");
+            r
+        } else {
+            rest
+        };
+        if !rest.is_empty() {
+            return None;
+        }
+        txt.parse::<f64>().ok()?
+    };
+    Some(if neg { -v } else { v })
+}
+
+fn kernel_integer(v: V, base: V) -> V {
+    if base != QNIL && !is_str(v) {
+        return arg_error("base specified for non string value");
+    }
+    if is_int(v) {
+        v
+    } else if is_float(v) {
+        let f = float_val(v);
+        if !f.is_finite() {
+            return raise(rt().c.float_domain_error, &float_to_s(f));
+        }
+        int_from_big(num_bigint::BigInt::from(f.trunc() as i128))
+    } else if is_str(v) {
+        let b = rstr(v).b.clone();
+        if b.contains(&0) {
+            return arg_error("string contains null byte");
+        }
+        let base = if is_fix(base) { fix(base).unsigned_abs() as u32 } else { 0 };
+        match strict_int(&b, base) {
+            Some(n) => int_from_big(n),
+            None => arg_error(&format!("invalid value for Integer(): {}", inspect_lossy(v))),
+        }
+    } else if v == QNIL {
+        type_error("can't convert nil into Integer")
+    } else if respond_to(v, sym("to_int")) {
+        send0(v, "to_int")
+    } else if respond_to(v, sym("to_i")) {
+        send0(v, "to_i")
+    } else {
+        type_error(&format!("can't convert {} into Integer", class_name(real_class(v))))
+    }
+}
+
+fn kernel_float(v: V) -> V {
+    if let Some(f) = num_to_f(v) {
+        return float_new(f);
+    }
+    if is_str(v) {
+        let b = rstr(v).b.clone();
+        if b.contains(&0) {
+            return arg_error("string for Float contains null byte");
+        }
+        return match strict_float(&b) {
+            Some(f) => float_new(f),
+            None => arg_error(&format!("invalid value for Float(): {}", inspect_lossy(v))),
+        };
+    }
+    if v == QNIL || v == QTRUE || v == QFALSE || is_sym(v) || !respond_to(v, sym("to_f")) {
+        let name = match v {
+            QNIL => "nil".to_string(),
+            QTRUE => "true".to_string(),
+            QFALSE => "false".to_string(),
+            _ => class_name(real_class(v)),
+        };
+        return type_error(&format!("can't convert {name} into Float"));
+    }
+    send0(v, "to_f")
+}
+
 pub fn init() {
     let c = rt().c;
     let k = c.kernel;
@@ -387,6 +581,49 @@ pub fn init() {
     defn(k, "require_relative", 1, 1, |_, _, _| QFALSE);
     fn raise_impl(a: &[V]) -> V {
         let r = rt();
+        // `cause:` (raise's only keyword)
+        let mut cause = None;
+        let mut av = a.to_vec();
+        if let Some(&h) = av.last() {
+            if is_hash(h) && hdr(h).flags & FL_KWHASH != 0 {
+                if let Some(&c) = rhash(h).m.get(&HKey(mksym(sym("cause")))) {
+                    cause = Some(c);
+                    if rhash(h).m.len() == 1 {
+                        av.pop();
+                    }
+                }
+            }
+        }
+        let a = &av[..];
+        if a.is_empty() && cause.is_some() {
+            return arg_error("only cause is given with no arguments");
+        }
+        let e = tri!(raise_new(r, a));
+        if !is_a(e, r.c.exception) {
+            return type_error("exception object expected");
+        }
+        if let Some(c) = cause {
+            if c != QNIL && !is_a(c, r.c.exception) {
+                return type_error("exception object expected");
+            }
+            if c != e {
+                // (CRuby's check: a cause chain that leads back to `e`)
+                let mut x = ivar_get(c, sym("@__cause"));
+                let mut n = 0;
+                while is_heap(x) && n < 10_000 {
+                    if x == e {
+                        return arg_error("circular causes");
+                    }
+                    x = ivar_get(x, sym("@__cause"));
+                    n += 1;
+                }
+                ivar_set(e, sym("@__cause"), c);
+                ivar_set(e, sym("@__cause_set"), QTRUE);
+            }
+        }
+        raise_exc(e)
+    }
+    fn raise_new(r: &Runtime, a: &[V]) -> V {
         let e = if a.is_empty() {
             if pst().errinfo != QNIL { pst().errinfo } else { exc_new(r.c.runtime_error, "unhandled exception") }
         } else if is_str(a[0]) {
@@ -405,13 +642,10 @@ pub fn init() {
         } else {
             return type_error("exception class/object expected");
         };
-        if !is_a(e, r.c.exception) {
-            return type_error("exception object expected");
-        }
-        raise_exc(e)
+        e
     }
-    defn(k, "raise", 0, 3, |_, a, _| raise_impl(a));
-    defn(k, "fail", 0, 3, |_, a, _| raise_impl(a));
+    defn(k, "raise", 0, 4, |_, a, _| raise_impl(a));
+    defn(k, "fail", 0, 4, |_, a, _| raise_impl(a));
     defn(k, "loop", 0, 0, |s, _, b| {
         if !is_proc(b) {
             return crate::misc::enum_for(s, "loop", &[]);
@@ -498,43 +732,40 @@ pub fn init() {
         out(&rstr(s).b.clone());
         QNIL
     });
-    defn(k, "Integer", 1, 2, |_, a, _| {
-        let v = a[0];
-        if is_int(v) {
-            v
-        } else if is_float(v) {
-            let f = float_val(v);
-            if !f.is_finite() {
-                return raise(rt().c.float_domain_error, &float_to_s(f));
+    // Integer(x, base = nil, exception: true), Float(x, exception: true)
+    fn exc_kw(a: &[V]) -> (Vec<V>, bool) {
+        let mut a = a.to_vec();
+        let mut raise = true;
+        if a.len() > 1 {
+            if let Some(&h) = a.last().filter(|h| is_hash(**h)) {
+                a.pop();
+                if hash_has(h, "exception") {
+                    raise = truthy(crate::hash::hget(h, mksym(sym("exception"))));
+                }
             }
-            int_from_big(num_bigint::BigInt::from(f.trunc() as i128))
-        } else if is_str(v) {
-            match parse_int(&rstr(v).b.clone(), true) {
-                Some(i) => i,
-                None => arg_error(&format!("invalid value for Integer(): {}", inspect_lossy(v))),
-            }
-        } else if v == QNIL {
-            type_error("can't convert nil into Integer")
-        } else {
-            send0(v, "to_i")
         }
+        (a, raise)
+    }
+    fn hash_has(h: V, k: &str) -> bool {
+        rhash(h).m.iter().any(|(key, _)| key.0 == mksym(sym(k)))
+    }
+    defn(k, "Integer", 1, 3, |_, a, _| {
+        let (a, raise) = exc_kw(a);
+        let r = kernel_integer(a[0], a.get(1).copied().unwrap_or(QNIL));
+        if r == UNDEF && !raise {
+            pst().pending = Throw::None;
+            return QNIL;
+        }
+        r
     });
-    defn(k, "Float", 1, 1, |_, a, _| {
-        let v = a[0];
-        if let Some(f) = num_to_f(v) {
-            return float_new(f);
+    defn(k, "Float", 1, 2, |_, a, _| {
+        let (a, raise) = exc_kw(a);
+        let r = kernel_float(a[0]);
+        if r == UNDEF && !raise {
+            pst().pending = Throw::None;
+            return QNIL;
         }
-        if is_str(v) {
-            let s = String::from_utf8_lossy(&rstr(v).b).trim().replace('_', "");
-            return match s.parse::<f64>() {
-                Ok(f) => float_new(f),
-                Err(_) => arg_error(&format!("invalid value for Float(): {}", inspect_lossy(v))),
-            };
-        }
-        if v == QNIL {
-            return type_error("can't convert nil into Float");
-        }
-        send0(v, "to_f")
+        r
     });
     defn(k, "String", 1, 1, |_, a, _| match to_s(a[0]) {
         Ok(b) => str_new(b),
@@ -641,7 +872,7 @@ pub fn init() {
             _ => eql(s, o),
         })
     });
-    defn(k, "hash", 0, 0, |s, _, _| mkfix((hash_of(s) >> 2) as i64));
+    defn(k, "hash", 0, 0, |s, _, _| mkfix((hash_self(s) >> 2) as i64));
     defn(k, "object_id", 0, 0, |s, _, _| mkfix(object_id_of(s)));
     defn(k, "to_s", 0, 0, |s, _, _| {
         if s == rt().main_obj {
@@ -769,24 +1000,23 @@ pub fn init() {
         rproc(p).lambda = true;
         p
     });
-    defn(k, "methods", 0, 1, |s, _, _| {
-        let mut out = RVec::new();
-        for c in ancestors(class_of(s)) {
-            for &id in unsafe { (*c).methods.keys() } {
-                if !out.contains(&mksym(id)) {
-                    out.push(mksym(id));
-                }
-            }
+    defn(k, "enum_for", 0, -1, |s, a, b| {
+        let m = a.first().copied().unwrap_or(mksym(sym("each")));
+        let e = crate::misc::enum_for(s, &sym_str(sym_id(m)), a.get(1..).unwrap_or(&[]));
+        if is_proc(b) {
+            // the size block (Enumerator#size calls it with the arguments)
+            ivar_set(e, sym("@__size"), b);
         }
-        ary_new(out.take())
+        e
     });
-    defn(k, "enum_for", 0, -1, |s, a, _| {
+    defn(k, "to_enum", 0, -1, |s, a, b| {
         let m = a.first().copied().unwrap_or(mksym(sym("each")));
-        crate::misc::enum_for(s, &sym_str(sym_id(m)), a.get(1..).unwrap_or(&[]))
-    });
-    defn(k, "to_enum", 0, -1, |s, a, _| {
-        let m = a.first().copied().unwrap_or(mksym(sym("each")));
-        crate::misc::enum_for(s, &sym_str(sym_id(m)), a.get(1..).unwrap_or(&[]))
+        let e = crate::misc::enum_for(s, &sym_str(sym_id(m)), a.get(1..).unwrap_or(&[]));
+        if is_proc(b) {
+            // the size block (Enumerator#size calls it with the arguments)
+            ivar_set(e, sym("@__size"), b);
+        }
+        e
     });
     defn(k, "display", 0, 0, |s, _, _| match to_s(s) {
         Ok(b) => {
@@ -938,7 +1168,17 @@ pub fn init() {
         if !is_proc(body) {
             return arg_error("tried to create Proc object without a block");
         }
-        add_method(s as *mut Class, id, Body::Proc(body));
+        let cls = s as *mut Class;
+        let m = add_method(cls, id, Body::Proc(body));
+        // like a def here: the class body's default visibility, and module_function's copy
+        if !crate::core::always_private(id) {
+            unsafe { (*(m as *mut Method)).vis = (*cls).default_vis };
+        }
+        if unsafe { (*cls).module_function } {
+            unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
+            let m2 = add_method(singleton_class(s), id, Body::Proc(body));
+            unsafe { (*(m2 as *mut Method)).vis = VIS_PUBLIC };
+        }
         mksym(id)
     });
     defn(md, "alias_method", 2, 2, |s, a, _| {
@@ -1174,7 +1414,10 @@ pub fn init() {
     defn(md, "constants", 0, 1, |s, _, _| ary_new(rclass(s).consts.keys().map(|&k| mksym(k)).collect()));
     defn(md, "const_missing", 1, 1, |s, a, _| {
         let prefix = if s as *mut Class == rt().c.object { String::new() } else { format!("{}::", class_name(s as *mut Class)) };
-        raise(rt().c.name_error, &format!("uninitialized constant {}{}", prefix, sym_str(sym_id(a[0]))))
+        let e = exc_new(rt().c.name_error, &format!("uninitialized constant {}{}", prefix, sym_str(sym_id(a[0]))));
+        ivar_set(e, sym("@name"), a[0]);
+        ivar_set(e, sym("@receiver"), s);
+        raise_exc(e)
     });
     fn class_eval(s: V, a: &[V], b: V) -> V {
         if !is_proc(b) {
@@ -1349,11 +1592,22 @@ pub fn init() {
     }
     defn(ex, "to_s", 0, 0, |s, _, _| exc_to_s(s));
     defn(ex, "message", 0, 0, |s, _, _| send0(s, "to_s"));
-    defn(ex, "detailed_message", 0, 1, |s, _, _| send0(s, "message"));
-    defn(ex, "full_message", 0, 1, |s, _, _| {
+    defn(ex, "detailed_message", 0, 1, |s, a, _| {
+        let hl = kw_arg(a, "highlight").is_some_and(truthy);
         let m = tri!(send0(s, "message"));
-        let m = String::from_utf8_lossy(&rstr(m).b).into_owned();
-        new_str_v(format!("{} ({})", m, class_name(real_class(s))))
+        let m = if is_str(m) { rstr(m).b.clone() } else { Vec::new() };
+        str_new(decorate_message(&m, &class_name(real_class(s)), real_class(s) == rt().c.runtime_error, hl))
+    });
+    defn(ex, "full_message", 0, 1, |s, a, _| {
+        let hl = match kw_arg(a, "highlight") {
+            Some(v) if v != QNIL => truthy(v),
+            _ => (unsafe { libc::isatty(2) }) == 1,
+        };
+        let bottom = kw_arg(a, "order").is_some_and(|o| o == mksym(sym("bottom")));
+        match full_message(s, hl, bottom) {
+            Some(m) => str_new(m),
+            None => UNDEF,
+        }
     });
     defn(ex, "inspect", 0, 0, |s, _, _| {
         let m = tri!(send0(s, "to_s"));
@@ -1406,6 +1660,9 @@ pub fn init() {
     }
     defn(c.name_error, "initialize", 0, -1, |s, a, _| name_error_init(s, a));
     defn(c.name_error, "receiver", 0, 0, |s, _, _| ivar_get(s, sym("@receiver")));
+    // (CRuby: the locals where it was raised, for DidYouMean; locals aren't visible here)
+    defn(c.name_error, "local_variables", 0, 0, |_, _, _| ary_new(vec![]));
+    defn(c.no_method_error, "private_call?", 0, 0, |s, _, _| bool_v(truthy(ivar_get(s, sym("@__private_call")))));
     defn(c.no_method_error, "args", 0, 0, |s, _, _| {
         let v = ivar_get(s, sym("@args"));
         if v == QNIL { ary_new(vec![]) } else { v }
@@ -1474,3 +1731,118 @@ pub fn clone_body(b: &Body) -> Body {
     }
 }
 
+
+/// A keyword argument a native method received (`highlight:` ...), from a trailing Hash.
+pub fn kw_arg(a: &[V], name: &str) -> Option<V> {
+    let h = *a.last()?;
+    if !is_hash(h) {
+        return None;
+    }
+    rhash(h).m.get(&HKey(mksym(sym(name)))).copied()
+}
+
+/// CRuby's `Exception#detailed_message`: "first line (Class)" then the other lines;
+/// an empty message is the class name ("unhandled exception" for RuntimeError).
+/// `highlight`: bold, with the class name underlined, as on a terminal.
+pub fn decorate_message(m: &[u8], class: &str, runtime_error: bool, highlight: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if m.is_empty() {
+        let t = if runtime_error { "unhandled exception" } else { class };
+        if highlight {
+            out.extend_from_slice(b"\x1b[1;4m");
+            out.extend_from_slice(t.as_bytes());
+            out.extend_from_slice(b"\x1b[m");
+        } else {
+            out.extend_from_slice(t.as_bytes());
+        }
+        return out;
+    }
+    let (first, rest) = match m.iter().position(|&c| c == b'\n') {
+        Some(i) => (&m[..i], Some(&m[i + 1..])),
+        None => (m, None),
+    };
+    if highlight {
+        out.extend_from_slice(b"\x1b[1m");
+        out.extend_from_slice(first);
+        out.extend_from_slice(format!(" (\x1b[1;4m{class}\x1b[m\x1b[1m)\x1b[m").as_bytes());
+        if let Some(rest) = rest {
+            for line in rest.split(|&c| c == b'\n') {
+                out.extend_from_slice(b"\n\x1b[1m");
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\x1b[m");
+            }
+        }
+    } else {
+        out.extend_from_slice(first);
+        out.extend_from_slice(format!(" ({class})").as_bytes());
+        if let Some(rest) = rest {
+            out.push(b'\n');
+            out.extend_from_slice(rest);
+        }
+    }
+    out
+}
+
+/// `e.detailed_message(highlight:)`, through Ruby so overrides (DidYouMean, gems) apply.
+fn detailed_of(e: V, highlight: bool) -> Option<Vec<u8>> {
+    let kw = hash_new();
+    crate::hash::hset(kw, mksym(sym("highlight")), bool_v(highlight));
+    hdr(kw).flags |= FL_KWHASH;
+    let m = send(e, sym("detailed_message"), &[kw], QNIL);
+    if m == UNDEF {
+        return None;
+    }
+    let m = if is_str(m) { rstr(m).b.clone() } else { tri_none!(crate::fmt::to_s(m)) };
+    Some(m)
+}
+macro_rules! tri_none {
+    ($e:expr) => {
+        match $e {
+            Ok(x) => x,
+            Err(_) => return None,
+        }
+    };
+}
+use tri_none;
+
+/// CRuby's `Exception#full_message` (and the report of an uncaught exception): the location,
+/// the detailed message, the backtrace, then each cause the same way. None if Ruby raised.
+pub fn full_message(e: V, highlight: bool, bottom: bool) -> Option<Vec<u8>> {
+    let mut chain = vec![e];
+    let mut c = ivar_get(e, sym("@__cause"));
+    while is_heap(c) && is_a(c, rt().c.exception) && !chain.contains(&c) {
+        chain.push(c);
+        c = ivar_get(c, sym("@__cause"));
+    }
+    let mut out = Vec::new();
+    if bottom {
+        out.extend_from_slice(b"Traceback (most recent call last):\n");
+        chain.reverse();
+    }
+    for &x in &chain {
+        let bt = crate::backtrace::exc_backtrace(x);
+        let lines: Vec<Vec<u8>> = if is_ary(bt) { rary(bt).v.iter().filter(|l| is_str(**l)).map(|l| rstr(*l).b.clone()).collect() } else { vec![] };
+        let loc = lines.first().cloned().unwrap_or_else(|| rt().script_name.clone().into_bytes());
+        let mut head = loc;
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(&detailed_of(x, highlight)?);
+        head.push(b'\n');
+        if bottom {
+            let n = lines.len().saturating_sub(1);
+            for (i, l) in lines.iter().skip(1).rev().enumerate() {
+                out.extend_from_slice(format!("\t{}: from ", n - i).as_bytes());
+                out.extend_from_slice(l);
+                out.push(b'\n');
+            }
+            out.extend_from_slice(&head);
+        } else {
+            out.extend_from_slice(&head);
+            for l in lines.iter().skip(1) {
+                out.extend_from_slice(b"\tfrom ");
+                out.extend_from_slice(l);
+                out.push(b'\n');
+            }
+        }
+    }
+    Some(out)
+}

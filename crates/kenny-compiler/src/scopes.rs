@@ -100,6 +100,19 @@ pub(crate) fn params_desc(p: Option<ParametersNode>) -> String {
     out.join(",")
 }
 
+/// Proc#parameters descriptor of a block (as for a lambda: Proc#parameters makes a proc's
+/// required parameters optional).
+fn block_params_desc(params: Option<&Node>) -> String {
+    let Some(pn) = params else { return String::new() };
+    if let Some(np) = pn.as_numbered_parameters_node() {
+        return (1..=np.maximum()).map(|i| format!("req:_{i}")).collect::<Vec<_>>().join(",");
+    }
+    if pn.as_it_parameters_node().is_some() {
+        return "req:".into();
+    }
+    pn.as_block_parameters_node().map(|bp| params_desc(bp.parameters())).unwrap_or_default()
+}
+
 fn names(list: &ConstantList) -> Vec<Vec<u8>> {
     list.iter().map(|c| c.as_slice().to_vec()).collect()
 }
@@ -125,6 +138,9 @@ impl<M: Module> Compiler<M> {
         let prog = node.as_program_node().unwrap();
         let stmts = prog.statements().as_node();
         let slot = self.cache_alloc(2);
+        if kind == ScopeKind::Top {
+            self.cfold_scan(slot, &prog);
+        }
         let spec = FnSpec {
             kind,
             lambda: false,
@@ -434,6 +450,7 @@ impl<M: Module> Compiler<M> {
                 locals,
                 unwind: vec![exit],
                 ensure_depth: 0,
+                rescue_prev: Vec::new(),
                 loops: Vec::new(),
                 retry: Vec::new(),
                 caches,
@@ -461,6 +478,13 @@ impl<M: Module> Compiler<M> {
                 sure_fix: HashSet::new(),
                 resume: HashMap::new(),
                 resume_req: HashMap::new(),
+                resume_before: HashMap::new(),
+                resume_before_req: HashMap::new(),
+                spec_stmt: None,
+                spec_stmt_used: false,
+                hoisted: HashMap::new(),
+                stmt_memo: HashMap::new(),
+                stmt_at: usize::MAX,
                 fast_args: spec.fast_arity.map(|n| p[1..=n].to_vec()),
                 vlocals,
                 vself: None,
@@ -841,9 +865,14 @@ impl<M: Module> Compiler<M> {
         fx.b.block_params(done)[0]
     }
     /// Assign the default value of an optional parameter unless an argument was passed.
-    fn optional_param(&mut self, fx: &mut Fx, name: &[u8], idx: usize, default: &Node, from_ary: Option<Value>) {
-        let argc = fx.b.use_var(fx.argc_v);
-        let has = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, argc, idx as i64);
+    /// Optional parameter `idx` gets an argument only when there are more than `idx`
+    /// plus the `posts` required after it (those are filled first).
+    fn optional_param(&mut self, fx: &mut Fx, name: &[u8], idx: usize, posts: usize, default: &Node, from_ary: Option<Value>) {
+        let argc = match from_ary {
+            Some(a) => self.call(fx, "kn_ary_len", &[a]),
+            None => fx.b.use_var(fx.argc_v),
+        };
+        let has = fx.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, argc, (idx + posts) as i64);
         let yes = fx.b.create_block();
         let no = fx.b.create_block();
         let done = fx.b.create_block();
@@ -989,7 +1018,7 @@ impl<M: Module> Compiler<M> {
         }
         for (j, o) in opts.iter().enumerate() {
             let o = o.as_optional_parameter_node().unwrap();
-            self.optional_param(fx, o.name().as_slice(), nreq + j, &o.value(), None);
+            self.optional_param(fx, o.name().as_slice(), nreq + j, npost, &o.value(), None);
         }
         let rest_name: Option<Vec<u8>> = match rest.as_ref().and_then(|r| r.as_rest_parameter_node()) {
             Some(rp) => Some(rp.name().map(|n| n.as_slice().to_vec()).unwrap_or(b"*".to_vec())),
@@ -1226,7 +1255,7 @@ impl<M: Module> Compiler<M> {
             }
             for (j, o) in opts.iter().enumerate() {
                 let o = o.as_optional_parameter_node().unwrap();
-                self.optional_param(fx, o.name().as_slice(), nreq + j, &o.value(), None);
+                self.optional_param(fx, o.name().as_slice(), nreq + j, 0, &o.value(), None);
             }
         } else {
             let argc = fx.b.use_var(fx.argc_v);
@@ -1239,7 +1268,7 @@ impl<M: Module> Compiler<M> {
             }
             for (j, o) in opts.iter().enumerate() {
                 let o = o.as_optional_parameter_node().unwrap();
-                self.optional_param(fx, o.name().as_slice(), nreq + j, &o.value(), Some(ary));
+                self.optional_param(fx, o.name().as_slice(), nreq + j, npost, &o.value(), Some(ary));
             }
             if let Some(rp) = rest.as_ref().and_then(|r| r.as_rest_parameter_node()) {
                 if let Some(n) = rp.name() {
@@ -1250,10 +1279,11 @@ impl<M: Module> Compiler<M> {
                 }
             }
             for (k, pn) in posts.iter().enumerate() {
-                let pre = self.iconst(fx, (nreq + nopt) as i64);
+                let rq = self.iconst(fx, nreq as i64);
+                let op = self.iconst(fx, (nopt | if has_rest { 1 << 32 } else { 0 }) as i64);
                 let po = self.iconst(fx, npost as i64);
                 let kk = self.iconst(fx, k as i64);
-                let v = self.call(fx, "kn_ary_post_ref", &[ary, pre, po, kk]);
+                let v = self.call(fx, "kn_block_post_ref", &[ary, rq, op, po, kk]);
                 self.bind_param_target(fx, pn, v);
             }
         }
@@ -1449,21 +1479,60 @@ impl<M: Module> Compiler<M> {
         }
     }
 
+    /// This frame's env for a closure made here.
+    fn frame_env(&mut self, fx: &mut Fx) -> Value {
+        match fx.env_v {
+            Some(_) if fx.lazy_env => self.lazy_env(fx),
+            Some(e) => fx.b.use_var(e),
+            None => self.iconst(fx, 0),
+        }
+    }
+
+    /// In inlined block bodies (`fx.inline_levels`): one environment per body, holding a
+    /// copy of its variables, chained onto this frame's; their scopes are pushed for the
+    /// closure being compiled (the caller pops them). Copies are enough: inline.rs `Check`
+    /// lets a nested block use only variables the body never assigns.
+    fn inline_envs(&mut self, fx: &mut Fx) -> Option<Value> {
+        if fx.inline_levels.is_empty() {
+            return None;
+        }
+        let mut env = self.frame_env(fx);
+        let nil = self.nil(fx);
+        for li in 0..fx.inline_levels.len() {
+            let mut names: Vec<(Vec<u8>, Variable)> = fx.inline_levels[li].iter().map(|(n, v)| (n.clone(), *v)).collect();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
+            let n = self.iconst(fx, names.len() as i64);
+            env = self.call(fx, "kn_env_new", &[env, nil, n]);
+            let mut env_slots = HashMap::new();
+            for (i, (name, var)) in names.into_iter().enumerate() {
+                let v = fx.b.use_var(var);
+                fx.b.ins().store(mem(), v, env, ENV_SLOTS + 8 * i as i32);
+                env_slots.insert(name, i);
+            }
+            self.scopes.push(ScopeInfo { env_slots });
+        }
+        Some(env)
+    }
+
     /// Compile a block or lambda literal into a Proc value.
     pub(crate) fn block_proc(&mut self, fx: &mut Fx, params: Option<Node>, body: Option<Node>, locals: Vec<Vec<u8>>, lambda: bool) -> Value {
         // (only this literal: the blocks in its body are ordinary)
         let bmethod = std::mem::take(&mut self.bmethod_next);
+        // made in an inlined block body (inline.rs `Check`): its variables copied into
+        // environments of their own, between this frame's and the closure's
+        let inl = self.inline_envs(fx);
+        let k = fx.inline_levels.len() as u32;
         // what its `return` returns from: this frame when it is a lambda or a method body
         // block (its env, one hop up), else whatever this frame's own returns from
         let ret_hops = match fx.kind {
-            ScopeKind::Block if fx.ret_here => Some(0),
-            ScopeKind::Block => fx.ret_hops.map(|h| h + 1),
+            ScopeKind::Block if fx.ret_here => Some(k),
+            ScopeKind::Block => fx.ret_hops.map(|h| h + 1 + k),
             _ => None,
         };
         let method = fx.method.as_ref().map(|m| MethodCtx {
             hops: Some(match m.hops {
-                None => 0,
-                Some(h) => h + 1,
+                None => k,
+                Some(h) => h + 1 + k,
             }),
             params: if m.hops.is_none() { fx.zsuper.clone() } else { m.params.clone() },
             ..m.clone()
@@ -1505,11 +1574,17 @@ impl<M: Module> Compiler<M> {
                 }
             })
         };
+        let desc = block_params_desc(params.as_ref());
+        if !desc.is_empty() && !self.eval_unit {
+            self.block_params.push((fid, desc));
+        }
+        for _ in 0..k {
+            self.scopes.pop();
+        }
         let addr = self.fn_addr(fx, fid);
-        let env = match fx.env_v {
-            Some(_) if fx.lazy_env => self.lazy_env(fx),
-            Some(e) => fx.b.use_var(e),
-            None => self.iconst(fx, 0),
+        let env = match inl {
+            Some(e) => e,
+            None => self.frame_env(fx),
         };
         let s = self.self_val(fx);
         let min = self.iconst(fx, arity.min);
@@ -1607,7 +1682,7 @@ pub(crate) fn typed_setup(
     let info = std::rc::Rc::new(if typed && std::env::var_os("KENNY_NO_TYPED").is_none() {
         analysis::typed_locals(nodes)
     } else {
-        analysis::Typed { types: HashMap::new(), boxed: HashSet::new(), refs: HashMap::new(), bad: HashSet::new(), seed: HashMap::new() }
+        analysis::Typed { types: HashMap::new(), boxed: HashSet::new(), refs: HashMap::new(), bad: HashSet::new(), seed: HashMap::new(), float_arrays: HashSet::new() }
     });
     let (types, boxed) = (&info.types, &info.boxed);
     if std::env::var_os("KENNY_DEBUG_TYPED").is_some() {

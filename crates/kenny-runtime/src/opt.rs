@@ -335,7 +335,7 @@ unsafe fn send1_found(m: *const Method, recv: V, mid: V, a: V, explicit: u64) ->
                 _ => {}
             }
         }
-        OPT_STR_APPEND if is_str(a) && !is_frozen(recv) => {
+        OPT_STR_APPEND if is_str(a) && !is_frozen(recv) && crate::transcode::same_native(recv, a) => {
             if a == recv {
                 let add = rstr(a).b.clone();
                 rstr(recv).b.extend_from_slice(&add);

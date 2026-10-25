@@ -657,6 +657,18 @@ impl<M: Module> Compiler<M> {
         if let Some(l) = node.as_local_variable_read_node() {
             return self.local_get_num(fx, l.name().as_slice(), l.depth());
         }
+        // (hoist.rs)
+        if let Some(n) = self.hoisted_get(fx, node) {
+            return n;
+        }
+        // an element of an Array of Floats in a statement of felem.rs
+        if fx.spec_stmt.is_some() {
+            if let Some((x, _)) = crate::felem::elem_read(node) {
+                if fx.typed_info.float_arrays.contains(&x) {
+                    return self.felem_read(fx, node, false);
+                }
+            }
+        }
         if let Some(c) = node.as_call_node() {
             if let Some(nc) = num_call_of(&c).filter(|_| self.refine_scope.is_none()) {
                 return self.num_call(fx, &c, nc);
@@ -673,10 +685,22 @@ impl<M: Module> Compiler<M> {
                     self.cur_offset = c.message_loc().map(|l| l.start_offset()).unwrap_or(c.location().start_offset());
                     return Num::Boxed(self.sym_eq(fx, &op, a, b, rs));
                 }
-                let a = self.num_expr(fx, &recv, true);
-                let b = self.num_expr(fx, &arg, true);
+                // (felem.rs: an element next to a Float operand)
+                let felem = fx.spec_stmt.is_some() && matches!(op.as_slice(), b"+" | b"-" | b"*" | b"/");
+                let a = if felem && crate::felem::elem_read(&recv).is_some() && crate::felem::static_float(fx, &arg) {
+                    self.felem_read(fx, &recv, true)
+                } else {
+                    self.num_expr(fx, &recv, true)
+                };
+                let b = if felem && crate::felem::elem_read(&arg).is_some() && crate::felem::static_float(fx, &recv) {
+                    self.felem_read(fx, &arg, true)
+                } else {
+                    self.num_expr(fx, &arg, true)
+                };
                 self.cur_offset = c.message_loc().map(|l| l.start_offset()).unwrap_or(c.location().start_offset());
-                return self.binop_num(fx, &op, a, b, lazy);
+                let r = self.binop_num(fx, &op, a, b, lazy);
+                self.stmt_memo_put(fx, node, r);
+                return r;
             }
         }
         Num::Boxed(self.expr(fx, node))
@@ -1445,6 +1469,30 @@ impl<M: Module> Compiler<M> {
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(done);
         fx.b.block_params(done)[0]
+    }
+
+    /// `recv[idx]` for a plain Array (its `[]` the builtin) and a Fixnum `idx` within it
+    /// (negative counts from the end), else to `fail` (felem.rs).
+    pub(crate) fn ary_load_or(&mut self, fx: &mut Fx, recv: Value, idx: Value, fail: Block) -> Value {
+        let f = mem();
+        let not_fix = fx.b.ins().bnot(idx);
+        let not_fix = fx.b.ins().band_imm_s(not_fix, 1);
+        self.ary_guard(fx, recv, false, not_fix, fail, &[]);
+        let cap_addr = fx.b.ins().iadd_imm_s(recv, ARY_CAP as i64);
+        let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
+        let ptr = fx.b.ins().load(I64, f, recv, ARY_PTR);
+        let len = fx.b.ins().load(I64, f, recv, ARY_LEN);
+        let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
+        let n = fx.b.ins().umin(len, capn);
+        let i = fx.b.ins().sshr_imm_s(idx, 1);
+        let sign = fx.b.ins().sshr_imm_s(i, 63);
+        let add = fx.b.ins().band(sign, n);
+        let i = fx.b.ins().iadd(i, add);
+        let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, i, n);
+        self.require(fx, inb, fail);
+        let off = fx.b.ins().ishl_imm_u(i, 3);
+        let addr = fx.b.ins().iadd(ptr, off);
+        fx.b.ins().load(I64, f, addr, 0)
     }
 
     /// An inline loop's guard without a call (inline.rs): to `ok` when `recv` is a Fixnum
