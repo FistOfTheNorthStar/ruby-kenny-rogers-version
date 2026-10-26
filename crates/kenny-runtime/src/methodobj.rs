@@ -58,8 +58,8 @@ pub fn desc_parameters(d: &str, proc_style: bool) -> V {
         let mut e = vec![mksym(sym(kind))];
         if !name.is_empty() && !matches!(name, "*" | "**" | "&") {
             e.push(mksym(sym(name)));
-        } else if proc_style && kind == "opt" {
-            e.push(QNIL); // a destructuring or `it` parameter: [:opt, nil]
+        } else if proc_style && kind == "opt" && !crate::misc::ruby4() {
+            e.push(QNIL); // a destructuring or `it` parameter: [:opt, nil] (Ruby 4.0: [:opt])
         }
         out.push(ary_new(e));
     }
@@ -80,7 +80,7 @@ pub unsafe extern "C" fn kn_register_block_params(table: *const u64, n: u64, str
 }
 
 /// A compiled block's descriptor.
-fn block_desc(p: V) -> Option<String> {
+pub fn block_desc(p: V) -> Option<String> {
     let pr = rproc(p);
     if !pr.native.is_null() {
         return None;
@@ -137,6 +137,31 @@ pub fn parameters(m: *const Method) -> V {
     ary_new(out)
 }
 
+/// Arity from a parameter descriptor, as CRuby counts it: at least the required positional
+/// parameters (and one more for required keywords), at most all positional ones (and one for
+/// any keywords), unlimited with a rest parameter. `lambda`: method or lambda rules (fixed
+/// only when min == max); a proc's is fixed unless it takes a rest parameter.
+pub fn desc_arity(d: &str, lambda: bool) -> i64 {
+    let (mut lead, mut opt, mut rest, mut kw, mut keyreq) = (0i64, 0i64, false, false, false);
+    for part in d.split(',').filter(|p| !p.is_empty()) {
+        match part.split(':').next().unwrap_or("") {
+            "req" => lead += 1,
+            "opt" => opt += 1,
+            "rest" => rest = true,
+            "keyreq" => {
+                kw = true;
+                keyreq = true;
+            }
+            "key" | "keyrest" => kw = true,
+            _ => {}
+        }
+    }
+    let min = lead + keyreq as i64;
+    let max = if rest { None } else { Some(lead + opt + kw as i64) };
+    let fixed = if lambda { max == Some(min) } else { max.is_some() };
+    if fixed { min } else { -min - 1 }
+}
+
 pub fn arity(m: *const Method) -> i64 {
     if m.is_null() {
         return -1;
@@ -150,6 +175,10 @@ pub fn arity(m: *const Method) -> i64 {
         Body::AttrWriter(_) => 1,
         Body::CFunc(_, a) => *a as i64,
         Body::Proc(p) => {
+            // (define_method: the block's parameters, with lambda rules)
+            if let Some(d) = block_desc(*p) {
+                return desc_arity(&d, true);
+            }
             let pr = rproc(*p);
             if pr.max < 0 || pr.min != pr.max { -(pr.min as i64) - 1 } else { pr.min as i64 }
         }
@@ -158,19 +187,7 @@ pub fn arity(m: *const Method) -> i64 {
                 return -1;
             }
             let d = unsafe { std::ffi::CStr::from_ptr(mm.params as *const std::ffi::c_char) }.to_string_lossy().into_owned();
-            let (mut req, mut optional, mut keyreq) = (0i64, false, false);
-            for part in d.split(',').filter(|p| !p.is_empty()) {
-                match part.split(':').next().unwrap_or("") {
-                    "req" => req += 1,
-                    "opt" | "rest" => optional = true,
-                    "keyreq" => keyreq = true,
-                    _ => {}
-                }
-            }
-            if keyreq {
-                req += 1;
-            }
-            if optional { -req - 1 } else { req }
+            desc_arity(&d, true)
         }
         Body::Undefined => 0,
     }

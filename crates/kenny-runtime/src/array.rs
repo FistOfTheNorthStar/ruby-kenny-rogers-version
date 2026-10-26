@@ -683,16 +683,35 @@ pub fn init() {
             ary_new(out.take())
         })
     });
-    fn find(s: V, b: V) -> V {
+    // find(ifnone = nil) { |x| }: ifnone.call when nothing is found
+    fn find(s: V, a: &[V], b: V, name: &str) -> V {
+        if b == QNIL {
+            return crate::misc::enum_for(s, name, a);
+        }
         for x in snapshot(s) {
             if truthy(tri!(call_block(b, &[x]))) {
                 return x;
             }
         }
-        QNIL
+        crate::misc::find_ifnone(a)
     }
-    defn(c, "find", 0, 1, |s, _, b| find(s, b));
-    defn(c, "detect", 0, 1, |s, _, b| find(s, b));
+    defn(c, "find", 0, 1, |s, a, b| find(s, a, b, "find"));
+    defn(c, "detect", 0, 1, |s, a, b| find(s, a, b, "detect"));
+    // Ruby 4.0: the last element the block is true for
+    if crate::misc::ruby4() {
+        defn(c, "rfind", 0, 1, |s, a, b| {
+            if b == QNIL {
+                return crate::misc::enum_for(s, "rfind", a);
+            }
+            let v = snapshot(s);
+            for &x in v.iter().rev() {
+                if truthy(tri!(call_block(b, &[x]))) {
+                    return x;
+                }
+            }
+            crate::misc::find_ifnone(a)
+        });
+    }
     fn inject(s: V, a: &[V], b: V) -> V {
         let mut items = snapshot(s).into_iter();
         let (mut acc, op) = match (a.len(), is_proc(b)) {

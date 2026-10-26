@@ -10,7 +10,14 @@ Kenny compiles Ruby ahead of time to a single native binary, like Go.
   differences. In dependencies (files found via `-I` load paths, gems, the stdlib) they are build
   warnings instead, and raise `NotImplementedError` only if that code path actually runs — so a
   gem whose debug page uses `binding` still compiles.
-- Syntax is parsed by Prism, Ruby's official parser, so the grammar is exactly Ruby's.
+- Syntax is parsed by Prism, Ruby's official parser, so the grammar is exactly Ruby's: the
+  newest one, so a build against Ruby 3.4 also accepts 4.0's syntax (a line starting with `&&`
+  or `||` continuing the one before).
+- Core behavior follows the Ruby the program is built against, 3.4 or 4.0 (see the README).
+  Not yet in 4.0 builds: `Binding#implicit_parameters` (a `Binding` sees no locals),
+  `ObjectSpace._id2ref` (dropped, below) and `Ractor`. A 4.0 `Set` keeps its elements in an
+  `@hash` instance variable, which `instance_variables` lists (CRuby's has none), and openssl
+  error messages leave out the text of OpenSSL's error queue.
 
 ## Rule 2: drop runtime powers that tax every program
 
@@ -62,7 +69,7 @@ which call sites come after it, and only those sites use a refinement-aware look
   refers to them (Rails refers to `DidYouMean`, csv to `ARGF`), or, for `DidYouMean`, to report
   an uncaught `NameError`. `ErrorHighlight.spot` returns nil (it needs
   `RubyVM::AbstractSyntaxTree`), so error messages have no `^^^^` line under the code.
-- **Backtraces show only Ruby code.** Frames carry Ruby 3.4's labels (`Foo#bar`, `Foo.baz`,
+- **Backtraces show only Ruby code.** Frames carry Ruby 3.4's and 4.0's labels (`Foo#bar`, `Foo.baz`,
   `block in Foo#bar`, inlined methods and blocks included), but methods built into Kenny
   (`Array#map`, `Kernel#require` ...) have no frame of their own, where CRuby lists them.
 - **Every `*args` method forwards keywords as if marked `ruby2_keywords`.** Keywords collected

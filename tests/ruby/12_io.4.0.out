@@ -1,0 +1,196 @@
+true
+12
+"hello\nworld\n"
+"hello\nworld\nmore\nxyz\n007\n"
+["hello\n", "world\n", "more\n", "xyz\n", "007\n"]
+["hello", "world", "more", "xyz", "007"]
+> hello
+> world
+> more
+> xyz
+> 007
+"007"
+5
+"hello\n"
+1
+"wor"
+"ld\n"
+false
+"more\nxyz\n007\n"
+true
+nil
+nil
+""
+5
+"l"
+"l"
+111
+5
+"Q\nw"
+"007\n"
+["hello", "world"]
+5
+"hello"
+"world"
+false
+"BASE/a.txt"
+"#<File:BASE/a.txt>"
+true
+"closed stream"
+"abc"
+true
+"abcdef"
+"ab"
+"abXdef"
+"abXd"
+"a12d"
+11
+[104, 195, 169]
+"hél"
+"lo\nwörld"
+["para1\nline\n\n", "para2\n"]
+"para"
+20
+true
+true
+true
+false
+20
+true
+false
+Time
+"file"
+1000000000
+true
+"100600"
+false
+true
+nil
+true
+"BASE/a.txt"
+true
+true
+"c.rb"
+"c"
+"b.tar"
+"/a/b"
+"."
+"/a"
+".rb"
+""
+"."
+["/a/b", "c.rb"]
+"a/b/c/d"
+"a/b"
+"/x/y/b"
+"/r/x"
+true
+true
+true
+false
+true
+true
+false
+true
+true
+false
+Errno::EEXIST: File exists @ dir_s_mkdir - BASE (errno=17)
+Errno::ENOTEMPTY: Directory not empty @ dir_s_rmdir - BASE (errno=66)
+Errno::EISDIR: Is a directory @ io_fread - BASE (errno=21)
+Errno::ENOTDIR: Not a directory @ rb_sysopen - BASE/a.txt/x (errno=20)
+Errno::ENOENT: No such file or directory @ rb_sysopen - BASE/nope (errno=2)
+Errno::ENOENT: No such file or directory @ rb_file_s_stat - BASE/nope (errno=2)
+Errno::ENOENT: No such file or directory @ rb_file_s_rename - (BASE/nope, BASE/x) (errno=2)
+Errno::ENOENT: No such file or directory @ apply2files - BASE/nope (errno=2)
+Errno::EEXIST: File exists @ rb_sysopen - BASE/a.txt (errno=17)
+Errno::EACCES: Permission denied - custom (errno=13)
+"No such file or directory - x"
+true
+StandardError
+true
+["sub/deep/y.rb", "sub/x.rb", "z.rb"]
+["a.txt", "link", "sub", "z.rb"]
+["a.txt", "link", "sub", "sub/deep", "sub/deep/y.rb", "sub/x.rb", "z.rb"]
+["sub/deep", "sub/x.rb"]
+["sub/deep/y.rb", "sub/x.rb"]
+["z.rb", "a.txt"]
+["sub/"]
+["sub/", "sub/deep/"]
+[".", ".hidden.rb", "a.txt", "link", "sub", "z.rb"]
+["sub/x.rb"]
+["z.rb", "sub/x.rb"]
+["sub/deep/y.rb", "sub/x.rb", "z.rb"]
+[".hidden.rb", "a.txt", "link", "sub", "z.rb"]
+[".", ".."]
+5
+false
+false
+".hidden.rb"
+"BASE"
+"3"
+true
+["sub2/deep", "sub2/deep/y.rb", "sub2/x.rb"]
+false
+"1"
+"x.rb"
+".rb"
+true
+"sub"
+"a/c"
+"../b"
+["moved.rb", "sub/deep/y.rb", "sub/x.rb", "z.rb"]
+"temp data"
+"temp data"
+false
+"x\n"
+false
+true
+true
+false
+before system
+from system
+true
+0
+Process::Status
+false
+3
+false
+nil
+array form
+true
+"hi there\n"
+["a\n", "b\n"]
+3
+"No such file or directory - nonexistent_command_xyz_kenny"
+RuntimeError
+"Command failed with exit 2: exit 2"
+"popen\n"
+"arr args\n"
+"abc"
+"out\nerr\n"
+""
+5
+Errno::ENOENT
+"kernel open file"
+"through pipe\n"
+"child_out\n"
+0
+in child
+7
+true
+3
+"#<Process::Status: pid N exit 3>"
+4
+true
+true
+15
+nil
+true
+true
+true
+"from main"
+false
+"captured\nx1\n"
+via $stdout
+via STDOUT
+false

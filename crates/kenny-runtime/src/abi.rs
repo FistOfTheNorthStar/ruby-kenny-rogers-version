@@ -1093,6 +1093,9 @@ fn implicit_const(id: u32) -> Option<&'static str> {
         "did_you_mean"
     } else if id == sym("ARGF") {
         "kenny/argf"
+    } else if id == sym("Pathname") && crate::misc::ruby4() {
+        // a core class in Ruby 4.0
+        "kenny/pathname4"
     } else {
         return None;
     };
@@ -1476,6 +1479,15 @@ pub extern "C" fn kn_const_defined(cref: V, id: V) -> u64 {
 /// empty module and the autoloaded file — with its own autoloads — would never run).
 /// Returns false if loading raised.
 fn autoload_before_define(outer: *mut Class, id: u32) -> bool {
+    // `class Set` / `class Pathname` (4.0) ... before the constant is used: reopen the class
+    // CRuby has without a require, which is loaded first (see implicit_const)
+    if outer == rt().c.object && !unsafe { (*outer).consts.contains_key(&id) } {
+        if let Some(file) = implicit_const(id) {
+            if crate::compat::require_compiled(file).is_some() && pst().pending_is_set() {
+                return false;
+            }
+        }
+    }
     let Some(a) = autoloads().get(&(outer as usize, id)).map(|a| Autoload { loader: a.loader, flag: a.flag, path: a.path.clone() }) else { return true };
     // the entry goes once the file has run: while it runs (this `class` statement may be the
     // file's own), other threads that find the constant wait for it (settle_autoload)

@@ -147,8 +147,12 @@ fn mix_name(e: Enc) -> &'static str {
     if e.codec == Codec::Binary { "BINARY (ASCII-8BIT)" } else { e.name }
 }
 /// How an encoding is named in a conversion error.
+/// The name CRuby's transcoder for `e` goes by in error messages: upper-case for the
+/// single-byte encodings (WINDOWS-1252, MACROMAN, IBM437 ...), the encoding's own name for
+/// the others (Shift_JIS, EUC-JP, UTF-16LE).
 fn conv_name(e: Enc) -> String {
-    e.name.to_ascii_uppercase()
+    let n = e.name;
+    if n.starts_with("Windows-12") || n == "Windows-874" || n.starts_with("mac") { n.to_ascii_uppercase() } else { n.to_string() }
 }
 
 fn enc_error(class: &str, msg: &str) -> V {
@@ -542,13 +546,23 @@ fn transcode(bytes: &[u8], src: Enc, dst: Enc, o: &Opts) -> Result<Vec<u8>, V> {
             }
         }
     };
+    // CRuby names the conversion steps by their transcoders (upper-case names) and the whole
+    // conversion by the encodings: the same names up to 3.4, the encodings' own (macRoman,
+    // Windows-1252) in 4.0, where a one-step conversion is then reported in the long form
+    let r4 = crate::misc::ruby4();
+    let whole = |e: Enc| if r4 { e.name.to_string() } else { conv_name(e) };
+    let short = |e: Enc| !r4 || e.name == conv_name(e);
     let via = |what: &str| {
-        if src.codec == Codec::Utf8 {
+        if src.codec == Codec::Utf8 && short(dst) {
             format!("{what} from UTF-8 to {}", conv_name(dst))
-        } else if dst.codec == Codec::Utf8 {
+        } else if src.codec == Codec::Utf8 {
+            format!("{what} to {} in conversion from UTF-8 to {}", conv_name(dst), conv_name(dst))
+        } else if dst.codec == Codec::Utf8 && short(src) {
             format!("{what} from {} to UTF-8", conv_name(src))
+        } else if dst.codec == Codec::Utf8 {
+            format!("{what} to UTF-8 in conversion from {} to UTF-8", whole(src))
         } else {
-            format!("{what} to {} in conversion from {} to UTF-8 to {}", conv_name(dst), conv_name(src), conv_name(dst))
+            format!("{what} to {} in conversion from {} to UTF-8 to {}", conv_name(dst), whole(src), conv_name(dst))
         }
     };
     if o.xml == Some(true) {
@@ -629,10 +643,12 @@ fn transcode(bytes: &[u8], src: Enc, dst: Enc, o: &Opts) -> Result<Vec<u8>, V> {
                     replacement(&mut out, &mut emit);
                     continue;
                 }
-                return Err(enc_error("UndefinedConversionError", &if dst.codec == Codec::Utf8 {
+                return Err(enc_error("UndefinedConversionError", &if dst.codec == Codec::Utf8 && short(src) {
                     format!("{} from {} to UTF-8", dump(&[b]), conv_name(src))
+                } else if dst.codec == Codec::Utf8 {
+                    format!("{} to UTF-8 in conversion from {} to UTF-8", dump(&[b]), whole(src))
                 } else {
-                    format!("{} to UTF-8 in conversion from {} to UTF-8 to {}", dump(&[b]), conv_name(src), conv_name(dst))
+                    format!("{} to UTF-8 in conversion from {} to UTF-8 to {}", dump(&[b]), whole(src), conv_name(dst))
                 }));
             }
             Unit::Bad { bytes, incomplete, next } => {

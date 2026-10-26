@@ -421,14 +421,17 @@ pub fn init() {
         let arr = ary_new(pair_ary(s));
         send(arr, sym("count"), a, b)
     });
-    defn(c, "find", 0, 1, |s, _, b| {
+    defn(c, "find", 0, 1, |s, a, b| {
+        if b == QNIL {
+            return crate::misc::enum_for(s, "find", a);
+        }
         for (k, v) in pairs(s) {
             let p = ary_new(vec![k, v]);
             if truthy(tri!(call_block(b, &[p]))) {
                 return p;
             }
         }
-        QNIL
+        crate::misc::find_ifnone(a)
     });
     defn(c, "detect", 0, 1, |s, a, b| send(s, sym("find"), a, b));
     defn(c, "sum", 0, 1, |s, a, b| send(ary_new(pair_ary(s)), sym("sum"), a, b));

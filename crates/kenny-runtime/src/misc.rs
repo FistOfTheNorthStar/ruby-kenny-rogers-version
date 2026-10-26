@@ -9,12 +9,55 @@ use crate::tri;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-/// The Ruby release Kenny matches (the one the tests' expected output and the builds' standard
-/// library come from; the repository's .ruby-version).
-pub const RUBY_VERSION: &str = "3.4.12";
-const RUBY_TEENY: &str = "12";
-const RUBY_PATCHLEVEL: &str = "148";
-const RUBY_RELEASE_DATE: &str = "2026-10-23";
+/// The Ruby a program was built against: its standard library and gems are compiled in, and it
+/// reports this version (RUBY_VERSION ...). Kenny implements Ruby 3.4 and 4.0; a program built
+/// against 4.0 or later gets 4.0's behavior where the two differ (see `ruby4`).
+pub struct RubyRelease {
+    pub version: String,
+    pub major: u32,
+    pub minor: u32,
+    pub teeny: u32,
+    pub patchlevel: i64,
+    pub release_date: String,
+}
+
+static RELEASE: std::sync::OnceLock<RubyRelease> = std::sync::OnceLock::new();
+static RUBY4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called by the program's `main` before the runtime starts: "VERSION PATCHLEVEL RELEASE_DATE"
+/// of the Ruby `kenny build` used.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_register_ruby(p: *const u8, len: u64) {
+    let line = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len as usize) }).into_owned();
+    let mut w = line.split_whitespace();
+    let (Some(version), patchlevel, date) = (w.next(), w.next(), w.next()) else { return };
+    let r = release_of(version, patchlevel.and_then(|p| p.parse().ok()).unwrap_or(0), date.unwrap_or(""));
+    RUBY4.store(r.major >= 4, std::sync::atomic::Ordering::Relaxed);
+    let _ = RELEASE.set(r);
+}
+
+fn release_of(version: &str, patchlevel: i64, date: &str) -> RubyRelease {
+    let n: Vec<u32> = version.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+    RubyRelease {
+        version: version.to_string(),
+        major: n.first().copied().unwrap_or(3),
+        minor: n.get(1).copied().unwrap_or(4),
+        teeny: n.get(2).copied().unwrap_or(0),
+        patchlevel,
+        release_date: date.to_string(),
+    }
+}
+
+/// The Ruby the program was built against (Ruby 3.4.12 when the build named none).
+pub fn ruby_release() -> &'static RubyRelease {
+    RELEASE.get_or_init(|| release_of("3.4.12", 148, "2026-10-23"))
+}
+
+/// Whether the program has Ruby 4.0's behavior (built against Ruby 4.0 or later).
+#[inline]
+pub fn ruby4() -> bool {
+    RUBY4.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 // ---------- iteration helpers ----------
 
@@ -90,6 +133,14 @@ pub fn each_args_until(v: V, f: impl FnMut(&[V]) -> Result<bool, V> + 'static) -
         return Err(UNDEF);
     }
     Ok(())
+}
+
+/// What Enumerable#find returns when nothing matched: `ifnone.call`, or nil.
+pub fn find_ifnone(a: &[V]) -> V {
+    match a.first() {
+        Some(&f) if f != QNIL => send(f, sym("call"), &[], QNIL),
+        _ => QNIL,
+    }
 }
 
 pub fn enum_for(recv: V, meth: &str, args: &[V]) -> V {
@@ -580,9 +631,22 @@ pub fn init() {
             Err(e) => e,
         }
     });
+    // (as CRuby's range_min / range_max)
+    fn numeric_end(v: V) -> bool {
+        is_fix(v) || is_a(v, rt().c.numeric)
+    }
     defn(rg, "min", 0, 1, |s, a, b| {
         let r = rrange(s);
-        if a.is_empty() && !is_proc(b) {
+        if r.lo == QNIL {
+            return raise(rt().c.range_error, "cannot get the minimum of beginless range");
+        }
+        if is_proc(b) || (r.excl && !numeric_end(r.hi)) || !a.is_empty() {
+            if r.hi == QNIL {
+                return raise(rt().c.range_error, "cannot get the minimum of endless range with custom comparison method");
+            }
+        } else if r.hi == QNIL {
+            return r.lo;
+        } else {
             let c = tri!(send1(r.lo, "<=>", r.hi));
             return if is_fix(c) && (fix(c) < 0 || (fix(c) == 0 && !r.excl)) { r.lo } else { QNIL };
         }
@@ -593,12 +657,95 @@ pub fn init() {
     });
     defn(rg, "max", 0, 1, |s, a, b| {
         let r = rrange(s);
-        if a.is_empty() && !is_proc(b) && !r.excl {
-            let c = tri!(send1(r.lo, "<=>", r.hi));
-            return if is_fix(c) && fix(c) <= 0 { r.hi } else { QNIL };
+        if r.hi == QNIL {
+            return raise(rt().c.range_error, "cannot get the maximum of endless range");
+        }
+        if is_proc(b) || (r.excl && !numeric_end(r.hi)) || !a.is_empty() {
+            if r.lo == QNIL {
+                return raise(rt().c.range_error, "cannot get the maximum of beginless range with custom comparison method");
+            }
+        } else {
+            let c = if r.lo == QNIL { mkfix(-1) } else { tri!(send1(r.lo, "<=>", r.hi)) };
+            if !is_fix(c) || fix(c) > 0 {
+                return QNIL;
+            }
+            if r.excl {
+                if !is_int(r.hi) {
+                    return type_error("cannot exclude non Integer end value");
+                }
+                if fix(c) == 0 {
+                    return QNIL;
+                }
+                // (Ruby 4.0: a beginless range's too)
+                if !is_int(r.lo) && !(r.lo == QNIL && ruby4()) {
+                    return type_error("cannot exclude end value with non Integer begin value");
+                }
+                return send(r.hi, sym("-"), &[mkfix(1)], QNIL);
+            }
+            return r.hi;
         }
         match each_to_vec(s) {
             Ok(v) => send(ary_new(v), sym("max"), a, b),
+            Err(e) => e,
+        }
+    });
+    if ruby4() {
+        defn(rg, "to_set", 0, -1, |s, a, b| {
+            if rrange(s).hi == QNIL {
+                return raise(rt().c.range_error, "cannot convert endless range to a set");
+            }
+            let m = find_method(rt().c.enumerable, sym("to_set"));
+            invoke(m, s, a, b)
+        });
+    }
+    // overlap?(range): whether some value is in both (as CRuby's range_overlap)
+    defn(rg, "overlap?", 1, 1, |s, a, _| {
+        if !is_range(a[0]) {
+            return type_error(&format!("wrong argument type {} (expected Range)", class_name(real_class(a[0]))));
+        }
+        let (x, y) = (rrange(s), rrange(a[0]));
+        // <=> of a and b (i32::MAX: not comparable)
+        fn less(a: V, b: V) -> Result<i64, V> {
+            let c = send1(a, "<=>", b);
+            if c == UNDEF {
+                return Err(c);
+            }
+            if c == QNIL {
+                return Ok(i32::MAX as i64);
+            }
+            let n = send1(c, "<=>", mkfix(0));
+            if n == UNDEF {
+                return Err(n);
+            }
+            Ok(if is_fix(n) { fix(n) } else { 0 })
+        }
+        fn empty(lo: V, hi: V, excl: bool) -> Result<bool, V> {
+            if lo == QNIL || hi == QNIL {
+                return Ok(false);
+            }
+            let l = less(lo, hi)?;
+            Ok(l > 0 || (excl && l == 0))
+        }
+        let r = (|| -> Result<bool, V> {
+            if empty(x.lo, y.hi, y.excl)? || empty(y.lo, x.hi, x.excl)? {
+                return Ok(false);
+            }
+            if x.lo != QNIL && y.lo != QNIL {
+                let c = send1(x.lo, "<=>", y.lo);
+                if c == UNDEF {
+                    return Err(c);
+                }
+                if c == QNIL {
+                    return Ok(false);
+                }
+                if less(x.lo, y.lo)? == 0 {
+                    return Ok(true);
+                }
+            }
+            Ok(!empty(x.lo, x.hi, x.excl)? && !empty(y.lo, y.hi, y.excl)?)
+        })();
+        match r {
+            Ok(b) => bool_v(b),
             Err(e) => e,
         }
     });
@@ -635,6 +782,9 @@ pub fn init() {
     defn(pc, "to_proc", 0, 0, |s, _, _| s);
     defn(pc, "lambda?", 0, 0, |s, _, _| bool_v(rproc(s).lambda));
     defn(pc, "arity", 0, 0, |s, _, _| {
+        if let Some(d) = crate::methodobj::block_desc(s) {
+            return mkfix(crate::methodobj::desc_arity(&d, rproc(s).lambda));
+        }
         let p = rproc(s);
         if p.max < 0 || (p.min != p.max && p.lambda) { mkfix(-(p.min as i64) - 1) } else { mkfix(p.min as i64) }
     });
@@ -726,7 +876,10 @@ pub fn init() {
         }
         each_with_index_via_each(s, b)
     });
-    fn find_impl(s: V, b: V) -> V {
+    fn find_impl(s: V, a: &[V], b: V, name: &str) -> V {
+        if b == QNIL {
+            return enum_for(s, name, a);
+        }
         let found = Rc::new(RefCell::new(RVec::new()));
         let f2 = found.clone();
         match each_until(s, move |x| {
@@ -740,12 +893,15 @@ pub fn init() {
             }
             Ok(false)
         }) {
-            Ok(()) => found.borrow().first().copied().unwrap_or(QNIL),
+            Ok(()) => match found.borrow().first().copied() {
+                Some(x) => x,
+                None => find_ifnone(a),
+            },
             Err(e) => e,
         }
     }
-    defn(en, "find", 0, 1, |s, _, b| find_impl(s, b));
-    defn(en, "detect", 0, 1, |s, _, b| find_impl(s, b));
+    defn(en, "find", 0, 1, |s, a, b| find_impl(s, a, b, "find"));
+    defn(en, "detect", 0, 1, |s, a, b| find_impl(s, a, b, "detect"));
     defn(en, "find_index", 0, 1, |s, a, b| {
         let idx = Rc::new(Cell::new(-1i64));
         let i2 = idx.clone();
@@ -1256,6 +1412,14 @@ pub fn init() {
     math1!("tanh", f64::tanh);
     math1!("exp", f64::exp);
     math1_pos!("log2", f64::log2);
+    if ruby4() {
+        defs(m, "log1p", 1, 1, |_, a, _| match float_arg(a[0]) {
+            Ok(x) if x < -1.0 => math_domain("log1p"),
+            Ok(x) => float_new(x.ln_1p()),
+            Err(e) => e,
+        });
+        math1!("expm1", f64::exp_m1);
+    }
     math1_pos!("log10", f64::log10);
     defs(m, "log", 1, 2, |_, a, _| {
         let x = match float_arg(a[0]) {
@@ -1364,12 +1528,15 @@ pub fn init() {
     for k in ["host_os", "target_os"] {
         crate::hash::hset(cfg, str_from(k), str_from(&os));
     }
+    let rel = ruby_release();
+    let (abi, major, minor, teeny, patchlevel) =
+        (format!("{}.{}.0", rel.major, rel.minor), rel.major.to_string(), rel.minor.to_string(), rel.teeny.to_string(), rel.patchlevel.to_string());
     for (k, v) in [
-        ("ruby_version", "3.4.0"),
-        ("MAJOR", "3"),
-        ("MINOR", "4"),
-        ("TEENY", RUBY_TEENY),
-        ("PATCHLEVEL", RUBY_PATCHLEVEL),
+        ("ruby_version", abi.as_str()),
+        ("MAJOR", major.as_str()),
+        ("MINOR", minor.as_str()),
+        ("TEENY", teeny.as_str()),
+        ("PATCHLEVEL", patchlevel.as_str()),
         ("host_cpu", if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" }),
         ("arch", if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" }),
         ("EXEEXT", ""),
@@ -1386,14 +1553,40 @@ pub fn init() {
     // CRuby's has the unexpanded Makefile values; Kenny's values have nothing to expand
     const_set(rbc, sym("MAKEFILE_CONFIG"), cfg);
     defs(rbc, "ruby", 0, 0, |_, _, _| str_from("ruby"));
-    set_global_const("RUBY_VERSION", str_from(RUBY_VERSION));
+    set_global_const("RUBY_VERSION", str_from(&rel.version));
     set_global_const("RUBY_PLATFORM", str_from(if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" }));
     set_global_const("RUBY_ENGINE", str_from("kenny"));
-    set_global_const("RUBY_PATCHLEVEL", mkfix(RUBY_PATCHLEVEL.parse().unwrap_or(0)));
-    set_global_const("RUBY_RELEASE_DATE", str_from(RUBY_RELEASE_DATE));
+    set_global_const("RUBY_PATCHLEVEL", mkfix(rel.patchlevel));
+    set_global_const("RUBY_RELEASE_DATE", str_from(&rel.release_date));
     set_global_const("RUBY_COPYRIGHT", str_from("Kenny Ruby"));
     let platform = if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" };
-    set_global_const("RUBY_DESCRIPTION", str_from(&format!("kenny (ruby {RUBY_VERSION} compatible) [{platform}]")));
+    let description = format!("kenny (ruby {} compatible) [{platform}]", rel.version);
+    set_global_const("RUBY_DESCRIPTION", str_from(&description));
+    // Ruby 4.0's `Ruby` module: the same facts as the RUBY_* constants
+    if ruby4() {
+        let m = new_module("Ruby");
+        set_global_const("Ruby", m as V);
+        for (k, v) in [
+            ("VERSION", str_from(&rel.version)),
+            ("PATCHLEVEL", mkfix(rel.patchlevel)),
+            ("RELEASE_DATE", str_from(&rel.release_date)),
+            ("PLATFORM", str_from(platform)),
+            ("DESCRIPTION", str_from(&description)),
+            ("COPYRIGHT", str_from("Kenny Ruby")),
+            ("ENGINE", str_from("ruby")),
+            ("ENGINE_VERSION", str_from(&rel.version)),
+        ] {
+            const_set(m, sym(k), v);
+        }
+        // Pathname is a core class in 4.0, loaded on first use: of the constant (abi.rs's
+        // implicit_const) or of Kernel#Pathname, which kenny/pathname4 then redefines
+        defn(rt().c.kernel, "Pathname", 1, 1, |s, a, b| {
+            if crate::compat::require_compiled("kenny/pathname4").is_none() {
+                return raise(rt().c.name_error, "uninitialized constant Pathname");
+            }
+            send(s, sym("Pathname"), a, b)
+        });
+    }
 }
 
 /// Major version of the running kernel (`uname -r`: "24.6.0" -> 24).

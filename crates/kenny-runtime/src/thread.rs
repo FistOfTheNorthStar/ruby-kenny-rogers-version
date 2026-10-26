@@ -1288,9 +1288,17 @@ pub fn fiber_yield(args: &[V]) -> V {
     };
     let f = unsafe { &*fiber_ptr(fid) };
     leave_ctx(f.ctx);
-    let y = f.yielder;
+    let (y, obj) = (f.yielder, f.obj);
     // resumed again
-    unsafe { (*y).suspend(v) }
+    let r = unsafe { (*y).suspend(v) };
+    // (Fiber#raise: resumed to raise its exception here)
+    let pend = ivar_get(obj, sym("@__raise"));
+    if pend != QNIL {
+        ivar_set(obj, sym("@__raise"), QNIL);
+        let args = crate::gc::Rooted::of(rary(pend).v.clone());
+        return send(QNIL, sym("raise"), &args, QNIL);
+    }
+    r
 }
 
 // ---------- Mutex objects ----------
@@ -1433,7 +1441,7 @@ pub fn init() {
         }
     }
     defn(th, "join", 0, 1, |s, a, _| {
-        let t = a.first().and_then(|x| crate::fmt::num_to_f(*x)).map(Duration::from_secs_f64);
+        let t = a.first().and_then(|x| crate::fmt::num_to_f(*x)).and_then(timeout_secs);
         join(s, t)
     });
     defn(th, "value", 0, 0, |s, _, _| {
@@ -1508,16 +1516,45 @@ pub fn init() {
         crate::gc::KN_GC_PENDING.fetch_or(PREEMPT_BIT, Ordering::Relaxed);
         s
     }
-    defn(th, "raise", 0, 2, |s, a, _| {
+    // raise(exception = RuntimeError, message, backtrace, cause:)
+    defn(th, "raise", 0, -1, |s, a, _| {
+        let mut av = a.to_vec();
+        let mut cause = None;
+        // (Ruby 3.4 takes keywords as the backtrace argument)
+        if let Some(&h) = av.last().filter(|_| crate::misc::ruby4()) {
+            if is_hash(h) && hdr(h).flags & FL_KWHASH != 0 {
+                if let Some(&c) = rhash(h).m.get(&HKey(mksym(sym("cause")))) {
+                    cause = Some(c);
+                }
+                av.pop();
+            }
+        }
+        if av.len() > 3 {
+            return arg_error(&format!("wrong number of arguments (given {}, expected 0..3)", av.len()));
+        }
+        let a = &av[..];
         let e = if a.is_empty() {
             exc_new(rt().c.runtime_error, "unhandled exception")
         } else if is_str(a[0]) {
             exc_new(rt().c.runtime_error, &String::from_utf8_lossy(&rstr(a[0]).b))
         } else if is_class(a[0]) {
-            tri!(send(a[0], sym("new"), &a[1..], QNIL))
+            tri!(send(a[0], sym("new"), &a[1..a.len().min(2)], QNIL))
         } else {
             a[0]
         };
+        if !is_a(e, rt().c.exception) {
+            return type_error("exception class/object expected");
+        }
+        if let Some(&bt) = a.get(2) {
+            tri!(send(e, sym("set_backtrace"), &[bt], QNIL));
+        }
+        if let Some(c) = cause {
+            if c != QNIL && !is_a(c, rt().c.exception) {
+                return type_error("exception object expected");
+            }
+            ivar_set(e, sym("@__cause"), c);
+            ivar_set(e, sym("@__cause_set"), QTRUE);
+        }
         interrupt(s, Throw::Raise(e))
     });
     for name in ["kill", "exit", "terminate"] {
@@ -1660,8 +1697,11 @@ pub fn init() {
         r
     });
     defn(mx, "sleep", 0, 1, |s, a, _| {
+        let d = match a.first().and_then(|x| crate::fmt::num_to_f(*x)) {
+            Some(x) => Some(match time_interval(x) { Ok(d) => d, Err(e) => return e }),
+            None => None,
+        };
         tri!(unlock(s));
-        let d = a.first().and_then(|x| crate::fmt::num_to_f(*x)).map(Duration::from_secs_f64);
         let r = sleep(d);
         tri!(lock(s));
         r
@@ -1673,7 +1713,10 @@ pub fn init() {
     const_set(th, sym("ConditionVariable"), cv as V);
     defn(cv, "wait", 1, 2, |s, a, _| {
         let m = a[0];
-        let d = a.get(1).and_then(|x| crate::fmt::num_to_f(*x)).map(Duration::from_secs_f64);
+        let d = match a.get(1).and_then(|x| crate::fmt::num_to_f(*x)) {
+            Some(x) => Some(match time_interval(x) { Ok(d) => d, Err(e) => return e }),
+            None => None,
+        };
         let native = mutex_state(m).filter(|st| st.owner.load(Ordering::Relaxed) == me());
         let w = if let (Some(mst), true) = (native, active()) {
             // release the mutex and start waiting in one locked step (no lost signal)
@@ -1773,7 +1816,7 @@ pub fn init() {
     fn pop(s: V, a: &[V]) -> V {
         let non_block = a.first().is_some_and(|x| !is_hash(*x) && truthy(*x));
         let timeout = a.iter().find(|x| is_hash(**x)).and_then(|h| rhash(*h).m.get(&HKey(mksym(sym("timeout")))).copied()).and_then(crate::fmt::num_to_f);
-        let deadline = timeout.map(|t| Instant::now() + Duration::from_secs_f64(t));
+        let deadline = timeout.and_then(timeout_secs).map(|t| Instant::now() + t);
         let room = ivar_get(s, sym("@__room"));
         loop {
             let closed = truthy(ivar_get(s, sym("@__closed")));
@@ -1935,6 +1978,20 @@ pub fn init() {
     });
     defs(fb, "yield", 0, -1, |_, a, _| fiber_yield(a));
     defn(fb, "resume", 0, -1, |s, a, _| fiber_resume(s, a));
+    // raise(exception = RuntimeError, message, backtrace, cause:) inside the fiber, where it
+    // last yielded
+    defn(fb, "raise", 0, -1, |s, a, _| {
+        let f = unsafe { &*fiber_ptr(fiber_of(s)) };
+        if !f.started {
+            return raise(sraw().unwrap().fiber_error, "cannot raise exception on unborn fiber");
+        }
+        if f.done {
+            return raise(sraw().unwrap().fiber_error, "attempt to resume a terminated fiber");
+        }
+        let args = if a.is_empty() { vec![rt().c.runtime_error as V, new_str_v("unhandled exception".into())] } else { a.to_vec() };
+        ivar_set(s, sym("@__raise"), ary_new(args));
+        fiber_resume(s, &[])
+    });
     defn(fb, "alive?", 0, 0, |s, _, _| {
         if ivar_get(s, sym("@__fid")) == QNIL {
             return QTRUE; // a thread's root fiber
@@ -2001,7 +2058,11 @@ pub fn init() {
     defn(rt().c.kernel, "sleep", 0, 1, |_, a, _| {
         let secs = a.first().and_then(|x| crate::fmt::num_to_f(*x));
         let start = Instant::now();
-        tri!(sleep(secs.map(|s| Duration::from_secs_f64(s.max(0.0)))));
+        let d = match secs {
+            Some(s) => Some(match time_interval(s) { Ok(d) => d, Err(e) => return e }),
+            None => None,
+        };
+        tri!(sleep(d));
         mkfix(start.elapsed().as_secs_f64().round() as i64)
     });
 

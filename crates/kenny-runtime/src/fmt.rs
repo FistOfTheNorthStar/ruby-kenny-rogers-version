@@ -104,7 +104,24 @@ pub fn obj_inspect(v: V) -> Result<String, ()> {
     guarded(v, || format!("#<{}:0x{:016x} ...>", class_name(real_class(v)), v), || obj_inspect_inner(v))
 }
 fn obj_inspect_inner(v: V) -> Result<String, ()> {
-    let ivs = ivar_list(v);
+    let mut ivs = ivar_list(v);
+    // Ruby 4.0: the instance variables an object's #instance_variables_to_inspect names (nil: all)
+    if crate::misc::ruby4() {
+        let m = sym("instance_variables_to_inspect");
+        if !find_method(class_of(v), m).is_null() {
+            let names = send(v, m, &[], QNIL);
+            if names == UNDEF {
+                return Err(());
+            }
+            if is_ary(names) {
+                let want: Vec<u32> = rary(names).v.iter().filter(|x| is_sym(**x)).map(|x| sym_id(*x)).collect();
+                ivs = want.iter().filter_map(|n| ivs.iter().find(|(k, _)| k == n).copied()).collect();
+            } else if names != QNIL {
+                type_error(&format!("Expected #instance_variables_to_inspect to return an Array or nil, but it returned {}", class_name(real_class(names))));
+                return Err(());
+            }
+        }
+    }
     let mut s = format!("#<{}:0x{:016x}", class_name(real_class(v)), v);
     for (i, (name, val)) in ivs.iter().enumerate() {
         s.push_str(if i == 0 { " " } else { ", " });

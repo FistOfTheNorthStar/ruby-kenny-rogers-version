@@ -707,7 +707,7 @@ pub fn init() {
     defn(k, "sleep", 0, 1, |_, a, _| {
         flush_out();
         let secs = a.first().and_then(|x| num_to_f(*x)).unwrap_or(0.0);
-        std::thread::sleep(std::time::Duration::from_secs_f64(secs.max(0.0)));
+        std::thread::sleep(match time_interval(secs) { Ok(d) => d, Err(e) => return e });
         mkfix(secs.round() as i64)
     });
     defn(k, "gets", 0, 1, |_, _, _| {
@@ -1623,7 +1623,20 @@ pub fn init() {
         }
         crate::backtrace::locations(&crate::backtrace::unpack(raw))
     });
-    defn(ex, "set_backtrace", 1, 1, |s, a, _| ivar_set(s, sym("@__backtrace"), a[0]));
+    // nil, a String, or an Array of Strings or of Thread::Backtrace::Locations
+    defn(ex, "set_backtrace", 1, 1, |s, a, _| {
+        let bt = a[0];
+        let loc = |x: V| class_name(real_class(x)) == "Thread::Backtrace::Location";
+        let v = if bt == QNIL || (is_ary(bt) && (rary(bt).v.iter().all(|x| is_str(*x)) || rary(bt).v.iter().all(|x| loc(*x)))) {
+            bt
+        } else if is_str(bt) {
+            ary_new(vec![bt])
+        } else {
+            return type_error("backtrace must be an Array of String or an Array of Thread::Backtrace::Location");
+        };
+        ivar_set(s, sym("@__backtrace"), v);
+        v
+    });
     defn(ex, "cause", 0, 0, |s, _, _| ivar_get(s, sym("@__cause")));
     defn(ex, "==", 1, 1, |s, a, _| bool_v(s == a[0] || (real_class(s) == real_class(a[0]) && is_heap(a[0]) && eql(ivar_get(s, sym("@__message")), ivar_get(a[0], sym("@__message"))))));
     defn(ex, "exception", 0, 1, |s, a, _| {
@@ -1659,6 +1672,25 @@ pub fn init() {
         QNIL
     }
     defn(c.name_error, "initialize", 0, -1, |s, a, _| name_error_init(s, a));
+    // FrozenError.new(msg = nil, receiver: obj) and #receiver (the object that is frozen)
+    defn(c.frozen_error, "initialize", 0, -1, |s, a, _| {
+        let mut a = a.to_vec();
+        if a.last().is_some_and(|x| is_hash(*x) && hdr(*x).flags & FL_KWHASH != 0) {
+            let h = a.pop().unwrap();
+            let r = crate::hash::hget(h, mksym(sym("receiver")));
+            if r != UNDEF {
+                ivar_set(s, sym("@__receiver"), r);
+            }
+        }
+        if a.len() > 1 {
+            return arg_error(&format!("wrong number of arguments (given {}, expected 0..1)", a.len()));
+        }
+        ivar_set(s, sym("@__message"), a.first().copied().unwrap_or(QNIL));
+        QNIL
+    });
+    defn(c.frozen_error, "receiver", 0, 0, |s, _, _| {
+        if ivar_defined(s, sym("@__receiver")) { ivar_get(s, sym("@__receiver")) } else { arg_error("no receiver is available") }
+    });
     defn(c.name_error, "receiver", 0, 0, |s, _, _| ivar_get(s, sym("@receiver")));
     // (CRuby: the locals where it was raised, for DidYouMean; locals aren't visible here)
     defn(c.name_error, "local_variables", 0, 0, |_, _, _| ary_new(vec![]));

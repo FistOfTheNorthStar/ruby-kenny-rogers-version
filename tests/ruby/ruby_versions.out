@@ -1,0 +1,34 @@
+ruby_module: nil
+set_literal: #<Set: {3, 1, 2}>
+set_class: [Set, 2]
+pathname: :not_core
+set_reopen: :reopened
+set_subclass: "#<MySet: {1}>"
+warning_categories: [false, true, false]
+warn_bad_uplevel: ArgumentError: negative level (-1)
+warn_bad_category: ArgumentError: unknown category: nope
+frozen_receiver: true
+frozen_no_receiver: ArgumentError: no receiver is available
+arity: [-2, 1, 1]
+proc_params: [[:opt, nil]]
+rfind: NoMethodError: undefined method 'rfind' for an instance of Array
+find_ifnone: :none
+strip_selectors: ArgumentError: wrong number of arguments (given 1, expected 0)
+log1p: NoMethodError: undefined method 'log1p' for module Math
+produce_size: ArgumentError: wrong number of arguments (given 2, expected 0..1)
+endless_to_set: :loops_before_4
+status_and: true
+pipe_open: "hi\n"
+ivars_to_inspect: "#<Secretive:X @host=\"h\", @password=\"p\">"
+beginless_max: TypeError: cannot exclude end value with non Integer begin value
+range_overlap: [true, false, true]
+beginless_max_incl: 5
+endless_max: RangeError: cannot get the maximum of endless range
+thread_raise_cause: TypeError: backtrace must be an Array of String or an Array of Thread::Backtrace::Location
+fiber_raise: [:rescued, "in fiber"]
+fiber_raise_unborn: FiberError: cannot raise exception on unborn fiber
+sleep_inf: RangeError: Inf out of Time range
+sleep_neg: ArgumentError: time interval must not be negative
+join_inf: 1
+select_inf: RangeError: Inf out of Time range
+shift_jis_name: Encoding::UndefinedConversionError: U+00E9 from UTF-8 to Shift_JIS

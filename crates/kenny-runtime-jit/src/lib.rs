@@ -139,6 +139,7 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_binding_new", kenny_runtime::compat::kn_binding_new as *const u8),
         ("kn_register_file", kenny_runtime::compat::kn_register_file as *const u8),
         ("kn_register_debug", kenny_runtime::backtrace::kn_register_debug as *const u8),
+        ("kn_register_ruby", kenny_runtime::misc::kn_register_ruby as *const u8),
         ("kn_send_refined", kenny_runtime::abi::kn_send_refined as *const u8),
         ("kn_send0", kenny_runtime::opt::kn_send0 as *const u8),
         ("kn_send1", kenny_runtime::opt::kn_send1 as *const u8),

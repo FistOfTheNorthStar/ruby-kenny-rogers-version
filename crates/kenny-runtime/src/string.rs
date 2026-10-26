@@ -761,9 +761,64 @@ pub fn init() {
     map_str!("capitalize", "capitalize!", capitalize);
     map_str!("swapcase", "swapcase!", swapcase);
     map_str!("reverse", "reverse!", |x: &str| x.chars().rev().collect::<String>());
-    map_str!("strip", "strip!", |x: &str| String::from_utf8_lossy(strip_r(strip_l(x.as_bytes()))).into_owned());
-    map_str!("lstrip", "lstrip!", |x: &str| String::from_utf8_lossy(strip_l(x.as_bytes())).into_owned());
-    map_str!("rstrip", "rstrip!", |x: &str| String::from_utf8_lossy(strip_r(x.as_bytes())).into_owned());
+    // strip(*selectors): whitespace, or in Ruby 4.0 with selectors the characters they select
+    // (as String#count's do: "a-z", "^x", several intersect) instead
+    fn stripped(s: V, a: &[V], left: bool, right: bool) -> Result<String, V> {
+        let x = s_of(s);
+        if a.is_empty() {
+            let mut b = x.as_bytes();
+            if left {
+                b = strip_l(b);
+            }
+            if right {
+                b = strip_r(b);
+            }
+            return Ok(String::from_utf8_lossy(b).into_owned());
+        }
+        if !crate::misc::ruby4() {
+            return Err(arg_error(&format!("wrong number of arguments (given {}, expected 0)", a.len())));
+        }
+        let sets = sets_of(a)?;
+        let cs: Vec<char> = x.chars().collect();
+        let (mut i, mut j) = (0, cs.len());
+        while left && i < j && in_sets(cs[i], &sets) {
+            i += 1;
+        }
+        while right && j > i && in_sets(cs[j - 1], &sets) {
+            j -= 1;
+        }
+        Ok(cs[i..j].iter().collect())
+    }
+    for (name, bang, left, right) in [("strip", "strip!", true, true), ("lstrip", "lstrip!", true, false), ("rstrip", "rstrip!", false, true)] {
+        let f: NativeFn = match (left, right) {
+            (true, true) => |s, a, _| match stripped(s, a, true, true) { Ok(n) => new_str_v(n), Err(e) => e },
+            (true, false) => |s, a, _| match stripped(s, a, true, false) { Ok(n) => new_str_v(n), Err(e) => e },
+            _ => |s, a, _| match stripped(s, a, false, true) { Ok(n) => new_str_v(n), Err(e) => e },
+        };
+        defn(c, name, 0, -1, f);
+        let fb: NativeFn = match (left, right) {
+            (true, true) => |s, a, _| strip_bang(s, stripped(s, a, true, true)),
+            (true, false) => |s, a, _| strip_bang(s, stripped(s, a, true, false)),
+            _ => |s, a, _| strip_bang(s, stripped(s, a, false, true)),
+        };
+        defn(c, bang, 0, -1, fb);
+    }
+    fn strip_bang(s: V, n: Result<String, V>) -> V {
+        let n = match n {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        if n.as_bytes() == rstr(s).b.as_slice() {
+            return QNIL;
+        }
+        match mutate(s) {
+            Ok(bs) => {
+                bs.set(n.into_bytes());
+                s
+            }
+            Err(e) => e,
+        }
+    }
     map_str!("chop", "chop!", |x: &str| {
         let mut s = x.to_string();
         if s.ends_with("\r\n") {

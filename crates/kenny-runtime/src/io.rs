@@ -3251,7 +3251,15 @@ pub fn init() {
             }
         };
         let (rs, ws) = (list(a.first()), list(a.get(1)));
-        let timeout = a.get(3).and_then(|t| num_to_f(*t)).map(|t| Duration::from_secs_f64(t.max(0.0)));
+        // (Ruby 4.0 takes Float::INFINITY for no timeout)
+        let timeout = match a.get(3).and_then(|t| num_to_f(*t)) {
+            Some(t) if t.is_infinite() && t > 0.0 && crate::misc::ruby4() => None,
+            Some(t) => match time_interval(t) {
+                Ok(d) => Some(d),
+                Err(e) => return e,
+            },
+            None => None,
+        };
         let mut ready_r = Vec::new();
         let mut ready_w = Vec::new();
         let mut pfds = Vec::new();
@@ -4151,8 +4159,11 @@ pub fn init() {
         }
         bool_v(s == a[0])
     });
-    defn(stc, "&", 1, 1, |s, a, _| mkfix(raw(s) as i64 & ok!(int_arg(a[0]))));
-    defn(stc, ">>", 1, 1, |s, a, _| mkfix((raw(s) as i64) >> ok!(int_arg(a[0]))));
+    // (deprecated in 3.3, gone in 4.0)
+    if !crate::misc::ruby4() {
+        defn(stc, "&", 1, 1, |s, a, _| mkfix(raw(s) as i64 & ok!(int_arg(a[0]))));
+        defn(stc, ">>", 1, 1, |s, a, _| mkfix((raw(s) as i64) >> ok!(int_arg(a[0]))));
+    }
     fn status_desc(s: V) -> String {
         let r = raw(s);
         let pid = sf(s, "@__pid");
@@ -4403,21 +4414,66 @@ pub fn init() {
         let o = redirected(*GV_STDOUT.get(), *STDOUT_V.get()).unwrap_or(*STDOUT_V.get());
         send(o, sym("putc"), a, QNIL)
     });
+    // warn(*msgs, uplevel: nil, category: nil): the messages as `puts` writes them, through
+    // Warning.warn (which programs override to capture warnings)
     defn(k, "warn", 0, -1, |_, a, _| {
-        let (a, _) = split_kw(a);
+        let (a, kw) = split_kw(a);
+        let mut uplevel = None;
+        let mut category = QNIL;
+        if let Some(h) = kw {
+            for (key, v) in crate::hash::pairs(h).into_iter() {
+                let name = if is_sym(key) { sym_name(sym_id(key)) } else { b"" };
+                match name {
+                    b"uplevel" if v != QNIL => {
+                        if !is_fix(v) {
+                            return type_error(&format!("no implicit conversion of {} into Integer", class_name(class_of(v))));
+                        }
+                        if fix(v) < 0 {
+                            return arg_error(&format!("negative level ({})", fix(v)));
+                        }
+                        uplevel = Some(fix(v) as usize);
+                    }
+                    b"category" if v != QNIL => {
+                        match warning_category_enabled(v) {
+                            Ok(true) => {}
+                            Ok(false) => return QNIL,
+                            Err(e) => return e,
+                        }
+                        category = v;
+                    }
+                    b"uplevel" | b"category" => {}
+                    _ => return arg_error(&format!("unknown keyword: {}", crate::fmt::inspect_lossy(key))),
+                }
+            }
+        }
         if a.is_empty() {
             return QNIL;
         }
         let mut buf = Vec::new();
-        tri!(puts_to(a, &mut |b| buf.extend_from_slice(b)));
-        match redirected(*GV_STDERR.get(), *STDERR_V.get()) {
-            None => err_out(&buf),
-            Some(o) => {
-                tri!(send(o, sym("write"), &[str_new(buf)], QNIL));
+        if let Some(n) = uplevel {
+            // (frame 0 is the code calling warn)
+            let addrs = crate::backtrace::capture();
+            if let Some(&f) = addrs.get(n) {
+                let line = crate::backtrace::lines(&[f]).into_iter().next().unwrap_or_default();
+                let at = line.split(":in ").next().unwrap_or(&line);
+                buf.extend_from_slice(format!("{at}: warning: ").as_bytes());
+            } else {
+                buf.extend_from_slice(b"warning: ");
             }
         }
-        QNIL
+        tri!(puts_to(a, &mut |b| buf.extend_from_slice(b)));
+        let msg = str_new(buf);
+        let warning = *WARNING.get();
+        if category == QNIL {
+            send(warning, sym("warn"), &[msg], QNIL)
+        } else {
+            let h = hash_new();
+            crate::hash::hset(h, mksym(sym("category")), category);
+            hdr(h).flags |= FL_KWHASH;
+            send(warning, sym("warn"), &[msg, h], QNIL)
+        }
     });
+    init_warning();
     fn stdin_obj() -> V {
         redirected(*GV_STDIN.get(), *STDIN_V.get()).unwrap_or(*STDIN_V.get())
     }
@@ -4433,7 +4489,8 @@ pub fn init() {
     });
     defn(k, "readlines", 0, 3, |_, a, _| send(stdin_obj(), sym("readlines"), a, QNIL));
     defn(k, "open", 1, -1, |_, a, b| {
-        if is_str(a[0]) && rstr(a[0]).b.starts_with(b"|") {
+        // open("|cmd") runs a command up to Ruby 3.4 (removed in 4.0: it opens a file)
+        if !crate::misc::ruby4() && is_str(a[0]) && rstr(a[0]).b.starts_with(b"|") {
             let mut args = RVec::from(a.to_vec());
             args[0] = str_new(rstr(a[0]).b[1..].to_vec());
             return io_popen(rt().c.io as V, &args, b);
@@ -4627,4 +4684,74 @@ fn init_etc() {
         }
         h
     });
+}
+
+// ---------- Warning ----------
+
+/// (a module: outside the moving heap, and reachable as a constant)
+static WARNING: G<V> = G::new(QNIL);
+
+/// Ruby's warning categories and whether each is on (CRuby's defaults; `Warning[cat] = `).
+static WARNING_CATEGORIES: std::sync::Mutex<[(&str, bool); 4]> =
+    std::sync::Mutex::new([("deprecated", false), ("experimental", true), ("performance", false), ("strict_unused_block", false)]);
+
+fn warning_category_enabled(cat: V) -> Result<bool, V> {
+    let name = if is_sym(cat) { String::from_utf8_lossy(sym_name(sym_id(cat))).into_owned() } else { String::new() };
+    let cats = WARNING_CATEGORIES.lock().unwrap_or_else(|e| e.into_inner());
+    match cats.iter().find(|(n, _)| *n == name) {
+        Some((_, on)) => Ok(*on),
+        None if is_sym(cat) => Err(arg_error(&format!("unknown category: {name}"))),
+        None => Err(type_error(&format!("no implicit conversion of {} into Symbol", class_name(class_of(cat))))),
+    }
+}
+
+/// The Warning module: Warning[category], Warning[category] = bool, Warning.categories, and
+/// Warning#warn (Warning extends itself, so `Warning.warn` can be overridden with
+/// `def Warning.warn` or by extending it with a module).
+fn init_warning() {
+    let w = new_module("Warning");
+    set_global_const("Warning", w as V);
+    *WARNING.get() = w as V;
+    defs(w, "[]", 1, 1, |_, a, _| match warning_category_enabled(a[0]) {
+        Ok(on) => bool_v(on),
+        Err(e) => e,
+    });
+    defs(w, "[]=", 2, 2, |_, a, _| {
+        if let Err(e) = warning_category_enabled(a[0]) {
+            return e;
+        }
+        let name = String::from_utf8_lossy(sym_name(sym_id(a[0]))).into_owned();
+        let mut cats = WARNING_CATEGORIES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cats.iter_mut().find(|(n, _)| *n == name) {
+            c.1 = truthy(a[1]);
+        }
+        a[1]
+    });
+    defs(w, "categories", 0, 0, |_, _, _| {
+        let cats = WARNING_CATEGORIES.lock().unwrap_or_else(|e| e.into_inner());
+        ary_new(cats.iter().map(|(n, _)| mksym(sym(n))).collect())
+    });
+    defn(w, "warn", 1, -1, |_, a, _| {
+        let (a, kw) = split_kw(a);
+        if let Some(h) = kw {
+            let c = crate::hash::hget(h, mksym(sym("category")));
+            if c != UNDEF && c != QNIL {
+                if let Err(e) = warning_category_enabled(c) {
+                    return e;
+                }
+            }
+        }
+        let Some(&msg) = a.first() else { return arg_error("wrong number of arguments (given 0, expected 1)") };
+        if !is_str(msg) {
+            return type_error(&format!("no implicit conversion of {} into String", class_name(class_of(msg))));
+        }
+        match redirected(*GV_STDERR.get(), *STDERR_V.get()) {
+            None => err_out(&rstr(msg).b.clone()),
+            Some(o) => {
+                tri!(send(o, sym("write"), &[msg], QNIL));
+            }
+        }
+        QNIL
+    });
+    let _ = send(w as V, sym("extend"), &[w as V], QNIL);
 }
