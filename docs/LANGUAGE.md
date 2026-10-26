@@ -78,7 +78,7 @@ No GVL. No new concurrency API. The existing ones become lightweight:
   switched by a scheduler when it blocks and every 10ms for fairness.
 - **Status:** threads of one process run on all cores at once (M:N): one scheduler per OS
   thread (`KENNY_THREADS`, default one per core; one under `RAILS_ENV`/`RACK_ENV=development`,
-  since Rails' classic autoloader counts on a GVL), each with its own run queue, allocator and
+  since Rails' autoloading in development counts on a GVL), each with its own run queue, allocator and
   caches. A scheduler with nothing to run takes a waiting thread from a busy one (work
   stealing), so threads move between cores as the load changes.
 - **IO doesn't stop other threads.** A thread waiting on a socket, pipe or `IO.select` yields
