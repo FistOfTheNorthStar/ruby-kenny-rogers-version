@@ -200,18 +200,28 @@ Not yet:
   `KENNY_MALLOC`).
 - `ObjectSpace`, `TracePoint` (dropped by design).
 
-## Early numbers (Apple Silicon M-series, 12 cores, vs Ruby 3.4.12 interpreter, no YJIT)
+## Early numbers (Apple M4 Pro, 12 cores, vs Ruby 3.4.12 and 4.0.7)
 
-| Benchmark | Speedup |
-|---|---|
-| Integer loop (`bench/loop.rb`) | 12.4x |
-| Recursive `fib` | 5.2x |
-| Blocks and collections (`blocks.rb`, `collections.rb`) | 4.4x, 4.9x |
-| String building and hashes (`strings_hash.rb`) | 3.4x |
-| Float math: `mandelbrot.rb`, `spectral_norm.rb`, `nbody.rb` | 22.8x, 8.0x, 4.8x |
-| Method-call-heavy OO code (`methods.rb`) | 6.1x |
-| Object allocation with GC (`objects.rb`) | 5.5x |
-| 12 CPU-bound Ruby threads (`threads.rb`) | 25x (0.03 s vs 0.83 s: Ruby's GVL runs one at a time) |
+Speedup of the Kenny binary over CRuby on the same script, best of 3, wall time including
+process start (about 27 ms for `ruby`, which flatters Kenny on the shortest runs). The YJIT
+column is `--yjit`, except for `loop.rb`, `mandelbrot.rb` and `threads.rb`: they run their hot
+loops at the top level, which YJIT compiles only with `--yjit-call-threshold=1` (that setting
+slows the others: `methods.rb` runs 3x slower). Kenny is as fast built against 3.4 as
+against 4.0.
+
+| Benchmark | vs Ruby 3.4 | vs Ruby 4.0 | vs Ruby 4.0 + YJIT |
+|---|---|---|---|
+| Integer loop (`bench/loop.rb`) | 13x | 13x | 1.3x |
+| Recursive `fib` (`fib.rb`) | 14x | 13x | 4.4x |
+| Blocks (`blocks.rb`) | 5.8x | 5.2x | 4.8x |
+| Collections (`collections.rb`) | 5.2x | 5.0x | 1.8x |
+| String building and hashes (`strings_hash.rb`) | 4.9x | 4.4x | 3.1x |
+| Float math: `mandelbrot.rb` | 43x | 41x | 28x |
+| Float math: `spectral_norm.rb` | 8.7x | 7.0x | 1.7x |
+| Float math: `nbody.rb` | 5.0x | 4.5x | 1.9x |
+| Method-call-heavy OO code (`methods.rb`) | 6.6x | 6.5x | 0.86x (YJIT is faster) |
+| Object allocation with GC (`objects.rb`) | 5.9x | 4.4x | 2.5x |
+| 12 CPU-bound Ruby threads (`threads.rb`) | 59x | 62x | 26x (Ruby's GVL runs one at a time) |
 
 Web (the machine was also running other work, so treat these as rough; `ab -c 10`/`-c 32`):
 
@@ -219,7 +229,7 @@ Web (the machine was also running other work, so treat these as rough; `ab -c 10
 |---|---|---|---|
 | Whole Rails 8.1 app (`examples/blog8`, SQLite, Solid Cache/Queue), scaffold index | 2.2k req/s, 119 MB | 6.7k req/s, 195 MB | 1.3k req/s, 71 MB (1 thread, Ruby 3.3); 4.8k req/s, 1,040 MB (12 workers) |
 
-Run them yourself: `bench/run.sh`. Tests: `tests/run.sh` (against Ruby 3.4), `tests/run.sh 4.0`
+Run them yourself: `bench/run.sh` (`RUBY=/path/to/ruby`, `RUBY_OPTS=--yjit`). Tests: `tests/run.sh` (against Ruby 3.4), `tests/run.sh 4.0`
 (against an installed Ruby 4.0; a test's `.4.0.out` holds what 4.0 prints differently). Compile-check a file without linking: `kenny check file.rb`.
 
 GC tuning and diagnostics (environment variables read by compiled programs):
