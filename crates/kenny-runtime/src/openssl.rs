@@ -21,6 +21,8 @@ static DIGEST_ERROR: G<*mut Class> = G::new(std::ptr::null_mut());
 static HMAC_ERROR: G<*mut Class> = G::new(std::ptr::null_mut());
 static CIPHER_ERROR: G<*mut Class> = G::new(std::ptr::null_mut());
 static AUTH_TAG_ERROR: G<*mut Class> = G::new(std::ptr::null_mut());
+static DIGEST_CLASS: G<*mut Class> = G::new(std::ptr::null_mut());
+static CIPHER_CLASS: G<*mut Class> = G::new(std::ptr::null_mut());
 static KDF_ERROR: G<*mut Class> = G::new(std::ptr::null_mut());
 
 // ---------- byte helpers ----------
@@ -565,7 +567,7 @@ impl Cipher {
                 let cbc = mode == Mode::Cbc;
                 if enc {
                     if !padding {
-                        return if r.buf.is_empty() { Ok(Vec::new()) } else { Err("data not multiple of block length") };
+                        return if r.buf.is_empty() { Ok(Vec::new()) } else { Err("wrong final block length") };
                     }
                     let p = 16 - r.buf.len();
                     let mut b = [p as u8; 16];
@@ -579,7 +581,7 @@ impl Cipher {
                     Ok(b.to_vec())
                 } else {
                     if !padding {
-                        return if r.buf.is_empty() { Ok(Vec::new()) } else { Err("data not multiple of block length") };
+                        return if r.buf.is_empty() { Ok(Vec::new()) } else { Err("wrong final block length") };
                     }
                     if r.buf.len() != 16 {
                         return Err("wrong final block length");
@@ -644,7 +646,44 @@ fn ctx_of(s: V) -> Option<&'static mut Ctx> {
     }
 }
 fn uninit(s: V) -> V {
+    // (CRuby's wording; Digest/Cipher raise a RuntimeError)
+    if is_a(s, *DIGEST_CLASS.get()) {
+        return raise(rt().c.runtime_error, "Digest CTX wasn't initialized!");
+    }
+    if is_a(s, *CIPHER_CLASS.get()) {
+        return raise(rt().c.runtime_error, "Cipher not initialized!");
+    }
     raise(*OSSL_ERROR.get(), &format!("{} not initialized", class_name(real_class(s))))
+}
+
+// ---------- errors ----------
+//
+// The openssl gem 4.0 (Ruby 4.0's) puts the entries of OpenSSL's error queue in the
+// exception's `@errors` (OpenSSLError#errors), and some messages end with the last entry's
+// reason. Kenny's crypto isn't OpenSSL, so it writes the entries OpenSSL 3 would have.
+
+/// OpenSSL 3's error-queue entry for an algorithm name it doesn't know.
+fn unsupported_entry(name: &str) -> String {
+    format!("error:0308010C:digital envelope routines:inner_evp_generic_fetch:unsupported (Global default library context, Algorithm ({name} : 0), Properties (<null>))")
+}
+const BAD_DECRYPT: &str = "error:1C800064:Provider routines:ossl_cipher_unpadblock:bad decrypt";
+const WRONG_FINAL_BLOCK: &str = "error:1C80006B:Provider routines:ossl_cipher_generic_block_final:wrong final block length";
+const INVALID_TAG: &str = "error:1C80006E:Provider routines:ossl_gcm_get_ctx_params:invalid tag";
+const INVALID_KEY_LENGTH: &str = "error:03000082:digital envelope routines:EVP_CIPHER_CTX_set_key_length:invalid key length";
+
+/// The reason text of an error-queue entry (what follows `error:CODE:library:function:`).
+fn reason(entry: &str) -> &str {
+    entry.splitn(5, ':').nth(4).unwrap_or(entry)
+}
+
+/// Raise `cls` with `msg` as the openssl gem does: in a 4.0 build with `@errors` holding the
+/// error queue's `entry` (none: an empty queue).
+fn ossl_raise(cls: *mut Class, msg: &str, entry: Option<&str>) -> V {
+    let e = exc_new(cls, msg);
+    if crate::misc::ruby4() {
+        ivar_set(e, sym("@errors"), ary_new(entry.into_iter().map(str_from).collect()));
+    }
+    raise_exc(e)
 }
 fn digest_ctx(s: V) -> Result<(Alg, &'static mut Hasher), V> {
     match ctx_of(s) {
@@ -692,7 +731,8 @@ fn alg_arg(v: V) -> Result<Alg, V> {
         let name = String::from_utf8_lossy(&name);
         // (the openssl gem 4.0 of Ruby 4.0 raises DigestError, 3.x a RuntimeError)
         if crate::misc::ruby4() {
-            raise(*DIGEST_ERROR.get(), &format!("unsupported digest algorithm: {name}: unsupported"))
+            let entry = unsupported_entry(&name);
+            ossl_raise(*DIGEST_ERROR.get(), &format!("unsupported digest algorithm: {name}: {}", reason(&entry)), Some(&entry))
         } else {
             raise(rt().c.runtime_error, &format!("Unsupported digest algorithm ({name}).: unknown object name"))
         }
@@ -742,6 +782,7 @@ fn fmt_b64(b: Vec<u8>) -> V {
 
 fn init_digest(ossl: *mut Class) {
     let d = class_under(ossl, "Digest", rt().c.object);
+    *DIGEST_CLASS.get() = d;
     *DIGEST_ERROR.get() = class_under(d, "DigestError", *OSSL_ERROR.get());
     defn(d, "initialize", 0, 2, |s, a, _| {
         let Some(&n) = a.first() else {
@@ -920,7 +961,7 @@ fn init_kdf(ossl: *mut Class) {
         let len = get!(kdf_len(a[3]));
         let alg = get!(alg_arg(a[4]));
         if len > 255 * alg.out_len() {
-            return raise(*KDF_ERROR.get(), "EVP_PKEY_derive: invalid key length");
+            return ossl_raise(*KDF_ERROR.get(), "EVP_PKEY_derive", None);
         }
         bin(hkdf(alg, &ikm, &salt, &info, len))
     });
@@ -929,11 +970,26 @@ fn init_kdf(ossl: *mut Class) {
 // ---------- OpenSSL::Cipher ----------
 
 fn cipher_err(m: &str) -> V {
-    raise(*CIPHER_ERROR.get(), m)
+    ossl_raise(*CIPHER_ERROR.get(), m, None)
+}
+/// A failed Cipher#final: OpenSSL's reason (`""` for a bad GCM tag), which openssl 4.0
+/// prefixes with "cipher final failed".
+fn cipher_final_err(m: &str) -> V {
+    let entry = match m {
+        "bad decrypt" => Some(BAD_DECRYPT),
+        "wrong final block length" => Some(WRONG_FINAL_BLOCK),
+        _ => None,
+    };
+    if crate::misc::ruby4() {
+        ossl_raise(*CIPHER_ERROR.get(), &format!("cipher final failed: {m}"), entry)
+    } else {
+        cipher_err(m)
+    }
 }
 
 fn init_cipher(ossl: *mut Class) {
     let c = class_under(ossl, "Cipher", rt().c.object);
+    *CIPHER_CLASS.get() = c;
     *CIPHER_ERROR.get() = class_under(c, "CipherError", *OSSL_ERROR.get());
     if crate::misc::ruby4() {
         // openssl 4.0: a failed AEAD tag check (Cipher#final)
@@ -946,7 +1002,11 @@ fn init_cipher(ossl: *mut Class) {
                 set_ctx(s, Ctx::Cipher(Box::new(ci)));
                 QNIL
             }
-            None if crate::misc::ruby4() => cipher_err(&format!("unsupported cipher algorithm: {}: unsupported", String::from_utf8_lossy(&n))),
+            None if crate::misc::ruby4() => {
+                let name = String::from_utf8_lossy(&n);
+                let entry = unsupported_entry(&name);
+                ossl_raise(*CIPHER_ERROR.get(), &format!("unsupported cipher algorithm: {name}: {}", reason(&entry)), Some(&entry))
+            }
             None => raise(rt().c.runtime_error, &format!("unsupported cipher algorithm ({})", String::from_utf8_lossy(&n))),
         }
     });
@@ -986,7 +1046,7 @@ fn init_cipher(ossl: *mut Class) {
     defn(c, "key_len=", 1, 1, |s, a, _| {
         let ci = get!(cipher_ctx(s));
         if get!(int(a[0])) as usize != ci.key_len() {
-            return cipher_err("invalid key length");
+            return ossl_raise(*CIPHER_ERROR.get(), "invalid key length", Some(INVALID_KEY_LENGTH));
         }
         a[0]
     });
@@ -1066,12 +1126,19 @@ fn init_cipher(ossl: *mut Class) {
             Some(&v) => get!(int(v)),
             None => 16,
         };
+        if ci.mode != Mode::Gcm {
+            return cipher_err("authentication tag not supported by this cipher");
+        }
         match &ci.tag_out {
-            Some(t) if ci.mode == Mode::Gcm && ci.enc && n > 0 && n <= 16 => bin(t[..n as usize].to_vec()),
-            _ => cipher_err("retrieving the authentication tag failed"),
+            Some(t) if ci.enc && n > 0 && n <= 16 => bin(t[..n as usize].to_vec()),
+            _ => ossl_raise(*CIPHER_ERROR.get(), &format!("retrieving the authentication tag failed: {}", reason(INVALID_TAG)), Some(INVALID_TAG)),
         }
     });
     defn(c, "update", 1, 2, |s, a, _| {
+        // (CRuby checks for a key before the context)
+        if ctx_of(s).is_none() {
+            return cipher_err("key not set");
+        }
         let ci = get!(cipher_ctx(s));
         let data = get!(bytes(a[0]));
         if data.is_empty() {
@@ -1096,9 +1163,8 @@ fn init_cipher(ossl: *mut Class) {
         match ci.finish() {
             Ok(out) => bin(out),
             // (openssl 4.0 says which call failed, and has its own class for a bad AEAD tag)
-            Err(_) if aead && crate::misc::ruby4() => raise(*AUTH_TAG_ERROR.get(), "AEAD authentication tag verification failed"),
-            Err(m) if crate::misc::ruby4() => cipher_err(&format!("cipher final failed: {m}")),
-            Err(m) => cipher_err(m),
+            Err(_) if aead && crate::misc::ruby4() => ossl_raise(*AUTH_TAG_ERROR.get(), "AEAD authentication tag verification failed", None),
+            Err(m) => cipher_final_err(m),
         }
     });
 }
@@ -1115,10 +1181,7 @@ fn init_openssl() -> V {
     *OSSL_ERROR.get() = class_under(ossl, "OpenSSLError", rt().c.standard_error);
     // the openssl gem of the Ruby the program is built against
     const_set(ossl, sym("VERSION"), str_from(if crate::misc::ruby4() { "4.0.0" } else { "3.3.0" }));
-    if crate::misc::ruby4() {
-        // openssl 4.0: the OpenSSL error queue's entries (Kenny's crypto keeps none)
-        defn(*OSSL_ERROR.get(), "errors", 0, 0, |_, _, _| ary_new(vec![]));
-    }
+    // (openssl 4.0's OpenSSLError#errors and #detailed_message are in lib/kenny/openssl.rb)
     const_set(ossl, sym("OPENSSL_VERSION"), str_from("OpenSSL 3.0.0 (Kenny native: RustCrypto)"));
     const_set(ossl, sym("OPENSSL_LIBRARY_VERSION"), str_from("OpenSSL 3.0.0 (Kenny native: RustCrypto)"));
     const_set(ossl, sym("OPENSSL_VERSION_NUMBER"), mkfix(0x30000000));

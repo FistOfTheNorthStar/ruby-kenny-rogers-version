@@ -7,6 +7,20 @@
 __kenny_openssl_init
 
 module OpenSSL
+  # openssl 4.0 (Ruby 4.0's): an error raised after a failed OpenSSL call keeps the entries of
+  # OpenSSL's error queue, and lists them in its detailed message
+  if VERSION >= "4"
+    class OpenSSLError
+      attr_reader :errors
+
+      def detailed_message(...)
+        msg = super
+        return msg unless errors.is_a?(Array) && !errors.empty?
+        "#{msg}\nOpenSSL error queue reported #{errors.size} errors:\n#{errors.join("\n")}"
+      end
+    end
+  end
+
   class Digest
     def initialize_copy(other)
       __kenny_copy(other)

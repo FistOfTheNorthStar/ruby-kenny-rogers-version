@@ -6,18 +6,24 @@
 # inspect form, set.c's error messages, and subclasses of Set get set.rb's old behavior from
 # the standard library's set/subclass_compatible.rb (Set::CoreSet is the class without it).
 #
-# The elements are the keys of @hash, each mapped to true, as in set.rb. That is also how
-# Ruby 4.0 marshals a Set (an object whose @hash is that Hash), so Marshal and YAML output
-# stay the same.
+# The elements are the keys of @__hash, each mapped to true, as in set.rb. Ivars named `@__`
+# are hidden, so `instance_variables` lists none (as set.c's), Psych dumps a Set with 4.0's
+# encode_with, and Marshal writes the Hash as `@hash`, the way Ruby 4.0 marshals a Set.
 
 class Set
   include Enumerable
+
+  def self.allocate
+    set = super
+    set.instance_variable_set(:@__hash, Hash.new(false))
+    set
+  end
 
   def self.[](*ary)
     h = Hash.new(false)
     ary.each { |o| h[o] = true }
     set = allocate
-    set.instance_variable_set(:@hash, h)
+    set.instance_variable_set(:@__hash, h)
     set
   end
 
@@ -25,7 +31,7 @@ class Set
   # subclass's initialize, such as set/subclass_compatible.rb's, needn't call super)
   def self.new(...)
     set = allocate
-    set.instance_variable_set(:@hash, Hash.new(false))
+    set.instance_variable_set(:@__hash, Hash.new(false))
     set.__send__(:initialize, ...)
     set
   end
@@ -33,7 +39,7 @@ class Set
   def initialize(enum = nil, &block)
     return if enum.nil?
     if block
-      __kenny_each_of(enum) { |o| @hash[block.call(o)] = true }
+      __kenny_each_of(enum) { |o| @__hash[block.call(o)] = true }
     else
       __kenny_merge(enum)
     end
@@ -41,31 +47,31 @@ class Set
 
   def initialize_copy(other)
     return self if equal?(other)
-    @hash = other.instance_variable_get(:@hash).dup
+    @__hash = other.instance_variable_get(:@__hash).dup
     self
   end
 
   def freeze
-    @hash.freeze
+    @__hash.freeze
     super
   end
 
-  def size = @hash.size
+  def size = @__hash.size
   alias length size
 
-  def empty? = @hash.empty?
+  def empty? = @__hash.empty?
 
-  def include?(o) = @hash.include?(o)
+  def include?(o) = @__hash.include?(o)
   alias member? include?
   alias === include?
 
   def each(&block)
     return enum_for(:each) { size } unless block
-    @hash.each_key(&block)
+    @__hash.each_key(&block)
     self
   end
 
-  def to_a = @hash.keys
+  def to_a = @__hash.keys
 
   def to_set(*args, &block)
     klass = if args.empty?
@@ -82,35 +88,35 @@ class Set
 
   def add(o)
     __kenny_modify
-    @hash[o] = true
+    @__hash[o] = true
     self
   end
   alias << add
 
   def add?(o)
     __kenny_modify
-    return nil if @hash.include?(o)
-    @hash[o] = true
+    return nil if @__hash.include?(o)
+    @__hash[o] = true
     self
   end
 
   def delete(o)
     __kenny_modify
-    @hash.delete(o)
+    @__hash.delete(o)
     self
   end
 
   def delete?(o)
     __kenny_modify
-    return nil unless @hash.include?(o)
-    @hash.delete(o)
+    return nil unless @__hash.include?(o)
+    @__hash.delete(o)
     self
   end
 
   def delete_if
     return enum_for(:delete_if) { size } unless block_given?
     __kenny_modify
-    @hash.delete_if { |o, _| yield o }
+    @__hash.delete_if { |o, _| yield o }
     self
   end
 
@@ -124,7 +130,7 @@ class Set
   def keep_if
     return enum_for(:keep_if) { size } unless block_given?
     __kenny_modify
-    @hash.keep_if { |o, _| yield o }
+    @__hash.keep_if { |o, _| yield o }
     self
   end
 
@@ -140,26 +146,26 @@ class Set
     return enum_for(:collect!) { size } unless block_given?
     __kenny_modify
     h = __kenny_new_hash
-    @hash.each_key { |o| h[yield(o)] = true }
-    @hash = h
+    @__hash.each_key { |o| h[yield(o)] = true }
+    @__hash = h
     self
   end
   alias map! collect!
 
   def clear
     __kenny_modify
-    @hash.clear
+    @__hash.clear
     self
   end
 
   def replace(enum)
     __kenny_modify
     if enum.is_a?(Set)
-      @hash = enum.instance_variable_get(:@hash).dup
-      @hash.compare_by_identity if enum.compare_by_identity? && !@hash.compare_by_identity?
+      @__hash = enum.instance_variable_get(:@__hash).dup
+      @__hash.compare_by_identity if enum.compare_by_identity? && !@__hash.compare_by_identity?
     else
       __kenny_enum_method(enum)
-      @hash.clear
+      @__hash.clear
       __kenny_merge(enum)
     end
     self
@@ -174,7 +180,7 @@ class Set
 
   def subtract(enum)
     __kenny_modify
-    __kenny_each_of(enum) { |o| @hash.delete(o) }
+    __kenny_each_of(enum) { |o| @__hash.delete(o) }
     self
   end
 
@@ -196,9 +202,9 @@ class Set
       small, big = size < enum.size ? [self, enum] : [enum, self]
       small.each { |o| h[o] = true if big.include?(o) }
     else
-      __kenny_each_of(enum) { |o| h[o] = true if @hash.include?(o) }
+      __kenny_each_of(enum) { |o| h[o] = true if @__hash.include?(o) }
     end
-    n.instance_variable_set(:@hash, h)
+    n.instance_variable_set(:@__hash, h)
     n
   end
   alias intersection &
@@ -206,7 +212,7 @@ class Set
   def ^(enum)
     n = dup
     other = enum.is_a?(Set) ? enum : Set.new(enum)
-    h = n.instance_variable_get(:@hash)
+    h = n.instance_variable_get(:@__hash)
     other.each { |o| h.include?(o) ? h.delete(o) : h[o] = true }
     n
   end
@@ -263,20 +269,20 @@ class Set
     return false unless other.is_a?(Set) && size == other.size
     return true if empty?
     return false if compare_by_identity? != other.compare_by_identity?
-    other.all? { |o| @hash.include?(o) }
+    other.all? { |o| @__hash.include?(o) }
   end
   alias eql? ==
 
   def hash
     h = size
-    @hash.each_key { |o| h ^= o.hash }
+    @__hash.each_key { |o| h ^= o.hash }
     [Set, h].hash
   end
 
   def classify
     return enum_for(:classify) { size } unless block_given?
     h = {}
-    @hash.each_key { |o| (h[yield(o)] ||= self.class.new).add(o) }
+    @__hash.each_key { |o| (h[yield(o)] ||= self.class.new).add(o) }
     h
   end
 
@@ -318,15 +324,15 @@ class Set
   def compare_by_identity
     return self if compare_by_identity?
     __kenny_modify
-    @hash.compare_by_identity
+    @__hash.compare_by_identity
     self
   end
 
-  def compare_by_identity? = @hash.compare_by_identity?
+  def compare_by_identity? = @__hash.compare_by_identity?
 
   def reset
     __kenny_modify
-    @hash.rehash
+    @__hash.rehash
     self
   end
 
@@ -335,7 +341,7 @@ class Set
     return "#{self.class}[...]" if ids.include?(self)
     begin
       ids[self] = true
-      +"#{self.class}[#{@hash.keys.map(&:inspect).join(", ")}]"
+      +"#{self.class}[#{@__hash.keys.map(&:inspect).join(", ")}]"
     ensure
       ids.delete(self)
     end
@@ -362,7 +368,7 @@ class Set
 
   def __kenny_new_hash
     h = Hash.new(false)
-    h.compare_by_identity if @hash.compare_by_identity?
+    h.compare_by_identity if @__hash.compare_by_identity?
     h
   end
 
@@ -386,9 +392,9 @@ class Set
   end
 
   def __kenny_merge(enum)
-    h = @hash
+    h = @__hash
     if enum.is_a?(Set)
-      enum.instance_variable_get(:@hash).each_key { |o| h[o] = true }
+      enum.instance_variable_get(:@__hash).each_key { |o| h[o] = true }
     elsif enum.is_a?(Array)
       enum.each { |o| h[o] = true }
     else
@@ -407,7 +413,7 @@ class Set
         __kenny_flatten_into(e, seen)
         seen[e.object_id] = false
       else
-        @hash[e] = true
+        @__hash[e] = true
       end
     end
   end
