@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 pub struct Ruby {
     /// RUBY_VERSION, e.g. "3.4.12"
     pub version: String,
+    /// RUBY_PATCHLEVEL and RUBY_RELEASE_DATE (the program reports the same)
+    pub patchlevel: String,
+    pub release_date: String,
     /// the ABI version gem directories are named after, e.g. "3.4.0"
     pub abi: String,
     pub libdir: Option<PathBuf>,
@@ -24,9 +27,24 @@ static RUBY: OnceLock<Option<Ruby>> = OnceLock::new();
 pub fn select(src: &Path) {
     RUBY.get_or_init(|| {
         let (exe, gem_env) = choose(src);
-        query(&exe, gem_env)
+        let r = query(&exe, gem_env);
+        if let Some(r) = &r {
+            if !SUPPORTED.iter().any(|s| r.minor_version() == *s) && std::env::var_os("KENNY_QUIET").is_none() {
+                let mode = if r.is_ruby4() { "4.0" } else { "3.4" };
+                eprintln!(
+                    "kenny: warning: building against Ruby {} ({}); Kenny supports Ruby {}. The program gets that Ruby's standard library and gems but behaves as Ruby {mode}",
+                    r.version,
+                    exe.display(),
+                    SUPPORTED.join(" and ")
+                );
+            }
+        }
+        r
     });
 }
+
+/// The Ruby versions whose behavior Kenny implements (major.minor).
+pub const SUPPORTED: [&str; 2] = ["3.4", "4.0"];
 
 /// The chosen Ruby (None: no Ruby installed, or `select` not called).
 pub fn get() -> Option<&'static Ruby> {
@@ -134,7 +152,7 @@ fn query(exe: &Path, gem_env: Option<(PathBuf, Vec<PathBuf>)>) -> Option<Ruby> {
     let mut cmd = Command::new(exe);
     cmd.args([
         "-e",
-        "puts RUBY_VERSION, RbConfig::CONFIG['ruby_version'], RbConfig::CONFIG['rubylibdir'], (Gem.default_dir rescue ''), (Gem.path.join(File::PATH_SEPARATOR) rescue '')",
+        "puts RUBY_VERSION, RUBY_PATCHLEVEL, RUBY_RELEASE_DATE, RbConfig::CONFIG['ruby_version'], RbConfig::CONFIG['rubylibdir'], (Gem.default_dir rescue ''), (Gem.path.join(File::PATH_SEPARATOR) rescue '')",
     ]);
     match gem_env {
         Some((home, path)) => {
@@ -151,15 +169,33 @@ fn query(exe: &Path, gem_env: Option<(PathBuf, Vec<PathBuf>)>) -> Option<Ruby> {
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut l = text.lines();
     let version = l.next()?.to_string();
+    let patchlevel = l.next().unwrap_or("0").to_string();
+    let release_date = l.next().unwrap_or("").to_string();
     let abi = l.next().unwrap_or("").to_string();
     let dir = |s: Option<&str>| s.map(PathBuf::from).filter(|p| p.is_dir());
     let libdir = dir(l.next());
     let default_gem_dir = dir(l.next());
     let gem_path = l.next().map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
-    Some(Ruby { version, abi, libdir, default_gem_dir, gem_path })
+    Some(Ruby { version, patchlevel, release_date, abi, libdir, default_gem_dir, gem_path })
 }
 
 impl Ruby {
+    /// "3.4", "4.0"
+    pub fn minor_version(&self) -> String {
+        self.version.split('.').take(2).collect::<Vec<_>>().join(".")
+    }
+
+    /// Whether programs built against this Ruby get Ruby 4.0's behavior (4.0 and later).
+    pub fn is_ruby4(&self) -> bool {
+        version_key(&self.version).first().is_some_and(|m| *m >= 4)
+    }
+
+    /// What the program is told about its Ruby (see kenny-runtime's `kn_register_ruby`):
+    /// "VERSION PATCHLEVEL RELEASE_DATE".
+    pub fn release_line(&self) -> String {
+        format!("{} {} {}", self.version, self.patchlevel, self.release_date)
+    }
+
     /// Whether gem directory `d` belongs to this Ruby (rvm's `ruby-3.4.12[@set]`, or a
     /// directory named after its ABI version: `~/.gem/ruby/3.4.0`, `.../lib/ruby/gems/3.4.0`).
     pub fn owns_gem_dir(&self, d: &Path) -> bool {

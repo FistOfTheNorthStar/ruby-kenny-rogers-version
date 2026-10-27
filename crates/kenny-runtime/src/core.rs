@@ -601,7 +601,9 @@ pub fn is_frozen(v: V) -> bool {
 pub fn check_frozen(v: V) -> V {
     if is_frozen(v) {
         let msg = format!("can't modify frozen {}: {}", class_name(class_of(v)), crate::fmt::inspect_lossy(v));
-        return raise(rt().c.frozen_error, &msg);
+        let e = exc_new(rt().c.frozen_error, &msg);
+        ivar_set(e, sym("@__receiver"), v);
+        return raise_exc(e);
     }
     QNIL
 }
@@ -2325,6 +2327,26 @@ pub fn type_error(msg: &str) -> V {
 }
 pub fn arg_error(msg: &str) -> V {
     raise(rt().c.argument_error, msg)
+}
+/// A time interval in seconds (sleep, Mutex#sleep, IO.select ...) as CRuby checks it.
+pub fn time_interval(secs: f64) -> Result<std::time::Duration, V> {
+    if secs.is_nan() {
+        Err(raise(rt().c.range_error, "NaN out of Time range"))
+    } else if secs.is_infinite() {
+        Err(raise(rt().c.range_error, if secs > 0.0 { "Inf out of Time range" } else { "-Inf out of Time range" }))
+    } else if secs < 0.0 {
+        Err(arg_error("time interval must not be negative"))
+    } else {
+        Ok(std::time::Duration::from_secs_f64(secs))
+    }
+}
+/// A timeout that may be infinite (Thread#join, Queue#pop): None waits forever.
+pub fn timeout_secs(secs: f64) -> Option<std::time::Duration> {
+    if secs.is_infinite() && secs > 0.0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs_f64(if secs.is_finite() { secs.max(0.0) } else { 0.0 }))
+    }
 }
 
 #[macro_export]

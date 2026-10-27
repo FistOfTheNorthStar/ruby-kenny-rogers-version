@@ -30,10 +30,11 @@ puts d == OpenSSL::Digest::SHA256.hexdigest("a")
 d.reset
 puts d.hexdigest[0, 16]
 puts OpenSSL::Digest::SHA256.digest("x").size
+# (openssl 4.0, Ruby 4.0's, raises DigestError and words it differently)
 begin
   OpenSSL::Digest.new("nope")
-rescue RuntimeError => ex
-  puts "RuntimeError #{ex.message.start_with?("Unsupported digest algorithm (nope)")}"
+rescue RuntimeError, OpenSSL::OpenSSLError => ex
+  puts "#{ex.class.name.split("::").last} #{ex.message.start_with?("Unsupported digest algorithm (nope)", "unsupported digest algorithm: nope")}"
 end
 # multi-block input crossing the 64-byte boundary
 puts OpenSSL::Digest::SHA256.hexdigest("x" * 1000)
@@ -200,8 +201,9 @@ rescue OpenSSL::Cipher::CipherError => ex
 end
 begin
   OpenSSL::Cipher.new("rot13")
-rescue RuntimeError => ex
-  puts "RuntimeError #{ex.message}"
+rescue RuntimeError, OpenSSL::OpenSSLError => ex
+  # (without the text of the OpenSSL library's error queue, which Kenny's crypto doesn't have)
+  puts "#{ex.class.name.split("::").last} #{ex.message.sub(/ \(Global default library context.*/, "")}"
 end
 d = OpenSSL::Cipher.new("aes-256-cbc")
 d.decrypt

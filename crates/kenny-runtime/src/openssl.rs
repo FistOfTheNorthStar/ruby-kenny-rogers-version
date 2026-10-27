@@ -20,6 +20,7 @@ static OSSL_ERROR: G<*mut Class> = G::new(std::ptr::null_mut());
 static DIGEST_ERROR: G<*mut Class> = G::new(std::ptr::null_mut());
 static HMAC_ERROR: G<*mut Class> = G::new(std::ptr::null_mut());
 static CIPHER_ERROR: G<*mut Class> = G::new(std::ptr::null_mut());
+static AUTH_TAG_ERROR: G<*mut Class> = G::new(std::ptr::null_mut());
 static KDF_ERROR: G<*mut Class> = G::new(std::ptr::null_mut());
 
 // ---------- byte helpers ----------
@@ -688,7 +689,13 @@ fn alg_arg(v: V) -> Result<Alg, V> {
         bytes(v)?
     };
     Alg::parse(&name).ok_or_else(|| {
-        raise(rt().c.runtime_error, &format!("Unsupported digest algorithm ({}).: unknown object name", String::from_utf8_lossy(&name)))
+        let name = String::from_utf8_lossy(&name);
+        // (the openssl gem 4.0 of Ruby 4.0 raises DigestError, 3.x a RuntimeError)
+        if crate::misc::ruby4() {
+            raise(*DIGEST_ERROR.get(), &format!("unsupported digest algorithm: {name}: unsupported"))
+        } else {
+            raise(rt().c.runtime_error, &format!("Unsupported digest algorithm ({name}).: unknown object name"))
+        }
     })
 }
 
@@ -928,6 +935,10 @@ fn cipher_err(m: &str) -> V {
 fn init_cipher(ossl: *mut Class) {
     let c = class_under(ossl, "Cipher", rt().c.object);
     *CIPHER_ERROR.get() = class_under(c, "CipherError", *OSSL_ERROR.get());
+    if crate::misc::ruby4() {
+        // openssl 4.0: a failed AEAD tag check (Cipher#final)
+        *AUTH_TAG_ERROR.get() = class_under(c, "AuthTagError", *CIPHER_ERROR.get());
+    }
     defn(c, "initialize", 1, 1, |s, a, _| {
         let n = get!(bytes(a[0]));
         match Cipher::parse(&n) {
@@ -935,6 +946,7 @@ fn init_cipher(ossl: *mut Class) {
                 set_ctx(s, Ctx::Cipher(Box::new(ci)));
                 QNIL
             }
+            None if crate::misc::ruby4() => cipher_err(&format!("unsupported cipher algorithm: {}: unsupported", String::from_utf8_lossy(&n))),
             None => raise(rt().c.runtime_error, &format!("unsupported cipher algorithm ({})", String::from_utf8_lossy(&n))),
         }
     });
@@ -1080,8 +1092,12 @@ fn init_cipher(ossl: *mut Class) {
     });
     defn(c, "final", 0, 0, |s, _, _| {
         let ci = get!(cipher_ctx(s));
+        let aead = ci.mode == Mode::Gcm;
         match ci.finish() {
             Ok(out) => bin(out),
+            // (openssl 4.0 says which call failed, and has its own class for a bad AEAD tag)
+            Err(_) if aead && crate::misc::ruby4() => raise(*AUTH_TAG_ERROR.get(), "AEAD authentication tag verification failed"),
+            Err(m) if crate::misc::ruby4() => cipher_err(&format!("cipher final failed: {m}")),
             Err(m) => cipher_err(m),
         }
     });
@@ -1097,7 +1113,12 @@ fn init_openssl() -> V {
     set_global_const("OpenSSL", ossl as V);
     *CTX.get() = new_class("OpenSSL::__Ctx", rt().c.object);
     *OSSL_ERROR.get() = class_under(ossl, "OpenSSLError", rt().c.standard_error);
-    const_set(ossl, sym("VERSION"), str_from("3.3.0"));
+    // the openssl gem of the Ruby the program is built against
+    const_set(ossl, sym("VERSION"), str_from(if crate::misc::ruby4() { "4.0.0" } else { "3.3.0" }));
+    if crate::misc::ruby4() {
+        // openssl 4.0: the OpenSSL error queue's entries (Kenny's crypto keeps none)
+        defn(*OSSL_ERROR.get(), "errors", 0, 0, |_, _, _| ary_new(vec![]));
+    }
     const_set(ossl, sym("OPENSSL_VERSION"), str_from("OpenSSL 3.0.0 (Kenny native: RustCrypto)"));
     const_set(ossl, sym("OPENSSL_LIBRARY_VERSION"), str_from("OpenSSL 3.0.0 (Kenny native: RustCrypto)"));
     const_set(ossl, sym("OPENSSL_VERSION_NUMBER"), mkfix(0x30000000));

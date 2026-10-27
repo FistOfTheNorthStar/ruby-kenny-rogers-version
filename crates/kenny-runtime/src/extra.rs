@@ -1426,7 +1426,31 @@ pub fn init() {
         }
         send(s, sym("each_with_object"), a, b)
     });
-    defs(er, "produce", 0, 1, |s, a, b| {
+    // produce(initial = none, size: Float::INFINITY) { |prev| } (size: since Ruby 4.0)
+    defs(er, "produce", 0, -1, |s, a, b| {
+        let mut a = a.to_vec();
+        let mut size = float_new(f64::INFINITY);
+        if crate::misc::ruby4() {
+            if let Some(&h) = a.last() {
+                if is_hash(h) && hdr(h).flags & FL_KWHASH != 0 {
+                    a.pop();
+                    for (k, v) in rhash(h).m.iter() {
+                        if k.0 != mksym(sym("size")) {
+                            return arg_error(&format!("unknown keyword: {}", String::from_utf8_lossy(&rstr(tri!(send(k.0, sym("inspect"), &[], QNIL))).b)));
+                        }
+                        let v = *v;
+                        let ok = v == QNIL || is_int(v) || respond_to(v, sym("call")) || (is_float(v) && float_val(v).is_infinite());
+                        if !ok {
+                            tri!(send(v, sym("to_int"), &[], QNIL));
+                        }
+                        size = v;
+                    }
+                }
+            }
+        }
+        if a.len() > 1 {
+            return arg_error(&format!("wrong number of arguments (given {}, expected 0..1)", a.len()));
+        }
         if !is_proc(b) {
             return arg_error("no block given");
         }
@@ -1459,6 +1483,7 @@ pub fn init() {
         );
         let e = object_new(s as *mut Class);
         ivar_set(e, sym("@__gen"), generator);
+        ivar_set(e, sym("@__size"), size);
         e
     });
 

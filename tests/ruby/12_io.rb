@@ -204,7 +204,8 @@ IO.popen(["echo", "arr", "args"]) { |io| p io.gets }
 p IO.popen("cat", "r+") { |io| io.write "abc"; io.close_write; io.read }
 p IO.popen(["sh", "-c", "echo out; echo err 1>&2"], err: [:child, :out], &:read)
 p IO.popen("exit 5", &:read), $?.exitstatus
-p open("|echo kernel open").read
+# (Ruby 4.0 removed open("|cmd"): it opens a file of that name)
+p((open("|echo kernel open").read rescue $!.class))
 open(File.join(BASE, "k"), "w") { |g| g << "kernel open file" }
 p open(File.join(BASE, "k"), &:read)
 r, w = IO.pipe

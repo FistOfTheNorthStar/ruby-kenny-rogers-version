@@ -46,6 +46,8 @@ const OVERLAY: &[(&str, &str)] = &[
     ("kenny/gem.rb", include_str!("../../../lib/kenny/kenny/gem.rb")),
     ("kenny/data.rb", include_str!("../../../lib/kenny/kenny/data.rb")),
     ("kenny/argf.rb", include_str!("../../../lib/kenny/kenny/argf.rb")),
+    ("kenny/pathname4.rb", include_str!("../../../lib/kenny/kenny/pathname4.rb")),
+    ("kenny/pathname_builtin.rb", include_str!("../../../lib/kenny/kenny/pathname_builtin.rb")),
     ("bundler.rb", include_str!("../../../lib/kenny/bundler.rb")),
     ("bundler/setup.rb", include_str!("../../../lib/kenny/bundler/setup.rb")),
     ("bootsnap/setup.rb", include_str!("../../../lib/kenny/bootsnap/setup.rb")),
@@ -355,8 +357,17 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, 
     let gem_rb = overlay.join("kenny/gem.rb");
     // (ARGF too, loaded on first use: kenny-runtime's const_missing)
     let mut embed_files = vec![gem_rb, overlay.join("kenny/data.rb"), overlay.join("kenny/argf.rb")];
-    // `Set` is loaded on first use, as Ruby 3.2+ does (kenny-runtime's const_missing)
-    if let Some(set_rb) = stdlib.as_ref().map(|d| d.join("set.rb")).filter(|p| p.is_file()) {
+    let ruby4 = ruby::get().is_some_and(|r| r.is_ruby4());
+    // `Set` is loaded on first use, as Ruby 3.2+ does (kenny-runtime's const_missing): from the
+    // stdlib's set.rb, or in Ruby 4.0, where Set is a core class, Kenny's (as the overlay's
+    // set.rb, so `require "set"` finds it too)
+    if ruby4 {
+        let set_rb = overlay.join("set.rb");
+        std::fs::write(&set_rb, include_str!("../../../lib/kenny/kenny/set4.rb")).map_err(|e| e.to_string())?;
+        embed_files.push(set_rb);
+        // Pathname too is core in 4.0 (loaded on first use)
+        embed_files.push(overlay.join("kenny/pathname4.rb"));
+    } else if let Some(set_rb) = stdlib.as_ref().map(|d| d.join("set.rb")).filter(|p| p.is_file()) {
         embed_files.push(set_rb);
     }
     // `DidYouMean` too (loaded on first use, or to report an uncaught NameError)
@@ -373,7 +384,8 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, 
         load_paths.extend(ruby::get().map(|r| r.bundled_gem_libs()).unwrap_or_default());
     }
     // every file of the -I dirs goes in (runtime-computed requires/autoloads, e.g. Rails)
-    Ok(kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs })
+    let ruby = ruby::get().map(|r| r.release_line()).unwrap_or_default();
+    Ok(kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs, ruby })
 }
 
 /// Returns whether the asset compilers were linked in (see `needs_assets`).

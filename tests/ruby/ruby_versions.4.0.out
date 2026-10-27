@@ -1,0 +1,34 @@
+ruby_module: [true, "ruby"]
+set_literal: Set[3, 1, 2]
+set_class: [Set, 2]
+pathname: "lib"
+set_reopen: :reopened
+set_subclass: "#<MySet: {1}>"
+warning_categories: [false, true, false]
+warn_bad_uplevel: ArgumentError: negative level (-1)
+warn_bad_category: ArgumentError: unknown category: nope
+frozen_receiver: true
+frozen_no_receiver: ArgumentError: no receiver is available
+arity: [-2, 1, 1]
+proc_params: [[:opt]]
+rfind: 3
+find_ifnone: :none
+strip_selectors: ["hi", "bba", "--x"]
+log1p: 0.0
+produce_size: [Infinity, 3]
+endless_to_set: RangeError: cannot convert endless range to a set
+status_and: false
+pipe_open: Errno::ENOENT: No such file or directory @ rb_sysopen - |echo hi
+ivars_to_inspect: "#<Secretive:X @host=\"h\">"
+beginless_max: 4
+range_overlap: [true, false, true]
+beginless_max_incl: 5
+endless_max: RangeError: cannot get the maximum of endless range
+thread_raise_cause: ["boom", "why"]
+fiber_raise: [:rescued, "in fiber"]
+fiber_raise_unborn: FiberError: cannot raise exception on unborn fiber
+sleep_inf: RangeError: Inf out of Time range
+sleep_neg: ArgumentError: time interval must not be negative
+join_inf: 1
+select_inf: 1
+shift_jis_name: Encoding::UndefinedConversionError: U+00E9 from UTF-8 to Shift_JIS

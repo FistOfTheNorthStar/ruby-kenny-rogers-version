@@ -277,6 +277,8 @@ pub struct Compiler<M: Module> {
     /// content hash of every compiled file (`load` recompiles a file whose disk copy differs)
     pub(crate) src_hashes: HashMap<PathBuf, u64>,
     pub(crate) load_paths: Vec<PathBuf>,
+    /// see `Options::ruby`
+    pub(crate) ruby: String,
     /// Canonical load paths and dependency directories (code compiled with gem semantics).
     pub(crate) dep_roots: Vec<PathBuf>,
     pub warnings: Vec<String>,
@@ -456,6 +458,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_binding_new", &[I64], &[I64]),
     ("kn_register_file", &[I64, I64, I64, I64, I64], &[]),
     ("kn_register_debug", &[I64, I64, I64, I64], &[]),
+    ("kn_register_ruby", &[I64, I64], &[]),
     ("kn_send_refined", &[I64, I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_send0", &[I64, I64, I64, I64], &[I64]),
     ("kn_send1", &[I64, I64, I64, I64, I64], &[I64]),
@@ -499,6 +502,10 @@ pub struct Options {
     /// Further directories of dependency code that are not load paths (a Rails engine's
     /// `app/` and `config/`): compiled like gem code (see `in_dependency`).
     pub dep_dirs: Vec<PathBuf>,
+    /// The Ruby the program is built against, "VERSION PATCHLEVEL RELEASE_DATE" (empty: the
+    /// runtime's default, Ruby 3.4). The program reports it (RUBY_VERSION ...) and gets that
+    /// version's behavior where 3.4 and 4.0 differ.
+    pub ruby: String,
 }
 
 pub fn compile_file(path: &Path) -> Result<Output, Vec<String>> {
@@ -517,6 +524,7 @@ pub fn compile(src: &[u8], path: &Path) -> Result<Output, Vec<String>> {
 pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, Vec<String>> {
     let mut c = Compiler::new_object(path, src).map_err(|e| vec![e])?;
     c.load_paths = opts.load_paths.clone();
+    c.ruby = opts.ruby.clone();
     c.dep_roots = opts.load_paths.iter().chain(opts.dep_dirs.iter()).map(|p| p.canonicalize().unwrap_or(p.clone())).collect();
     let top = c.compile_program(src, path);
     c.embed(&opts.embed_dirs);
@@ -601,6 +609,7 @@ impl<M: Module> Compiler<M> {
             file_unit: false,
             src_hashes: HashMap::new(),
             load_paths: Vec::new(),
+            ruby: String::new(),
             dep_roots: Vec::new(),
             warnings: Vec::new(),
             refine_scope: None,
@@ -647,6 +656,17 @@ impl Compiler<ObjectModule> {
             let syms = gv(&mut self.module, &mut b, self.syms_id);
             let script = gv(&mut self.module, &mut b, script_id);
             let nsyms = b.ins().iconst(I64, self.syms.len() as i64);
+            // the Ruby the program was built against (before anything else runs)
+            if !self.ruby.is_empty() {
+                let line = self.ruby.clone().into_bytes();
+                let off = self.str_offset(&line);
+                let strs = gv(&mut self.module, &mut b, self.strs_id);
+                let p = b.ins().iadd_imm_s(strs, off as i64);
+                let n = b.ins().iconst(I64, line.len() as i64);
+                let f = self.rt_id("kn_register_ruby");
+                let f = self.module.declare_func_in_func(f, b.func);
+                b.ins().call(f, &[p, n]);
+            }
             // file table for runtime `require` / autoload of precompiled files
             let reg_id = self.rt_id("kn_register_file");
             let reg = self.module.declare_func_in_func(reg_id, b.func);

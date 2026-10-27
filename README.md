@@ -23,11 +23,15 @@ cargo build --release
 ruby examples/blog8/compare.rb blog8   # 45 requests against Puma and the binary: identical
 ```
 
-Kenny targets Ruby 3.4 (3.4.12: the repository's `.ruby-version`) and builds against an
-installed Ruby: the one `KENNY_RUBY` names, else the version in the program's `.ruby-version`
-(or `.tool-versions`, next to it or above) found among rvm, rbenv, asdf, chruby and mise
-installs, else `ruby` on PATH. That Ruby's standard library and gems are what goes into the
-binary.
+Kenny supports Ruby 3.4 and Ruby 4.0 (the repository's `.ruby-version` is 3.4.12) and builds
+against an installed Ruby: the one `KENNY_RUBY` names, else the version in the program's
+`.ruby-version` (or `.tool-versions`, next to it or above) found among rvm, rbenv, asdf, chruby
+and mise installs, else `ruby` on PATH. That Ruby's standard library and gems are what goes into
+the binary, and the program behaves as that version: built against 4.0 it gets `Set` and
+`Pathname` as core classes, the `Ruby` module, `Array#rfind`, `String#strip` selectors and the
+rest of 4.0's changes (`open("|cmd")` is gone, conversion error messages changed, the openssl
+gem's new errors). Building against any other version prints a warning: the program gets
+that Ruby's libraries but behaves as 3.4 (older) or 4.0 (newer).
 
 When the program has a `Gemfile.lock` next to it (or in a parent directory), `kenny build`
 resolves the locked gems itself from the installed gem directories (that Ruby's first, then
@@ -93,7 +97,7 @@ Notable choices:
 ## Status
 
 Working:
-- **Language:** everything in Ruby 3.4 syntax except the few runtime features dropped in
+- **Language:** everything in Ruby 3.4 and 4.0 syntax except the few runtime features dropped in
   [docs/LANGUAGE.md](docs/LANGUAGE.md). That includes pattern matching, argument forwarding,
   refinements, `redo`/`retry`, `Rational`, and keyword arguments on methods and blocks.
 - **Garbage collection:** generational, and compacting when it pays. Most collections are
@@ -215,7 +219,8 @@ Web (the machine was also running other work, so treat these as rough; `ab -c 10
 |---|---|---|---|
 | Whole Rails 8.1 app (`examples/blog8`, SQLite, Solid Cache/Queue), scaffold index | 2.2k req/s, 119 MB | 6.7k req/s, 195 MB | 1.3k req/s, 71 MB (1 thread, Ruby 3.3); 4.8k req/s, 1,040 MB (12 workers) |
 
-Run them yourself: `bench/run.sh`. Tests: `tests/run.sh`. Compile-check a file without linking: `kenny check file.rb`.
+Run them yourself: `bench/run.sh`. Tests: `tests/run.sh` (against Ruby 3.4), `tests/run.sh 4.0`
+(against an installed Ruby 4.0; a test's `.4.0.out` holds what 4.0 prints differently). Compile-check a file without linking: `kenny check file.rb`.
 
 GC tuning and diagnostics (environment variables read by compiled programs):
 `KENNY_GC_STATS=1` prints collections, GC time and heap size at exit (`=2` after every

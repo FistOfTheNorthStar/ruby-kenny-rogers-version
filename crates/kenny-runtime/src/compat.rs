@@ -450,7 +450,7 @@ pub fn init() {
     defn(c.module, "class_variables", 0, 1, |s, _, _| ary_new(rclass(s).cvars.keys().map(|k| mksym(*k)).collect()));
     // most gems branch on RUBY_ENGINE == "ruby"; Kenny is detectable via KENNY_VERSION
     set_global_const("RUBY_ENGINE", str_from("ruby"));
-    set_global_const("RUBY_ENGINE_VERSION", str_from("3.4.0"));
+    set_global_const("RUBY_ENGINE_VERSION", str_from(&crate::misc::ruby_release().version));
     set_global_const("KENNY_VERSION", str_from(env!("CARGO_PKG_VERSION")));
     defn(c.kernel, "ruby2_keywords", 0, -1, |_, _, _| QNIL);
     defn(c.proc_, "ruby2_keywords", 0, 0, |s, _, _| s);
