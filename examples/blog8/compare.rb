@@ -22,6 +22,9 @@ require "fileutils"
 APP = __dir__
 BIN = File.expand_path(ARGV[0] || File.join(APP, "../../blog8"))
 DBS = %w[production production_cache production_queue production_cable].map { |d| File.join(APP, "storage/#{d}.sqlite3") }
+# A database with its write-ahead log: a server stopped by TERM can leave rows in the -wal file,
+# so it is saved and restored (or removed) along with the database.
+DB_FILES = DBS.flat_map { |db| [db, "#{db}-wal", "#{db}-shm"] }
 ENV_VARS = { "RAILS_ENV" => "production", "SECRET_KEY_BASE" => "compare" * 20, "RAILS_MAX_THREADS" => "1" }.freeze
 
 def wait_for(port)
@@ -129,7 +132,7 @@ end
 
 def run(name, cmd, port)
   FileUtils.mkdir_p(File.join(APP, "tmp/pids"))
-  DBS.each { |db| FileUtils.cp(db, "#{db}.compare-backup") if File.exist?(db) }
+  DB_FILES.each { |f| FileUtils.cp(f, "#{f}.compare-backup") if File.exist?(f) }
   pid = Process.spawn(ENV_VARS.merge("PORT" => port.to_s), *cmd, chdir: APP, out: File::NULL, err: File::NULL)
   wait_for(port)
   t = transcript(scenario(port))
@@ -140,7 +143,13 @@ ensure
     Process.kill("TERM", pid)
     Process.wait(pid)
   end
-  DBS.each { |db| FileUtils.mv("#{db}.compare-backup", db) if File.exist?("#{db}.compare-backup") }
+  DB_FILES.each do |f|
+    if File.exist?("#{f}.compare-backup")
+      FileUtils.mv("#{f}.compare-backup", f)
+    else
+      FileUtils.rm_f(f)
+    end
+  end
 end
 
 port = Integer(ENV.fetch("COMPARE_PORT", "47321"))
