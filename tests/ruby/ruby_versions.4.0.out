@@ -21,6 +21,13 @@ status_and: false
 pipe_open: Errno::ENOENT: No such file or directory @ rb_sysopen - |echo hi
 ivars_to_inspect: "#<Secretive:X @host=\"h\">"
 beginless_max: 4
+implicit_parameters: [[], false, "'foo' is not an implicit parameter"]
+set_ivars: [:@a]
+set_marshal: "\x04\bo:\bSet\x06:\n@hash}\ai\x06Ti\aTF"
+set_marshal_ivar: [Set[1], 1]
+set_marshal_34: Set[1, 2]
+set_yaml: ["--- !ruby/object:Set\nhash:\n  1: true\n", Set[1, 2]]
+openssl_errors: ["cipher final failed: bad decrypt", ["error:1C800064:Provider routines:ossl_cipher_unpadblock:bad decrypt"]]
 range_overlap: [true, false, true]
 beginless_max_incl: 5
 endless_max: RangeError: cannot get the maximum of endless range

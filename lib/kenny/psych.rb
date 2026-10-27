@@ -307,3 +307,22 @@ class Object
     Psych.dump(self, options)
   end
 end
+
+# As psych/core_ext.rb: Ruby 4.0's Set has no instance variables, so psych dumps it as the
+# `hash:` mapping set.rb's @hash gave, and loads that back.
+if defined?(::Set) && Set.new.instance_variables.empty?
+  class Set
+    def encode_with(coder)
+      hash = {}
+      each do |m|
+        hash[m] = true
+      end
+      coder["hash"] = hash
+      coder
+    end
+
+    def init_with(coder)
+      replace(coder["hash"].keys)
+    end
+  end
+end

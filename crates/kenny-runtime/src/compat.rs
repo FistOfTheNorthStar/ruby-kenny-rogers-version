@@ -277,6 +277,31 @@ pub fn binding_receiver(b: V) -> Option<V> {
     if is_kind(b, Kind::Object) && real_class(b) == *BINDING.get() { Some(ivar_get(b, sym("@__self"))) } else { None }
 }
 
+/// The name given to Binding#implicit_parameter_get / _defined?, which must be `it` or `_1`..`_9`.
+fn implicit_param_name(b: V, v: V) -> Result<u32, V> {
+    let id = if is_sym(v) {
+        sym_id(v)
+    } else if is_str(v) {
+        sym(&String::from_utf8_lossy(&rstr(v).b))
+    } else {
+        let shown = crate::fmt::inspect(v).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        return Err(type_error(&format!("{shown} is not a symbol nor a string")));
+    };
+    let n = sym_name(id);
+    if n == b"it" || (n.len() == 2 && n[0] == b'_' && (b'1'..=b'9').contains(&n[1])) {
+        Ok(id)
+    } else {
+        Err(name_error(&format!("'{}' is not an implicit parameter", sym_str(id)), id, b))
+    }
+}
+/// A NameError with its `name` and `receiver`.
+fn name_error(msg: &str, name: u32, receiver: V) -> V {
+    let e = exc_new(rt().c.name_error, msg);
+    ivar_set(e, sym("@name"), mksym(name));
+    ivar_set(e, sym("@receiver"), receiver);
+    raise_exc(e)
+}
+
 fn init_binding() {
     let b = new_class("Binding", rt().c.object);
     set_global_const("Binding", b as V);
@@ -292,6 +317,19 @@ fn init_binding() {
         });
     }
     defn(b, "irb", 0, 0, |_, _, _| raise(rt().c.not_implemented_error, "binding.irb is not available in compiled programs"));
+    if crate::misc::ruby4() {
+        // Ruby 4.0: a block's `it` / `_1`..`_9` seen through its binding. A Kenny binding
+        // sees no locals, so it has none of these either.
+        defn(b, "implicit_parameters", 0, 0, |_, _, _| ary_new(vec![]));
+        defn(b, "implicit_parameter_defined?", 1, 1, |s, a, _| match implicit_param_name(s, a[0]) {
+            Ok(_) => QFALSE,
+            Err(e) => e,
+        });
+        defn(b, "implicit_parameter_get", 1, 1, |s, a, _| match implicit_param_name(s, a[0]) {
+            Ok(id) => name_error(&format!("implicit parameter '{}' is not defined for {}", sym_str(id), crate::fmt::any_to_s(s)), id, s),
+            Err(e) => e,
+        });
+    }
     defn(rt().c.proc_, "binding", 0, 0, |s, _, _| kn_binding_new(rproc(s).self_));
     defn(rt().c.kernel, "binding", 0, 0, |s, _, _| kn_binding_new(s));
 }

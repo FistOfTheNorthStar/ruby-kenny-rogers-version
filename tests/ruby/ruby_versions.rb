@@ -59,6 +59,33 @@ class Secretive
 end
 t(:ivars_to_inspect) { Secretive.new.inspect.sub(/0x\h+/, "X") }
 t(:beginless_max) { (...5).max }
+t(:implicit_parameters) do
+  b = binding
+  [b.implicit_parameters, b.implicit_parameter_defined?(:it), (b.implicit_parameter_get(:foo) rescue $!.message)]
+end
+
+# --- Set's elements aren't instance variables in 4.0 (Marshal and YAML keep 3.4's format)
+t(:set_ivars) { s = Set[1]; s.instance_variable_set(:@a, 1); s.instance_variables }
+t(:set_marshal) { Marshal.dump(Set[1, 2]) }
+t(:set_marshal_ivar) { s = Set[1]; s.instance_variable_set(:@a, 1); x = Marshal.load(Marshal.dump(s)); [x, x.instance_variable_get(:@a)] }
+t(:set_marshal_34) { Marshal.load("\x04\bo:\bSet\x06:\n@hash}\ai\x06Ti\aTF".b) }
+t(:set_yaml) do
+  require "yaml"
+  [Set[1].to_yaml, YAML.unsafe_load(Set[1, 2].to_yaml)]
+end
+
+# --- openssl 4.0 keeps OpenSSL's error queue in OpenSSLError#errors
+t(:openssl_errors) do
+  require "openssl"
+  c = OpenSSL::Cipher.new("aes-128-cbc").decrypt
+  c.key = "k" * 16
+  c.iv = "i" * 16
+  begin
+    c.update("x" * 16) + c.final
+  rescue OpenSSL::Cipher::CipherError => e
+    [e.message, e.respond_to?(:errors) && e.errors]
+  end
+end
 
 # --- both versions
 t(:range_overlap) { [(1..3).overlap?(3..5), (1...3).overlap?(3..5), (..1).overlap?(1..)] }

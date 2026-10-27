@@ -543,6 +543,22 @@ impl Dumper {
             }
             return Ok(());
         }
+        if is_core_set(v) {
+            // Ruby 4.0 writes a Set as an object with one `@hash` ivar (the elements, each
+            // mapped to true), and the Set's own ivars after it, as a String's are
+            let iv = ivar_list(v);
+            if !iv.is_empty() {
+                self.byte(b'I');
+            }
+            self.class_rec(b'o', v, true)?;
+            self.long(1);
+            self.symbol(sym("@hash"));
+            self.object(ivar_get(v, sym("@__hash")), lim)?;
+            if !iv.is_empty() {
+                self.ivars(None, &iv, lim)?;
+            }
+            return Ok(());
+        }
         self.class_rec(b'o', v, true)?;
         let iv = ivar_list(v);
         self.long(iv.len() as i64);
@@ -552,6 +568,19 @@ impl Dumper {
         }
         Ok(())
     }
+}
+
+/// A Set of a Ruby 4.0 build (lib/kenny/kenny/set4.rb), whose elements live in the hidden
+/// `@__hash`. (A 3.4 build's set.rb keeps them in a plain `@hash`, marshaled as is.)
+fn is_core_set(v: V) -> bool {
+    is_core_set_class(v) && ivar_defined(v, sym("@__hash"))
+}
+fn is_core_set_class(v: V) -> bool {
+    if !crate::misc::ruby4() || !is_kind(v, Kind::Object) {
+        return false;
+    }
+    let set = global_class("Set");
+    !set.is_null() && class_le(real_class(v), set)
 }
 
 /// The `E` encoding ivar of a string: Some(true) UTF-8, Some(false) US-ASCII, None binary.
@@ -834,6 +863,10 @@ impl Loader {
             }
             if is_exc && name == b"mesg" {
                 ivar_set(obj, sym("@__message"), val);
+                continue;
+            }
+            if name == b"@hash" && is_core_set_class(obj) {
+                ivar_set(obj, sym("@__hash"), val);
                 continue;
             }
             if is_exc && name == b"bt" {

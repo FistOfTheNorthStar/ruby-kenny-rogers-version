@@ -73,7 +73,7 @@ round trip ✓
 ArgumentError key must be 32 bytes
 ArgumentError iv must be 12 bytes
 ArgumentError data must not be empty
-CipherError retrieving the authentication tag failed
+CipherError retrieving the authentication tag failed: invalid tag
 CipherError unsupported cipher algorithm: rot13: unsupported
 CipherError cipher final failed: bad decrypt
 [OpenSSL::Cipher::CipherError, OpenSSL::OpenSSLError, StandardError]

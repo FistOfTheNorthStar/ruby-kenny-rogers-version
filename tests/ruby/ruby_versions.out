@@ -21,6 +21,13 @@ status_and: true
 pipe_open: "hi\n"
 ivars_to_inspect: "#<Secretive:X @host=\"h\", @password=\"p\">"
 beginless_max: TypeError: cannot exclude end value with non Integer begin value
+implicit_parameters: NoMethodError: undefined method 'implicit_parameters' for an instance of Binding
+set_ivars: [:@hash, :@a]
+set_marshal: "\x04\bo:\bSet\x06:\n@hash}\ai\x06Ti\aTF"
+set_marshal_ivar: [#<Set: {1}>, 1]
+set_marshal_34: #<Set: {1, 2}>
+set_yaml: ["--- !ruby/object:Set\nhash:\n  1: true\n", #<Set: {1, 2}>]
+openssl_errors: ["bad decrypt", false]
 range_overlap: [true, false, true]
 beginless_max_incl: 5
 endless_max: RangeError: cannot get the maximum of endless range

@@ -14,10 +14,8 @@ Kenny compiles Ruby ahead of time to a single native binary, like Go.
   newest one, so a build against Ruby 3.4 also accepts 4.0's syntax (a line starting with `&&`
   or `||` continuing the one before).
 - Core behavior follows the Ruby the program is built against, 3.4 or 4.0 (see the README).
-  Not yet in 4.0 builds: `Binding#implicit_parameters` (a `Binding` sees no locals),
-  `ObjectSpace._id2ref` (dropped, below) and `Ractor`. A 4.0 `Set` keeps its elements in an
-  `@hash` instance variable, which `instance_variables` lists (CRuby's has none), and openssl
-  error messages leave out the text of OpenSSL's error queue.
+  In 4.0 builds `Binding#implicit_parameters` is always empty, as `local_variables` is (a
+  `Binding` sees no locals). `ObjectSpace._id2ref` and `Ractor` are dropped in both (below).
 
 ## Rule 2: drop runtime powers that tax every program
 
