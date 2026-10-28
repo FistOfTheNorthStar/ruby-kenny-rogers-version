@@ -27,6 +27,8 @@ struct Func {
     exact: bool,
     /// The unit's strings (inline records).
     strs: *const u8,
+    /// The line of its `def` or block, 0 if none (Method/Proc#source_location).
+    def_line: u32,
 }
 /// A call location that is an inline record (see the module docs).
 const INLINE: u32 = 1 << 31;
@@ -52,7 +54,7 @@ struct RawFn {
     size: u32,
     label: u32,
     file: u32,
-    _pad: u32,
+    def_line: u32,
     calls_start: u32,
     calls_len: u32,
 }
@@ -76,6 +78,7 @@ pub unsafe extern "C" fn kn_register_debug(fns: *const u8, n: u64, calls: *const
             owned: false,
             exact: f.size & EXACT != 0,
             strs,
+            def_line: f.def_line,
         });
     }
     t.sorted = false;
@@ -83,9 +86,9 @@ pub unsafe extern "C" fn kn_register_debug(fns: *const u8, n: u64, calls: *const
 
 /// Register functions compiled at runtime (eval units): (address, size, label offset,
 /// [(return offset, loc offset)]) with offsets into `strs`, which must live forever.
-pub fn register_jit(funcs: &[(usize, u32, u32, u32, Vec<(u32, u32)>)], strs: *const u8) {
+pub fn register_jit(funcs: &[(usize, u32, u32, u32, Vec<(u32, u32)>, u32)], strs: *const u8) {
     let mut t = TABLE.write().unwrap();
-    for (addr, size, label, file, calls) in funcs {
+    for (addr, size, label, file, calls, def_line) in funcs {
         // (only read with the table locked; freed when the unit is: `unregister_jit`)
         let cs: &'static [[u32; 2]] = Box::leak(calls.iter().map(|&(r, l)| [r, l]).collect::<Vec<_>>().into_boxed_slice());
         t.funcs.push(Func {
@@ -97,6 +100,7 @@ pub fn register_jit(funcs: &[(usize, u32, u32, u32, Vec<(u32, u32)>)], strs: *co
             owned: true,
             exact: *size & EXACT != 0,
             strs,
+            def_line: *def_line,
         });
     }
     t.sorted = false;
@@ -205,6 +209,22 @@ fn frames(f: &Func, mut loc: u32) -> Vec<(*const u8, u32, *const u8)> {
     }
     out.push((f.file, loc & !INLINE, f.label));
     out
+}
+
+/// [file, line] of the `def` or block whose compiled function starts at `addr`
+/// (Method/Proc#source_location).
+pub fn def_location(addr: usize) -> Option<(String, i64)> {
+    if !TABLE.read().unwrap().sorted {
+        let mut t = TABLE.write().unwrap();
+        if !t.sorted {
+            t.funcs.sort_by_key(|f| f.start);
+            t.sorted = true;
+        }
+    }
+    let t = TABLE.read().unwrap();
+    let i = t.funcs.partition_point(|f| f.start < addr);
+    let f = t.funcs.get(i).filter(|f| f.start == addr && f.def_line != 0)?;
+    Some((cstr(f.file), f.def_line as i64))
 }
 
 /// (path, line, label) of one captured return address.

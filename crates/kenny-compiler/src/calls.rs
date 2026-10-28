@@ -187,7 +187,7 @@ impl<M: Module> Compiler<M> {
                     (v, None)
                 } else if let Some(bn) = b.as_block_node() {
                     let locals = bn.locals().iter().map(|c| c.as_slice().to_vec()).collect();
-                    let p = self.block_proc(fx, bn.parameters(), bn.body(), locals, lambda);
+                    let p = self.block_proc(fx, bn.parameters(), bn.body(), locals, lambda, bn.location().start_offset());
                     (p, Some(p))
                 } else {
                     (self.nil(fx), None)

@@ -544,6 +544,9 @@ pub fn init() {
     defn(k, "p", 0, -1, |_, a, _| p_impl(a));
     defn(k, "pp", 0, -1, |_, a, _| p_impl(a));
     defn(k, "warn", 0, -1, |_, a, _| {
+        if rt().gvars.get(&sym("$VERBOSE")).copied().unwrap_or(QFALSE) == QNIL {
+            return QNIL;
+        }
         let a: Vec<V> = a.iter().copied().filter(|x| !is_hash(*x)).collect();
         puts_to(&a, &mut |b| err_out(b))
     });

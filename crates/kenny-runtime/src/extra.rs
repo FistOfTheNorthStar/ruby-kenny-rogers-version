@@ -1810,7 +1810,7 @@ pub fn init() {
     // ===== Proc =====
     let pc = c.proc_;
     defn(pc, "to_s", 0, 0, |s, _, _| send0(s, "inspect"));
-    defn(pc, "source_location", 0, 0, |_, _, _| QNIL);
+    defn(pc, "source_location", 0, 0, |s, _, _| crate::methodobj::proc_location(s));
     defn(pc, "ruby2_keywords", 0, 0, |s, _, _| s);
 
     // ===== Range =====

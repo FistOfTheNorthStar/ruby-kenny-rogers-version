@@ -1124,7 +1124,9 @@ pub fn init() {
     // ---- Struct ----
     let st = c.struct_;
     defs(st, "new", 0, -1, |s, a, b| {
-        if s as *mut Class != rt().c.struct_ {
+        // a struct class makes an instance; Struct and a subclass of it with no members yet
+        // (`class Options < Struct; end; Options.new(:a, :b)`, Faraday's) make a struct class
+        if ancestors(s as *mut Class).iter().any(|c| unsafe { (**c).civars.contains_key(&sym("@__struct")) }) {
             return crate::kernel::class_new_instance(s, a, b);
         }
         let kw_init = has_kw(a, "keyword_init");
@@ -1145,10 +1147,12 @@ pub fn init() {
                 Err(e) => return e,
             }
         }
-        let k = new_class("", rt().c.struct_);
+        let k = new_class("", s as *mut Class);
         unsafe {
             (*k).struct_members.set(members.clone());
         }
+        // (a class Struct.new made: its `new` makes instances)
+        rclass(k as V).civars.insert(sym("@__struct"), QTRUE);
         if let Some(n) = cname {
             const_set(rt().c.struct_, sym(&n), k as V);
         }

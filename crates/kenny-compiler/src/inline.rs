@@ -344,7 +344,7 @@ impl<M: Module> Compiler<M> {
         // the normal call, with the block as a closure
         fx.b.switch_to_block(fallback);
         let locals: Vec<Vec<u8>> = bn.locals().iter().map(|c| c.as_slice().to_vec()).collect();
-        let p = self.block_proc(fx, bn.parameters(), bn.body(), locals.clone(), false);
+        let p = self.block_proc(fx, bn.parameters(), bn.body(), locals.clone(), false, bn.location().start_offset());
         self.cur_offset = at_loc;
         let r = self.send_with_block(fx, recv, &name, arg, p);
         fx.b.ins().jump(done, &[r.into()]);

@@ -135,6 +135,41 @@ const ERRNOS: &[(&str, i32)] = &[
     ("EALREADY", libc::EALREADY),
     ("EINPROGRESS", libc::EINPROGRESS),
     ("EPROTO", libc::EPROTO),
+    ("ENOTBLK", libc::ENOTBLK),
+    ("ETXTBSY", libc::ETXTBSY),
+    ("ENOLCK", libc::ENOLCK),
+    ("EIDRM", libc::EIDRM),
+    ("ENOMSG", libc::ENOMSG),
+    ("EOVERFLOW", libc::EOVERFLOW),
+    ("ECANCELED", libc::ECANCELED),
+    ("EILSEQ", libc::EILSEQ),
+    ("EBADMSG", libc::EBADMSG),
+    ("ENODATA", libc::ENODATA),
+    ("ETIME", libc::ETIME),
+    ("ENOSR", libc::ENOSR),
+    ("ENOSTR", libc::ENOSTR),
+    ("ENOLINK", libc::ENOLINK),
+    ("EMULTIHOP", libc::EMULTIHOP),
+    ("EOWNERDEAD", libc::EOWNERDEAD),
+    ("ENOTRECOVERABLE", libc::ENOTRECOVERABLE),
+    ("EDESTADDRREQ", libc::EDESTADDRREQ),
+    ("EMSGSIZE", libc::EMSGSIZE),
+    ("EPROTOTYPE", libc::EPROTOTYPE),
+    ("ENOPROTOOPT", libc::ENOPROTOOPT),
+    ("EPROTONOSUPPORT", libc::EPROTONOSUPPORT),
+    ("ESOCKTNOSUPPORT", libc::ESOCKTNOSUPPORT),
+    ("EPFNOSUPPORT", libc::EPFNOSUPPORT),
+    ("EAFNOSUPPORT", libc::EAFNOSUPPORT),
+    ("ENETRESET", libc::ENETRESET),
+    ("ENOBUFS", libc::ENOBUFS),
+    ("EISCONN", libc::EISCONN),
+    ("ESHUTDOWN", libc::ESHUTDOWN),
+    ("ETOOMANYREFS", libc::ETOOMANYREFS),
+    ("EHOSTDOWN", libc::EHOSTDOWN),
+    ("EUSERS", libc::EUSERS),
+    ("EDQUOT", libc::EDQUOT),
+    ("ESTALE", libc::ESTALE),
+    ("EREMOTE", libc::EREMOTE),
 ];
 
 fn strerror(e: i32) -> String {
@@ -4417,6 +4452,10 @@ pub fn init() {
     // warn(*msgs, uplevel: nil, category: nil): the messages as `puts` writes them, through
     // Warning.warn (which programs override to capture warnings)
     defn(k, "warn", 0, -1, |_, a, _| {
+        // `$VERBOSE = nil` silences warn (Rails' silence_warnings)
+        if rt().gvars.get(&sym("$VERBOSE")).copied().unwrap_or(QFALSE) == QNIL {
+            return QNIL;
+        }
         let (a, kw) = split_kw(a);
         let mut uplevel = None;
         let mut category = QNIL;

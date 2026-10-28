@@ -447,6 +447,10 @@ pub fn init() {
     for (n, v) in [("$LOAD_PATH", lp), ("$:", lp), ("$-I", lp), ("$LOADED_FEATURES", lf), ("$\"", lf)] {
         rt().gvars.insert(sym(n), v);
     }
+    // warnings on, not verbose (CRuby's default); `$VERBOSE = nil` silences `warn`
+    if rt().gvars.get(&sym("$VERBOSE")).is_none() {
+        rt().gvars.insert(sym("$VERBOSE"), QFALSE);
+    }
     // $LOAD_PATH.resolve_feature_path(name): [:rb, path] for a compiled-in file, [:so, name]
     // for a feature the runtime provides natively, nil otherwise (Ruby 3.3's erb/util asks
     // it whether the erb/escape accelerator exists)

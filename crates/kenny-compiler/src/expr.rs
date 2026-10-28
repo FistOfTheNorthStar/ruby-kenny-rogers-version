@@ -789,7 +789,7 @@ impl<M: Module> Compiler<M> {
             Node::LambdaNode { .. } => {
                 let l = node.as_lambda_node().unwrap();
                 let locals = l.locals().iter().map(|c| c.as_slice().to_vec()).collect();
-                self.block_proc(fx, l.parameters(), l.body(), locals, true)
+                self.block_proc(fx, l.parameters(), l.body(), locals, true, l.location().start_offset())
             }
 
             // ---- control flow, calls ----

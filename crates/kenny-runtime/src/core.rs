@@ -2118,7 +2118,7 @@ pub fn ivar_list(v: V) -> Vec<(u32, V)> {
                 .filter(|(n, x)| *x != UNDEF && !sym_name(*n).starts_with(b"@__"))
                 .collect()
         }
-        Some(Kind::Class) => rclass(v).civars.iter().map(|(&k, &v)| (k, v)).collect(),
+        Some(Kind::Class) => rclass(v).civars.iter().map(|(&k, &v)| (k, v)).filter(|(n, _)| !sym_name(*n).starts_with(b"@__")).collect(),
         _ => gen_ivar_list(v),
     }
 }

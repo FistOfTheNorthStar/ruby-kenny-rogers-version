@@ -253,7 +253,7 @@ impl<M: Module> Compiler<M> {
             self.errors.push(format!("internal codegen error in {name}: {e:?}"));
         } else if let Some(code) = ctx.compiled_code() {
             let before = self.debug_fns.len();
-            self.record_debug_info(id, label, code);
+            self.record_debug_info(id, label, code, 0);
             if let Some(d) = self.debug_fns.get_mut(before) {
                 d.exact = true;
             }
@@ -302,6 +302,8 @@ impl<M: Module> Compiler<M> {
             _ => spec.label.clone(),
         };
         self.fn_labels.push(bt_label.clone());
+        // its definition's line (Method/Proc#source_location); 0: none
+        let def_line = std::mem::take(&mut self.def_line_next);
         // (a function of its own: its call sites aren't inside the enclosing inlined code)
         let saved_dbg = std::mem::take(&mut self.dbg_frames);
         let saved_parent = self.block_parent.take();
@@ -544,7 +546,7 @@ impl<M: Module> Compiler<M> {
         if let Err(e) = self.module.define_function(id, &mut ctx) {
             self.errors.push(format!("internal codegen error in {name}: {e:?}"));
         } else if let Some(code) = ctx.compiled_code() {
-            self.record_debug_info(id, &bt_label, code);
+            self.record_debug_info(id, &bt_label, code, def_line);
         }
         id
     }
@@ -1438,6 +1440,7 @@ impl<M: Module> Compiler<M> {
             _ => None,
         };
         let def_line = self.line_of(offset) as u32;
+        self.def_line_next = def_line;
         // (code inlined into this body is compiled with no inline context of its own)
         let saved_ctx = std::mem::take(&mut self.inline_ctx);
         self.def_stack.push((self.file.clone(), offset));
@@ -1522,7 +1525,8 @@ impl<M: Module> Compiler<M> {
     }
 
     /// Compile a block or lambda literal into a Proc value.
-    pub(crate) fn block_proc(&mut self, fx: &mut Fx, params: Option<Node>, body: Option<Node>, locals: Vec<Vec<u8>>, lambda: bool) -> Value {
+    pub(crate) fn block_proc(&mut self, fx: &mut Fx, params: Option<Node>, body: Option<Node>, locals: Vec<Vec<u8>>, lambda: bool, offset: usize) -> Value {
+        self.def_line_next = self.line_of(offset) as u32;
         // (only this literal: the blocks in its body are ordinary)
         let bmethod = std::mem::take(&mut self.bmethod_next);
         // made in an inlined block body (inline.rs `Check`): its variables copied into
