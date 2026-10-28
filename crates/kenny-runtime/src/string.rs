@@ -367,7 +367,7 @@ fn sets_of(a: &[V]) -> Result<Vec<(bool, Vec<char>)>, V> {
     a.iter().map(|x| want_str(*x).map(|b| tr_expand(&String::from_utf8_lossy(&b)))).collect()
 }
 
-fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
+fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<(Vec<u8>, crate::transcode::Enc)>, V> {
     if a.is_empty() {
         return Err(arity_error(0, 1, 2));
     }
@@ -379,6 +379,11 @@ fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
     }
     let pat = rstr(a[0]).b.clone();
     let src = rstr(s).b.clone();
+    let src_ascii = src.is_ascii();
+    let mut enc = crate::transcode::enc_of(s);
+    if let Some(&x) = a.get(1).filter(|x| is_str(**x)) {
+        crate::transcode::note_piece(&mut enc, src_ascii, x);
+    }
     let mut out = Vec::with_capacity(src.len());
     let mut start = 0;
     let mut changed = false;
@@ -400,6 +405,7 @@ fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
             if v == UNDEF {
                 return Err(UNDEF);
             }
+            crate::transcode::note_piece(&mut enc, src_ascii, v);
             to_s(v).map_err(|_| UNDEF)?
         } else if is_proc(blk) {
             let matched = str_new(pat.clone());
@@ -407,6 +413,7 @@ fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
             if v == UNDEF {
                 return Err(UNDEF);
             }
+            crate::transcode::note_piece(&mut enc, src_ascii, v);
             to_s(v).map_err(|_| UNDEF)?
         } else {
             return Err(arity_error(1, 2, 2));
@@ -427,7 +434,7 @@ fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
     if start < src.len() {
         out.extend_from_slice(&src[start..]);
     }
-    Ok(if changed { Some(out) } else { None })
+    Ok(if changed { Some((out, enc)) } else { None })
 }
 
 fn succ(x: &[u8]) -> Vec<u8> {
@@ -1407,20 +1414,30 @@ pub fn init() {
         Ok(sets) => mkfix(s_of(s).chars().filter(|ch| in_sets(*ch, &sets)).count() as i64),
         Err(e) => e,
     });
-    defn(c, "sub", 1, 2, |s, a, blk| match sub_impl(s, a, blk, false) {
-        Ok(Some(o)) => str_new(o),
-        Ok(None) => str_new(rstr(s).b.clone()),
-        Err(e) => e,
-    });
-    defn(c, "gsub", 1, 2, |s, a, blk| match sub_impl(s, a, blk, true) {
-        Ok(Some(o)) => str_new(o),
-        Ok(None) => str_new(rstr(s).b.clone()),
-        Err(e) => e,
-    });
+    fn sub_result(s: V, r: Result<Option<(Vec<u8>, crate::transcode::Enc)>, V>) -> V {
+        match r {
+            Ok(Some((o, enc))) => {
+                let v = str_new(o);
+                crate::transcode::set_enc(v, enc);
+                v
+            }
+            Ok(None) => {
+                let v = str_new(rstr(s).b.clone());
+                crate::transcode::set_enc(v, crate::transcode::enc_of(s));
+                v
+            }
+            Err(e) => e,
+        }
+    }
+    defn(c, "sub", 1, 2, |s, a, blk| sub_result(s, sub_impl(s, a, blk, false)));
+    defn(c, "gsub", 1, 2, |s, a, blk| sub_result(s, sub_impl(s, a, blk, true)));
     defn(c, "sub!", 1, 2, |s, a, blk| match sub_impl(s, a, blk, false) {
-        Ok(Some(o)) => match mutate(s) {
+        Ok(Some((o, enc))) => match mutate(s) {
             Ok(bs) => {
                 bs.set(o);
+                if enc != crate::transcode::enc_of(s) {
+                    crate::transcode::set_enc(s, enc);
+                }
                 s
             }
             Err(e) => e,
@@ -1429,9 +1446,12 @@ pub fn init() {
         Err(e) => e,
     });
     defn(c, "gsub!", 1, 2, |s, a, blk| match sub_impl(s, a, blk, true) {
-        Ok(Some(o)) => match mutate(s) {
+        Ok(Some((o, enc))) => match mutate(s) {
             Ok(bs) => {
                 bs.set(o);
+                if enc != crate::transcode::enc_of(s) {
+                    crate::transcode::set_enc(s, enc);
+                }
                 s
             }
             Err(e) => e,

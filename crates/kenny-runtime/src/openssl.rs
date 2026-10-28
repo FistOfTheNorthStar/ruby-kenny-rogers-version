@@ -812,7 +812,9 @@ fn init_digest(ossl: *mut Class) {
     // Digest::Instance#file and Digest::Class.file (CRuby's OpenSSL::Digest is a Digest::Class):
     // ActiveStorage checksums uploads with OpenSSL::Digest::MD5.file
     defn(d, "file", 1, 1, |s, a, _| {
-        let path = match crate::fmt::to_s(a[0]) {
+        // (a path, or anything with to_path: a Tempfile, a Pathname)
+        let p = if !is_str(a[0]) && respond_to(a[0], sym("to_path")) { tri!(send(a[0], sym("to_path"), &[], QNIL)) } else { a[0] };
+        let path = match crate::fmt::to_s(p) {
             Ok(b) => b,
             Err(()) => return UNDEF,
         };
