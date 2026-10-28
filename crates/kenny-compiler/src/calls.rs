@@ -273,6 +273,21 @@ impl<M: Module> Compiler<M> {
                 b"require_relative" if arg_nodes.len() == 1 && arg_nodes[0].as_string_node().is_some() => {
                     return self.require_relative(fx, &arg_nodes[0], at);
                 }
+                // a computed path (`require_relative "versions/#{v}"`): resolved at run time
+                // against this file's directory; the files of gem directories are compiled in
+                b"require_relative" if arg_nodes.len() == 1 && block.is_none() => {
+                    let base = self.file.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                    let dir = base.canonicalize().unwrap_or(base);
+                    // the program's own files aren't all compiled in: one it names this way is
+                    // compiled when it is required (gems' files are all in the binary)
+                    if !self.in_dependency() {
+                        self.needs_jit = true;
+                    }
+                    let v = self.expr(fx, &arg_nodes[0]);
+                    let d = self.str_lit(fx, dir.display().to_string().as_bytes());
+                    let s = self.self_val(fx);
+                    return self.send(fx, s, b"__kenny_require_relative", &[v, d], None);
+                }
                 b"using" if arg_nodes.len() == 1 => {
                     let m = self.expr(fx, &arg_nodes[0]);
                     self.refine_counter += 1;
@@ -292,13 +307,7 @@ impl<M: Module> Compiler<M> {
                     if let Some(d) = self.file.parent() {
                         dirs.push(d.to_path_buf());
                     }
-                    let found = dirs.iter().map(|d| {
-                        let mut p = d.join(&name);
-                        if p.extension().is_none() {
-                            p.set_extension("rb");
-                        }
-                        p
-                    }).find(|p| p.is_file());
+                    let found = dirs.iter().map(|d| rb_file(d.join(&name))).find(|p| p.is_file());
                     if let Some(p) = found {
                         if let Some((fid, flag)) = self.require_file(p, at) {
                             let s = self.self_val(fx);
@@ -624,10 +633,7 @@ impl<M: Module> Compiler<M> {
     fn require_relative(&mut self, fx: &mut Fx, arg: &Node, at: usize) -> Value {
         let rel = String::from_utf8_lossy(arg.as_string_node().unwrap().unescaped()).into_owned();
         let base = self.file.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let mut full = base.join(&rel);
-        if full.extension().is_none() {
-            full.set_extension("rb");
-        }
+        let full = rb_file(base.join(&rel));
         if self.file_unit {
             // a file compiled at runtime: the program's own copy of the file (compiled in, or
             // loaded from disk by the runtime), not a second one inside this unit
@@ -907,4 +913,18 @@ impl<M: Module> Compiler<M> {
             }
         }
     }
+}
+
+/// The file `require` loads for `path`: `path.rb` unless `path` ends in `.rb` (or names a
+/// C extension) or only `path` itself exists, as in CRuby (`require_relative "parser.tab"`
+/// loads parser.tab.rb).
+pub(crate) fn rb_file(path: PathBuf) -> PathBuf {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("rb" | "so" | "bundle" | "o" | "dll") => return path,
+        _ => {}
+    }
+    let mut with = path.clone().into_os_string();
+    with.push(".rb");
+    let with = PathBuf::from(with);
+    if with.exists() || !path.is_file() { with } else { path }
 }

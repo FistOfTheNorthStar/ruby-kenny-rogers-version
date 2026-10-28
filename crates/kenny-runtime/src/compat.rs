@@ -626,7 +626,8 @@ fn disk_source(name: &str, with_rb: bool) -> Option<(String, Vec<u8>, bool)> {
 }
 
 /// Files `require`d from disk through the runtime compiler (absolute paths).
-static DISK_REQUIRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// (real path, the path listed in $LOADED_FEATURES)
+static DISK_REQUIRED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
 /// `require "/abs/path"` of a file that isn't compiled in but exists (e.g. a file added to a
 /// Rails app while it runs in development): compile it at runtime, once.
@@ -639,16 +640,27 @@ pub fn require_from_disk(name: &str) -> Option<V> {
     if FILE_TABLE.get().as_ref().is_some_and(|t| t.contains_key(abs.trim_end_matches(".rb"))) {
         return require_compiled(&abs);
     }
+    // $LOADED_FEATURES lists the expanded path, not the real one (CRuby's; /var, not /private/var)
+    let mut feature = std::path::absolute(name).map(|p| p.display().to_string()).unwrap_or_else(|_| abs.clone());
+    if abs.ends_with(".rb") && !feature.ends_with(".rb") {
+        feature.push_str(".rb");
+    }
     {
+        let lf = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf));
         let mut d = DISK_REQUIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if d.contains(&abs) {
-            return Some(QFALSE);
+        if let Some(i) = d.iter().position(|(a, _)| *a == abs) {
+            // still loaded, unless the program took it out of $LOADED_FEATURES since
+            // (Zeitwerk's reload)
+            if !lf.is_some_and(|lf| !lf_contains(lf, &d[i].1)) {
+                return Some(QFALSE);
+            }
+            d.remove(i);
         }
-        d.push(abs.clone());
+        d.push((abs.clone(), feature.clone()));
     }
     if let Some(&lf) = rt().gvars.get(&sym("$LOADED_FEATURES")) {
         if is_ary(lf) {
-            rary(lf).v.push(str_from(&abs));
+            rary(lf).v.push(str_from(&feature));
         }
     }
     Some(hook(&src, &abs))
@@ -705,15 +717,42 @@ pub fn compiled_entry(name: &str) -> Option<(CompiledFn, *mut V)> {
     FILE_TABLE.get().as_ref()?.get(key).map(|e| (e.0, e.1))
 }
 
+/// Whether `$LOADED_FEATURES` lists `feature`.
+fn lf_contains(lf: V, feature: &str) -> bool {
+    rary(lf).v.iter().any(|x| is_str(*x) && rstr(*x).b[..] == *feature.as_bytes())
+}
+
+/// Features this runtime added to `$LOADED_FEATURES` (by a `require` that went through it). If
+/// one is gone from there later, a program unloaded it (Zeitwerk's reload deletes the file's
+/// path and requires it again), and the next `require` runs the file again, as in CRuby. Files
+/// required by a literal `require` in compiled code aren't listed, so they aren't affected.
+static PUSHED_FEATURES: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+
+fn note_pushed(feature: &str) {
+    PUSHED_FEATURES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(feature.to_string());
+}
+
+/// Whether `feature` was added to `$LOADED_FEATURES` by this runtime and removed since.
+fn was_unloaded(lf: Option<V>, feature: &str) -> bool {
+    let Some(lf) = lf else { return false };
+    let pushed = PUSHED_FEATURES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(feature));
+    pushed && !lf_contains(lf, feature)
+}
+
 pub fn require_compiled(name: &str) -> Option<V> {
     let key = name.trim_end_matches(".rb");
     let (f, flag, _) = *FILE_TABLE.get().as_ref()?.get(key)?;
-    let st = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire);
     let feature = format!("{key}.rb");
     let lf = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf));
+    let fl = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) };
+    if fl.load(std::sync::atomic::Ordering::Acquire) == 1 && was_unloaded(lf, &feature) {
+        let _ = fl.compare_exchange(1, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
+    }
+    let st = fl.load(std::sync::atomic::Ordering::Acquire);
     if st == 0 {
         if let Some(lf) = lf {
             rary(lf).v.push(str_from(&feature));
+            note_pushed(&feature);
         }
     }
     let r = run_file_once(f, flag);

@@ -578,7 +578,30 @@ pub fn init() {
         ivar_set(e, sym("@path"), str_from(&name));
         raise_exc(e)
     });
+    // `require_relative` with a literal path is compiled; this one is for a computed path, where
+    // the compiler passes the directory of the calling file
     defn(k, "require_relative", 1, 1, |_, _, _| QFALSE);
+    defn(k, "__kenny_require_relative", 2, 2, |s, a, _| {
+        let p = if is_str(a[0]) { a[0] } else { tri!(send(a[0], sym(if respond_to(a[0], sym("to_path")) { "to_path" } else { "to_str" }), &[], QNIL)) };
+        if !is_str(p) {
+            return type_error("no implicit conversion into String");
+        }
+        let rel = String::from_utf8_lossy(&rstr(p).b).into_owned();
+        let dir = String::from_utf8_lossy(&rstr(a[1]).b).into_owned();
+        let joined = if rel.starts_with('/') { std::path::PathBuf::from(&rel) } else { std::path::Path::new(&dir).join(&rel) };
+        // File.expand_path: drop `.` and resolve `..`
+        let mut full = std::path::PathBuf::new();
+        for c in joined.components() {
+            match c {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    full.pop();
+                }
+                c => full.push(c),
+            }
+        }
+        send(s, sym("require"), &[str_from(&full.display().to_string())], QNIL)
+    });
     fn raise_impl(a: &[V]) -> V {
         let r = rt();
         // `cause:` (raise's only keyword)

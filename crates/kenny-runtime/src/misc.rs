@@ -1469,20 +1469,139 @@ pub fn init() {
         }
     });
     defn(envc, "key?", 1, 1, |_, a, _| bool_v(path_arg(a[0]).ok().is_some_and(|k| std::env::var(k).is_ok())));
-    defn(envc, "[]=", 2, 2, |_, a, _| {
-        if let (Ok(k), Ok(v)) = (path_arg(a[0]), path_arg(a[1])) {
-            unsafe { std::env::set_var(k, v) };
+    fn env_set(k: V, v: V) -> V {
+        let k = match path_arg(k) {
+            Ok(k) => k,
+            Err(e) => return e,
+        };
+        if v == QNIL {
+            unsafe { std::env::remove_var(k) };
+            return QNIL;
         }
-        a[1]
-    });
-    defn(envc, "to_h", 0, 0, |_, _, _| {
+        match path_arg(v) {
+            Ok(v) => unsafe { std::env::set_var(k, v) },
+            Err(e) => return e,
+        }
+        v
+    }
+    defn(envc, "[]=", 2, 2, |_, a, _| env_set(a[0], a[1]));
+    defn(envc, "store", 2, 2, |_, a, _| env_set(a[0], a[1]));
+    fn env_hash() -> V {
         let h = hash_new();
-        for (k, v) in std::env::vars() {
-            crate::hash::hset(h, new_str_v(k), new_str_v(v));
+        for (k, v) in std::env::vars_os() {
+            crate::hash::hset(h, new_str_v(k.to_string_lossy().into_owned()), new_str_v(v.to_string_lossy().into_owned()));
         }
         h
+    }
+    defn(envc, "to_hash", 0, 0, |_, _, _| env_hash());
+    defn(envc, "to_h", 0, 0, |_, _, b| if is_proc(b) { send(env_hash(), sym("to_h"), &[], b) } else { env_hash() });
+    defn(envc, "inspect", 0, 0, |_, _, _| send(env_hash(), sym("inspect"), &[], QNIL));
+    defn(envc, "to_s", 0, 0, |_, _, _| str_from("ENV"));
+    defn(envc, "include?", 1, 1, |_, a, _| bool_v(path_arg(a[0]).ok().is_some_and(|k| std::env::var_os(k).is_some())));
+    defn(envc, "has_key?", 1, 1, |_, a, _| bool_v(path_arg(a[0]).ok().is_some_and(|k| std::env::var_os(k).is_some())));
+    defn(envc, "member?", 1, 1, |_, a, _| bool_v(path_arg(a[0]).ok().is_some_and(|k| std::env::var_os(k).is_some())));
+    fn env_each(s: V, b: V, name: &str) -> V {
+        if !is_proc(b) {
+            return enum_for(s, name, &[]);
+        }
+        let h = env_hash();
+        for (k, v) in crate::hash::pairs(h).iter().copied() {
+            tri!(call_block(b, &[ary_new(vec![k, v])]));
+        }
+        s
+    }
+    defn(envc, "each", 0, 0, |s, _, b| env_each(s, b, "each"));
+    defn(envc, "each_pair", 0, 0, |s, _, b| env_each(s, b, "each_pair"));
+    fn env_delete(k: V) -> Option<V> {
+        let k = path_arg(k).ok()?;
+        let old = std::env::var_os(&k)?;
+        unsafe { std::env::remove_var(&k) };
+        Some(new_str_v(old.to_string_lossy().into_owned()))
+    }
+    defn(envc, "delete", 1, 1, |_, a, b| match env_delete(a[0]) {
+        Some(v) => v,
+        None if is_proc(b) => call_block(b, &[a[0]]),
+        None => QNIL,
     });
-    defn(envc, "inspect", 0, 0, |_, _, _| str_from("ENV"));
+    fn env_update(s: V, a: &[V], b: V) -> V {
+        for &h in a {
+            let h = tri!(send(h, sym("to_hash"), &[], QNIL));
+            for (k, v) in crate::hash::pairs(h).iter().copied() {
+                let mut v = v;
+                if is_proc(b) {
+                    let old = send(s, sym("[]"), &[k], QNIL);
+                    if old != QNIL {
+                        v = tri!(call_block(b, &[k, old, v]));
+                    }
+                }
+                tri!(env_set(k, v));
+            }
+        }
+        s
+    }
+    defn(envc, "update", 0, -1, env_update);
+    defn(envc, "merge!", 0, -1, env_update);
+    defn(envc, "replace", 1, 1, |s, a, _| {
+        let h = tri!(send(a[0], sym("to_hash"), &[], QNIL));
+        let mut keep = Vec::new();
+        for (k, _) in crate::hash::pairs(h).iter().copied() {
+            match path_arg(k) {
+                Ok(k) => keep.push(k),
+                Err(e) => return e,
+            }
+        }
+        for (k, _) in std::env::vars_os() {
+            if !keep.iter().any(|x| std::ffi::OsStr::new(x) == k) {
+                unsafe { std::env::remove_var(&k) };
+            }
+        }
+        env_update(s, &[h], QNIL)
+    });
+    defn(envc, "clear", 0, 0, |s, _, _| {
+        for (k, _) in std::env::vars_os() {
+            unsafe { std::env::remove_var(k) };
+        }
+        s
+    });
+    // delete_if/reject! (drop when the block is true), keep_if/select!/filter! (drop when false)
+    fn env_filter(s: V, b: V, name: &str, drop_when: bool) -> V {
+        if !is_proc(b) {
+            return enum_for(s, name, &[]);
+        }
+        let h = env_hash();
+        let mut changed = false;
+        for (k, v) in crate::hash::pairs(h).iter().copied() {
+            if truthy(tri!(call_block(b, &[k, v]))) == drop_when {
+                env_delete(k);
+                changed = true;
+            }
+        }
+        if !changed && (name == "reject!" || name == "select!" || name == "filter!") { QNIL } else { s }
+    }
+    defn(envc, "delete_if", 0, 0, |s, _, b| env_filter(s, b, "delete_if", true));
+    defn(envc, "reject!", 0, 0, |s, _, b| env_filter(s, b, "reject!", true));
+    defn(envc, "keep_if", 0, 0, |s, _, b| env_filter(s, b, "keep_if", false));
+    defn(envc, "select!", 0, 0, |s, _, b| env_filter(s, b, "select!", false));
+    defn(envc, "filter!", 0, 0, |s, _, b| env_filter(s, b, "filter!", false));
+    defn(envc, "rehash", 0, 0, |_, _, _| QNIL);
+    defn(envc, "freeze", 0, 0, |_, _, _| raise(rt().c.type_error, "cannot freeze ENV"));
+    defn(envc, "dup", 0, 0, |_, _, _| raise(rt().c.type_error, "Cannot dup ENV, use ENV.to_h to get a copy of ENV as a hash"));
+    // the read-only rest acts on a Hash snapshot, as CRuby's ENV methods return Hashes and Arrays
+    macro_rules! env_via_hash {
+        ($($name:literal),*) => {
+            $(defn(envc, $name, 0, -1, |s, a, b| {
+                let r = send(env_hash(), sym($name), a, b);
+                if !is_proc(b) && is_a(r, rt().c.enumerator) { enum_for(s, $name, a) } else { r }
+            });)*
+        };
+    }
+    env_via_hash!(
+        "keys", "values", "to_a", "size", "length", "empty?", "value?", "has_value?", "key", "values_at",
+        "fetch_values", "slice", "except", "assoc", "rassoc", "invert", "select", "filter", "reject",
+        "each_key", "each_value", "filter_map", "any?", "find", "detect", "map", "count", "sort_by", "min_by",
+        "max_by", "sum", "each_with_object", "partition", "group_by", "to_set"
+    );
+    crate::kernel::do_include(envc, rt().c.enumerable as V);
 
     // ---- GC ----
     let gc = new_module("GC");
