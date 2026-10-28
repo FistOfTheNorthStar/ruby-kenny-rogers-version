@@ -2329,10 +2329,15 @@ fn k_fork(blk: V) -> V {
             let r = call_block(blk, &[]);
             let mut code = 0;
             if r == UNDEF {
-                if matches!(pst().pending, Throw::Raise(_)) {
-                    code = 1;
+                match pst().pending {
+                    // `exit n` in the child: its status, nothing printed
+                    Throw::Raise(e) if class_name(real_class(e)) == "SystemExit" => code = crate::kernel::system_exit_status(e),
+                    Throw::Raise(_) => {
+                        code = 1;
+                        print_uncaught();
+                    }
+                    _ => print_uncaught(),
                 }
-                print_uncaught();
                 pst().pending = Throw::None;
             }
             crate::abi::run_at_exit();

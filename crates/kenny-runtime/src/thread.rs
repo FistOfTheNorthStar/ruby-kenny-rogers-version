@@ -676,7 +676,8 @@ fn resume_thread(i: usize) {
                 pk.unpark();
             }
             if let Some((obj, e)) = report {
-                if truthy(ivar_get(obj, sym("@__report"))) {
+                // (a thread ending by `exit` isn't reported, as in CRuby)
+                if truthy(ivar_get(obj, sym("@__report"))) && class_name(real_class(e)) != "SystemExit" {
                     report_thread_exception(obj, e);
                     pst().pending = Throw::None;
                 }

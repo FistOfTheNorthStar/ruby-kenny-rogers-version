@@ -143,7 +143,7 @@ fn report_uncaught() -> i32 {
     let msg = match pending {
         Throw::Raise(e) => {
             if is_a(e, r.c.exception) && class_name(real_class(e)) == "SystemExit" {
-                return 0;
+                return crate::kernel::system_exit_status(e);
             }
             // CRuby loads did_you_mean at startup; here it loads when first needed, so an
             // uncaught NameError still says "Did you mean?"
