@@ -16,6 +16,16 @@ module Gem
   autoload :Requirement, "rubygems/requirement"
   autoload :Dependency, "rubygems/dependency"
 
+  # Gem::Specification on first reference (not an autoload: RubyGems' own `class
+  # Specification < BasicSpecification` must define it when RubyGems itself is loaded)
+  def self.const_missing(name)
+    if name == :Specification
+      require "kenny/gem_specification"
+      return const_get(:Specification, false)
+    end
+    super
+  end
+
   @loaded_specs = {}
   # the gem directories the program's gems were compiled from (set by Bundler.setup)
   @path = []
@@ -33,6 +43,15 @@ module Gem
       @platforms = list
     end
     def target_rbconfig = RbConfig::CONFIG
+
+    # a GEM_REQUIREMENT_<NAME> environment variable's extra requirement
+    def env_requirement(gem_name)
+      @env_requirements_by_name ||= {}
+      @env_requirements_by_name[gem_name] ||= begin
+        req = ENV["GEM_REQUIREMENT_#{gem_name.upcase}"] || ">= 0"
+        Gem::Requirement.create(req)
+      end
+    end
 
     # [file, line] of a caller (Gem::Deprecate's notes)
     def location_of_caller(depth = 1)

@@ -180,7 +180,10 @@ impl<M: Module> Compiler<M> {
         let saved_src = std::mem::replace(&mut self.src, src.clone());
         let saved_scopes = std::mem::take(&mut self.scopes);
         let saved_refine = self.refine_scope.take();
+        // (the file's classes are named from the top level, not from where it was required)
+        let saved_lex = std::mem::take(&mut self.lex_classes);
         let r = self.compile_program(&src, &path);
+        self.lex_classes = saved_lex;
         self.refine_scope = saved_refine;
         self.scopes = saved_scopes;
         self.file = saved_file;

@@ -44,6 +44,7 @@ const OVERLAY: &[(&str, &str)] = &[
     ("pathname.so", include_str!("../../../lib/kenny/pathname_ext.rb")),
     ("ripper.so", include_str!("../../../lib/kenny/ripper_ext.rb")),
     ("kenny/gem.rb", include_str!("../../../lib/kenny/kenny/gem.rb")),
+    ("kenny/gem_specification.rb", include_str!("../../../lib/kenny/kenny/gem_specification.rb")),
     ("kenny/data.rb", include_str!("../../../lib/kenny/kenny/data.rb")),
     ("kenny/argf.rb", include_str!("../../../lib/kenny/kenny/argf.rb")),
     ("kenny/pathname4.rb", include_str!("../../../lib/kenny/kenny/pathname4.rb")),
