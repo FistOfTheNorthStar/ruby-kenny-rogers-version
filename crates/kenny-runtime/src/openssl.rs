@@ -1,6 +1,6 @@
 //! Native subset of Ruby's OpenSSL extension (what Rails' message signing and
 //! encryption need) built on pure-Rust crypto: digests, HMAC, PBKDF2/HKDF,
-//! AES in ECB/CBC/CTR/GCM modes and the OS random source. Also hosts
+//! AES in ECB/CBC/CTR/GCM modes, RSA keys (openssl_pkey.rs) and the OS random source. Also hosts
 //! `Random::Formatter` (the formatting half of SecureRandom).
 //!
 //! `require "openssl"` compiles the overlay `lib/kenny/openssl.rb`, which calls
@@ -614,6 +614,7 @@ enum Ctx {
     Digest(Alg, Hasher),
     Hmac(Alg, Mac, Mac),
     Cipher(Box<Cipher>),
+    Rsa(Box<pkey::Rsa>),
 }
 impl Ctx {
     fn dup(&self) -> Ctx {
@@ -621,6 +622,7 @@ impl Ctx {
             Ctx::Digest(a, h) => Ctx::Digest(*a, h.clone()),
             Ctx::Hmac(a, m, m0) => Ctx::Hmac(*a, m.clone(), m0.clone()),
             Ctx::Cipher(c) => Ctx::Cipher(c.clone()),
+            Ctx::Rsa(k) => Ctx::Rsa(k.clone()),
         }
     }
 }
@@ -1190,6 +1192,10 @@ fn init_cipher(ossl: *mut Class) {
     });
 }
 
+// (after get! and the helpers it uses: macros are in scope from their definition on)
+#[path = "openssl_pkey.rs"]
+mod pkey;
+
 // ---------- OpenSSL module ----------
 
 fn init_openssl() -> V {
@@ -1248,6 +1254,7 @@ fn init_openssl() -> V {
     init_hmac(ossl);
     init_kdf(ossl);
     init_cipher(ossl);
+    pkey::init_pkey(ossl);
     ossl as V
 }
 

@@ -515,6 +515,12 @@ pub fn init() {
         set_global_const("ErrorHighlight", eh as V);
         defs(eh, "spot", 0, -1, |_, _, _| QNIL);
     }
+    // An empty RubyVM: RUBY_ENGINE is "ruby", so gems reach for it unguarded (aws-sdk's user
+    // agent asks `RubyVM.const_defined?(:YJIT)`). Its CRuby internals (InstructionSequence,
+    // AbstractSyntaxTree, YJIT) stay absent, so `defined?(RubyVM::X)` checks still see none.
+    if const_lookup(rt().c.object, sym("RubyVM")).is_none() {
+        set_global_const("RubyVM", new_module("RubyVM") as V);
+    }
     defn(rt().c.kernel, "load", 1, 2, |_, a, _| kernel_load(a));
     if let Some(le) = const_lookup(rt().c.object, sym("LoadError")) {
         defn(le as *mut Class, "path", 0, 0, |s, _, _| ivar_get(s, sym("@path")));
