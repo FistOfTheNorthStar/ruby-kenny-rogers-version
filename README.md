@@ -142,7 +142,8 @@ Working:
   without a Gemfile so are the gems that Ruby bundles in place of former stdlib parts, such as
   `csv` and `bigdecimal` in 3.4).
 - **Native stdlib extensions** (Rust instead of C): date, json, yaml (Psych API), bigdecimal,
-  strscan, digest, zlib, openssl (digests, HMAC, ciphers), Marshal (byte-compatible format 4.8),
+  strscan, digest, zlib, openssl (digests, HMAC, ciphers, RSA keys and signatures; no TLS, X509
+  certificates or EC keys), Marshal (byte-compatible format 4.8),
   cgi/escape, erb/escape (Rails' `html_escape`), plus `Gem::Version`/`Gem::Requirement`.
   Nokogiri is native too (html5ever and quick-xml underneath, its own XPath 1.0 engine, and
   nokogiri's Ruby layer on top), so loofah and the Rails HTML sanitizers work without libxml2.
