@@ -32,6 +32,9 @@ end
 conn = ActionCable::Channel::ConnectionStub.new(user: "kenny")
 ch = ChatChannel.new(conn, "{\"channel\":\"ChatChannel\",\"room\":\"lobby\"}", { "room" => "lobby" }.with_indifferent_access)
 ch.subscribe_to_channel
+# (the pubsub adapter confirms the subscription from a worker thread)
+deadline = Time.now + 5
+sleep 0.01 until ch.send(:subscription_confirmation_sent?) || Time.now > deadline
 p ch.send(:streams).keys
 ch.perform_action("action" => "speak", "message" => "hi")
 ch.perform_action("action" => "ping")

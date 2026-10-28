@@ -208,9 +208,9 @@ pub fn do_include(target: *mut Class, m: V) -> V {
 
 
 /// Runtime compiler for `eval`-family calls (installed by the JIT-enabled runtime).
-/// Arguments: source, mode (0 = eval/instance_eval, 1 = class_eval), self.
-/// (source, mode, self, the caller's locals as [name Symbol, value, ...] or nil, the file
-/// and first line it is said to come from: eval's `file`, `line` arguments)
+/// Arguments: source, mode (0 = eval/instance_eval, 1 = class_eval), self, the caller's
+/// locals ([name Symbol, value, ...] or nil), and the file and first line the source is said
+/// to come from (eval's `file`, `line` arguments).
 pub static EVAL_HOOK: G<Option<fn(&[u8], u8, V, V, Option<&str>, i64) -> V>> = G::new(None);
 
 /// Eval `src`, seeing the locals its compiled call site handed over for it (kn_eval_locals).
