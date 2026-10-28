@@ -933,6 +933,10 @@ pub struct PState {
     pub pending: Throw,
     pub errinfo: V,
     pub last_match: V,
+    /// The caller's locals for the string about to be eval'd (`eval_src`): set by the
+    /// compiled call site just before the call (see kernel::eval_string).
+    pub eval_locals: V,
+    pub eval_src: V,
     pub stack_limit: usize,
     /// `class`/`module` bodies and `class_eval` blocks being run (the default definee).
     pub definee: Vec<*mut Class>,
@@ -1034,6 +1038,8 @@ pub fn new_pstate() -> *mut PState {
         pending: Throw::None,
         errinfo: QNIL,
         last_match: QNIL,
+        eval_locals: QNIL,
+        eval_src: QNIL,
         stack_limit: 0,
         definee: Vec::new(),
         dm_stack: Vec::new(),

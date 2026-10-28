@@ -2418,6 +2418,8 @@ fn mark_roots(m: &mut Marker, h: &mut Heap, all_classes: bool) {
         let p = unsafe { &*(p as *const PState) };
         m.value(p.errinfo);
         m.value(p.last_match);
+        m.value(p.eval_locals);
+        m.value(p.eval_src);
         match p.pending {
             Throw::Raise(e) => m.value(e),
             Throw::Break { val, .. } | Throw::Return { val, .. } | Throw::StopLoop(val) => m.value(val),

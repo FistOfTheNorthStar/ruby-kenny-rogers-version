@@ -1,6 +1,7 @@
 //! Small compatibility shims found while compiling real gems (Rack, stdlib).
 
 use crate::core::*;
+use crate::tri;
 
 pub const FL_BINARY: u32 = 16;
 
@@ -272,12 +273,60 @@ fn init_monitor() {
 
 static BINDING: G<*mut Class> = G::new(std::ptr::null_mut());
 
-/// A Binding in Kenny captures `self` only (locals live in registers; see docs/LANGUAGE.md).
+/// A Binding in Kenny captures `self` and a snapshot of the locals (they live in registers;
+/// see docs/LANGUAGE.md).
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_binding_new(self_: V) -> V {
     let b = object_new(*BINDING.get());
     ivar_set(b, sym("@__self"), self_);
     b
+}
+/// `binding` with the locals visible where it is called ([name Symbol, value, ...]).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_binding_new_l(self_: V, locals: V) -> V {
+    let b = kn_binding_new(self_);
+    let h = hash_new();
+    if is_ary(locals) {
+        let items = rary(locals).v.clone();
+        for pair in items.chunks(2) {
+            if pair.len() == 2 {
+                crate::hash::hset(h, pair[0], pair[1]);
+            }
+        }
+    }
+    ivar_set(b, sym("@__locals"), h);
+    b
+}
+/// A call site's locals for the string `src` it is about to eval.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_eval_locals(locals: V, src: V) -> V {
+    let p = pst();
+    p.eval_locals = locals;
+    p.eval_src = src;
+    QNIL
+}
+/// A Binding's locals as eval takes them ([name Symbol, value, ...], or nil).
+pub fn binding_locals(b: V) -> V {
+    let h = ivar_get(b, sym("@__locals"));
+    if !is_hash(h) {
+        return QNIL;
+    }
+    let mut v = Vec::new();
+    for (k, x) in crate::hash::pairs(h) {
+        v.push(k);
+        v.push(x);
+    }
+    ary_new(v)
+}
+fn binding_lvar_name(v: V) -> Result<V, V> {
+    if is_sym(v) {
+        Ok(v)
+    } else if is_str(v) {
+        Ok(mksym(sym(&String::from_utf8_lossy(&rstr(v).b))))
+    } else {
+        let shown = crate::fmt::inspect(v).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        Err(type_error(&format!("{shown} is not a symbol nor a string")))
+    }
 }
 pub fn binding_receiver(b: V) -> Option<V> {
     if is_kind(b, Kind::Object) && real_class(b) == *BINDING.get() { Some(ivar_get(b, sym("@__self"))) } else { None }
@@ -314,14 +363,38 @@ fn init_binding() {
     *BINDING.get() = b;
     set_global_const("TOPLEVEL_BINDING", kn_binding_new(rt().main_obj));
     defn(b, "receiver", 0, 0, |s, _, _| ivar_get(s, sym("@__self")));
-    defn(b, "eval", 1, 3, |s, a, _| crate::kernel::eval_string(a[0], 0, ivar_get(s, sym("@__self"))));
-    defn(b, "local_variables", 0, 0, |_, _, _| ary_new(vec![]));
-    defn(b, "local_variable_defined?", 1, 1, |_, _, _| QFALSE);
-    for name in ["local_variable_get", "local_variable_set"] {
-        defn(b, name, 1, 2, |_, _, _| {
-            raise(rt().c.not_implemented_error, "Kenny bindings capture self only, not local variables (see docs/LANGUAGE.md)")
-        });
+    defn(b, "eval", 1, 3, |s, a, _| {
+        crate::kernel::eval_string_l(a[0], 0, ivar_get(s, sym("@__self")), binding_locals(s), a.get(1).copied().unwrap_or(QNIL), a.get(2).copied().unwrap_or(QNIL))
+    });
+    // (a snapshot taken where `binding` was called: local_variable_set changes the
+    // Binding's copy, which later evals through it see, not the original variable)
+    fn lvars(s: V) -> V {
+        let h = ivar_get(s, sym("@__locals"));
+        if is_hash(h) {
+            return h;
+        }
+        let h = hash_new();
+        ivar_set(s, sym("@__locals"), h);
+        h
     }
+    defn(b, "local_variables", 0, 0, |s, _, _| send0(lvars(s), "keys"));
+    defn(b, "local_variable_defined?", 1, 1, |s, a, _| {
+        let n = match binding_lvar_name(a[0]) { Ok(n) => n, Err(e) => return e };
+        send(lvars(s), sym("key?"), &[n], QNIL)
+    });
+    defn(b, "local_variable_get", 1, 1, |s, a, _| {
+        let n = match binding_lvar_name(a[0]) { Ok(n) => n, Err(e) => return e };
+        let h = lvars(s);
+        if !truthy(tri!(send(h, sym("key?"), &[n], QNIL))) {
+            return name_error(&format!("local variable '{}' is not defined for {}", sym_str(sym_id(n)), String::from_utf8_lossy(&crate::fmt::inspect(s).unwrap_or_default())), sym_id(n), s);
+        }
+        crate::hash::hget(h, n)
+    });
+    defn(b, "local_variable_set", 2, 2, |s, a, _| {
+        let n = match binding_lvar_name(a[0]) { Ok(n) => n, Err(e) => return e };
+        crate::hash::hset(lvars(s), n, a[1]);
+        a[1]
+    });
     defn(b, "irb", 0, 0, |_, _, _| raise(rt().c.not_implemented_error, "binding.irb is not available in compiled programs"));
     if crate::misc::ruby4() {
         // Ruby 4.0: a block's `it` / `_1`..`_9` seen through its binding. A Kenny binding

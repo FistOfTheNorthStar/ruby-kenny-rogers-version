@@ -156,7 +156,18 @@ impl<M: Module> Compiler<M> {
             ret_hops: None,
             entry_check: false,
         };
-        Ok(self.build_fn(spec, |c, fx| c.expr(fx, &stmts)))
+        Ok(self.build_fn(spec, |c, fx| {
+            // `BEGIN { ... }` (only at the top level): runs before the rest of the file
+            if let Some(list) = stmts.as_statements_node() {
+                for n in list.body().iter() {
+                    if let Some(body) = n.as_pre_execution_node().and_then(|p| p.statements()) {
+                        let v = c.expr(fx, &body.as_node());
+                        c.check(fx, v);
+                    }
+                }
+            }
+            c.expr(fx, &stmts)
+        }))
     }
 
     /// `require_relative "x"`: compile the file into its own top-level function (once).
@@ -359,7 +370,7 @@ impl<M: Module> Compiler<M> {
             let caps = analysis::captures(&spec.analysis);
             let mut env_slots = HashMap::new();
             for n in &spec.locals {
-                if (caps.captured.contains(n) || (caps.zsuper_in_block && spec.kind == ScopeKind::Method)) && !env_slots.contains_key(n) {
+                if (caps.captured.contains(n) || caps.eval_in_block || (caps.zsuper_in_block && spec.kind == ScopeKind::Method)) && !env_slots.contains_key(n) {
                     let i = env_slots.len();
                     env_slots.insert(n.clone(), i);
                 }
@@ -440,7 +451,7 @@ impl<M: Module> Compiler<M> {
                 }
             }
             let exit = b.create_block();
-            self.scopes.push(ScopeInfo { env_slots });
+            self.scopes.push(ScopeInfo { env_slots, block: spec.kind == ScopeKind::Block });
             let mut fx = Fx {
                 b,
                 kind: spec.kind,
@@ -575,6 +586,80 @@ impl<M: Module> Compiler<M> {
         }
         p
     }
+    /// The local variables visible here, as an Array [name Symbol, value, ...] sorted by
+    /// name (an eval'd string or a Binding sees them: a snapshot, read where it is taken).
+    pub(crate) fn locals_snapshot(&mut self, fx: &mut Fx) -> Value {
+        let mut seen = self.visible_locals(fx);
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut vals = Vec::with_capacity(seen.len() * 2);
+        for (n, d) in &seen {
+            let s = self.sym_val(fx, n);
+            let v = self.local_get(fx, n, *d);
+            vals.push(s);
+            vals.push(v);
+        }
+        let len = self.iconst(fx, vals.len() as i64);
+        let buf = self.args_buf(fx, &vals);
+        self.call(fx, "kn_ary_new", &[len, buf])
+    }
+
+    /// `local_variables`: the names of the locals visible here (innermost scope first).
+    pub(crate) fn local_variables(&mut self, fx: &mut Fx) -> Value {
+        let seen = self.visible_locals(fx);
+        let vals: Vec<Value> = seen.iter().map(|(n, _)| self.sym_val(fx, n)).collect();
+        let len = self.iconst(fx, vals.len() as i64);
+        let buf = self.args_buf(fx, &vals);
+        self.call(fx, "kn_ary_new", &[len, buf])
+    }
+
+    /// The plain local variables visible here, with their Prism depths (innermost scope
+    /// first, each scope's sorted by name).
+    fn visible_locals(&self, fx: &Fx) -> Vec<(Vec<u8>, u32)> {
+        fn plain(n: &[u8]) -> bool {
+            matches!(n.first(), Some(b'a'..=b'z' | b'_'))
+                && n.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                && !(n.len() == 2 && n[0] == b'_' && n[1].is_ascii_digit())
+                && n != b"it"
+        }
+        let mut seen: Vec<(Vec<u8>, u32)> = Vec::new();
+        let add = |n: &[u8], d: u32, seen: &mut Vec<(Vec<u8>, u32)>| {
+            if plain(n) && !seen.iter().any(|(m, _)| m == n) {
+                seen.push((n.to_vec(), d));
+            }
+        };
+        let nl = fx.inline_levels.len();
+        for d in 0..nl {
+            let mut names: Vec<Vec<u8>> = fx.inline_levels[nl - 1 - d].keys().cloned().collect();
+            names.sort();
+            for n in names {
+                add(&n, d as u32, &mut seen);
+            }
+        }
+        let mut names: Vec<Vec<u8>> = fx.locals.keys().cloned().collect();
+        names.sort();
+        for n in names {
+            add(&n, nl as u32, &mut seen);
+        }
+        // a block's enclosing scopes (their locals are in their environments: see
+        // analysis::Captures::eval_in_block)
+        if fx.kind == ScopeKind::Block {
+            let mut d = 1usize;
+            while let Some(idx) = fx.scope.checked_sub(d) {
+                let Some(sc) = self.scopes.get(idx) else { break };
+                let mut names: Vec<Vec<u8>> = sc.env_slots.keys().cloned().collect();
+                names.sort();
+                for n in names {
+                    add(&n, (nl + d) as u32, &mut seen);
+                }
+                if !sc.block {
+                    break;
+                }
+                d += 1;
+            }
+        }
+        seen
+    }
+
     fn outer_slot(&self, fx: &Fx, name: &[u8], depth: u32) -> Option<usize> {
         let idx = fx.scope.checked_sub(depth as usize)?;
         self.scopes.get(idx)?.env_slots.get(name).copied()
@@ -1522,7 +1607,7 @@ impl<M: Module> Compiler<M> {
                 fx.b.ins().store(mem(), v, env, ENV_SLOTS + 8 * i as i32);
                 env_slots.insert(name, i);
             }
-            self.scopes.push(ScopeInfo { env_slots });
+            self.scopes.push(ScopeInfo { env_slots, block: true });
         }
         Some(env)
     }

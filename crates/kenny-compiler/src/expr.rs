@@ -887,8 +887,10 @@ impl<M: Module> Compiler<M> {
                 self.unsupported(fx, at, "flip-flops are not supported by Kenny (see docs/LANGUAGE.md)");
                 self.nil(fx)
             }
-            Node::PreExecutionNode { .. } | Node::PostExecutionNode { .. } => {
-                self.unsupported(fx, at, "BEGIN/END blocks are not supported by Kenny (see docs/LANGUAGE.md)");
+            // (hoisted: compile_unit runs it first)
+            Node::PreExecutionNode { .. } => self.nil(fx),
+            Node::PostExecutionNode { .. } => {
+                self.unsupported(fx, at, "END blocks are not supported by Kenny (see docs/LANGUAGE.md)");
                 self.nil(fx)
             }
             Node::CaseMatchNode { .. } => self.case_match(fx, &node.as_case_match_node().unwrap()),

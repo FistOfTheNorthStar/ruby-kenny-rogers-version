@@ -209,14 +209,33 @@ pub fn do_include(target: *mut Class, m: V) -> V {
 
 /// Runtime compiler for `eval`-family calls (installed by the JIT-enabled runtime).
 /// Arguments: source, mode (0 = eval/instance_eval, 1 = class_eval), self.
-pub static EVAL_HOOK: G<Option<fn(&[u8], u8, V) -> V>> = G::new(None);
+/// (source, mode, self, the caller's locals as [name Symbol, value, ...] or nil, the file
+/// and first line it is said to come from: eval's `file`, `line` arguments)
+pub static EVAL_HOOK: G<Option<fn(&[u8], u8, V, V, Option<&str>, i64) -> V>> = G::new(None);
 
+/// Eval `src`, seeing the locals its compiled call site handed over for it (kn_eval_locals).
 pub fn eval_string(src: V, mode: u8, self_: V) -> V {
+    eval_string_at(src, mode, self_, QNIL, QNIL)
+}
+
+/// eval_string with eval's `file` and `line` arguments (nil: not given).
+pub fn eval_string_at(src: V, mode: u8, self_: V, file: V, line: V) -> V {
+    let p = pst();
+    let locals = if p.eval_src == src && src != QNIL { p.eval_locals } else { QNIL };
+    p.eval_locals = QNIL;
+    p.eval_src = QNIL;
+    eval_string_l(src, mode, self_, locals, file, line)
+}
+
+/// Eval `src` with these locals ([name Symbol, value, ...] or nil).
+pub fn eval_string_l(src: V, mode: u8, self_: V, locals: V, file: V, line: V) -> V {
     if !is_str(src) {
         return type_error(&format!("no implicit conversion of {} into String", class_name(real_class(src))));
     }
+    let file = if is_str(file) { Some(String::from_utf8_lossy(&rstr(file).b).into_owned()) } else { None };
+    let line = if is_fix(line) { fix(line) } else { 1 };
     match *EVAL_HOOK.get() {
-        Some(f) => f(&rstr(src).b.clone(), mode, self_),
+        Some(f) => f(&rstr(src).b.clone(), mode, self_, locals, file.as_deref(), line),
         None => raise(
             rt().c.not_implemented_error,
             "eval of strings needs the runtime compiler; this binary was built without it (kenny links it automatically when it sees eval/class_eval/instance_eval with a string)",
@@ -829,15 +848,18 @@ pub fn init() {
     });
     defn(k, "proc", 0, 0, |_, _, b| b);
     defn(k, "block_given?", 0, 0, |_, _, _| QFALSE);
-    defn(k, "eval", 1, 4, |s, a, _| {
-        let recv = match a.get(1).copied().filter(|b| *b != QNIL) {
-            Some(b) => match crate::compat::binding_receiver(b) {
-                Some(r) => r,
-                None => return type_error("wrong argument type (expected binding)"),
-            },
-            None => s,
-        };
-        eval_string(a[0], 0, recv)
+    defn(k, "eval", 1, 4, |s, a, _| match a.get(1).copied().filter(|b| *b != QNIL) {
+        // through a Binding: its self and locals
+        Some(b) => match crate::compat::binding_receiver(b) {
+            Some(r) => {
+                let p = pst();
+                p.eval_locals = QNIL;
+                p.eval_src = QNIL;
+                eval_string_l(a[0], 0, r, crate::compat::binding_locals(b), a.get(2).copied().unwrap_or(QNIL), a.get(3).copied().unwrap_or(QNIL))
+            }
+            None => type_error("wrong argument type (expected binding)"),
+        },
+        None => eval_string_at(a[0], 0, s, a.get(2).copied().unwrap_or(QNIL), a.get(3).copied().unwrap_or(QNIL)),
     });
     defn(k, "binding", 0, 0, |_, _, _| raise(rt().c.not_implemented_error, "binding is not supported by Kenny"));
     defn(k, "caller", 0, 2, |_, _, _| ary_new(vec![]));
@@ -1009,7 +1031,7 @@ pub fn init() {
         if !is_proc(b) {
             let Some(&src) = a.first() else { return arg_error("wrong number of arguments (given 0, expected 1..3)") };
             let sc = if is_heap(s) { singleton_class(s) } else { class_of(s) };
-            return with_definee(sc, || eval_string(src, 0, s));
+            return with_definee(sc, || eval_string_at(src, 0, s, a.get(1).copied().unwrap_or(QNIL), a.get(2).copied().unwrap_or(QNIL)));
         }
         with_singleton_definee(s, || call_proc_with_self(b, s, &[s], QNIL, false))
     });
@@ -1457,7 +1479,7 @@ pub fn init() {
             let (vis, mf) = (k.default_vis, k.module_function);
             k.default_vis = VIS_PUBLIC;
             k.module_function = false;
-            let r = with_definee(s as *mut Class, || eval_string(src, 1, s));
+            let r = with_definee(s as *mut Class, || eval_string_at(src, 1, s, a.get(1).copied().unwrap_or(QNIL), a.get(2).copied().unwrap_or(QNIL)));
             let k = rclass(s);
             k.default_vis = vis;
             k.module_function = mf;

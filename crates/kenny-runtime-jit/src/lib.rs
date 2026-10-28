@@ -131,6 +131,8 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_require_file", kenny_runtime::compat::kn_require_file as *const u8),
         ("kn_wb_env", kenny_runtime::abi::kn_wb_env as *const u8),
         ("kn_using", kenny_runtime::abi::kn_using as *const u8),
+        ("kn_binding_new_l", kenny_runtime::compat::kn_binding_new_l as *const u8),
+        ("kn_eval_locals", kenny_runtime::compat::kn_eval_locals as *const u8),
         ("kn_refine_scope", kenny_runtime::abi::kn_refine_scope as *const u8),
         ("kn_super_dyn", kenny_runtime::abi::kn_super_dyn as *const u8),
         ("kn_super_blk", kenny_runtime::abi::kn_super_blk as *const u8),
@@ -286,10 +288,44 @@ fn compiled(key: (u8, Vec<u8>), src: &[u8], mode: EvalMode, file: &str) -> Resul
     }
 }
 
-fn eval_hook(src: &[u8], mode: u8, self_: V) -> V {
+fn eval_hook(src: &[u8], mode: u8, self_: V, locals: V, file: Option<&str>, line: i64) -> V {
     let m = if mode == 1 { EvalMode::ClassEval } else { EvalMode::Eval };
-    match compiled((mode, src.to_vec()), src, m, "(eval)") {
-        Ok(f) => unsafe { f(self_, 0, std::ptr::null(), QNIL) },
+    // the caller's locals: the source starts with `a, b, = __kenny_evl;` (on its first line,
+    // so line numbers stay), and their values come in as the unit's argument
+    let (names, vals): (Vec<V>, Vec<V>) = if is_ary(locals) {
+        let items = rary(locals).v.clone();
+        items.chunks(2).filter(|p| p.len() == 2 && is_sym(p[0])).map(|p| (p[0], p[1])).unzip()
+    } else {
+        (vec![], vec![])
+    };
+    // eval's `line` argument: the source starts that many lines down (leading newlines)
+    let shift = (line - 1).clamp(0, 1_000_000) as usize;
+    let file = file.unwrap_or("(eval)");
+    if names.is_empty() && shift == 0 {
+        let mut key = src.to_vec();
+        key.extend_from_slice(b"\0");
+        key.extend_from_slice(file.as_bytes());
+        return match compiled((mode, key), src, m, file) {
+            Ok(f) => unsafe { f(self_, 0, std::ptr::null(), QNIL) },
+            Err(e) => e,
+        };
+    }
+    let mut full = Vec::with_capacity(src.len() + names.len() * 8 + shift + 16);
+    if !names.is_empty() {
+        for n in &names {
+            full.extend_from_slice(&sym_name(sym_id(*n)));
+            full.extend_from_slice(b", ");
+        }
+        full.extend_from_slice(b"= __kenny_evl; ");
+    }
+    full.extend(std::iter::repeat_n(b'\n', shift));
+    full.extend_from_slice(src);
+    let mut key = full.clone();
+    key.extend_from_slice(b"\0");
+    key.extend_from_slice(file.as_bytes());
+    let vals = ary_new(vals);
+    match compiled((mode, key), &full, m, file) {
+        Ok(f) => unsafe { f(self_, names.len().min(1) as u64, &vals as *const V, QNIL) },
         Err(e) => e,
     }
 }

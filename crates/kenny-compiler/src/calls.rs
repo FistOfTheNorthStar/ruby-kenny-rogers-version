@@ -372,10 +372,32 @@ impl<M: Module> Compiler<M> {
                     }
                 }
                 b"binding" if arg_nodes.is_empty() && block.is_none() => {
-                    // captures self only; eval through it needs the runtime compiler
+                    // self and a snapshot of the locals; eval through it needs the runtime
+                    // compiler
                     self.needs_jit = true;
                     let s = self.self_val(fx);
-                    return self.call(fx, "kn_binding_new", &[s]);
+                    let l = self.locals_snapshot(fx);
+                    return self.call(fx, "kn_binding_new_l", &[s, l]);
+                }
+                b"local_variables" if arg_nodes.is_empty() && block.is_none() => {
+                    return self.local_variables(fx);
+                }
+                // in an eval'd string: the caller's locals (the runtime prefixes the source
+                // with `a, b, = __kenny_evl;` and passes their values as the argument)
+                b"__kenny_evl" if self.eval_unit && arg_nodes.is_empty() && block.is_none() => {
+                    let argc = fx.b.use_var(fx.argc_v);
+                    let argv = fx.b.use_var(fx.argv_v);
+                    let has = fx.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, argc, 0);
+                    let ok = fx.b.create_block();
+                    let done = fx.b.create_block();
+                    fx.b.append_block_param(done, I64);
+                    let nil = self.nil(fx);
+                    fx.b.ins().brif(has, ok, &[], done, &[nil.into()]);
+                    fx.b.switch_to_block(ok);
+                    let v = fx.b.ins().load(I64, mem(), argv, 0);
+                    fx.b.ins().jump(done, &[v.into()]);
+                    fx.b.switch_to_block(done);
+                    return fx.b.block_params(done)[0];
                 }
                 b"lambda" if arg_nodes.is_empty() && block.as_ref().is_some_and(|b| b.as_block_node().is_some()) => {
                     let (p, _) = self.block_arg(fx, block, true);
@@ -498,6 +520,13 @@ impl<M: Module> Compiler<M> {
             r
         } else {
             let args = self.eval_args(fx, c.arguments());
+            // an eval'd string sees the caller's locals: a snapshot, handed to the runtime with
+            // the source string it is for
+            if crate::analysis::sees_locals(c) && args.splat.is_none() && !args.vals.is_empty() {
+                let l = self.locals_snapshot(fx);
+                let src = args.vals[0];
+                self.call(fx, "kn_eval_locals", &[l, src]);
+            }
             let forwards = arg_nodes.iter().any(|n| n.as_forwarding_arguments_node().is_some());
             let no_block = block.is_none() && !forwards;
             let (blk, literal) = if forwards && block.is_none() {

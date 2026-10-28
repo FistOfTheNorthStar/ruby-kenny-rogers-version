@@ -69,6 +69,8 @@ pub(crate) enum Local {
 
 pub(crate) struct ScopeInfo {
     pub env_slots: HashMap<Vec<u8>, usize>,
+    /// a block's scope (its parent's locals are visible to it)
+    pub block: bool,
 }
 
 pub(crate) struct LoopCtx {
@@ -461,6 +463,8 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_set_lexical_parent", &[I64, I64], &[I64]),
     ("kn_rational_lit", &[I64, I64], &[I64]),
     ("kn_binding_new", &[I64], &[I64]),
+    ("kn_binding_new_l", &[I64, I64], &[I64]),
+    ("kn_eval_locals", &[I64, I64], &[I64]),
     ("kn_register_file", &[I64, I64, I64, I64, I64], &[]),
     ("kn_register_debug", &[I64, I64, I64, I64], &[]),
     ("kn_register_ruby", &[I64, I64], &[]),
