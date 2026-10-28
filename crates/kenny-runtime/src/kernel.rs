@@ -1319,14 +1319,14 @@ pub fn init() {
             }
             let id = sym(part);
             let found = if i == 0 { const_lookup(cur, id) } else { const_get_under(cur, id) };
-            match found {
-                Some(v) => {
-                    val = v;
-                    if is_class(v) {
-                        cur = v as *mut Class;
-                    }
-                }
-                None => return crate::abi::const_missing(cur, id),
+            // (a pending autoload runs here: the rest of the path continues from its value)
+            let v = match found {
+                Some(v) => v,
+                None => tri!(crate::abi::const_missing(cur, id)),
+            };
+            val = v;
+            if is_class(v) {
+                cur = v as *mut Class;
             }
         }
         val

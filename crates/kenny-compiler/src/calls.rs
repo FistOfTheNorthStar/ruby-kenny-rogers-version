@@ -385,6 +385,16 @@ impl<M: Module> Compiler<M> {
         if name.as_slice() == b"load" && !arg_nodes.is_empty() {
             self.needs_jit = true;
         }
+        // so does a `require` or `autoload` of a computed path in the program's own code (it
+        // may name a file that isn't compiled in; gems' files all are)
+        let path_arg = match name.as_slice() {
+            b"require" => arg_nodes.first(),
+            b"autoload" => arg_nodes.get(1),
+            _ => None,
+        };
+        if path_arg.is_some_and(|a| a.as_string_node().is_none()) && !self.in_dependency() {
+            self.needs_jit = true;
+        }
 
         let recv = match &recv_node {
             Some(r) => self.expr(fx, r),

@@ -1302,6 +1302,21 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
                     return v;
                 }
             }
+            // an absolute path that isn't compiled in: compiled from disk, as `require` does
+            None if {
+                LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let r = crate::compat::require_from_disk(&a.path);
+                LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                r.is_some_and(|r| r != UNDEF || pst().pending_is_set())
+            } => {
+                autoloads().remove(&(owner as usize, id));
+                if pst().pending_is_set() {
+                    return UNDEF;
+                }
+                if let Some(v) = after_autoload(owner, c, id) {
+                    return v;
+                }
+            }
             None => {
                 autoloads().remove(&(owner as usize, id));
                 let le = const_lookup(rt().c.object, sym("LoadError")).unwrap();

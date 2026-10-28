@@ -1154,27 +1154,92 @@ pub fn init() {
         let i = if i < 0 { i + b.len() as i64 } else { i };
         if i < 0 { QNIL } else { b.get(i as usize).map(|x| mkfix(*x as i64)).unwrap_or(QNIL) }
     });
-    fn lines(s: V) -> Vec<V> {
+    /// The lines of `s` for `lines` / `each_line(sep = $/, chomp: false)`: `sep` nil is the
+    /// whole string, "" is paragraph mode (lines end at a run of 2+ newlines); `chomp`
+    /// drops each line's separator (and a "\r" before "\n").
+    fn split_lines(s: V, a: &[V]) -> Result<Vec<V>, V> {
+        let mut a = a;
+        let mut chomp = false;
+        if let Some(&h) = a.last() {
+            if is_hash(h) {
+                chomp = rhash(h).m.get(&HKey(mksym(sym("chomp")))).is_some_and(|v| truthy(*v));
+                a = &a[..a.len() - 1];
+            }
+        }
+        let sep: Option<Vec<u8>> = match a.first() {
+            None => Some(b"\n".to_vec()),
+            Some(&v) if v == QNIL => None,
+            Some(&v) if is_str(v) => Some(rstr(v).b.clone()),
+            Some(&v) => return Err(type_error(&format!("no implicit conversion of {} into String", class_name(real_class(v))))),
+        };
         let x = rstr(s).b.clone();
         let mut out = Vec::new();
-        let mut start = 0;
-        for (i, ch) in x.iter().enumerate() {
-            if *ch == b'\n' {
-                out.push(str_new(x[start..=i].to_vec()));
-                start = i + 1;
+        let Some(sep) = sep else {
+            if !x.is_empty() {
+                out.push(str_new(x));
             }
+            return Ok(out);
+        };
+        let paragraph = sep.is_empty();
+        let mut start = 0;
+        let mut i = 0;
+        while i < x.len() {
+            // the end of this line's separator, if one starts at i
+            let end = if paragraph {
+                if x[i] == b'\n' && x.get(i + 1) == Some(&b'\n') {
+                    let mut j = i;
+                    while j < x.len() && x[j] == b'\n' {
+                        j += 1;
+                    }
+                    Some(j)
+                } else {
+                    None
+                }
+            } else if x[i..].starts_with(&sep) {
+                Some(i + sep.len())
+            } else {
+                None
+            };
+            let Some(end) = end else {
+                i += 1;
+                continue;
+            };
+            // (a paragraph keeps two of its newlines; the rest are skipped)
+            let mut line_end = if chomp { i } else if paragraph { i + 2 } else { end };
+            if chomp && sep == b"\n" && line_end > start && x[line_end - 1] == b'\r' {
+                line_end -= 1;
+            }
+            out.push(str_new(x[start..line_end].to_vec()));
+            start = end;
+            i = end;
         }
         if start < x.len() {
             out.push(str_new(x[start..].to_vec()));
         }
-        out
+        Ok(out)
     }
-    defn(c, "lines", 0, 1, |s, _, _| ary_new(lines(s)));
-    defn(c, "each_line", 0, 1, |s, _, blk| {
-        if !is_proc(blk) {
-            return crate::misc::enum_for(s, "each_line", &[]);
+    defn(c, "lines", 0, 2, |s, a, blk| {
+        let ls = match split_lines(s, a) {
+            Ok(l) => l,
+            Err(e) => return e,
+        };
+        if is_proc(blk) {
+            let ls = crate::gc::RVec::from(ls);
+            for i in 0..ls.len() {
+                tri!(call_block(blk, &[ls[i]]));
+            }
+            return s;
         }
-        let ls = crate::gc::RVec::from(lines(s));
+        ary_new(ls)
+    });
+    defn(c, "each_line", 0, 2, |s, a, blk| {
+        if !is_proc(blk) {
+            return crate::misc::enum_for(s, "each_line", a);
+        }
+        let ls = match split_lines(s, a) {
+            Ok(l) => crate::gc::RVec::from(l),
+            Err(e) => return e,
+        };
         for i in 0..ls.len() {
             tri!(call_block(blk, &[ls[i]]));
         }

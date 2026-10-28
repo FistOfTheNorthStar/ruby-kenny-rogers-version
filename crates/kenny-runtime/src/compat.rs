@@ -127,7 +127,13 @@ fn init_locations() {
         str_new(b)
     }
     defn(loc, "path", 0, 0, |s, _, _| str_from(&parts(s).0));
-    defn(loc, "absolute_path", 0, 0, |s, _, _| str_from(&parts(s).0));
+    defn(loc, "absolute_path", 0, 0, |s, _, _| {
+        let p = parts(s).0;
+        match std::fs::canonicalize(&p).or_else(|_| std::path::absolute(&p)) {
+            Ok(a) => str_from(&a.display().to_string()),
+            Err(_) => str_from(&p),
+        }
+    });
     defn(loc, "lineno", 0, 0, |s, _, _| mkfix(parts(s).1));
     defn(loc, "label", 0, 0, |s, _, _| label(s));
     // the method's own name: "block in Foo#bar" -> "bar", "Foo.baz" -> "baz"
