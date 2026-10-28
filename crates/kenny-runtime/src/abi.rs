@@ -1689,7 +1689,10 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
         return raise(rt().c.name_error, &format!("undefined method '{}' for class '{}'", sym_str(old), class_name(c)));
     }
     let body = crate::kernel::clone_body(unsafe { &(*m).body });
-    let nm = Box::into_raw(Box::new(Method { fast: unsafe { (*m).fast }, body, owner: unsafe { (*m).owner }, name: new, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
+    // a define_method body keeps its original name: its `super` looks for that one, as in
+    // CRuby (rspec's `alias_method :only_failures?, :only_failures` of a reader that calls super)
+    let name = if matches!(body, Body::Proc(_)) { unsafe { (*m).name } } else { new };
+    let nm = Box::into_raw(Box::new(Method { fast: unsafe { (*m).fast }, body, owner: unsafe { (*m).owner }, name, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
     if unsafe { (*c).methods.insert(new, nm) }.is_none() {
         crate::core::method_name_count(new, true);
     }
@@ -2124,13 +2127,32 @@ pub extern "C" fn kn_ary_ptr(a: V) -> *const V {
 pub unsafe extern "C" fn kn_super_blk(procp: V, owner_slot: *const V, self_: V, mid: V, args: V, blk: V) -> V {
     if let Some(&m) = pst().dm_stack.last() {
         if let Body::Proc(p) = unsafe { &(*m).body } {
-            if *p == procp {
+            if *p == procp || nested_in(procp, *p) {
                 return kn_super_dyn(self_, args, blk);
             }
         }
     }
     let a = rary(args).v.clone();
     unsafe { kn_super(owner_slot, self_, mid, a.len() as u64, a.as_ptr(), blk) }
+}
+/// Whether block `inner` is written inside block `outer`'s body (`define_method(n) { each { super() } }`):
+/// its chain of environments reaches the one `outer` closed over.
+fn nested_in(inner: V, outer: V) -> bool {
+    if !is_proc(inner) || !is_proc(outer) {
+        return false;
+    }
+    let target = unsafe { (*(outer as *const RProc)).env };
+    if target.is_null() {
+        return false;
+    }
+    let mut e = unsafe { (*(inner as *const RProc)).env };
+    while !e.is_null() {
+        if e == target {
+            return true;
+        }
+        e = unsafe { (*e).parent };
+    }
+    false
 }
 /// `super(...)` inside a define_method block.
 #[unsafe(no_mangle)]

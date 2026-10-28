@@ -1418,7 +1418,9 @@ pub fn singleton_class(v: V) -> *mut Class {
         let meta = new_class_raw("", sup, false);
         (*meta).is_singleton = true;
         (*meta).attached = v;
-        (*meta).h.klass = rt().c.class;
+        // the singleton class of a plain object sees its class's class methods (CRuby: its
+        // singleton class inherits from the class's): `class << obj; self; end.class_macro`
+        (*meta).h.klass = if !is_class(v) && !(*sup).is_module && !(*sup).is_singleton { singleton_of_class(sup) } else { rt().c.class };
         (*meta).alloc = (*sup).alloc;
         h.klass = meta;
 
