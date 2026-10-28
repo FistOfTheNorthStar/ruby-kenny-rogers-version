@@ -1670,10 +1670,31 @@ pub fn init() {
         ("ruby_install_name", "ruby"),
         ("RUBY_INSTALL_NAME", "ruby"),
         ("bindir", "/usr/local/bin"),
-        ("rubylibdir", ""),
         ("engine", "kenny"),
     ] {
         crate::hash::hset(cfg, str_from(k), str_from(v));
+    }
+    // the install layout CRuby's RbConfig describes (RubyGems builds its default paths from
+    // it); a Kenny binary has no Ruby install, so these are CRuby's defaults under /usr/local
+    let lib = "/usr/local/lib/ruby".to_string();
+    for (k, v) in [
+        ("prefix", "/usr/local".to_string()),
+        ("exec_prefix", "/usr/local".to_string()),
+        ("libdir", "/usr/local/lib".to_string()),
+        ("datadir", "/usr/local/share".to_string()),
+        ("sysconfdir", "/usr/local/etc".to_string()),
+        ("rubylibprefix", lib.clone()),
+        ("rubylibdir", format!("{lib}/{abi}")),
+        ("rubyarchdir", format!("{lib}/{abi}/{arch}")),
+        ("archdir", format!("{lib}/{abi}/{arch}")),
+        ("sitedir", format!("{lib}/site_ruby")),
+        ("sitelibdir", format!("{lib}/site_ruby/{abi}")),
+        ("sitearchdir", format!("{lib}/site_ruby/{abi}/{arch}")),
+        ("vendordir", format!("{lib}/vendor_ruby")),
+        ("vendorlibdir", format!("{lib}/vendor_ruby/{abi}")),
+        ("vendorarchdir", format!("{lib}/vendor_ruby/{abi}/{arch}")),
+    ] {
+        crate::hash::hset(cfg, str_from(k), str_from(&v));
     }
     const_set(rbc, sym("CONFIG"), cfg);
     // CRuby's has the unexpanded Makefile values; Kenny's values have nothing to expand

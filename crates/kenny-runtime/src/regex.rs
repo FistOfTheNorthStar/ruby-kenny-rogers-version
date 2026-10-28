@@ -24,7 +24,7 @@ pub struct Re {
     bin_twin: std::sync::OnceLock<Option<Regex>>,
 }
 impl Re {
-    fn twin(&self) -> Option<&Regex> {
+    pub(crate) fn twin(&self) -> Option<&Regex> {
         if self.binary {
             return Some(&self.re);
         }

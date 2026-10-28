@@ -197,6 +197,29 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn call_node(&mut self, fx: &mut Fx, c: &CallNode) -> Value {
+        // `refine X do ... end`: inside the block the module's refinements are active (CRuby
+        // activates them in refine blocks), so its calls are refined call sites
+        if c.receiver().is_none()
+            && c.name().as_slice() == b"refine"
+            && c.arguments().is_some_and(|a| a.arguments().iter().count() == 1)
+            && c.block().is_some_and(|b| b.as_block_node().is_some())
+        {
+            self.refine_counter += 1;
+            let id = (self.fn_counter as u64) << 20 | self.refine_counter;
+            let parent = self.refine_scope.unwrap_or(0);
+            let idv = self.iconst(fx, id as i64);
+            let pv = self.iconst(fx, parent as i64);
+            let m = self.self_val(fx);
+            self.callc(fx, "kn_refine_scope", &[idv, m, pv]);
+            let saved = self.refine_scope.replace(id);
+            let r = self.call_node_inner(fx, c);
+            self.refine_scope = saved;
+            return r;
+        }
+        self.call_node_inner(fx, c)
+    }
+
+    fn call_node_inner(&mut self, fx: &mut Fx, c: &CallNode) -> Value {
         let name = c.name().as_slice().to_vec();
         let at = c.location().start_offset();
         let at_loc = c.message_loc().map(|l| l.start_offset()).unwrap_or(at);
@@ -428,6 +451,11 @@ impl<M: Module> Compiler<M> {
         {
             let a = self.expr(fx, &arg_nodes[0]);
             self.binop(fx, &name, recv, a)
+        } else if c.is_variable_call() && self.refine_scope.is_some() {
+            // (a self call sees refinements too)
+            let r = self.send_raw(fx, recv, &name, &Args { vals: vec![], splat: None }, None, false);
+            self.check(fx, r);
+            r
         } else if c.is_variable_call() {
             self.mark_loc(fx);
             let cache = self.owned_cache_ptr(fx, OWNED_CALL);

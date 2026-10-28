@@ -454,6 +454,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_require_file", &[I64, I64], &[I64]),
     ("kn_wb_env", &[I64], &[I64]),
     ("kn_using", &[I64, I64, I64], &[I64]),
+    ("kn_refine_scope", &[I64, I64, I64], &[I64]),
     ("kn_super_dyn", &[I64, I64, I64], &[I64]),
     ("kn_super_blk", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_clear_pending", &[], &[I64]),

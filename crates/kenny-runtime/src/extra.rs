@@ -1250,7 +1250,9 @@ pub fn init() {
         old
     });
     defn(k, "gem", 1, -1, |_, _, _| QTRUE);
-    defn(k, "gem_original_require", 1, 1, |s, a, _| send(s, sym("require"), a, QNIL));
+    // the builtin require, as RubyGems keeps it before overriding `require` (an override
+    // calls it: a re-dispatch to `require` would loop)
+    crate::abi::alias(k, sym("gem_original_require"), sym("require"));
     defn(k, "initialize_copy", 1, 1, |s, _, _| s);
     defn(k, "initialize_dup", 1, 1, |s, a, _| send(s, sym("initialize_copy"), &[a[0]], QNIL));
     defn(k, "initialize_clone", 1, 2, |s, a, _| send(s, sym("initialize_copy"), &[a[0]], QNIL));

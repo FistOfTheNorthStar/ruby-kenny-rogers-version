@@ -1528,10 +1528,26 @@ fn autoload_before_define(outer: *mut Class, id: u32) -> bool {
                 return false;
             }
         }
-        None => {
-            if crate::compat::require_compiled(&a.path).is_some() && pst().pending_is_set() {
-                autoloads().remove(&(outer as usize, id));
+        // (as in const_missing_in: an overridden `require` sees the autoload, e.g. Zeitwerk's)
+        None if require_overridden() => {
+            let r = send(rt().main_obj, sym("require"), &[str_from(&a.path)], QNIL);
+            autoloads().remove(&(outer as usize, id));
+            if r == UNDEF {
                 return false;
+            }
+        }
+        None => {
+            if crate::compat::require_compiled(&a.path).is_some() {
+                if pst().pending_is_set() {
+                    autoloads().remove(&(outer as usize, id));
+                    return false;
+                }
+            } else if let Some(r) = crate::compat::require_from_disk(&a.path) {
+                autoloads().remove(&(outer as usize, id));
+                if r == UNDEF || pst().pending_is_set() {
+                    return false;
+                }
+                return true;
             }
             if crate::compat::compiled_entry(&a.path).is_none_or(|(_, flag)| done(flag)) {
                 autoloads().remove(&(outer as usize, id));
@@ -2143,18 +2159,46 @@ pub extern "C" fn kn_using(scope: u64, m: V, parent: u64) -> V {
     refine_scopes().insert(scope, list);
     QNIL
 }
+/// The body of a `refine` block in module `m`: its call sites see m's refinements (all of
+/// them, as m has them when the call runs) and then those of the enclosing scope.
+static REFINE_MODS: crate::mt::L<std::collections::HashMap<u64, (V, u64), FxBuild>> = crate::mt::L::new(std::collections::HashMap::with_hasher(FxBuild::new()));
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_refine_scope(scope: u64, m: V, parent: u64) -> V {
+    if is_class(m) {
+        REFINE_MODS.get().insert(scope, (m, parent));
+    }
+    QNIL
+}
+fn scope_refinements(scope: u64) -> Option<Vec<(*mut Class, *mut Class)>> {
+    if let Some(list) = refine_scopes().get(&scope) {
+        return Some(list.clone());
+    }
+    let (m, parent) = *REFINE_MODS.get().get(&scope)?;
+    let mut list = refinements_of(m);
+    if parent != 0 {
+        list.extend(scope_refinements(parent).unwrap_or_default());
+    }
+    Some(list)
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_send_refined(cache: *mut CallCache, scope: u64, recv: V, mid: V, argc: u64, argv: *const V, blk: V) -> V {
-    if let Some(list) = refine_scopes().get(&scope) {
+    if let Some(list) = scope_refinements(scope) {
         if !list.is_empty() {
             let id = sym_id(mid);
             let k = class_of(recv);
-            let anc = ancestors(k);
-            for (target, r) in list.clone() {
-                if anc.contains(&target) {
-                    if let Some(&m) = unsafe { (*r).methods.get(&id) } {
-                        return invoke(m, recv, unsafe { args_slice(argc, argv) }, blk);
+            // as CRuby: along the receiver's ancestors, each class's refinements come before
+            // its own methods (so `refine Array` beats `refine Object` for an Array, and a
+            // method Array defines itself beats `refine Object`)
+            for a in ancestors(k) {
+                for &(target, r) in list.iter() {
+                    if target == a {
+                        if let Some(&m) = unsafe { (*r).methods.get(&id) } {
+                            return invoke(m, recv, unsafe { args_slice(argc, argv) }, blk);
+                        }
                     }
+                }
+                if unsafe { (*a).methods.get(&id) }.is_some_and(|&m| !matches!(unsafe { &(*m).body }, Body::Undefined)) {
+                    break;
                 }
             }
         }
