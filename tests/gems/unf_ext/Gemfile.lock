@@ -1,0 +1,14 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    unf_ext (0.0.9.1)
+
+PLATFORMS
+  arm64-darwin-27
+  ruby
+
+DEPENDENCIES
+  unf_ext
+
+BUNDLED WITH
+   2.6.9

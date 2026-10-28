@@ -1,0 +1,14 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    websocket-extensions (0.1.5)
+
+PLATFORMS
+  arm64-darwin-27
+  ruby
+
+DEPENDENCIES
+  websocket-extensions
+
+BUNDLED WITH
+   2.6.9
