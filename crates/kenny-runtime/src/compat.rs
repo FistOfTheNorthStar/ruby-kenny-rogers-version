@@ -1,6 +1,7 @@
 //! Small compatibility shims found while compiling real gems (Rack, stdlib).
 
 use crate::core::*;
+use crate::tri;
 
 pub const FL_BINARY: u32 = 16;
 
@@ -127,7 +128,13 @@ fn init_locations() {
         str_new(b)
     }
     defn(loc, "path", 0, 0, |s, _, _| str_from(&parts(s).0));
-    defn(loc, "absolute_path", 0, 0, |s, _, _| str_from(&parts(s).0));
+    defn(loc, "absolute_path", 0, 0, |s, _, _| {
+        let p = parts(s).0;
+        match std::fs::canonicalize(&p).or_else(|_| std::path::absolute(&p)) {
+            Ok(a) => str_from(&a.display().to_string()),
+            Err(_) => str_from(&p),
+        }
+    });
     defn(loc, "lineno", 0, 0, |s, _, _| mkfix(parts(s).1));
     defn(loc, "label", 0, 0, |s, _, _| label(s));
     // the method's own name: "block in Foo#bar" -> "bar", "Foo.baz" -> "baz"
@@ -266,12 +273,60 @@ fn init_monitor() {
 
 static BINDING: G<*mut Class> = G::new(std::ptr::null_mut());
 
-/// A Binding in Kenny captures `self` only (locals live in registers; see docs/LANGUAGE.md).
+/// A Binding in Kenny captures `self` and a snapshot of the locals (they live in registers;
+/// see docs/LANGUAGE.md).
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_binding_new(self_: V) -> V {
     let b = object_new(*BINDING.get());
     ivar_set(b, sym("@__self"), self_);
     b
+}
+/// `binding` with the locals visible where it is called ([name Symbol, value, ...]).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_binding_new_l(self_: V, locals: V) -> V {
+    let b = kn_binding_new(self_);
+    let h = hash_new();
+    if is_ary(locals) {
+        let items = rary(locals).v.clone();
+        for pair in items.chunks(2) {
+            if pair.len() == 2 {
+                crate::hash::hset(h, pair[0], pair[1]);
+            }
+        }
+    }
+    ivar_set(b, sym("@__locals"), h);
+    b
+}
+/// A call site's locals for the string `src` it is about to eval.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_eval_locals(locals: V, src: V) -> V {
+    let p = pst();
+    p.eval_locals = locals;
+    p.eval_src = src;
+    QNIL
+}
+/// A Binding's locals as eval takes them ([name Symbol, value, ...], or nil).
+pub fn binding_locals(b: V) -> V {
+    let h = ivar_get(b, sym("@__locals"));
+    if !is_hash(h) {
+        return QNIL;
+    }
+    let mut v = Vec::new();
+    for (k, x) in crate::hash::pairs(h) {
+        v.push(k);
+        v.push(x);
+    }
+    ary_new(v)
+}
+fn binding_lvar_name(v: V) -> Result<V, V> {
+    if is_sym(v) {
+        Ok(v)
+    } else if is_str(v) {
+        Ok(mksym(sym(&String::from_utf8_lossy(&rstr(v).b))))
+    } else {
+        let shown = crate::fmt::inspect(v).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        Err(type_error(&format!("{shown} is not a symbol nor a string")))
+    }
 }
 pub fn binding_receiver(b: V) -> Option<V> {
     if is_kind(b, Kind::Object) && real_class(b) == *BINDING.get() { Some(ivar_get(b, sym("@__self"))) } else { None }
@@ -308,14 +363,38 @@ fn init_binding() {
     *BINDING.get() = b;
     set_global_const("TOPLEVEL_BINDING", kn_binding_new(rt().main_obj));
     defn(b, "receiver", 0, 0, |s, _, _| ivar_get(s, sym("@__self")));
-    defn(b, "eval", 1, 3, |s, a, _| crate::kernel::eval_string(a[0], 0, ivar_get(s, sym("@__self"))));
-    defn(b, "local_variables", 0, 0, |_, _, _| ary_new(vec![]));
-    defn(b, "local_variable_defined?", 1, 1, |_, _, _| QFALSE);
-    for name in ["local_variable_get", "local_variable_set"] {
-        defn(b, name, 1, 2, |_, _, _| {
-            raise(rt().c.not_implemented_error, "Kenny bindings capture self only, not local variables (see docs/LANGUAGE.md)")
-        });
+    defn(b, "eval", 1, 3, |s, a, _| {
+        crate::kernel::eval_string_l(a[0], 0, ivar_get(s, sym("@__self")), binding_locals(s), a.get(1).copied().unwrap_or(QNIL), a.get(2).copied().unwrap_or(QNIL))
+    });
+    // (a snapshot taken where `binding` was called: local_variable_set changes the
+    // Binding's copy, which later evals through it see, not the original variable)
+    fn lvars(s: V) -> V {
+        let h = ivar_get(s, sym("@__locals"));
+        if is_hash(h) {
+            return h;
+        }
+        let h = hash_new();
+        ivar_set(s, sym("@__locals"), h);
+        h
     }
+    defn(b, "local_variables", 0, 0, |s, _, _| send0(lvars(s), "keys"));
+    defn(b, "local_variable_defined?", 1, 1, |s, a, _| {
+        let n = match binding_lvar_name(a[0]) { Ok(n) => n, Err(e) => return e };
+        send(lvars(s), sym("key?"), &[n], QNIL)
+    });
+    defn(b, "local_variable_get", 1, 1, |s, a, _| {
+        let n = match binding_lvar_name(a[0]) { Ok(n) => n, Err(e) => return e };
+        let h = lvars(s);
+        if !truthy(tri!(send(h, sym("key?"), &[n], QNIL))) {
+            return name_error(&format!("local variable '{}' is not defined for {}", sym_str(sym_id(n)), String::from_utf8_lossy(&crate::fmt::inspect(s).unwrap_or_default())), sym_id(n), s);
+        }
+        crate::hash::hget(h, n)
+    });
+    defn(b, "local_variable_set", 2, 2, |s, a, _| {
+        let n = match binding_lvar_name(a[0]) { Ok(n) => n, Err(e) => return e };
+        crate::hash::hset(lvars(s), n, a[1]);
+        a[1]
+    });
     defn(b, "irb", 0, 0, |_, _, _| raise(rt().c.not_implemented_error, "binding.irb is not available in compiled programs"));
     if crate::misc::ruby4() {
         // Ruby 4.0: a block's `it` / `_1`..`_9` seen through its binding. A Kenny binding
@@ -446,6 +525,10 @@ pub fn init() {
     let lf = ary_new(vec![]);
     for (n, v) in [("$LOAD_PATH", lp), ("$:", lp), ("$-I", lp), ("$LOADED_FEATURES", lf), ("$\"", lf)] {
         rt().gvars.insert(sym(n), v);
+    }
+    // warnings on, not verbose (CRuby's default); `$VERBOSE = nil` silences `warn`
+    if rt().gvars.get(&sym("$VERBOSE")).is_none() {
+        rt().gvars.insert(sym("$VERBOSE"), QFALSE);
     }
     // $LOAD_PATH.resolve_feature_path(name): [:rb, path] for a compiled-in file, [:so, name]
     // for a feature the runtime provides natively, nil otherwise (Ruby 3.3's erb/util asks
@@ -626,7 +709,8 @@ fn disk_source(name: &str, with_rb: bool) -> Option<(String, Vec<u8>, bool)> {
 }
 
 /// Files `require`d from disk through the runtime compiler (absolute paths).
-static DISK_REQUIRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// (real path, the path listed in $LOADED_FEATURES)
+static DISK_REQUIRED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
 /// `require "/abs/path"` of a file that isn't compiled in but exists (e.g. a file added to a
 /// Rails app while it runs in development): compile it at runtime, once.
@@ -639,16 +723,27 @@ pub fn require_from_disk(name: &str) -> Option<V> {
     if FILE_TABLE.get().as_ref().is_some_and(|t| t.contains_key(abs.trim_end_matches(".rb"))) {
         return require_compiled(&abs);
     }
+    // $LOADED_FEATURES lists the expanded path, not the real one (CRuby's; /var, not /private/var)
+    let mut feature = std::path::absolute(name).map(|p| p.display().to_string()).unwrap_or_else(|_| abs.clone());
+    if abs.ends_with(".rb") && !feature.ends_with(".rb") {
+        feature.push_str(".rb");
+    }
     {
+        let lf = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf));
         let mut d = DISK_REQUIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if d.contains(&abs) {
-            return Some(QFALSE);
+        if let Some(i) = d.iter().position(|(a, _)| *a == abs) {
+            // still loaded, unless the program took it out of $LOADED_FEATURES since
+            // (Zeitwerk's reload)
+            if !lf.is_some_and(|lf| !lf_contains(lf, &d[i].1)) {
+                return Some(QFALSE);
+            }
+            d.remove(i);
         }
-        d.push(abs.clone());
+        d.push((abs.clone(), feature.clone()));
     }
     if let Some(&lf) = rt().gvars.get(&sym("$LOADED_FEATURES")) {
         if is_ary(lf) {
-            rary(lf).v.push(str_from(&abs));
+            rary(lf).v.push(str_from(&feature));
         }
     }
     Some(hook(&src, &abs))
@@ -705,15 +800,42 @@ pub fn compiled_entry(name: &str) -> Option<(CompiledFn, *mut V)> {
     FILE_TABLE.get().as_ref()?.get(key).map(|e| (e.0, e.1))
 }
 
+/// Whether `$LOADED_FEATURES` lists `feature`.
+fn lf_contains(lf: V, feature: &str) -> bool {
+    rary(lf).v.iter().any(|x| is_str(*x) && rstr(*x).b[..] == *feature.as_bytes())
+}
+
+/// Features this runtime added to `$LOADED_FEATURES` (by a `require` that went through it). If
+/// one is gone from there later, a program unloaded it (Zeitwerk's reload deletes the file's
+/// path and requires it again), and the next `require` runs the file again, as in CRuby. Files
+/// required by a literal `require` in compiled code aren't listed, so they aren't affected.
+static PUSHED_FEATURES: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+
+fn note_pushed(feature: &str) {
+    PUSHED_FEATURES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(feature.to_string());
+}
+
+/// Whether `feature` was added to `$LOADED_FEATURES` by this runtime and removed since.
+fn was_unloaded(lf: Option<V>, feature: &str) -> bool {
+    let Some(lf) = lf else { return false };
+    let pushed = PUSHED_FEATURES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(feature));
+    pushed && !lf_contains(lf, feature)
+}
+
 pub fn require_compiled(name: &str) -> Option<V> {
     let key = name.trim_end_matches(".rb");
     let (f, flag, _) = *FILE_TABLE.get().as_ref()?.get(key)?;
-    let st = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire);
     let feature = format!("{key}.rb");
     let lf = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf));
+    let fl = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) };
+    if fl.load(std::sync::atomic::Ordering::Acquire) == 1 && was_unloaded(lf, &feature) {
+        let _ = fl.compare_exchange(1, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
+    }
+    let st = fl.load(std::sync::atomic::Ordering::Acquire);
     if st == 0 {
         if let Some(lf) = lf {
             rary(lf).v.push(str_from(&feature));
+            note_pushed(&feature);
         }
     }
     let r = run_file_once(f, flag);

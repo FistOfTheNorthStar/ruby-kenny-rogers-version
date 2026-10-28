@@ -1,0 +1,16 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    excon (1.8.0)
+      logger
+    logger (1.7.0)
+
+PLATFORMS
+  arm64-darwin-27
+  ruby
+
+DEPENDENCIES
+  excon
+
+BUNDLED WITH
+   2.6.9

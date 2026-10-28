@@ -809,6 +809,27 @@ fn init_digest(ossl: *mut Class) {
     }
     defn(d, "update", 1, 1, update);
     defn(d, "<<", 1, 1, update);
+    // Digest::Instance#file and Digest::Class.file (CRuby's OpenSSL::Digest is a Digest::Class):
+    // ActiveStorage checksums uploads with OpenSSL::Digest::MD5.file
+    defn(d, "file", 1, 1, |s, a, _| {
+        // (a path, or anything with to_path: a Tempfile, a Pathname)
+        let p = if !is_str(a[0]) && respond_to(a[0], sym("to_path")) { tri!(send(a[0], sym("to_path"), &[], QNIL)) } else { a[0] };
+        let path = match crate::fmt::to_s(p) {
+            Ok(b) => b,
+            Err(()) => return UNDEF,
+        };
+        match crate::vfs::read_file(&path) {
+            Ok(b) => {
+                tri!(send(s, sym("update"), &[bin(b.into_owned())], QNIL));
+                s
+            }
+            Err(e) => crate::io::raise_errno(e.raw_os_error().unwrap_or(libc::ENOENT), Some("rb_sysopen"), &path),
+        }
+    });
+    defs(d, "file", 1, -1, |s, a, _| {
+        let o = tri!(send(s, sym("new"), &a[1..], QNIL));
+        send(o, sym("file"), &[a[0]], QNIL)
+    });
     defn(d, "reset", 0, 0, |s, _, _| {
         let (alg, h) = get!(digest_ctx(s));
         *h = Hasher::new(alg);

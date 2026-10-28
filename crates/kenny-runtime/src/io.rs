@@ -135,6 +135,41 @@ const ERRNOS: &[(&str, i32)] = &[
     ("EALREADY", libc::EALREADY),
     ("EINPROGRESS", libc::EINPROGRESS),
     ("EPROTO", libc::EPROTO),
+    ("ENOTBLK", libc::ENOTBLK),
+    ("ETXTBSY", libc::ETXTBSY),
+    ("ENOLCK", libc::ENOLCK),
+    ("EIDRM", libc::EIDRM),
+    ("ENOMSG", libc::ENOMSG),
+    ("EOVERFLOW", libc::EOVERFLOW),
+    ("ECANCELED", libc::ECANCELED),
+    ("EILSEQ", libc::EILSEQ),
+    ("EBADMSG", libc::EBADMSG),
+    ("ENODATA", libc::ENODATA),
+    ("ETIME", libc::ETIME),
+    ("ENOSR", libc::ENOSR),
+    ("ENOSTR", libc::ENOSTR),
+    ("ENOLINK", libc::ENOLINK),
+    ("EMULTIHOP", libc::EMULTIHOP),
+    ("EOWNERDEAD", libc::EOWNERDEAD),
+    ("ENOTRECOVERABLE", libc::ENOTRECOVERABLE),
+    ("EDESTADDRREQ", libc::EDESTADDRREQ),
+    ("EMSGSIZE", libc::EMSGSIZE),
+    ("EPROTOTYPE", libc::EPROTOTYPE),
+    ("ENOPROTOOPT", libc::ENOPROTOOPT),
+    ("EPROTONOSUPPORT", libc::EPROTONOSUPPORT),
+    ("ESOCKTNOSUPPORT", libc::ESOCKTNOSUPPORT),
+    ("EPFNOSUPPORT", libc::EPFNOSUPPORT),
+    ("EAFNOSUPPORT", libc::EAFNOSUPPORT),
+    ("ENETRESET", libc::ENETRESET),
+    ("ENOBUFS", libc::ENOBUFS),
+    ("EISCONN", libc::EISCONN),
+    ("ESHUTDOWN", libc::ESHUTDOWN),
+    ("ETOOMANYREFS", libc::ETOOMANYREFS),
+    ("EHOSTDOWN", libc::EHOSTDOWN),
+    ("EUSERS", libc::EUSERS),
+    ("EDQUOT", libc::EDQUOT),
+    ("ESTALE", libc::ESTALE),
+    ("EREMOTE", libc::EREMOTE),
 ];
 
 fn strerror(e: i32) -> String {
@@ -2294,10 +2329,15 @@ fn k_fork(blk: V) -> V {
             let r = call_block(blk, &[]);
             let mut code = 0;
             if r == UNDEF {
-                if matches!(pst().pending, Throw::Raise(_)) {
-                    code = 1;
+                match pst().pending {
+                    // `exit n` in the child: its status, nothing printed
+                    Throw::Raise(e) if class_name(real_class(e)) == "SystemExit" => code = crate::kernel::system_exit_status(e),
+                    Throw::Raise(_) => {
+                        code = 1;
+                        print_uncaught();
+                    }
+                    _ => print_uncaught(),
                 }
-                print_uncaught();
                 pst().pending = Throw::None;
             }
             crate::abi::run_at_exit();
@@ -4417,6 +4457,10 @@ pub fn init() {
     // warn(*msgs, uplevel: nil, category: nil): the messages as `puts` writes them, through
     // Warning.warn (which programs override to capture warnings)
     defn(k, "warn", 0, -1, |_, a, _| {
+        // `$VERBOSE = nil` silences warn (Rails' silence_warnings)
+        if rt().gvars.get(&sym("$VERBOSE")).copied().unwrap_or(QFALSE) == QNIL {
+            return QNIL;
+        }
         let (a, kw) = split_kw(a);
         let mut uplevel = None;
         let mut category = QNIL;

@@ -933,6 +933,10 @@ pub struct PState {
     pub pending: Throw,
     pub errinfo: V,
     pub last_match: V,
+    /// The caller's locals for the string about to be eval'd (`eval_src`): set by the
+    /// compiled call site just before the call (see kernel::eval_string).
+    pub eval_locals: V,
+    pub eval_src: V,
     pub stack_limit: usize,
     /// `class`/`module` bodies and `class_eval` blocks being run (the default definee).
     pub definee: Vec<*mut Class>,
@@ -1034,6 +1038,8 @@ pub fn new_pstate() -> *mut PState {
         pending: Throw::None,
         errinfo: QNIL,
         last_match: QNIL,
+        eval_locals: QNIL,
+        eval_src: QNIL,
         stack_limit: 0,
         definee: Vec::new(),
         dm_stack: Vec::new(),
@@ -1418,7 +1424,9 @@ pub fn singleton_class(v: V) -> *mut Class {
         let meta = new_class_raw("", sup, false);
         (*meta).is_singleton = true;
         (*meta).attached = v;
-        (*meta).h.klass = rt().c.class;
+        // the singleton class of a plain object sees its class's class methods (CRuby: its
+        // singleton class inherits from the class's): `class << obj; self; end.class_macro`
+        (*meta).h.klass = if !is_class(v) && !(*sup).is_module && !(*sup).is_singleton { singleton_of_class(sup) } else { rt().c.class };
         (*meta).alloc = (*sup).alloc;
         h.klass = meta;
 
@@ -2118,7 +2126,7 @@ pub fn ivar_list(v: V) -> Vec<(u32, V)> {
                 .filter(|(n, x)| *x != UNDEF && !sym_name(*n).starts_with(b"@__"))
                 .collect()
         }
-        Some(Kind::Class) => rclass(v).civars.iter().map(|(&k, &v)| (k, v)).collect(),
+        Some(Kind::Class) => rclass(v).civars.iter().map(|(&k, &v)| (k, v)).filter(|(n, _)| !sym_name(*n).starts_with(b"@__")).collect(),
         _ => gen_ivar_list(v),
     }
 }

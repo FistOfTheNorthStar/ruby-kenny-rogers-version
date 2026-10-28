@@ -246,7 +246,8 @@ pub struct JitUnit {
     pub syms: Vec<Vec<u8>>,
     /// backtrace info: (function address, code size, label, file, [(return offset, line)]);
     /// label and file are offsets into `strs`
-    pub debug: Vec<(usize, u32, u32, u32, Vec<(u32, u32)>)>,
+    /// (address, size, label, file, calls, definition line)
+    pub debug: Vec<(usize, u32, u32, u32, Vec<(u32, u32)>, u32)>,
     pub strs: *const u8,
     /// The unit's memory: (start, len, is_code); see `free_unit`.
     pub memory: Vec<(usize, usize, bool)>,
@@ -317,7 +318,7 @@ pub fn compile(src: &[u8], mode: EvalMode, file: &str, symbols: &[(&'static str,
     let (strs_ptr, _) = c.module.get_finalized_data(c.strs_id);
     let debug = std::mem::take(&mut c.debug_fns)
         .into_iter()
-        .map(|f| (c.module.get_finalized_function(f.id) as usize, f.size | if f.exact { crate::DEBUG_EXACT } else { 0 }, f.label, f.file, f.calls))
+        .map(|f| (c.module.get_finalized_function(f.id) as usize, f.size | if f.exact { crate::DEBUG_EXACT } else { 0 }, f.label, f.file, f.calls, f.def_line))
         .collect();
     let memory = SHARED.lock().unwrap().as_mut().map(|s| std::mem::take(&mut s.unit)).unwrap_or_default();
     let unit = JitUnit {

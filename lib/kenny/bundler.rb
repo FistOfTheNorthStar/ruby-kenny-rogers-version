@@ -6,7 +6,8 @@ require "kenny/bundle"
 require "pathname"
 
 module Bundler
-  VERSION = "2.4.22"
+  # the Bundler that wrote the lock file
+  VERSION = (defined?(Kenny::BUNDLED_WITH) && Kenny::BUNDLED_WITH) || "2.4.22"
 
   class BundlerError < StandardError; end
   class GemfileError < BundlerError; end
@@ -26,17 +27,20 @@ module Bundler
   class Dependency
     attr_reader :name, :groups, :autorequire
 
-    def initialize(name, groups, autorequire, platform_ok, compiled)
+    def initialize(name, groups, autorequire, platform_ok, compiled, requirements = [])
       @name = name
       @groups = groups
       @autorequire = autorequire
       @platform_ok = platform_ok
       @compiled = compiled
+      @requirements = requirements
     end
 
     def should_include? = @platform_ok
     def compiled? = @compiled
     def to_s = @name
+    def requirement = Gem::Requirement.new(*@requirements)
+    def type = :runtime
   end
 
   # The parts of Gem::Specification that code asks Bundler / Gem.loaded_specs for.
@@ -68,6 +72,8 @@ module Bundler
 
     def specs = Bundler.specs
     def dependencies = Bundler.dependencies
+    def current_dependencies = dependencies.select(&:should_include?)
+    def requested_specs = specs
     def gems = specs
 
     def setup(*groups)
@@ -122,6 +128,53 @@ module Bundler
     end
   end
 
+  # The lock file's sections, as Bundler's parser gives them.
+  class LockfileParser
+    LazySpecification = Struct.new(:name, :version, :platform, :dependencies) do
+      def full_name = platform == "ruby" ? "#{name}-#{version}" : "#{name}-#{version}-#{platform}"
+      def to_s = full_name
+    end
+
+    attr_reader :specs, :dependencies, :platforms, :bundler_version, :ruby_version
+
+    def initialize(text)
+      @specs = []
+      @dependencies = {}
+      @platforms = []
+      @bundler_version = @ruby_version = nil
+      section = nil
+      text.each_line do |line|
+        line = line.chomp
+        next if line.strip.empty?
+        unless line.start_with?(" ")
+          section = line.strip
+          next
+        end
+        indent = line[/\A */].size
+        t = line.strip
+        case section
+        when "GEM", "PATH", "GIT"
+          if indent == 4 && (m = /\A(\S+) \(([^)]+)\)\z/.match(t))
+            v, plat = m[2].split("-", 2)
+            @specs << LazySpecification.new(m[1], Gem::Version.new(v), plat || "ruby", [])
+          elsif indent == 6 && @specs.last
+            n, r = t.split(" ", 2)
+            @specs.last.dependencies << Gem::Dependency.new(n, *(r ? r.delete("()").split(", ") : []))
+          end
+        when "DEPENDENCIES"
+          n, r = t.delete("!").split(" ", 2)
+          @dependencies[n] = Gem::Dependency.new(n, *(r ? r.delete("()").split(", ") : []))
+        when "PLATFORMS"
+          @platforms << Gem::Platform.new(t)
+        when "BUNDLED WITH"
+          @bundler_version = Gem::Version.new(t)
+        when "RUBY VERSION"
+          @ruby_version = t
+        end
+      end
+    end
+  end
+
   class << self
     def root
       @root ||= Pathname.new(Kenny::ROOT || Dir.pwd)
@@ -135,8 +188,10 @@ module Bundler
       @dependencies ||= Kenny::DEPENDENCIES.map { |row| Dependency.new(*row) }
     end
 
+    # (Bundler itself among them, as Bundler lists it)
     def specs
-      @specs ||= Kenny::SPECS.map { |row| StubSpecification.new(*row) }
+      @specs ||= (Kenny::SPECS.map { |row| StubSpecification.new(*row) } +
+                  [StubSpecification.new("bundler", VERSION, "", [])]).sort_by(&:name)
     end
 
     def load

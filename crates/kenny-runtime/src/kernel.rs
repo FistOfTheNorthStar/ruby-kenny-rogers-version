@@ -208,15 +208,34 @@ pub fn do_include(target: *mut Class, m: V) -> V {
 
 
 /// Runtime compiler for `eval`-family calls (installed by the JIT-enabled runtime).
-/// Arguments: source, mode (0 = eval/instance_eval, 1 = class_eval), self.
-pub static EVAL_HOOK: G<Option<fn(&[u8], u8, V) -> V>> = G::new(None);
+/// Arguments: source, mode (0 = eval/instance_eval, 1 = class_eval), self, the caller's
+/// locals ([name Symbol, value, ...] or nil), and the file and first line the source is said
+/// to come from (eval's `file`, `line` arguments).
+pub static EVAL_HOOK: G<Option<fn(&[u8], u8, V, V, Option<&str>, i64) -> V>> = G::new(None);
 
+/// Eval `src`, seeing the locals its compiled call site handed over for it (kn_eval_locals).
 pub fn eval_string(src: V, mode: u8, self_: V) -> V {
+    eval_string_at(src, mode, self_, QNIL, QNIL)
+}
+
+/// eval_string with eval's `file` and `line` arguments (nil: not given).
+pub fn eval_string_at(src: V, mode: u8, self_: V, file: V, line: V) -> V {
+    let p = pst();
+    let locals = if p.eval_src == src && src != QNIL { p.eval_locals } else { QNIL };
+    p.eval_locals = QNIL;
+    p.eval_src = QNIL;
+    eval_string_l(src, mode, self_, locals, file, line)
+}
+
+/// Eval `src` with these locals ([name Symbol, value, ...] or nil).
+pub fn eval_string_l(src: V, mode: u8, self_: V, locals: V, file: V, line: V) -> V {
     if !is_str(src) {
         return type_error(&format!("no implicit conversion of {} into String", class_name(real_class(src))));
     }
+    let file = if is_str(file) { Some(String::from_utf8_lossy(&rstr(file).b).into_owned()) } else { None };
+    let line = if is_fix(line) { fix(line) } else { 1 };
     match *EVAL_HOOK.get() {
-        Some(f) => f(&rstr(src).b.clone(), mode, self_),
+        Some(f) => f(&rstr(src).b.clone(), mode, self_, locals, file.as_deref(), line),
         None => raise(
             rt().c.not_implemented_error,
             "eval of strings needs the runtime compiler; this binary was built without it (kenny links it automatically when it sees eval/class_eval/instance_eval with a string)",
@@ -544,6 +563,9 @@ pub fn init() {
     defn(k, "p", 0, -1, |_, a, _| p_impl(a));
     defn(k, "pp", 0, -1, |_, a, _| p_impl(a));
     defn(k, "warn", 0, -1, |_, a, _| {
+        if rt().gvars.get(&sym("$VERBOSE")).copied().unwrap_or(QFALSE) == QNIL {
+            return QNIL;
+        }
         let a: Vec<V> = a.iter().copied().filter(|x| !is_hash(*x)).collect();
         puts_to(&a, &mut |b| err_out(b))
     });
@@ -578,7 +600,30 @@ pub fn init() {
         ivar_set(e, sym("@path"), str_from(&name));
         raise_exc(e)
     });
+    // `require_relative` with a literal path is compiled; this one is for a computed path, where
+    // the compiler passes the directory of the calling file
     defn(k, "require_relative", 1, 1, |_, _, _| QFALSE);
+    defn(k, "__kenny_require_relative", 2, 2, |s, a, _| {
+        let p = if is_str(a[0]) { a[0] } else { tri!(send(a[0], sym(if respond_to(a[0], sym("to_path")) { "to_path" } else { "to_str" }), &[], QNIL)) };
+        if !is_str(p) {
+            return type_error("no implicit conversion into String");
+        }
+        let rel = String::from_utf8_lossy(&rstr(p).b).into_owned();
+        let dir = String::from_utf8_lossy(&rstr(a[1]).b).into_owned();
+        let joined = if rel.starts_with('/') { std::path::PathBuf::from(&rel) } else { std::path::Path::new(&dir).join(&rel) };
+        // File.expand_path: drop `.` and resolve `..`
+        let mut full = std::path::PathBuf::new();
+        for c in joined.components() {
+            match c {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    full.pop();
+                }
+                c => full.push(c),
+            }
+        }
+        send(s, sym("require"), &[str_from(&full.display().to_string())], QNIL)
+    });
     fn raise_impl(a: &[V]) -> V {
         let r = rt();
         // `cause:` (raise's only keyword)
@@ -803,44 +848,47 @@ pub fn init() {
     });
     defn(k, "proc", 0, 0, |_, _, b| b);
     defn(k, "block_given?", 0, 0, |_, _, _| QFALSE);
-    defn(k, "eval", 1, 4, |s, a, _| {
-        let recv = match a.get(1).copied().filter(|b| *b != QNIL) {
-            Some(b) => match crate::compat::binding_receiver(b) {
-                Some(r) => r,
-                None => return type_error("wrong argument type (expected binding)"),
-            },
-            None => s,
-        };
-        eval_string(a[0], 0, recv)
+    defn(k, "eval", 1, 4, |s, a, _| match a.get(1).copied().filter(|b| *b != QNIL) {
+        // through a Binding: its self and locals
+        Some(b) => match crate::compat::binding_receiver(b) {
+            Some(r) => {
+                let p = pst();
+                p.eval_locals = QNIL;
+                p.eval_src = QNIL;
+                eval_string_l(a[0], 0, r, crate::compat::binding_locals(b), a.get(2).copied().unwrap_or(QNIL), a.get(3).copied().unwrap_or(QNIL))
+            }
+            None => type_error("wrong argument type (expected binding)"),
+        },
+        None => eval_string_at(a[0], 0, s, a.get(2).copied().unwrap_or(QNIL), a.get(3).copied().unwrap_or(QNIL)),
     });
     defn(k, "binding", 0, 0, |_, _, _| raise(rt().c.not_implemented_error, "binding is not supported by Kenny"));
     defn(k, "caller", 0, 2, |_, _, _| ary_new(vec![]));
     defn(k, "caller_locations", 0, 2, |_, _, _| ary_new(vec![]));
+    // exit raises SystemExit (so `ensure` runs and `rescue SystemExit` sees it); the
+    // program then ends with its status, after the at_exit handlers
     defn(k, "exit", 0, 1, |_, a, _| {
         let code = match a.first() {
             Some(&QTRUE) | None => 0,
             Some(&QFALSE) => 1,
-            Some(&x) if is_fix(x) => fix(x) as i32,
-            _ => 0,
+            Some(&x) if is_fix(x) => fix(x),
+            Some(&x) => return type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(x)))),
         };
-        crate::abi::run_at_exit();
-        flush_out();
-        std::process::exit(code)
+        raise_system_exit(code, "exit")
     });
     defn(k, "exit!", 0, 1, |_, a, _| {
         flush_out();
         std::process::exit(a.first().filter(|x| is_fix(**x)).map(|x| fix(*x) as i32).unwrap_or(0))
     });
     defn(k, "abort", 0, 1, |_, a, _| {
+        let mut msg = "exit".to_string();
         if let Some(&m) = a.first() {
             if let Ok(mut s) = to_s(m) {
+                msg = String::from_utf8_lossy(&s).into_owned();
                 s.push(b'\n');
                 err_out(&s);
             }
         }
-        crate::abi::run_at_exit();
-        flush_out();
-        std::process::exit(1)
+        raise_system_exit(1, &msg)
     });
     defn(k, "at_exit", 0, 0, |_, _, b| {
         crate::abi::AT_EXIT.get().push(b);
@@ -983,7 +1031,7 @@ pub fn init() {
         if !is_proc(b) {
             let Some(&src) = a.first() else { return arg_error("wrong number of arguments (given 0, expected 1..3)") };
             let sc = if is_heap(s) { singleton_class(s) } else { class_of(s) };
-            return with_definee(sc, || eval_string(src, 0, s));
+            return with_definee(sc, || eval_string_at(src, 0, s, a.get(1).copied().unwrap_or(QNIL), a.get(2).copied().unwrap_or(QNIL)));
         }
         with_singleton_definee(s, || call_proc_with_self(b, s, &[s], QNIL, false))
     });
@@ -1146,11 +1194,13 @@ pub fn init() {
             if r {
                 add_method(s as *mut Class, id, Body::AttrReader(iv));
                 out.push(mksym(id));
+                tri!(crate::abi::fire_method_added(s as *mut Class, id));
             }
             if w {
                 let wid = sym(&format!("{name}="));
                 add_method(s as *mut Class, wid, Body::AttrWriter(iv));
                 out.push(mksym(wid));
+                tri!(crate::abi::fire_method_added(s as *mut Class, wid));
             }
         }
         ary_new(out.take())
@@ -1179,6 +1229,7 @@ pub fn init() {
             let m2 = add_method(singleton_class(s), id, Body::Proc(body));
             unsafe { (*(m2 as *mut Method)).vis = VIS_PUBLIC };
         }
+        tri!(crate::abi::fire_method_added(cls, id));
         mksym(id)
     });
     defn(md, "alias_method", 2, 2, |s, a, _| {
@@ -1293,14 +1344,14 @@ pub fn init() {
             }
             let id = sym(part);
             let found = if i == 0 { const_lookup(cur, id) } else { const_get_under(cur, id) };
-            match found {
-                Some(v) => {
-                    val = v;
-                    if is_class(v) {
-                        cur = v as *mut Class;
-                    }
-                }
-                None => return crate::abi::const_missing(cur, id),
+            // (a pending autoload runs here: the rest of the path continues from its value)
+            let v = match found {
+                Some(v) => v,
+                None => tri!(crate::abi::const_missing(cur, id)),
+            };
+            val = v;
+            if is_class(v) {
+                cur = v as *mut Class;
             }
         }
         val
@@ -1428,7 +1479,7 @@ pub fn init() {
             let (vis, mf) = (k.default_vis, k.module_function);
             k.default_vis = VIS_PUBLIC;
             k.module_function = false;
-            let r = with_definee(s as *mut Class, || eval_string(src, 1, s));
+            let r = with_definee(s as *mut Class, || eval_string_at(src, 1, s, a.get(1).copied().unwrap_or(QNIL), a.get(2).copied().unwrap_or(QNIL)));
             let k = rclass(s);
             k.default_vis = vis;
             k.module_function = mf;
@@ -1671,6 +1722,7 @@ pub fn init() {
         }
         QNIL
     }
+    init_system_exit();
     defn(c.name_error, "initialize", 0, -1, |s, a, _| name_error_init(s, a));
     // FrozenError.new(msg = nil, receiver: obj) and #receiver (the object that is frozen)
     defn(c.frozen_error, "initialize", 0, -1, |s, a, _| {
@@ -1877,4 +1929,43 @@ pub fn full_message(e: V, highlight: bool, bottom: bool) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+fn system_exit_class() -> *mut Class {
+    const_lookup(rt().c.object, sym("SystemExit")).unwrap() as *mut Class
+}
+
+/// Raise `SystemExit` with this status (Kernel#exit, #abort).
+pub fn raise_system_exit(status: i64, msg: &str) -> V {
+    let e = exc_new(system_exit_class(), msg);
+    ivar_set(e, sym("@__status"), mkfix(status));
+    raise_exc(e)
+}
+
+/// The exit status of an uncaught SystemExit.
+pub fn system_exit_status(e: V) -> i32 {
+    let s = ivar_get(e, sym("@__status"));
+    if is_fix(s) { fix(s) as i32 } else { 0 }
+}
+
+/// SystemExit.new(status = 0, message = "exit"): status may be true (0) or false (1).
+pub fn init_system_exit() {
+    let c = system_exit_class();
+    defn(c, "initialize", 0, 2, |s, a, _| {
+        let (status, rest) = match a.first() {
+            Some(&QTRUE) => (0, &a[1..]),
+            Some(&QFALSE) => (1, &a[1..]),
+            Some(&x) if is_fix(x) => (fix(x), &a[1..]),
+            _ => (0, a),
+        };
+        ivar_set(s, sym("@__status"), mkfix(status));
+        let msg = rest.first().copied().unwrap_or(QNIL);
+        ivar_set(s, sym("@__message"), msg);
+        QNIL
+    });
+    defn(c, "status", 0, 0, |s, _, _| {
+        let v = ivar_get(s, sym("@__status"));
+        if v == QNIL { mkfix(0) } else { v }
+    });
+    defn(c, "success?", 0, 0, |s, _, _| bool_v(system_exit_status(s) == 0));
 }

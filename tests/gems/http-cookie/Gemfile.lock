@@ -1,0 +1,16 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    domain_name (0.7.20261007)
+    http-cookie (1.1.6)
+      domain_name (~> 0.5)
+
+PLATFORMS
+  arm64-darwin-27
+  ruby
+
+DEPENDENCIES
+  http-cookie
+
+BUNDLED WITH
+   2.6.9

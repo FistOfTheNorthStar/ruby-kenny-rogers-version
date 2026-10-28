@@ -179,7 +179,8 @@ fn init_instance(inst: *mut Class) {
     defn(inst, "length", 0, 0, |s, _, _| len(s));
     defn(inst, "size", 0, 0, |s, _, _| len(s));
     defn(inst, "file", 1, 1, |s, a, _| {
-        let path = match crate::fmt::to_s(a[0]) {
+        let p = if !is_str(a[0]) && respond_to(a[0], sym("to_path")) { tri!(send(a[0], sym("to_path"), &[], QNIL)) } else { a[0] };
+        let path = match crate::fmt::to_s(p) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(()) => return UNDEF,
         };

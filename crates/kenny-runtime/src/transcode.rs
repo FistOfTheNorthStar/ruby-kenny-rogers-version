@@ -96,6 +96,14 @@ pub fn enc_of(v: V) -> Enc {
     }
 }
 
+/// The encoding of `sub`/`gsub`'s result: the subject's, or (as CRuby's rb_enc_check)
+/// a non-ASCII replacement's when the subject is ASCII-only.
+pub fn note_piece(enc: &mut Enc, src_ascii: bool, piece: V) {
+    if src_ascii && is_str(piece) && !rstr(piece).b.is_ascii() {
+        *enc = enc_of(piece);
+    }
+}
+
 /// Give String `v` encoding `e`.
 pub fn set_enc(v: V, e: Enc) {
     let h = hdr(v);

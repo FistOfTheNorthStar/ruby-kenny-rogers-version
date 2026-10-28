@@ -1,0 +1,14 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    zeitwerk (2.8.3)
+
+PLATFORMS
+  arm64-darwin-27
+  ruby
+
+DEPENDENCIES
+  zeitwerk
+
+BUNDLED WITH
+   2.6.9

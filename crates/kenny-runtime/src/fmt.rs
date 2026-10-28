@@ -302,14 +302,78 @@ pub fn num_to_f(v: V) -> Option<f64> {
     }
 }
 
+/// The digits of a negative Integer in two's complement, as CRuby's sprintf shows them
+/// without a sign flag: `"%x" % -255` is "..f01" (`radix` 16, 8 or 2).
+fn twos_complement(v: V, radix: u32) -> String {
+    use num_bigint::BigInt;
+    let n = if is_fix(v) { BigInt::from(fix(v)) } else { rbig(v).n.clone() };
+    let digits = (-&n).to_str_radix(radix).len() as u32 + 1;
+    let m: BigInt = BigInt::from(radix).pow(digits) + &n;
+    let mut s = m.to_str_radix(radix);
+    while (s.len() as u32) < digits {
+        s.insert(0, '0');
+    }
+    let top = std::char::from_digit(radix - 1, radix).unwrap();
+    let keep = s.find(|c| c != top).map(|i| i.saturating_sub(1)).unwrap_or(s.len() - 1);
+    format!("..{}", &s[keep..])
+}
+
+/// C's `%g`: `p` significant digits, the shorter of fixed and exponent forms, trailing
+/// zeros dropped unless `alt` (`#`).
+fn fmt_g(f: f64, p: usize, alt: bool, upper: bool) -> String {
+    let p = p.max(1);
+    if f == 0.0 {
+        let mut s = if f.is_sign_negative() { "-0".to_string() } else { "0".to_string() };
+        if alt {
+            s.push('.');
+            s.extend(std::iter::repeat_n('0', p - 1));
+        }
+        return s;
+    }
+    let e = format!("{:.*e}", p - 1, f);
+    let (m, ex) = e.split_once('e').unwrap();
+    let x: i32 = ex.parse().unwrap();
+    let strip = |s: String| -> String {
+        if alt || !s.contains('.') {
+            return s;
+        }
+        let t = s.trim_end_matches('0');
+        t.trim_end_matches('.').to_string()
+    };
+    if x < -4 || x >= p as i32 {
+        let m = strip(m.to_string());
+        format!("{m}{}{}{:02}", if upper { 'E' } else { 'e' }, if x < 0 { '-' } else { '+' }, x.abs())
+    } else {
+        let prec = (p as i32 - 1 - x).max(0) as usize;
+        let s = format!("{:.*}", prec, f);
+        if alt && !s.contains('.') { format!("{s}.") } else { strip(s) }
+    }
+}
+
+/// Kernel#format / String#%, as CRuby's sprintf: flags `-+ 0#`, width and precision (also
+/// `*`), `%<name>` / `%{name}` (from a Hash argument) and `%1$s` argument references.
 pub fn sprintf(fmt: &[u8], args: &[V]) -> Result<Vec<u8>, V> {
     let mut out = Vec::new();
     let mut ai = 0;
     let mut i = 0;
-    let next = |ai: &mut usize| -> Result<V, V> {
-        let v = args.get(*ai).copied();
-        *ai += 1;
-        v.ok_or_else(|| arg_error("too few arguments"))
+    let hash_arg = || -> Result<V, V> {
+        match args {
+            [h] if is_hash(*h) => Ok(*h),
+            _ => Err(arg_error("one hash required")),
+        }
+    };
+    let lookup = |h: V, name: &[u8]| -> Result<V, V> {
+        let key = mksym(sym(&String::from_utf8_lossy(name)));
+        let hh = rhash(h);
+        if let Some(v) = hh.m.get(&HKey(key)) {
+            return Ok(*v);
+        }
+        if hh.default_proc != QNIL || hh.default != QNIL {
+            let v = crate::hash::hget(h, key);
+            return if v == UNDEF { Err(UNDEF) } else { Ok(v) };
+        }
+        let e = exc_new(rt().c.key_error, &format!("key<{}> not found", String::from_utf8_lossy(name)));
+        Err(raise_exc(e))
     };
     while i < fmt.len() {
         let c = fmt[i];
@@ -320,69 +384,188 @@ pub fn sprintf(fmt: &[u8], args: &[V]) -> Result<Vec<u8>, V> {
         }
         i += 1;
         if i >= fmt.len() {
-            out.push(b'%');
-            break;
+            return Err(arg_error("incomplete format specifier; use %% (double %) instead"));
         }
         if fmt[i] == b'%' {
             out.push(b'%');
             i += 1;
             continue;
         }
-        let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
-        while i < fmt.len() && matches!(fmt[i], b'-' | b'0' | b'+' | b' ') {
+        if fmt[i] == b'\n' || fmt[i] == 0 {
+            return Err(arg_error("malformed format string"));
+        }
+        let (mut left, mut zero, mut plus, mut space, mut alt) = (false, false, false, false, false);
+        let mut width: Option<usize> = None;
+        let mut prec: Option<usize> = None;
+        let mut value: Option<V> = None;
+        let mut braced: Option<V> = None;
+        // flags, width, `<name>`, `{name}` and `n$` in any order before the precision
+        loop {
+            if i >= fmt.len() {
+                return Err(arg_error("incomplete format specifier; use %% (double %) instead"));
+            }
             match fmt[i] {
                 b'-' => left = true,
                 b'0' => zero = true,
                 b'+' => plus = true,
-                _ => space = true,
+                b' ' => space = true,
+                b'#' => alt = true,
+                b'<' | b'{' => {
+                    let close = if fmt[i] == b'<' { b'>' } else { b'}' };
+                    let Some(len) = fmt[i + 1..].iter().position(|&c| c == close) else {
+                        return Err(arg_error("malformed name - unmatched parenthesis"));
+                    };
+                    let name = &fmt[i + 1..i + 1 + len];
+                    let v = lookup(hash_arg()?, name)?;
+                    if close == b'>' {
+                        value = Some(v);
+                    } else {
+                        braced = Some(v);
+                    }
+                    i += len + 1;
+                }
+                b'*' => {
+                    let w = args.get(ai).copied().ok_or_else(|| arg_error("too few arguments"))?;
+                    ai += 1;
+                    if !is_fix(w) {
+                        return Err(type_error("no implicit conversion into Integer"));
+                    }
+                    let n = fix(w);
+                    if n < 0 {
+                        left = true;
+                    }
+                    width = Some(n.unsigned_abs() as usize);
+                }
+                b'1'..=b'9' => {
+                    let mut n = 0usize;
+                    while i < fmt.len() && fmt[i].is_ascii_digit() {
+                        n = n * 10 + (fmt[i] - b'0') as usize;
+                        i += 1;
+                    }
+                    if i < fmt.len() && fmt[i] == b'$' {
+                        value = Some(args.get(n - 1).copied().ok_or_else(|| arg_error("too few arguments"))?);
+                    } else {
+                        width = Some(n);
+                        continue;
+                    }
+                }
+                _ => break,
             }
             i += 1;
+            if braced.is_some() {
+                break;
+            }
         }
-        let mut width = 0usize;
-        if i < fmt.len() && fmt[i] == b'*' {
-            width = fix(next(&mut ai)?) as usize;
+        if braced.is_none() && i < fmt.len() && fmt[i] == b'.' {
             i += 1;
-        }
-        while i < fmt.len() && fmt[i].is_ascii_digit() {
-            width = width * 10 + (fmt[i] - b'0') as usize;
-            i += 1;
-        }
-        let mut prec: Option<usize> = None;
-        if i < fmt.len() && fmt[i] == b'.' {
-            i += 1;
-            let mut p = 0;
-            while i < fmt.len() && fmt[i].is_ascii_digit() {
-                p = p * 10 + (fmt[i] - b'0') as usize;
+            if i < fmt.len() && fmt[i] == b'*' {
+                let p = args.get(ai).copied().ok_or_else(|| arg_error("too few arguments"))?;
+                ai += 1;
+                prec = Some(if is_fix(p) { fix(p).max(0) as usize } else { 0 });
                 i += 1;
-            }
-            prec = Some(p);
-        }
-        if i >= fmt.len() {
-            break;
-        }
-        let conv = fmt[i];
-        i += 1;
-        let body: String = match conv {
-            b'd' | b'i' | b'u' => {
-                let v = next(&mut ai)?;
-                let v = if is_float(v) { int_from_i128(float_val(v).floor() as i128) } else { v };
-                if !is_int(v) {
-                    return Err(type_error("can't convert to Integer"));
+            } else {
+                let mut p = 0;
+                while i < fmt.len() && fmt[i].is_ascii_digit() {
+                    p = p * 10 + (fmt[i] - b'0') as usize;
+                    i += 1;
                 }
-                let s = int_to_s(v);
-                if plus && !s.starts_with('-') {
-                    format!("+{s}")
-                } else if space && !s.starts_with('-') {
-                    format!(" {s}")
+                prec = Some(p);
+            }
+        }
+        let conv = if braced.is_some() {
+            b'S'
+        } else {
+            if i >= fmt.len() {
+                return Err(arg_error("incomplete format specifier; use %% (double %) instead"));
+            }
+            i += 1;
+            fmt[i - 1]
+        };
+        let mut next = || -> Result<V, V> {
+            if let Some(v) = value.take() {
+                return Ok(v);
+            }
+            let v = args.get(ai).copied();
+            ai += 1;
+            v.ok_or_else(|| arg_error("too few arguments"))
+        };
+        // (sign, prefix like "0x", digits/body): padding goes between prefix and digits for `0`
+        let (sign, prefix, body): (&str, String, String) = match conv {
+            b'S' => {
+                let b = to_s(braced.unwrap()).map_err(|_| UNDEF)?;
+                ("", String::new(), String::from_utf8_lossy(&b).into_owned())
+            }
+            b'd' | b'i' | b'u' | b'x' | b'X' | b'o' | b'b' | b'B' => {
+                let v = next()?;
+                let v = if is_float(v) {
+                    let f = float_val(v);
+                    if !f.is_finite() {
+                        return Err(raise(rt().c.float_domain_error, &crate::fmt::float_to_s(f)));
+                    }
+                    send(v, sym("to_i"), &[], QNIL)
+                } else if is_int(v) {
+                    v
+                } else if v == QNIL {
+                    return Err(type_error("can't convert nil into Integer"));
                 } else {
-                    s
+                    let r = send(rt().main_obj, sym("Integer"), &[v], QNIL);
+                    if r == UNDEF {
+                        return Err(UNDEF);
+                    }
+                    r
+                };
+                let neg = if is_fix(v) { fix(v) < 0 } else { rbig(v).n.sign() == num_bigint::Sign::Minus };
+                let radix = match conv {
+                    b'x' | b'X' => 16,
+                    b'o' => 8,
+                    b'b' | b'B' => 2,
+                    _ => 10,
+                };
+                let mut sign = if neg { "-" } else if plus { "+" } else if space { " " } else { "" };
+                let mut digits = if neg && radix != 10 && !plus && !space {
+                    sign = "";
+                    twos_complement(v, radix)
+                } else {
+                    let s = crate::numeric::int_to_s_radix(v, radix);
+                    s.trim_start_matches('-').to_string()
+                };
+                if let Some(p) = prec {
+                    if digits.starts_with("..") {
+                        let fill = digits.chars().nth(2).unwrap_or('f');
+                        while digits.len() - 2 < p {
+                            digits.insert(2, fill);
+                        }
+                    } else {
+                        while digits.len() < p {
+                            digits.insert(0, '0');
+                        }
+                    }
                 }
+                let is_zero = v == mkfix(0);
+                let prefix = match conv {
+                    b'x' if alt && !is_zero => "0x",
+                    b'X' if alt && !is_zero => "0X",
+                    b'b' if alt && !is_zero => "0b",
+                    b'B' if alt && !is_zero => "0B",
+                    b'o' if alt && !digits.starts_with('0') => "0",
+                    _ => "",
+                };
+                if conv == b'X' {
+                    digits = digits.to_uppercase();
+                }
+                (sign, prefix.to_string(), digits)
             }
-            b'f' | b'e' | b'g' => {
-                let v = next(&mut ai)?;
-                // other Numerics (BigDecimal, ...) go through #to_f like Kernel#Float
+            b'f' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
+                let v = next()?;
+                // other Numerics (BigDecimal, Rational, ...) go through #to_f like Kernel#Float
                 let v = if num_to_f(v).is_none() && is_heap(v) && !is_str(v) && respond_to(v, sym("to_f")) {
                     let r = send(v, sym("to_f"), &[], QNIL);
+                    if r == UNDEF {
+                        return Err(UNDEF);
+                    }
+                    r
+                } else if is_str(v) {
+                    let r = send(rt().main_obj, sym("Float"), &[v], QNIL);
                     if r == UNDEF {
                         return Err(UNDEF);
                     }
@@ -390,77 +573,93 @@ pub fn sprintf(fmt: &[u8], args: &[V]) -> Result<Vec<u8>, V> {
                 } else {
                     v
                 };
-                let f = num_to_f(v).ok_or_else(|| type_error("can't convert to Float"))?;
-                let p = prec.unwrap_or(6);
-                let s = match conv {
-                    b'f' => format!("{:.*}", p, f),
-                    b'e' => {
-                        let s = format!("{:.*e}", p, f);
-                        let (m, e) = s.split_once('e').unwrap();
-                        let e: i32 = e.parse().unwrap();
-                        format!("{}e{}{:02}", m, if e < 0 { '-' } else { '+' }, e.abs())
-                    }
-                    _ => {
-                        let s = format!("{}", f);
-                        s
+                let f = num_to_f(v).ok_or_else(|| type_error(&format!("can't convert {} into Float", if v == QNIL { "nil".to_string() } else { class_name(class_of(v)) })))?;
+                let sign = if f.is_sign_negative() && !(f == 0.0 && conv != b'f') || f < 0.0 { "-" } else if plus { "+" } else if space { " " } else { "" };
+                let sign = if f.is_nan() { if plus { "+" } else if space { " " } else { "" } } else { sign };
+                let a = f.abs();
+                let body = if f.is_nan() {
+                    "NaN".to_string()
+                } else if f.is_infinite() {
+                    "Inf".to_string()
+                } else {
+                    let p = prec.unwrap_or(6);
+                    match conv {
+                        b'f' => {
+                            let s = format!("{:.*}", p, a);
+                            if alt && p == 0 { format!("{s}.") } else { s }
+                        }
+                        b'e' | b'E' => {
+                            let s = format!("{:.*e}", p, a);
+                            let (m, e) = s.split_once('e').unwrap();
+                            let e: i32 = e.parse().unwrap();
+                            let m = if alt && p == 0 { format!("{m}.") } else { m.to_string() };
+                            format!("{}{}{}{:02}", m, if conv == b'E' { 'E' } else { 'e' }, if e < 0 { '-' } else { '+' }, e.abs())
+                        }
+                        b'g' | b'G' => fmt_g(a, p, alt, conv == b'G'),
+                        _ => return Err(arg_error(&format!("malformed format string - %{}", conv as char))),
                     }
                 };
-                if plus && f >= 0.0 { format!("+{s}") } else { s }
+                // (zero padding doesn't apply to Inf/NaN)
+                if !f.is_finite() {
+                    zero = false;
+                }
+                (sign, String::new(), body)
             }
-            b's' => {
-                let v = next(&mut ai)?;
-                let b = to_s(v).map_err(|_| UNDEF)?;
+            b's' | b'p' => {
+                let v = next()?;
+                let b = if conv == b's' { to_s(v).map_err(|_| UNDEF)? } else { inspect(v).map_err(|_| UNDEF)? };
                 let s = String::from_utf8_lossy(&b).into_owned();
-                match prec {
+                ("", String::new(), match prec {
                     Some(p) => s.chars().take(p).collect(),
                     None => s,
-                }
-            }
-            b'p' => {
-                let v = next(&mut ai)?;
-                String::from_utf8_lossy(&inspect(v).map_err(|_| UNDEF)?).into_owned()
-            }
-            b'x' | b'X' | b'o' | b'b' | b'B' => {
-                let v = next(&mut ai)?;
-                if !is_fix(v) {
-                    return Err(type_error("can't convert to Integer"));
-                }
-                let n = fix(v);
-                let (neg, a) = (n < 0, n.unsigned_abs());
-                let s = match conv {
-                    b'x' => format!("{:x}", a),
-                    b'X' => format!("{:X}", a),
-                    b'o' => format!("{:o}", a),
-                    _ => format!("{:b}", a),
-                };
-                if neg { format!("-{s}") } else { s }
+                })
             }
             b'c' => {
-                let v = next(&mut ai)?;
-                if is_fix(v) {
+                let v = next()?;
+                let s = if is_fix(v) {
                     char::from_u32(fix(v) as u32).map(|c| c.to_string()).unwrap_or_default()
                 } else {
                     String::from_utf8_lossy(&to_s(v).map_err(|_| UNDEF)?).chars().take(1).collect()
-                }
+                };
+                ("", String::new(), s)
             }
             _ => return Err(arg_error(&format!("malformed format string - %{}", conv as char))),
         };
-        let len = body.chars().count();
+        let width = width.unwrap_or(0);
+        let len = sign.chars().count() + prefix.chars().count() + body.chars().count();
+        let numeric = !matches!(conv, b's' | b'p' | b'c' | b'S');
+        // (an integer precision turns `0` padding off, as in C)
+        let int_conv = matches!(conv, b'd' | b'i' | b'u' | b'x' | b'X' | b'o' | b'b' | b'B');
         if len >= width {
+            out.extend_from_slice(sign.as_bytes());
+            out.extend_from_slice(prefix.as_bytes());
             out.extend_from_slice(body.as_bytes());
         } else if left {
+            out.extend_from_slice(sign.as_bytes());
+            out.extend_from_slice(prefix.as_bytes());
             out.extend_from_slice(body.as_bytes());
             out.extend(std::iter::repeat_n(b' ', width - len));
-        } else if zero && matches!(conv, b'd' | b'i' | b'f' | b'x' | b'X' | b'o' | b'b' | b'e') {
-            let (sign, digits) = match body.strip_prefix(['-', '+']) {
-                Some(d) => (&body[..1], d),
-                None => ("", body.as_str()),
-            };
+        } else if zero && numeric && !(int_conv && prec.is_some()) {
             out.extend_from_slice(sign.as_bytes());
-            out.extend(std::iter::repeat_n(b'0', width - len));
-            out.extend_from_slice(digits.as_bytes());
+            out.extend_from_slice(prefix.as_bytes());
+            // a two's-complement number pads with its fill digit ("..f01" -> "..fff01")
+            if let Some(rest) = body.strip_prefix("..") {
+                let fill = rest.chars().next().unwrap_or('0') as u8;
+                out.extend(std::iter::repeat_n(fill, width - len));
+                out.extend_from_slice(rest.as_bytes());
+                out.extend_from_slice(b"..");
+                let n = out.len();
+                // ("..": in front, as CRuby writes it)
+                let start = n - rest.len() - 2 - (width - len);
+                out[start..].rotate_right(2);
+            } else {
+                out.extend(std::iter::repeat_n(b'0', width - len));
+                out.extend_from_slice(body.as_bytes());
+            }
         } else {
             out.extend(std::iter::repeat_n(b' ', width - len));
+            out.extend_from_slice(sign.as_bytes());
+            out.extend_from_slice(prefix.as_bytes());
             out.extend_from_slice(body.as_bytes());
         }
     }

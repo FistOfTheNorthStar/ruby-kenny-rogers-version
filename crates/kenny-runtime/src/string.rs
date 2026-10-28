@@ -367,7 +367,7 @@ fn sets_of(a: &[V]) -> Result<Vec<(bool, Vec<char>)>, V> {
     a.iter().map(|x| want_str(*x).map(|b| tr_expand(&String::from_utf8_lossy(&b)))).collect()
 }
 
-fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
+fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<(Vec<u8>, crate::transcode::Enc)>, V> {
     if a.is_empty() {
         return Err(arity_error(0, 1, 2));
     }
@@ -379,6 +379,11 @@ fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
     }
     let pat = rstr(a[0]).b.clone();
     let src = rstr(s).b.clone();
+    let src_ascii = src.is_ascii();
+    let mut enc = crate::transcode::enc_of(s);
+    if let Some(&x) = a.get(1).filter(|x| is_str(**x)) {
+        crate::transcode::note_piece(&mut enc, src_ascii, x);
+    }
     let mut out = Vec::with_capacity(src.len());
     let mut start = 0;
     let mut changed = false;
@@ -400,6 +405,7 @@ fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
             if v == UNDEF {
                 return Err(UNDEF);
             }
+            crate::transcode::note_piece(&mut enc, src_ascii, v);
             to_s(v).map_err(|_| UNDEF)?
         } else if is_proc(blk) {
             let matched = str_new(pat.clone());
@@ -407,6 +413,7 @@ fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
             if v == UNDEF {
                 return Err(UNDEF);
             }
+            crate::transcode::note_piece(&mut enc, src_ascii, v);
             to_s(v).map_err(|_| UNDEF)?
         } else {
             return Err(arity_error(1, 2, 2));
@@ -427,7 +434,7 @@ fn sub_impl(s: V, a: &[V], blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
     if start < src.len() {
         out.extend_from_slice(&src[start..]);
     }
-    Ok(if changed { Some(out) } else { None })
+    Ok(if changed { Some((out, enc)) } else { None })
 }
 
 fn succ(x: &[u8]) -> Vec<u8> {
@@ -1154,27 +1161,92 @@ pub fn init() {
         let i = if i < 0 { i + b.len() as i64 } else { i };
         if i < 0 { QNIL } else { b.get(i as usize).map(|x| mkfix(*x as i64)).unwrap_or(QNIL) }
     });
-    fn lines(s: V) -> Vec<V> {
+    /// The lines of `s` for `lines` / `each_line(sep = $/, chomp: false)`: `sep` nil is the
+    /// whole string, "" is paragraph mode (lines end at a run of 2+ newlines); `chomp`
+    /// drops each line's separator (and a "\r" before "\n").
+    fn split_lines(s: V, a: &[V]) -> Result<Vec<V>, V> {
+        let mut a = a;
+        let mut chomp = false;
+        if let Some(&h) = a.last() {
+            if is_hash(h) {
+                chomp = rhash(h).m.get(&HKey(mksym(sym("chomp")))).is_some_and(|v| truthy(*v));
+                a = &a[..a.len() - 1];
+            }
+        }
+        let sep: Option<Vec<u8>> = match a.first() {
+            None => Some(b"\n".to_vec()),
+            Some(&v) if v == QNIL => None,
+            Some(&v) if is_str(v) => Some(rstr(v).b.clone()),
+            Some(&v) => return Err(type_error(&format!("no implicit conversion of {} into String", class_name(real_class(v))))),
+        };
         let x = rstr(s).b.clone();
         let mut out = Vec::new();
-        let mut start = 0;
-        for (i, ch) in x.iter().enumerate() {
-            if *ch == b'\n' {
-                out.push(str_new(x[start..=i].to_vec()));
-                start = i + 1;
+        let Some(sep) = sep else {
+            if !x.is_empty() {
+                out.push(str_new(x));
             }
+            return Ok(out);
+        };
+        let paragraph = sep.is_empty();
+        let mut start = 0;
+        let mut i = 0;
+        while i < x.len() {
+            // the end of this line's separator, if one starts at i
+            let end = if paragraph {
+                if x[i] == b'\n' && x.get(i + 1) == Some(&b'\n') {
+                    let mut j = i;
+                    while j < x.len() && x[j] == b'\n' {
+                        j += 1;
+                    }
+                    Some(j)
+                } else {
+                    None
+                }
+            } else if x[i..].starts_with(&sep) {
+                Some(i + sep.len())
+            } else {
+                None
+            };
+            let Some(end) = end else {
+                i += 1;
+                continue;
+            };
+            // (a paragraph keeps two of its newlines; the rest are skipped)
+            let mut line_end = if chomp { i } else if paragraph { i + 2 } else { end };
+            if chomp && sep == b"\n" && line_end > start && x[line_end - 1] == b'\r' {
+                line_end -= 1;
+            }
+            out.push(str_new(x[start..line_end].to_vec()));
+            start = end;
+            i = end;
         }
         if start < x.len() {
             out.push(str_new(x[start..].to_vec()));
         }
-        out
+        Ok(out)
     }
-    defn(c, "lines", 0, 1, |s, _, _| ary_new(lines(s)));
-    defn(c, "each_line", 0, 1, |s, _, blk| {
-        if !is_proc(blk) {
-            return crate::misc::enum_for(s, "each_line", &[]);
+    defn(c, "lines", 0, 2, |s, a, blk| {
+        let ls = match split_lines(s, a) {
+            Ok(l) => l,
+            Err(e) => return e,
+        };
+        if is_proc(blk) {
+            let ls = crate::gc::RVec::from(ls);
+            for i in 0..ls.len() {
+                tri!(call_block(blk, &[ls[i]]));
+            }
+            return s;
         }
-        let ls = crate::gc::RVec::from(lines(s));
+        ary_new(ls)
+    });
+    defn(c, "each_line", 0, 2, |s, a, blk| {
+        if !is_proc(blk) {
+            return crate::misc::enum_for(s, "each_line", a);
+        }
+        let ls = match split_lines(s, a) {
+            Ok(l) => crate::gc::RVec::from(l),
+            Err(e) => return e,
+        };
         for i in 0..ls.len() {
             tri!(call_block(blk, &[ls[i]]));
         }
@@ -1342,20 +1414,30 @@ pub fn init() {
         Ok(sets) => mkfix(s_of(s).chars().filter(|ch| in_sets(*ch, &sets)).count() as i64),
         Err(e) => e,
     });
-    defn(c, "sub", 1, 2, |s, a, blk| match sub_impl(s, a, blk, false) {
-        Ok(Some(o)) => str_new(o),
-        Ok(None) => str_new(rstr(s).b.clone()),
-        Err(e) => e,
-    });
-    defn(c, "gsub", 1, 2, |s, a, blk| match sub_impl(s, a, blk, true) {
-        Ok(Some(o)) => str_new(o),
-        Ok(None) => str_new(rstr(s).b.clone()),
-        Err(e) => e,
-    });
+    fn sub_result(s: V, r: Result<Option<(Vec<u8>, crate::transcode::Enc)>, V>) -> V {
+        match r {
+            Ok(Some((o, enc))) => {
+                let v = str_new(o);
+                crate::transcode::set_enc(v, enc);
+                v
+            }
+            Ok(None) => {
+                let v = str_new(rstr(s).b.clone());
+                crate::transcode::set_enc(v, crate::transcode::enc_of(s));
+                v
+            }
+            Err(e) => e,
+        }
+    }
+    defn(c, "sub", 1, 2, |s, a, blk| sub_result(s, sub_impl(s, a, blk, false)));
+    defn(c, "gsub", 1, 2, |s, a, blk| sub_result(s, sub_impl(s, a, blk, true)));
     defn(c, "sub!", 1, 2, |s, a, blk| match sub_impl(s, a, blk, false) {
-        Ok(Some(o)) => match mutate(s) {
+        Ok(Some((o, enc))) => match mutate(s) {
             Ok(bs) => {
                 bs.set(o);
+                if enc != crate::transcode::enc_of(s) {
+                    crate::transcode::set_enc(s, enc);
+                }
                 s
             }
             Err(e) => e,
@@ -1364,9 +1446,12 @@ pub fn init() {
         Err(e) => e,
     });
     defn(c, "gsub!", 1, 2, |s, a, blk| match sub_impl(s, a, blk, true) {
-        Ok(Some(o)) => match mutate(s) {
+        Ok(Some((o, enc))) => match mutate(s) {
             Ok(bs) => {
                 bs.set(o);
+                if enc != crate::transcode::enc_of(s) {
+                    crate::transcode::set_enc(s, enc);
+                }
                 s
             }
             Err(e) => e,

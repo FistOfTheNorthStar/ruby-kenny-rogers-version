@@ -14,14 +14,14 @@ Kenny compiles Ruby ahead of time to a single native binary, like Go.
   newest one, so a build against Ruby 3.4 also accepts 4.0's syntax (a line starting with `&&`
   or `||` continuing the one before).
 - Core behavior follows the Ruby the program is built against, 3.4 or 4.0 (see the README).
-  In 4.0 builds `Binding#implicit_parameters` is always empty, as `local_variables` is (a
-  `Binding` sees no locals). `ObjectSpace._id2ref` and `Ractor` are dropped in both (below).
+  In 4.0 builds `Binding#implicit_parameters` is always empty (a block's `it` / `_1` aren't in
+  a Binding's locals). `ObjectSpace._id2ref` and `Ractor` are dropped in both (below).
 
 ## Rule 2: drop runtime powers that tax every program
 
 | Dropped | Reason |
 |---|---|
-| Local variables seen through a `Binding` (`local_variable_get/set`, `eval("x", binding)` reading locals) | Locals must be able to live in registers. `binding` itself works but captures `self` only, so `ERB#result(binding)` and `eval(src, binding)` with methods/ivars work |
+| Writing a caller's local variables from an `eval`'d string or through a `Binding` | Locals must be able to live in registers. `binding` and `eval` / `class_eval` / `instance_eval` of a string see a snapshot of the locals taken at the call, so `ERB#result(binding)`, `local_variable_get` and `class_eval "... #{x} ..."` reading `x` work; an assignment inside the string (or `local_variable_set`) changes the snapshot, not the variable. A block that calls `binding` or evals a string keeps the enclosing locals in its heap environment |
 | Redefining Integer and Float operators (`Integer#+`, `Float#<`, `Integer#&`, ...: `+ - * / % < <= > >= == != & \| ^`) | Lets arithmetic and comparisons compile inline, on unboxed values, with no guards |
 | `ObjectSpace.each_object` (except for `Class`/`Module`), `ObjectSpace._id2ref` | Heap doesn't need to be walkable; GC can move objects. Classes are tracked anyway, so `each_object(Class)` works |
 | `TracePoint`, `set_trace_func` | No hooks on every call/line (a debug build flag replaces them) |
@@ -29,7 +29,7 @@ Kenny compiles Ruby ahead of time to a single native binary, like Go.
 | `require` / `autoload` of a library by name (searched on `$LOAD_PATH`) that wasn't compiled in | Whole program is compiled together. `load` of a file, and `require` of an absolute path, that is new or changed since the build are compiled at runtime by the embedded JIT (Rails' code reloading in development) |
 | Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in with `--ext`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError`. As with the ffi gem, `ffi_lib` raises `LoadError` when the library isn't installed. The `sassc` gem (libsass through FFI) is replaced by a native Sass compiler |
 | `Thread#raise` / `Thread#kill` landing at arbitrary instructions | Delivered only at safe points (calls, loop back-edges, IO) |
-| `RubyVM::*`, `Ractor`, `$;`, `$,`, `callcc`, flip-flop, `BEGIN`/`END` | CRuby internals, superseded, or deprecated |
+| `RubyVM::*`, `Ractor`, `$;`, `$,`, `callcc`, flip-flop, `END` | CRuby internals, superseded, or deprecated (`BEGIN` works; use `at_exit` for `END`) |
 
 Other core methods (`Array#[]`, `Hash#[]=`, `String#==`, `Integer#times`, `Array#each`, ...) can
 still be redefined, subclassed or refined: their specialised paths check through the call site's

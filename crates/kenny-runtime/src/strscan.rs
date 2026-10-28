@@ -75,12 +75,18 @@ fn do_scan(s: V, pat: V, adv: bool, getstr: bool, head: bool) -> V {
         let bytes = &s_bytes(s)[..];
         let rest = &bytes[pos..];
         let m: Option<Vec<i64>> = if is_regexp(pat) {
-            let re = &re_of(pat).re;
+            let r = re_of(pat);
             let mut region = Region::new();
-            let hit = if head {
-                re.match_with_encoding(Bytes(rest), 0, SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some()
-            } else {
-                re.search_with_encoding(Bytes(rest), 0, rest.len(), SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some()
+            // a byte (/n) pattern, or a binary string with bytes >= 0x80: matched as
+            // ASCII-8BIT (Oniguruma panics on a pattern / subject encoding mismatch)
+            let raw = hdr(s_str(s)).flags & FL_BINARY != 0 && !rest.is_ascii();
+            let ascii = if r.binary || raw { r.twin() } else { None };
+            let hit = match ascii {
+                Some(re) if head => re.match_with_encoding(onig::EncodedBytes::ascii(rest), 0, SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some(),
+                Some(re) => re.search_with_encoding(onig::EncodedBytes::ascii(rest), 0, rest.len(), SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some(),
+                None if r.binary || raw => false,
+                None if head => r.re.match_with_encoding(Bytes(rest), 0, SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some(),
+                None => r.re.search_with_encoding(Bytes(rest), 0, rest.len(), SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some(),
             };
             if hit {
                 let mut v = Vec::with_capacity(region.len() * 2);
