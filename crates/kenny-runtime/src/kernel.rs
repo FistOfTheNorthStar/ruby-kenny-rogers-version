@@ -1172,11 +1172,13 @@ pub fn init() {
             if r {
                 add_method(s as *mut Class, id, Body::AttrReader(iv));
                 out.push(mksym(id));
+                tri!(crate::abi::fire_method_added(s as *mut Class, id));
             }
             if w {
                 let wid = sym(&format!("{name}="));
                 add_method(s as *mut Class, wid, Body::AttrWriter(iv));
                 out.push(mksym(wid));
+                tri!(crate::abi::fire_method_added(s as *mut Class, wid));
             }
         }
         ary_new(out.take())
@@ -1205,6 +1207,7 @@ pub fn init() {
             let m2 = add_method(singleton_class(s), id, Body::Proc(body));
             unsafe { (*(m2 as *mut Method)).vis = VIS_PUBLIC };
         }
+        tri!(crate::abi::fire_method_added(cls, id));
         mksym(id)
     });
     defn(md, "alias_method", 2, 2, |s, a, _| {
