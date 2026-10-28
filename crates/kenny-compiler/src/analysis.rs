@@ -8,6 +8,8 @@ pub struct Captures {
     pub captured: HashSet<Vec<u8>>,
     pub has_block: bool,
     pub zsuper_in_block: bool,
+    /// a nested block calls `binding` or evals a string: it sees all of this scope's locals
+    pub eval_in_block: bool,
 }
 
 struct V {
@@ -15,6 +17,17 @@ struct V {
     captured: HashSet<Vec<u8>>,
     has_block: bool,
     zsuper_in_block: bool,
+    eval_in_block: bool,
+}
+
+/// A call that sees the caller's local variables: `binding`, `local_variables`, or `eval` / `class_eval` /
+/// `module_eval` / `instance_eval` of a string.
+pub fn sees_locals(n: &CallNode) -> bool {
+    match n.name().as_slice() {
+        b"binding" | b"local_variables" => n.receiver().is_none() && n.arguments().is_none() && n.block().is_none(),
+        b"eval" | b"class_eval" | b"module_eval" | b"instance_eval" => n.arguments().is_some() && n.block().is_none(),
+        _ => false,
+    }
 }
 
 impl V {
@@ -59,6 +72,12 @@ impl<'pr> Visit<'pr> for V {
     }
     fn visit_singleton_class_node(&mut self, node: &SingletonClassNode<'pr>) {
         self.visit(&node.expression());
+    }
+    fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+        if self.depth >= 1 && sees_locals(node) {
+            self.eval_in_block = true;
+        }
+        visit_call_node(self, node);
     }
     fn visit_forwarding_super_node(&mut self, node: &ForwardingSuperNode<'pr>) {
         if self.depth >= 1 {
@@ -119,11 +138,11 @@ impl<'pr> Visit<'pr> for V {
 
 /// Analyse the nodes making up one scope's body (and parameter defaults).
 pub fn captures<'pr>(nodes: &[&Node<'pr>]) -> Captures {
-    let mut v = V { depth: 0, captured: HashSet::new(), has_block: false, zsuper_in_block: false };
+    let mut v = V { depth: 0, captured: HashSet::new(), has_block: false, zsuper_in_block: false, eval_in_block: false };
     for n in nodes {
         v.visit(n);
     }
-    Captures { captured: v.captured, has_block: v.has_block, zsuper_in_block: v.zsuper_in_block }
+    Captures { captured: v.captured, has_block: v.has_block, zsuper_in_block: v.zsuper_in_block, eval_in_block: v.eval_in_block }
 }
 
 /// Is `n` an arithmetic expression whose result may be a Float (`a * b`, `x + 1.5`,

@@ -722,4 +722,10 @@ pub fn init() {
     const_set(fc, sym("MAX"), float_new(f64::MAX));
     const_set(fc, sym("MIN"), float_new(f64::MIN_POSITIVE));
     const_set(fc, sym("DIG"), mkfix(15));
+    const_set(fc, sym("MANT_DIG"), mkfix(53));
+    const_set(fc, sym("RADIX"), mkfix(2));
+    const_set(fc, sym("MAX_EXP"), mkfix(1024));
+    const_set(fc, sym("MIN_EXP"), mkfix(-1021));
+    const_set(fc, sym("MAX_10_EXP"), mkfix(308));
+    const_set(fc, sym("MIN_10_EXP"), mkfix(-307));
 }

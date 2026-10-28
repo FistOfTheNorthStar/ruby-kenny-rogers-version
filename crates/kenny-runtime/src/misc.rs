@@ -1124,7 +1124,9 @@ pub fn init() {
     // ---- Struct ----
     let st = c.struct_;
     defs(st, "new", 0, -1, |s, a, b| {
-        if s as *mut Class != rt().c.struct_ {
+        // a struct class makes an instance; Struct and a subclass of it with no members yet
+        // (`class Options < Struct; end; Options.new(:a, :b)`, Faraday's) make a struct class
+        if ancestors(s as *mut Class).iter().any(|c| unsafe { (**c).civars.contains_key(&sym("@__struct")) }) {
             return crate::kernel::class_new_instance(s, a, b);
         }
         let kw_init = has_kw(a, "keyword_init");
@@ -1145,10 +1147,12 @@ pub fn init() {
                 Err(e) => return e,
             }
         }
-        let k = new_class("", rt().c.struct_);
+        let k = new_class("", s as *mut Class);
         unsafe {
             (*k).struct_members.set(members.clone());
         }
+        // (a class Struct.new made: its `new` makes instances)
+        rclass(k as V).civars.insert(sym("@__struct"), QTRUE);
         if let Some(n) = cname {
             const_set(rt().c.struct_, sym(&n), k as V);
         }
@@ -1469,20 +1473,139 @@ pub fn init() {
         }
     });
     defn(envc, "key?", 1, 1, |_, a, _| bool_v(path_arg(a[0]).ok().is_some_and(|k| std::env::var(k).is_ok())));
-    defn(envc, "[]=", 2, 2, |_, a, _| {
-        if let (Ok(k), Ok(v)) = (path_arg(a[0]), path_arg(a[1])) {
-            unsafe { std::env::set_var(k, v) };
+    fn env_set(k: V, v: V) -> V {
+        let k = match path_arg(k) {
+            Ok(k) => k,
+            Err(e) => return e,
+        };
+        if v == QNIL {
+            unsafe { std::env::remove_var(k) };
+            return QNIL;
         }
-        a[1]
-    });
-    defn(envc, "to_h", 0, 0, |_, _, _| {
+        match path_arg(v) {
+            Ok(v) => unsafe { std::env::set_var(k, v) },
+            Err(e) => return e,
+        }
+        v
+    }
+    defn(envc, "[]=", 2, 2, |_, a, _| env_set(a[0], a[1]));
+    defn(envc, "store", 2, 2, |_, a, _| env_set(a[0], a[1]));
+    fn env_hash() -> V {
         let h = hash_new();
-        for (k, v) in std::env::vars() {
-            crate::hash::hset(h, new_str_v(k), new_str_v(v));
+        for (k, v) in std::env::vars_os() {
+            crate::hash::hset(h, new_str_v(k.to_string_lossy().into_owned()), new_str_v(v.to_string_lossy().into_owned()));
         }
         h
+    }
+    defn(envc, "to_hash", 0, 0, |_, _, _| env_hash());
+    defn(envc, "to_h", 0, 0, |_, _, b| if is_proc(b) { send(env_hash(), sym("to_h"), &[], b) } else { env_hash() });
+    defn(envc, "inspect", 0, 0, |_, _, _| send(env_hash(), sym("inspect"), &[], QNIL));
+    defn(envc, "to_s", 0, 0, |_, _, _| str_from("ENV"));
+    defn(envc, "include?", 1, 1, |_, a, _| bool_v(path_arg(a[0]).ok().is_some_and(|k| std::env::var_os(k).is_some())));
+    defn(envc, "has_key?", 1, 1, |_, a, _| bool_v(path_arg(a[0]).ok().is_some_and(|k| std::env::var_os(k).is_some())));
+    defn(envc, "member?", 1, 1, |_, a, _| bool_v(path_arg(a[0]).ok().is_some_and(|k| std::env::var_os(k).is_some())));
+    fn env_each(s: V, b: V, name: &str) -> V {
+        if !is_proc(b) {
+            return enum_for(s, name, &[]);
+        }
+        let h = env_hash();
+        for (k, v) in crate::hash::pairs(h).iter().copied() {
+            tri!(call_block(b, &[ary_new(vec![k, v])]));
+        }
+        s
+    }
+    defn(envc, "each", 0, 0, |s, _, b| env_each(s, b, "each"));
+    defn(envc, "each_pair", 0, 0, |s, _, b| env_each(s, b, "each_pair"));
+    fn env_delete(k: V) -> Option<V> {
+        let k = path_arg(k).ok()?;
+        let old = std::env::var_os(&k)?;
+        unsafe { std::env::remove_var(&k) };
+        Some(new_str_v(old.to_string_lossy().into_owned()))
+    }
+    defn(envc, "delete", 1, 1, |_, a, b| match env_delete(a[0]) {
+        Some(v) => v,
+        None if is_proc(b) => call_block(b, &[a[0]]),
+        None => QNIL,
     });
-    defn(envc, "inspect", 0, 0, |_, _, _| str_from("ENV"));
+    fn env_update(s: V, a: &[V], b: V) -> V {
+        for &h in a {
+            let h = tri!(send(h, sym("to_hash"), &[], QNIL));
+            for (k, v) in crate::hash::pairs(h).iter().copied() {
+                let mut v = v;
+                if is_proc(b) {
+                    let old = send(s, sym("[]"), &[k], QNIL);
+                    if old != QNIL {
+                        v = tri!(call_block(b, &[k, old, v]));
+                    }
+                }
+                tri!(env_set(k, v));
+            }
+        }
+        s
+    }
+    defn(envc, "update", 0, -1, env_update);
+    defn(envc, "merge!", 0, -1, env_update);
+    defn(envc, "replace", 1, 1, |s, a, _| {
+        let h = tri!(send(a[0], sym("to_hash"), &[], QNIL));
+        let mut keep = Vec::new();
+        for (k, _) in crate::hash::pairs(h).iter().copied() {
+            match path_arg(k) {
+                Ok(k) => keep.push(k),
+                Err(e) => return e,
+            }
+        }
+        for (k, _) in std::env::vars_os() {
+            if !keep.iter().any(|x| std::ffi::OsStr::new(x) == k) {
+                unsafe { std::env::remove_var(&k) };
+            }
+        }
+        env_update(s, &[h], QNIL)
+    });
+    defn(envc, "clear", 0, 0, |s, _, _| {
+        for (k, _) in std::env::vars_os() {
+            unsafe { std::env::remove_var(k) };
+        }
+        s
+    });
+    // delete_if/reject! (drop when the block is true), keep_if/select!/filter! (drop when false)
+    fn env_filter(s: V, b: V, name: &str, drop_when: bool) -> V {
+        if !is_proc(b) {
+            return enum_for(s, name, &[]);
+        }
+        let h = env_hash();
+        let mut changed = false;
+        for (k, v) in crate::hash::pairs(h).iter().copied() {
+            if truthy(tri!(call_block(b, &[k, v]))) == drop_when {
+                env_delete(k);
+                changed = true;
+            }
+        }
+        if !changed && (name == "reject!" || name == "select!" || name == "filter!") { QNIL } else { s }
+    }
+    defn(envc, "delete_if", 0, 0, |s, _, b| env_filter(s, b, "delete_if", true));
+    defn(envc, "reject!", 0, 0, |s, _, b| env_filter(s, b, "reject!", true));
+    defn(envc, "keep_if", 0, 0, |s, _, b| env_filter(s, b, "keep_if", false));
+    defn(envc, "select!", 0, 0, |s, _, b| env_filter(s, b, "select!", false));
+    defn(envc, "filter!", 0, 0, |s, _, b| env_filter(s, b, "filter!", false));
+    defn(envc, "rehash", 0, 0, |_, _, _| QNIL);
+    defn(envc, "freeze", 0, 0, |_, _, _| raise(rt().c.type_error, "cannot freeze ENV"));
+    defn(envc, "dup", 0, 0, |_, _, _| raise(rt().c.type_error, "Cannot dup ENV, use ENV.to_h to get a copy of ENV as a hash"));
+    // the read-only rest acts on a Hash snapshot, as CRuby's ENV methods return Hashes and Arrays
+    macro_rules! env_via_hash {
+        ($($name:literal),*) => {
+            $(defn(envc, $name, 0, -1, |s, a, b| {
+                let r = send(env_hash(), sym($name), a, b);
+                if !is_proc(b) && is_a(r, rt().c.enumerator) { enum_for(s, $name, a) } else { r }
+            });)*
+        };
+    }
+    env_via_hash!(
+        "keys", "values", "to_a", "size", "length", "empty?", "value?", "has_value?", "key", "values_at",
+        "fetch_values", "slice", "except", "assoc", "rassoc", "invert", "select", "filter", "reject",
+        "each_key", "each_value", "filter_map", "any?", "find", "detect", "map", "count", "sort_by", "min_by",
+        "max_by", "sum", "each_with_object", "partition", "group_by", "to_set"
+    );
+    crate::kernel::do_include(envc, rt().c.enumerable as V);
 
     // ---- GC ----
     let gc = new_module("GC");
@@ -1528,6 +1651,10 @@ pub fn init() {
     for k in ["host_os", "target_os"] {
         crate::hash::hset(cfg, str_from(k), str_from(&os));
     }
+    // "arm64-darwin27" / "x86_64-linux", as CRuby names its platform
+    let cpu = if cfg!(target_arch = "aarch64") { if cfg!(target_os = "macos") { "arm64" } else { "aarch64" } } else { "x86_64" };
+    let arch = format!("{cpu}-{os}");
+    crate::hash::hset(cfg, str_from("arch"), str_from(&arch));
     let rel = ruby_release();
     let (abi, major, minor, teeny, patchlevel) =
         (format!("{}.{}.0", rel.major, rel.minor), rel.major.to_string(), rel.minor.to_string(), rel.teeny.to_string(), rel.patchlevel.to_string());
@@ -1538,28 +1665,48 @@ pub fn init() {
         ("TEENY", teeny.as_str()),
         ("PATCHLEVEL", patchlevel.as_str()),
         ("host_cpu", if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" }),
-        ("arch", if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" }),
         ("EXEEXT", ""),
         ("DLEXT", "bundle"),
         ("ruby_install_name", "ruby"),
         ("RUBY_INSTALL_NAME", "ruby"),
         ("bindir", "/usr/local/bin"),
-        ("rubylibdir", ""),
         ("engine", "kenny"),
     ] {
         crate::hash::hset(cfg, str_from(k), str_from(v));
+    }
+    // the install layout CRuby's RbConfig describes (RubyGems builds its default paths from
+    // it); a Kenny binary has no Ruby install, so these are CRuby's defaults under /usr/local
+    let lib = "/usr/local/lib/ruby".to_string();
+    for (k, v) in [
+        ("prefix", "/usr/local".to_string()),
+        ("exec_prefix", "/usr/local".to_string()),
+        ("libdir", "/usr/local/lib".to_string()),
+        ("datadir", "/usr/local/share".to_string()),
+        ("sysconfdir", "/usr/local/etc".to_string()),
+        ("rubylibprefix", lib.clone()),
+        ("rubylibdir", format!("{lib}/{abi}")),
+        ("rubyarchdir", format!("{lib}/{abi}/{arch}")),
+        ("archdir", format!("{lib}/{abi}/{arch}")),
+        ("sitedir", format!("{lib}/site_ruby")),
+        ("sitelibdir", format!("{lib}/site_ruby/{abi}")),
+        ("sitearchdir", format!("{lib}/site_ruby/{abi}/{arch}")),
+        ("vendordir", format!("{lib}/vendor_ruby")),
+        ("vendorlibdir", format!("{lib}/vendor_ruby/{abi}")),
+        ("vendorarchdir", format!("{lib}/vendor_ruby/{abi}/{arch}")),
+    ] {
+        crate::hash::hset(cfg, str_from(k), str_from(&v));
     }
     const_set(rbc, sym("CONFIG"), cfg);
     // CRuby's has the unexpanded Makefile values; Kenny's values have nothing to expand
     const_set(rbc, sym("MAKEFILE_CONFIG"), cfg);
     defs(rbc, "ruby", 0, 0, |_, _, _| str_from("ruby"));
     set_global_const("RUBY_VERSION", str_from(&rel.version));
-    set_global_const("RUBY_PLATFORM", str_from(if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" }));
+    set_global_const("RUBY_PLATFORM", str_from(&arch));
     set_global_const("RUBY_ENGINE", str_from("kenny"));
     set_global_const("RUBY_PATCHLEVEL", mkfix(rel.patchlevel));
     set_global_const("RUBY_RELEASE_DATE", str_from(&rel.release_date));
     set_global_const("RUBY_COPYRIGHT", str_from("Kenny Ruby"));
-    let platform = if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" };
+    let platform = arch.as_str();
     let description = format!("kenny (ruby {} compatible) [{platform}]", rel.version);
     set_global_const("RUBY_DESCRIPTION", str_from(&description));
     // Ruby 4.0's `Ruby` module: the same facts as the RUBY_* constants

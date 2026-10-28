@@ -69,6 +69,8 @@ pub(crate) enum Local {
 
 pub(crate) struct ScopeInfo {
     pub env_slots: HashMap<Vec<u8>, usize>,
+    /// a block's scope (its parent's locals are visible to it)
+    pub block: bool,
 }
 
 pub(crate) struct LoopCtx {
@@ -303,6 +305,8 @@ pub struct Compiler<M: Module> {
     pub(crate) block_parent: Option<String>,
     /// Per compiled function: return-address offsets of its calls and their source locations.
     pub(crate) debug_fns: Vec<DebugFn>,
+    /// The definition line of the next function `build_fn` compiles (see `DebugFn::def_line`).
+    pub(crate) def_line_next: u32,
     /// Proc#parameters descriptors of the blocks compiled (`scopes::params_desc` form).
     pub(crate) block_params: Vec<(FuncId, String)>,
     /// Start offset of every line of the current source (for `line_of`), keyed by the source.
@@ -321,6 +325,8 @@ pub(crate) struct DebugFn {
     /// Only `calls` are frames (kenny-runtime backtrace.rs `Func::exact`; written as the
     /// size's top bit).
     pub exact: bool,
+    /// The line of its `def` or block (0: none): Method/Proc#source_location.
+    pub def_line: u32,
 }
 pub(crate) const DEBUG_EXACT: u32 = 1 << 31;
 
@@ -450,12 +456,15 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_require_file", &[I64, I64], &[I64]),
     ("kn_wb_env", &[I64], &[I64]),
     ("kn_using", &[I64, I64, I64], &[I64]),
+    ("kn_refine_scope", &[I64, I64, I64], &[I64]),
     ("kn_super_dyn", &[I64, I64, I64], &[I64]),
     ("kn_super_blk", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_clear_pending", &[], &[I64]),
     ("kn_set_lexical_parent", &[I64, I64], &[I64]),
     ("kn_rational_lit", &[I64, I64], &[I64]),
     ("kn_binding_new", &[I64], &[I64]),
+    ("kn_binding_new_l", &[I64, I64], &[I64]),
+    ("kn_eval_locals", &[I64, I64], &[I64]),
     ("kn_register_file", &[I64, I64, I64, I64, I64], &[]),
     ("kn_register_debug", &[I64, I64, I64, I64], &[]),
     ("kn_register_ruby", &[I64, I64], &[]),
@@ -621,6 +630,7 @@ impl<M: Module> Compiler<M> {
             block_parent: None,
             cref_parents: HashMap::new(),
             debug_fns: Vec::new(),
+            def_line_next: 0,
             block_params: Vec::new(),
             line_index: (PathBuf::new(), 0, 0, Vec::new()),
         })
@@ -721,7 +731,7 @@ impl Compiler<ObjectModule> {
                     fn_bytes.extend_from_slice(&(f.size | if f.exact { DEBUG_EXACT } else { 0 }).to_le_bytes());
                     fn_bytes.extend_from_slice(&f.label.to_le_bytes());
                     fn_bytes.extend_from_slice(&f.file.to_le_bytes());
-                    fn_bytes.extend_from_slice(&0u32.to_le_bytes());
+                    fn_bytes.extend_from_slice(&f.def_line.to_le_bytes());
                     fn_bytes.extend_from_slice(&((call_bytes.len() / 8) as u32).to_le_bytes());
                     fn_bytes.extend_from_slice(&(f.calls.len() as u32).to_le_bytes());
                     for (ret, loc) in &f.calls {
@@ -835,7 +845,7 @@ impl<M: Module> Compiler<M> {
     }
 
     /// Keep the call sites' source locations of a compiled function (see `DebugFn`).
-    pub(crate) fn record_debug_info(&mut self, id: FuncId, label: &str, code: &cranelift_codegen::CompiledCode) {
+    pub(crate) fn record_debug_info(&mut self, id: FuncId, label: &str, code: &cranelift_codegen::CompiledCode, def_line: u32) {
         let srclocs = code.buffer.get_srclocs_sorted();
         let mut calls: Vec<(u32, u32)> = Vec::new();
         for cs in code.buffer.call_sites() {
@@ -848,7 +858,8 @@ impl<M: Module> Compiler<M> {
             }
             calls.push((cs.ret_addr, loc));
         }
-        if calls.is_empty() {
+        // (a function with no calls is listed when it has a definition line, for source_location)
+        if calls.is_empty() && def_line == 0 {
             return;
         }
         let mut l = label.as_bytes().to_vec();
@@ -858,7 +869,7 @@ impl<M: Module> Compiler<M> {
         f.push(0);
         let file = self.str_offset(&f) as u32;
         let size = code.buffer.data().len() as u32;
-        self.debug_fns.push(DebugFn { id, size, label, file, calls, exact: false });
+        self.debug_fns.push(DebugFn { id, size, label, file, calls, exact: false, def_line });
     }
     /// True when compiling a file found via a load path (a dependency, not the app itself).
     pub(crate) fn in_dependency(&self) -> bool {

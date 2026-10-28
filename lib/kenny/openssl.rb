@@ -26,6 +26,9 @@ module OpenSSL
       __kenny_copy(other)
     end
 
+    # Digest::Instance#new: a reset copy (same algorithm, no data)
+    def new = dup.reset
+
     class MD5 < Digest
       def initialize(data = nil)
         super("MD5", data)

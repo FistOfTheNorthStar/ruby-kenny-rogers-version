@@ -95,6 +95,11 @@ fn method_vis(c: *mut Class, id: u32) -> Option<u8> {
 /// Method names of `c` (and ancestors if `inherit`) whose visibility passes `want`.
 fn list(c: *mut Class, inherit: bool, want: &dyn Fn(u8) -> bool) -> V {
     let classes = if inherit { ancestors(c) } else { vec![c] };
+    list_in(&classes, want)
+}
+
+fn list_in(classes: &[*mut Class], want: &dyn Fn(u8) -> bool) -> V {
+    let classes = classes.iter().copied();
     let mut seen: Vec<u32> = Vec::new();
     let mut out = Vec::new();
     for k in classes {
@@ -215,9 +220,25 @@ pub fn init() {
         }
         send(s, id, &a[1..], b)
     });
-    defn(k, "private_methods", 0, 1, |s, _, _| list(class_of(s), true, &|v| v == VIS_PRIVATE));
-    defn(k, "protected_methods", 0, 1, |s, _, _| list(class_of(s), true, &|v| v == VIS_PROTECTED));
-    defn(k, "public_methods", 0, 1, |s, _, _| list(class_of(s), true, &|v| v == VIS_PUBLIC));
+    // (all = false: the methods of the object's singleton class and its class, not of the
+    // ancestors above)
+    fn obj_list(s: V, a: &[V], want: &dyn Fn(u8) -> bool) -> V {
+        if a.first().is_none_or(|x| truthy(*x)) {
+            return list(class_of(s), true, want);
+        }
+        let real = real_class(s);
+        let mut own = Vec::new();
+        for k in ancestors(class_of(s)) {
+            own.push(k);
+            if k == real {
+                break;
+            }
+        }
+        list_in(&own, want)
+    }
+    defn(k, "private_methods", 0, 1, |s, a, _| obj_list(s, a, &|v| v == VIS_PRIVATE));
+    defn(k, "protected_methods", 0, 1, |s, a, _| obj_list(s, a, &|v| v == VIS_PROTECTED));
+    defn(k, "public_methods", 0, 1, |s, a, _| obj_list(s, a, &|v| v == VIS_PUBLIC));
     // public and protected, as in CRuby (`methods(false)`: the singleton methods)
     defn(k, "methods", 0, 1, |s, a, _| {
         if a.first().is_some_and(|x| !truthy(*x)) {

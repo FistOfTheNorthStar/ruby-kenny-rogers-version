@@ -7,6 +7,47 @@ use crate::tri;
 static METHOD: G<*mut Class> = G::new(std::ptr::null_mut());
 static UNBOUND: G<*mut Class> = G::new(std::ptr::null_mut());
 
+/// [file, line] of compiled code starting at `addr`, or nil.
+fn code_location(addr: usize) -> V {
+    match crate::backtrace::def_location(addr) {
+        Some((file, line)) => ary_new(vec![str_from(&file), mkfix(line)]),
+        None => QNIL,
+    }
+}
+
+/// `Proc#source_location`: where its block starts (nil for a native block).
+pub fn proc_location(p: V) -> V {
+    if !is_proc(p) {
+        return QNIL;
+    }
+    let pr = unsafe { &*(p as *const RProc) };
+    if !pr.native.is_null() {
+        return QNIL;
+    }
+    code_location(pr.func as usize)
+}
+
+/// `Method#source_location`: where its `def` (or `define_method` block) is; nil for a
+/// method built into Kenny.
+pub fn method_location(m: *const Method) -> V {
+    if m.is_null() {
+        return QNIL;
+    }
+    let m = unsafe { &*m };
+    match &m.body {
+        Body::Compiled(f) => {
+            let r = code_location(*f as usize);
+            if r != QNIL || m.fast == 0 {
+                return r;
+            }
+            // (a method with a fast entry: the body is that function; `f` wraps it)
+            code_location(m.fast & ((1 << 56) - 1))
+        }
+        Body::Proc(p) => proc_location(*p),
+        _ => QNIL,
+    }
+}
+
 fn mptr(v: V) -> *const Method {
     fix(ivar_get(v, sym("@__m"))) as usize as *const Method
 }
@@ -340,7 +381,7 @@ pub fn init() {
         });
         defn(c, "arity", 0, 0, |s, _, _| mkfix(arity(mptr(s))));
         defn(c, "parameters", 0, 0, |s, _, _| parameters(mptr(s)));
-        defn(c, "source_location", 0, 0, |_, _, _| QNIL);
+        defn(c, "source_location", 0, 0, |s, _, _| method_location(mptr(s)));
         defn(c, "super_method", 0, 0, |s, _, _| super_method(s));
         defn(c, "original_name", 0, 0, |s, _, _| {
             let m = mptr(s);

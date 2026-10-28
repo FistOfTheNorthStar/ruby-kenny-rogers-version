@@ -81,7 +81,8 @@ pub fn resolve(lockfile: &Path) -> Result<Bundle, String> {
     let root = lockfile.parent().unwrap().to_path_buf();
     let gemfile = if lockfile.file_name().is_some_and(|n| n == "gems.locked") { root.join("gems.rb") } else { root.join("Gemfile") };
     let lock = std::fs::read_to_string(lockfile).map_err(|e| format!("{}: {e}", lockfile.display()))?;
-    let (specs, lock_deps) = parse_lock(&lock, &root);
+    let (specs, lock_reqs, bundled_with) = parse_lock(&lock, &root);
+    let lock_deps: Vec<String> = lock_reqs.iter().map(|(n, _)| n.clone()).collect();
     let gemfile_src = std::fs::read(&gemfile).map_err(|e| format!("{}: {e}", gemfile.display()))?;
     let mut deps = parse_gemfile(&gemfile_src);
     // the lock's DEPENDENCIES is the authority on which gems the Gemfile declares
@@ -182,19 +183,22 @@ pub fn resolve(lockfile: &Path) -> Result<Bundle, String> {
     rb.push_str(&format!("    LOCKFILE = {}\n", rstr(&lockfile.display().to_string())));
     rb.push_str(&format!("    WITHOUT = [{}]\n", without.iter().filter(|g| !with.contains(*g)).map(|g| format!(":{g}")).collect::<Vec<_>>().join(", ")));
     rb.push_str(&format!("    # gems replaced by the binary itself (its HTTP server)\n    REPLACED = [{}].freeze\n", REPLACED.iter().map(|g| rstr(g)).collect::<Vec<_>>().join(", ")));
-    rb.push_str("    # name, groups, autorequire (nil: the gem's name), for this platform, compiled in\n    DEPENDENCIES = [\n");
+    rb.push_str(&format!("    # the lock's BUNDLED WITH\n    BUNDLED_WITH = {}\n", bundled_with.as_deref().map(rstr).unwrap_or_else(|| "nil".into())));
+    rb.push_str("    # name, groups, autorequire (nil: the gem's name), for this platform, compiled in,\n    # version requirements (from the lock)\n    DEPENDENCIES = [\n");
     for d in &deps {
         let auto = match &d.autorequire {
             None => "nil".to_string(),
             Some(v) => format!("[{}]", v.iter().map(|s| rstr(s)).collect::<Vec<_>>().join(", ")),
         };
+        let reqs = lock_reqs.iter().find(|(n, _)| *n == d.name).map(|(_, r)| r.iter().map(|x| rstr(x)).collect::<Vec<_>>().join(", ")).unwrap_or_default();
         rb.push_str(&format!(
-            "      [{}, [{}], {}, {}, {}],\n",
+            "      [{}, [{}], {}, {}, {}, [{}]],\n",
             rstr(&d.name),
             d.groups.iter().map(|g| format!(":{g}")).collect::<Vec<_>>().join(", "),
             auto,
             platform_ok(&d.platforms),
-            compiled.contains(d.name.as_str()) && included(d)
+            compiled.contains(d.name.as_str()) && included(d),
+            reqs
         ));
     }
     rb.push_str("    ].freeze\n    # name, version, gem directory, require paths\n    SPECS = [\n");
@@ -253,9 +257,11 @@ fn group_settings(root: &Path) -> (Vec<String>, Vec<String>) {
 
 // ---------- Gemfile.lock ----------
 
-fn parse_lock(text: &str, root: &Path) -> (Vec<Spec>, Vec<String>) {
+/// The lock's specs, its DEPENDENCIES (name, requirements) and BUNDLED WITH version.
+fn parse_lock(text: &str, root: &Path) -> (Vec<Spec>, Vec<(String, Vec<String>)>, Option<String>) {
     let mut specs = Vec::new();
     let mut deps = Vec::new();
+    let mut bundled_with = None;
     let mut section = "";
     let mut source = Source::Gem;
     let mut remote = String::new();
@@ -267,6 +273,7 @@ fn parse_lock(text: &str, root: &Path) -> (Vec<Spec>, Vec<String>) {
                 "PATH" => "PATH",
                 "GIT" => "GIT",
                 "DEPENDENCIES" => "DEPENDENCIES",
+                "BUNDLED WITH" => "BUNDLED WITH",
                 _ => "",
             };
             remote.clear();
@@ -302,13 +309,16 @@ fn parse_lock(text: &str, root: &Path) -> (Vec<Spec>, Vec<String>) {
             "DEPENDENCIES" if indent == 2 => {
                 let n = t.split([' ', '!']).next().unwrap_or("");
                 if !n.is_empty() {
-                    deps.push(n.to_string());
+                    // `rails (~> 8.0, >= 8.0.1)`
+                    let reqs = t.split_once(" (").map(|(_, r)| r.trim_end_matches(')').split(", ").map(str::to_string).collect()).unwrap_or_default();
+                    deps.push((n.to_string(), reqs));
                 }
             }
+            "BUNDLED WITH" if !t.is_empty() => bundled_with = Some(t.to_string()),
             _ => {}
         }
     }
-    (specs, deps)
+    (specs, deps, bundled_with)
 }
 
 // ---------- installed gems ----------

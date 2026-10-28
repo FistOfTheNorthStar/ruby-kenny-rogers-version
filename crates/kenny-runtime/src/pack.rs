@@ -1061,8 +1061,18 @@ pub fn init() {
             }
             Some(buf) if buf != QNIL => type_error(&format!("buffer must be String, not {}", class_name(real_class(buf)))),
             _ => {
-                let first = fmt.iter().find(|c| !c.is_ascii_whitespace()).copied();
-                if first == Some(b'U') { str_new(bytes) } else { bin_str(bytes) }
+                // CRuby's choice: UTF-8 when the template starts with U, US-ASCII when it has
+                // only m/M/u (base64, quoted-printable, uuencode), else binary
+                let dirs: Vec<u8> = fmt.iter().copied().filter(|c| c.is_ascii_alphabetic()).collect();
+                if dirs.first() == Some(&b'U') {
+                    str_new(bytes)
+                } else if !dirs.is_empty() && dirs.iter().all(|c| matches!(c, b'm' | b'M' | b'u')) {
+                    let v = str_new(bytes);
+                    hdr(v).flags |= crate::compat::FL_BINARY << 1;
+                    v
+                } else {
+                    bin_str(bytes)
+                }
             }
         }
     });

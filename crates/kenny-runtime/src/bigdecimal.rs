@@ -686,6 +686,22 @@ fn div(a: &D, b: &D) -> D {
     d.neg = neg;
     d
 }
+/// The program bundles bigdecimal 4.x (set by lib/kenny/bigdecimal.rb): `/` rounds to
+/// max(precisions) + 16 digits (at least 32), divmod's quotient is an Integer, sqrt(n)
+/// rounds to n digits.
+static V4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn v4() -> bool {
+    V4.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// 4.x's `a / b`.
+fn div_v4(a: &D, b: &D) -> D {
+    if a.k != Kd::Fin || b.k != Kd::Fin || a.m.is_zero() || b.m.is_zero() {
+        return div(a, b);
+    }
+    let ix = (a.precision_scale().0.max(b.precision_scale().0) + 16).max(32);
+    div_digits(a, b, ix)
+}
+
 fn div_maxprec(a: &D, b: &D) -> i64 {
     let (ap, _) = a.precision_scale();
     let (bp, _) = b.precision_scale();
@@ -1141,6 +1157,10 @@ fn init_bigdecimal() {
     });
     defs(c, "limit", 0, 1, |_, _, _| mkfix(0));
     defs(c, "double_fig", 0, 0, |_, _, _| mkfix(16));
+    defs(c, "__kenny_v4!", 0, 0, |_, _, _| {
+        V4.store(true, std::sync::atomic::Ordering::Relaxed);
+        QNIL
+    });
     defs(c, "save_rounding_mode", 0, 0, |_, _, b| {
         let m = mode();
         let r = call_block(b, &[]);
@@ -1154,6 +1174,7 @@ fn init_bigdecimal() {
     defn(c, "-", 1, 1, |s, a, _| binop(s, a[0], "-", |x, y| add(x, &y.neg_())));
     defn(c, "*", 1, 1, |s, a, _| binop(s, a[0], "*", mul));
     defn(c, "/", 1, 1, |s, a, _| match operand(a[0]) {
+        Some(b) if v4() => new_bd(div_v4(&get(s), &b)),
         Some(b) => {
             let x = get(s);
             let r = div(&x, &b);
@@ -1222,7 +1243,7 @@ fn init_bigdecimal() {
                 return arg_error("negative precision");
             }
             if n == 0 {
-                return new_bd(div(&x, &b));
+                return new_bd(if v4() { div_v4(&x, &b) } else { div(&x, &b) });
             }
             return new_bd(div_digits(&x, &b, n));
         }
@@ -1249,6 +1270,7 @@ fn init_bigdecimal() {
     defn(c, "divmod", 1, 1, |s, a, _| {
         let Some(b) = operand(a[0]) else { return coerce_bin(s, a[0], "divmod") };
         match divmod(&get(s), &b) {
+            Ok((q, m)) if v4() && q.k == Kd::Fin => ary_new(vec![tri!(to_int(&q)), new_bd(m)]),
             Ok((q, m)) => ary_new(vec![new_bd(q), new_bd(m)]),
             Err(e) => e,
         }
@@ -1313,7 +1335,13 @@ fn init_bigdecimal() {
         if x.k == Kd::Inf || x.m.is_zero() {
             return s;
         }
-        let digits = (n.max(16) / 9 + 2) * 9 + 1;
+        // 4.x: n significant digits (n = 0: the value's own + 16), rounded
+        let (digits, n4) = if v4() {
+            let n = if n == 0 { x.digits().len() as i64 + 16 } else { n };
+            (n + 9, Some(n))
+        } else {
+            ((n.max(16) / 9 + 2) * 9 + 1, None)
+        };
         // sqrt(m * 10^e) with `digits` significant digits (truncated)
         let mut e = x.e;
         let mut m = x.m.clone();
@@ -1326,7 +1354,11 @@ fn init_bigdecimal() {
         m *= pow10(shift);
         e -= shift;
         let r = m.sqrt();
-        new_bd(round_sig(&D::fin(false, r, e / 2), digits, ROUND_DOWN))
+        let r = round_sig(&D::fin(false, r, e / 2), digits, ROUND_DOWN);
+        new_bd(match n4 {
+            Some(n) => round_sig(&r, n, mode()),
+            None => r,
+        })
     });
     defn(c, "-@", 0, 0, |s, _, _| new_bd(get(s).neg_()));
     defn(c, "+@", 0, 0, |s, _, _| s);
@@ -1424,11 +1456,9 @@ fn init_bigdecimal() {
         if d.k != Kd::Fin {
             return domain_error(&d);
         }
-        let Some(r) = const_lookup(rt().c.object, sym("Rational")) else {
-            return raise(rt().c.not_implemented_error, "Rational is not available");
-        };
         let (n, den) = if d.e >= 0 { (d.signed() * pow10(d.e), BigInt::one()) } else { (d.signed(), pow10(-d.e)) };
-        send(r, sym("new"), &[int_from_big(n), int_from_big(den)], QNIL)
+        // Kernel#Rational reduces (Rational has no public `new`)
+        send(rt().main_obj, sym("Rational"), &[int_from_big(n), int_from_big(den)], QNIL)
     });
     defn(c, "hash", 0, 0, |s, _, _| send0(s, "__kn_hash"));
 

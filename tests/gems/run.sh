@@ -1,6 +1,6 @@
 #!/bin/sh
 # Smoke-test popular gems under Kenny: each tests/gems/<gem>/test.rb runs under CRuby and
-# under `kenny run`, and the two outputs must match.
+# as a Kenny binary; the two outputs (stdout, and stderr apart) must match.
 #
 #   tests/gems/run.sh              every gem
 #   tests/gems/run.sh rack json    only these
@@ -36,18 +36,20 @@ pass=0; fail=0; failed=""
 for g in $gems; do
   dir="$root/tests/gems/$g"
   [ -f "$dir/test.rb" ] || { echo "no test for $g"; continue; }
-  (cd "$dir" && limit ruby test.rb) > "$out/$g.ruby" 2>&1
+  # (stdout and stderr compared apart: CRuby buffers stdout into a file, so how the two
+  # interleave differs)
+  (cd "$dir" && limit ruby test.rb) > "$out/$g.ruby" 2> "$out/$g.ruby.err"
   if ! (cd "$dir" && limit "$root/target/release/kenny" build test.rb -o "$out/$g.bin") > "$out/$g.build" 2>&1; then
     fail=$((fail+1)); failed="$failed $g"; echo "FAIL $g (build)"
     grep -v '^warning: ' "$out/$g.build" | head -${KENNY_GEMS_DIFF:-15}
     continue
   fi
-  (cd "$dir" && limit "$out/$g.bin") > "$out/$g.kenny" 2>&1
-  if cmp -s "$out/$g.ruby" "$out/$g.kenny"; then
+  (cd "$dir" && limit "$out/$g.bin") > "$out/$g.kenny" 2> "$out/$g.kenny.err"
+  if cmp -s "$out/$g.ruby" "$out/$g.kenny" && cmp -s "$out/$g.ruby.err" "$out/$g.kenny.err"; then
     pass=$((pass+1)); echo "ok   $g"
   else
     fail=$((fail+1)); failed="$failed $g"; echo "FAIL $g"
-    diff "$out/$g.ruby" "$out/$g.kenny" | head -${KENNY_GEMS_DIFF:-15}
+    { diff "$out/$g.ruby" "$out/$g.kenny"; diff "$out/$g.ruby.err" "$out/$g.kenny.err"; } | head -${KENNY_GEMS_DIFF:-15}
   fi
 done
 echo "$pass passed, $fail failed${failed:+:$failed}"

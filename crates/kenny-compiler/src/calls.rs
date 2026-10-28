@@ -187,7 +187,7 @@ impl<M: Module> Compiler<M> {
                     (v, None)
                 } else if let Some(bn) = b.as_block_node() {
                     let locals = bn.locals().iter().map(|c| c.as_slice().to_vec()).collect();
-                    let p = self.block_proc(fx, bn.parameters(), bn.body(), locals, lambda);
+                    let p = self.block_proc(fx, bn.parameters(), bn.body(), locals, lambda, bn.location().start_offset());
                     (p, Some(p))
                 } else {
                     (self.nil(fx), None)
@@ -197,6 +197,29 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn call_node(&mut self, fx: &mut Fx, c: &CallNode) -> Value {
+        // `refine X do ... end`: inside the block the module's refinements are active (CRuby
+        // activates them in refine blocks), so its calls are refined call sites
+        if c.receiver().is_none()
+            && c.name().as_slice() == b"refine"
+            && c.arguments().is_some_and(|a| a.arguments().iter().count() == 1)
+            && c.block().is_some_and(|b| b.as_block_node().is_some())
+        {
+            self.refine_counter += 1;
+            let id = (self.fn_counter as u64) << 20 | self.refine_counter;
+            let parent = self.refine_scope.unwrap_or(0);
+            let idv = self.iconst(fx, id as i64);
+            let pv = self.iconst(fx, parent as i64);
+            let m = self.self_val(fx);
+            self.callc(fx, "kn_refine_scope", &[idv, m, pv]);
+            let saved = self.refine_scope.replace(id);
+            let r = self.call_node_inner(fx, c);
+            self.refine_scope = saved;
+            return r;
+        }
+        self.call_node_inner(fx, c)
+    }
+
+    fn call_node_inner(&mut self, fx: &mut Fx, c: &CallNode) -> Value {
         let name = c.name().as_slice().to_vec();
         let at = c.location().start_offset();
         let at_loc = c.message_loc().map(|l| l.start_offset()).unwrap_or(at);
@@ -273,6 +296,21 @@ impl<M: Module> Compiler<M> {
                 b"require_relative" if arg_nodes.len() == 1 && arg_nodes[0].as_string_node().is_some() => {
                     return self.require_relative(fx, &arg_nodes[0], at);
                 }
+                // a computed path (`require_relative "versions/#{v}"`): resolved at run time
+                // against this file's directory; the files of gem directories are compiled in
+                b"require_relative" if arg_nodes.len() == 1 && block.is_none() => {
+                    let base = self.file.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                    let dir = base.canonicalize().unwrap_or(base);
+                    // the program's own files aren't all compiled in: one it names this way is
+                    // compiled when it is required (gems' files are all in the binary)
+                    if !self.in_dependency() {
+                        self.needs_jit = true;
+                    }
+                    let v = self.expr(fx, &arg_nodes[0]);
+                    let d = self.str_lit(fx, dir.display().to_string().as_bytes());
+                    let s = self.self_val(fx);
+                    return self.send(fx, s, b"__kenny_require_relative", &[v, d], None);
+                }
                 b"using" if arg_nodes.len() == 1 => {
                     let m = self.expr(fx, &arg_nodes[0]);
                     self.refine_counter += 1;
@@ -292,13 +330,7 @@ impl<M: Module> Compiler<M> {
                     if let Some(d) = self.file.parent() {
                         dirs.push(d.to_path_buf());
                     }
-                    let found = dirs.iter().map(|d| {
-                        let mut p = d.join(&name);
-                        if p.extension().is_none() {
-                            p.set_extension("rb");
-                        }
-                        p
-                    }).find(|p| p.is_file());
+                    let found = dirs.iter().map(|d| rb_file(d.join(&name))).find(|p| p.is_file());
                     if let Some(p) = found {
                         if let Some((fid, flag)) = self.require_file(p, at) {
                             let s = self.self_val(fx);
@@ -340,10 +372,32 @@ impl<M: Module> Compiler<M> {
                     }
                 }
                 b"binding" if arg_nodes.is_empty() && block.is_none() => {
-                    // captures self only; eval through it needs the runtime compiler
+                    // self and a snapshot of the locals; eval through it needs the runtime
+                    // compiler
                     self.needs_jit = true;
                     let s = self.self_val(fx);
-                    return self.call(fx, "kn_binding_new", &[s]);
+                    let l = self.locals_snapshot(fx);
+                    return self.call(fx, "kn_binding_new_l", &[s, l]);
+                }
+                b"local_variables" if arg_nodes.is_empty() && block.is_none() => {
+                    return self.local_variables(fx);
+                }
+                // in an eval'd string: the caller's locals (the runtime prefixes the source
+                // with `a, b, = __kenny_evl;` and passes their values as the argument)
+                b"__kenny_evl" if self.eval_unit && arg_nodes.is_empty() && block.is_none() => {
+                    let argc = fx.b.use_var(fx.argc_v);
+                    let argv = fx.b.use_var(fx.argv_v);
+                    let has = fx.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, argc, 0);
+                    let ok = fx.b.create_block();
+                    let done = fx.b.create_block();
+                    fx.b.append_block_param(done, I64);
+                    let nil = self.nil(fx);
+                    fx.b.ins().brif(has, ok, &[], done, &[nil.into()]);
+                    fx.b.switch_to_block(ok);
+                    let v = fx.b.ins().load(I64, mem(), argv, 0);
+                    fx.b.ins().jump(done, &[v.into()]);
+                    fx.b.switch_to_block(done);
+                    return fx.b.block_params(done)[0];
                 }
                 b"lambda" if arg_nodes.is_empty() && block.as_ref().is_some_and(|b| b.as_block_node().is_some()) => {
                     let (p, _) = self.block_arg(fx, block, true);
@@ -374,6 +428,16 @@ impl<M: Module> Compiler<M> {
         // `load(path)` at runtime recompiles a file that changed since the build (or isn't
         // compiled in), so it needs the runtime compiler too
         if name.as_slice() == b"load" && !arg_nodes.is_empty() {
+            self.needs_jit = true;
+        }
+        // so does a `require` or `autoload` of a computed path in the program's own code (it
+        // may name a file that isn't compiled in; gems' files all are)
+        let path_arg = match name.as_slice() {
+            b"require" => arg_nodes.first(),
+            b"autoload" => arg_nodes.get(1),
+            _ => None,
+        };
+        if path_arg.is_some_and(|a| a.as_string_node().is_none()) && !self.in_dependency() {
             self.needs_jit = true;
         }
 
@@ -409,6 +473,11 @@ impl<M: Module> Compiler<M> {
         {
             let a = self.expr(fx, &arg_nodes[0]);
             self.binop(fx, &name, recv, a)
+        } else if c.is_variable_call() && self.refine_scope.is_some() {
+            // (a self call sees refinements too)
+            let r = self.send_raw(fx, recv, &name, &Args { vals: vec![], splat: None }, None, false);
+            self.check(fx, r);
+            r
         } else if c.is_variable_call() {
             self.mark_loc(fx);
             let cache = self.owned_cache_ptr(fx, OWNED_CALL);
@@ -451,6 +520,13 @@ impl<M: Module> Compiler<M> {
             r
         } else {
             let args = self.eval_args(fx, c.arguments());
+            // an eval'd string sees the caller's locals: a snapshot, handed to the runtime with
+            // the source string it is for
+            if crate::analysis::sees_locals(c) && args.splat.is_none() && !args.vals.is_empty() {
+                let l = self.locals_snapshot(fx);
+                let src = args.vals[0];
+                self.call(fx, "kn_eval_locals", &[l, src]);
+            }
             let forwards = arg_nodes.iter().any(|n| n.as_forwarding_arguments_node().is_some());
             let no_block = block.is_none() && !forwards;
             let (blk, literal) = if forwards && block.is_none() {
@@ -624,10 +700,7 @@ impl<M: Module> Compiler<M> {
     fn require_relative(&mut self, fx: &mut Fx, arg: &Node, at: usize) -> Value {
         let rel = String::from_utf8_lossy(arg.as_string_node().unwrap().unescaped()).into_owned();
         let base = self.file.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let mut full = base.join(&rel);
-        if full.extension().is_none() {
-            full.set_extension("rb");
-        }
+        let full = rb_file(base.join(&rel));
         if self.file_unit {
             // a file compiled at runtime: the program's own copy of the file (compiled in, or
             // loaded from disk by the runtime), not a second one inside this unit
@@ -907,4 +980,18 @@ impl<M: Module> Compiler<M> {
             }
         }
     }
+}
+
+/// The file `require` loads for `path`: `path.rb` unless `path` ends in `.rb` (or names a
+/// C extension) or only `path` itself exists, as in CRuby (`require_relative "parser.tab"`
+/// loads parser.tab.rb).
+pub(crate) fn rb_file(path: PathBuf) -> PathBuf {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("rb" | "so" | "bundle" | "o" | "dll") => return path,
+        _ => {}
+    }
+    let mut with = path.clone().into_os_string();
+    with.push(".rb");
+    let with = PathBuf::from(with);
+    if with.exists() || !path.is_file() { with } else { path }
 }

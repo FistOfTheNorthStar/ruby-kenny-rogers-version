@@ -1423,15 +1423,53 @@ pub fn init() {
             for i in 0..v.len() {
                 v[i] = tri!(call_block(b, &[mkfix(i as i64)]));
             }
-        } else if let Some(&x) = a.first() {
-            let start = a.get(1).map(|i| fix(*i).max(0) as usize).unwrap_or(0);
-            let end = a.get(2).map(|n| start + fix(*n).max(0) as usize).unwrap_or(v.len());
-            if end > v.len() {
-                v.resize(end, QNIL);
+            return s;
+        }
+        // fill(x), fill(x, start [, length]), fill(x, range); start may be negative or nil
+        let Some(&x) = a.first() else { return arg_error("wrong number of arguments (given 0, expected 1..3)") };
+        let len = v.len() as i64;
+        let (start, end) = match a.get(1).copied() {
+            Some(r) if is_range(r) => {
+                if a.len() > 2 {
+                    return arg_error("wrong number of arguments (given 3, expected 1..2)");
+                }
+                let rr = unsafe { &*(r as *const RRange) };
+                let b = if rr.lo == QNIL { 0 } else if is_fix(rr.lo) { fix(rr.lo) } else { return type_error("no implicit conversion into Integer") };
+                let b = if b < 0 { b + len } else { b };
+                if b < 0 {
+                    return raise(rt().c.range_error, &format!("{} out of range", crate::fmt::inspect_lossy(r)));
+                }
+                let e = if rr.hi == QNIL { len } else if is_fix(rr.hi) { fix(rr.hi) } else { return type_error("no implicit conversion into Integer") };
+                let e = if e < 0 { e + len } else { e };
+                let e = if rr.hi != QNIL && !rr.excl { e + 1 } else { e };
+                (b, e.max(b))
             }
-            for y in &mut v[start..end] {
-                *y = x;
+            st => {
+                let b = match st {
+                    None => 0,
+                    Some(q) if q == QNIL => 0,
+                    Some(q) if is_fix(q) => fix(q),
+                    Some(_) => return type_error("no implicit conversion into Integer"),
+                };
+                let b = if b < 0 { (b + len).max(0) } else { b };
+                let e = match a.get(2).copied() {
+                    None => len.max(b),
+                    Some(q) if q == QNIL => len.max(b),
+                    Some(q) if is_fix(q) => b + fix(q).max(0),
+                    Some(_) => return type_error("no implicit conversion into Integer"),
+                };
+                (b, e)
             }
+        };
+        if end <= start {
+            return s;
+        }
+        let v = mutv!(s);
+        if end as usize > v.len() {
+            v.resize(end as usize, QNIL);
+        }
+        for y in &mut v[start as usize..end as usize] {
+            *y = x;
         }
         s
     });

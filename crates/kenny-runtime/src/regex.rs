@@ -19,6 +19,35 @@ pub struct Re {
     /// `/\A[[:space:]]*\z/` (ActiveSupport's String#blank?): `match?` checks the characters
     /// directly
     pub all_space: bool,
+    /// the pattern compiled as ASCII-8BIT, for matching binary strings with bytes >= 0x80
+    /// byte by byte (built when first needed)
+    bin_twin: std::sync::OnceLock<Option<Regex>>,
+}
+impl Re {
+    pub(crate) fn twin(&self) -> Option<&Regex> {
+        if self.binary {
+            return Some(&self.re);
+        }
+        self.bin_twin
+            .get_or_init(|| {
+                let pat = unescape_unicode(&String::from_utf8_lossy(&self.source)).into_owned();
+                Regex::with_options_and_encoding(onig::EncodedBytes::ascii(pat.as_bytes()), onig_options(self.opts), Syntax::ruby()).ok()
+            })
+            .as_ref()
+    }
+}
+fn onig_options(opts: u32) -> RegexOptions {
+    let mut o = RegexOptions::REGEX_OPTION_NONE;
+    if opts & OPT_I != 0 {
+        o |= RegexOptions::REGEX_OPTION_IGNORECASE;
+    }
+    if opts & OPT_X != 0 {
+        o |= RegexOptions::REGEX_OPTION_EXTEND;
+    }
+    if opts & OPT_M != 0 {
+        o |= RegexOptions::REGEX_OPTION_MULTILINE;
+    }
+    o
 }
 pub const OPT_I: u32 = 1;
 pub const OPT_X: u32 = 2;
@@ -150,16 +179,7 @@ fn optional_groups_as_alternation(pat: &str) -> String {
 pub fn regexp_new(src: &[u8], opts: u32) -> V {
     let raw = String::from_utf8_lossy(src);
     let pat = unescape_unicode(&raw).into_owned();
-    let mut o = RegexOptions::REGEX_OPTION_NONE;
-    if opts & OPT_I != 0 {
-        o |= RegexOptions::REGEX_OPTION_IGNORECASE;
-    }
-    if opts & OPT_X != 0 {
-        o |= RegexOptions::REGEX_OPTION_EXTEND;
-    }
-    if opts & OPT_M != 0 {
-        o |= RegexOptions::REGEX_OPTION_MULTILINE;
-    }
+    let o = onig_options(opts);
     // `/n` with `\x80`-`\xff` escapes: a byte regexp (CRuby makes it ASCII-8BIT); UTF-8
     // Oniguruma would reject the lone bytes as broken multibyte characters
     let binary = opts & OPT_N != 0 && has_high_byte_escape(&pat);
@@ -190,7 +210,7 @@ pub fn regexp_new(src: &[u8], opts: u32) -> V {
             });
             names.sort_by_key(|(_, g)| g.iter().min().copied().unwrap_or(0));
             let all_space = !binary && opts & (OPT_I | OPT_X | OPT_M) == 0 && src == br"\A[[:space:]]*\z";
-            let data = Box::into_raw(Box::new(Re { re, source: src.to_vec(), opts, names, binary, all_space }));
+            let data = Box::into_raw(Box::new(Re { re, source: src.to_vec(), opts, names, binary, all_space, bin_twin: std::sync::OnceLock::new() }));
             let v = alloc(RData {
                 h: Header { klass: *REGEXP.get(), kind: Kind::Data, flags: FL_FROZEN },
                 data: data as *mut std::ffi::c_void,
@@ -221,8 +241,60 @@ fn has_high_byte_escape(pat: &str) -> bool {
     false
 }
 
-fn text(s: V) -> String {
-    String::from_utf8_lossy(&rstr(s).b).into_owned()
+/// A string as the matcher sees it: its bytes (made valid UTF-8 for a text string) and
+/// whether it is ASCII-8BIT. A binary string with bytes >= 0x80 (`raw`) is matched byte by
+/// byte, with the pattern's ASCII-8BIT twin, as CRuby matches it.
+struct Subj {
+    b: Vec<u8>,
+    bin: bool,
+    raw: bool,
+}
+impl Subj {
+    fn len(&self) -> usize {
+        self.b.len()
+    }
+    fn as_bytes(&self) -> &[u8] {
+        &self.b
+    }
+    fn into_bytes(self) -> Vec<u8> {
+        self.b
+    }
+    /// The byte length of the character at `i`.
+    fn step(&self, i: usize) -> usize {
+        if self.raw {
+            return 1;
+        }
+        unsafe { std::str::from_utf8_unchecked(&self.b[i..]) }.chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+    }
+    /// Character index `ch` as a byte offset.
+    fn byte_index(&self, ch: usize) -> usize {
+        if self.raw { ch.min(self.b.len()) } else { byte_index(unsafe { std::str::from_utf8_unchecked(&self.b) }, ch) }
+    }
+    /// A piece of the subject, as a string in its encoding.
+    fn str(&self, bytes: &[u8]) -> V {
+        let v = str_new(bytes.to_vec());
+        if self.bin {
+            hdr(v).flags |= crate::compat::FL_BINARY;
+        }
+        v
+    }
+}
+fn text(s: V) -> Subj {
+    let b = &rstr(s).b;
+    let bin = hdr(s).flags & crate::compat::FL_BINARY != 0;
+    let raw = bin && !b.is_ascii();
+    let b = if raw || std::str::from_utf8(b).is_ok() { b.to_vec() } else { String::from_utf8_lossy(b).into_owned().into_bytes() };
+    Subj { b, bin, raw }
+}
+/// Search `t` from `start` towards `range` (before `start`: backwards).
+fn search_range(r: &Re, t: &Subj, start: usize, range: usize, region: Option<&mut Region>) -> bool {
+    if t.raw || r.binary {
+        let Some(re) = (if t.raw { r.twin() } else { Some(&r.re) }) else { return false };
+        re.search_with_encoding(onig::EncodedBytes::ascii(&t.b), start, range, SearchOptions::SEARCH_OPTION_NONE, region).is_some()
+    } else {
+        let s = unsafe { std::str::from_utf8_unchecked(&t.b) };
+        r.re.search_with_options(s, start, range, SearchOptions::SEARCH_OPTION_NONE, region).is_some()
+    }
 }
 pub fn char_index(b: &[u8], byte: usize) -> usize {
     let byte = byte.min(b.len());
@@ -236,7 +308,7 @@ fn byte_index(t: &str, ch: usize) -> usize {
 }
 
 /// Search from byte offset `start`; returns group offsets (begin,end pairs; -1 if unset).
-pub fn search(re: V, t: &str, start: usize) -> Option<Vec<i64>> {
+fn search(re: V, t: &Subj, start: usize) -> Option<Vec<i64>> {
     let mut region = Region::new();
     if !search_region(re_of(re), t, start, &mut region) {
         return None;
@@ -245,15 +317,11 @@ pub fn search(re: V, t: &str, start: usize) -> Option<Vec<i64>> {
 }
 
 /// Search from byte offset `start` into a caller-owned region (reused across a loop).
-fn search_region(r: &Re, t: &str, start: usize, region: &mut Region) -> bool {
+fn search_region(r: &Re, t: &Subj, start: usize, region: &mut Region) -> bool {
     if start > t.len() {
         return false;
     }
-    if r.binary {
-        r.re.search_with_encoding(onig::EncodedBytes::ascii(t.as_bytes()), start, t.len(), SearchOptions::SEARCH_OPTION_NONE, Some(region)).is_some()
-    } else {
-        r.re.search_with_options(t, start, t.len(), SearchOptions::SEARCH_OPTION_NONE, Some(region)).is_some()
-    }
+    search_range(r, t, start, t.len(), Some(region))
 }
 
 /// Group offsets of a match (begin,end pairs; -1 if the group didn't take part).
@@ -279,6 +347,14 @@ fn region_pos(region: &Region) -> Vec<i64> {
 pub fn matches(re: V, s: V, pos: i64) -> bool {
     let b: &[u8] = &rstr(s).b;
     let r = re_of(re);
+    if hdr(s).flags & crate::compat::FL_BINARY != 0 && !b.is_ascii() {
+        let p = if pos < 0 { pos + b.len() as i64 } else { pos };
+        if p < 0 || p as usize > b.len() {
+            return false;
+        }
+        let Some(tw) = r.twin() else { return false };
+        return tw.search_with_encoding(onig::EncodedBytes::ascii(b), p as usize, b.len(), SearchOptions::SEARCH_OPTION_NONE, None).is_some();
+    }
     let owned;
     let t: &str = match std::str::from_utf8(b) {
         Ok(t) => t,
@@ -317,10 +393,13 @@ pub fn last_match() -> V {
     pst().last_match
 }
 
-fn matchdata_new(re: V, s_bytes: Vec<u8>, pos: Vec<i64>) -> V {
+fn matchdata_new(re: V, s_bytes: Vec<u8>, bin: bool, pos: Vec<i64>) -> V {
     let m = object_new(*MATCHDATA.get());
     let s = str_new(s_bytes);
     hdr(s).flags |= FL_FROZEN;
+    if bin {
+        hdr(s).flags |= crate::compat::FL_BINARY;
+    }
     ivar_set(m, sym("@__str"), s);
     ivar_set(m, sym("@__re"), re);
     ivar_set(m, sym("@__pos"), ary_new(pos.into_iter().map(mkfix).collect()));
@@ -338,7 +417,20 @@ pub fn md_group(m: V, i: usize) -> V {
         return QNIL;
     }
     let b = &rstr(md_str(m)).b;
-    str_new(b[pos[i * 2] as usize..pos[i * 2 + 1] as usize].to_vec())
+    md_piece(m, &b[pos[i * 2] as usize..pos[i * 2 + 1] as usize])
+}
+/// Part of the matched string, in its encoding.
+fn md_piece(m: V, bytes: &[u8]) -> V {
+    let v = str_new(bytes.to_vec());
+    if hdr(md_str(m)).flags & crate::compat::FL_BINARY != 0 {
+        hdr(v).flags |= crate::compat::FL_BINARY;
+    }
+    v
+}
+/// A byte offset in the matched string as a character index.
+fn md_char_index(m: V, byte: usize) -> usize {
+    let s = md_str(m);
+    if hdr(s).flags & crate::compat::FL_BINARY != 0 { byte } else { char_index(&rstr(s).b, byte) }
 }
 fn md_named_index(m: V, name: &str) -> Option<usize> {
     let re = ivar_get(m, sym("@__re"));
@@ -351,10 +443,11 @@ fn md_named_index(m: V, name: &str) -> Option<usize> {
 /// Match `re` against string `s` from char position `pos`; sets `$~`.
 pub fn do_match(re: V, s: V, pos: usize, set: bool) -> V {
     let t = text(s);
-    let start = byte_index(&t, pos);
+    let start = t.byte_index(pos);
     match search(re, &t, start) {
         Some(p) => {
-            let m = matchdata_new(re, t.into_bytes(), p);
+            let bin = t.bin;
+            let m = matchdata_new(re, t.into_bytes(), bin, p);
             if set {
                 set_last(m);
             }
@@ -474,9 +567,14 @@ pub fn expand(rep: &[u8], src: &[u8], pos: &[i64], re: V) -> Vec<u8> {
 }
 
 /// String#sub/gsub with a Regexp pattern. Ok(None) = no change.
-pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<Vec<u8>>, V> {
+pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<(Vec<u8>, crate::transcode::Enc)>, V> {
     let t = text(s);
     let r = re_of(re);
+    let src_ascii = t.b.is_ascii();
+    let mut enc = crate::transcode::enc_of(s);
+    if let Some(x) = rep.filter(|x| is_str(*x)) {
+        crate::transcode::note_piece(&mut enc, src_ascii, x);
+    }
     // a String replacement is converted once, and expanded per match only if it has `\`
     let rep_bytes: Option<Vec<u8>> = match rep {
         Some(x) if !is_hash(x) => Some(to_s(x).map_err(|_| UNDEF)?),
@@ -505,10 +603,11 @@ pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<V
             match cache.iter().find(|(k, _)| k[..] == *matched) {
                 Some((_, piece)) => out.extend_from_slice(piece),
                 None => {
-                    let v = crate::hash::hget(h, str_new(matched.to_vec()));
+                    let v = crate::hash::hget(h, t.str(matched));
                     if v == UNDEF {
                         return Err(UNDEF);
                     }
+                    crate::transcode::note_piece(&mut enc, src_ascii, v);
                     let piece = to_s(v).map_err(|_| UNDEF)?;
                     out.extend_from_slice(&piece);
                     if cacheable && cache.len() < 64 {
@@ -526,12 +625,13 @@ pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<V
             if !is_proc(blk) {
                 return Err(arity_error(1, 2, 2));
             }
-            let m = matchdata_new(re, src.to_vec(), region_pos(&region));
+            let m = matchdata_new(re, src.to_vec(), t.bin, region_pos(&region));
             set_last(m);
-            let v = call_block(blk, &[str_new(src[b..e].to_vec())]);
+            let v = call_block(blk, &[t.str(&src[b..e])]);
             if v == UNDEF {
                 return Err(UNDEF);
             }
+            crate::transcode::note_piece(&mut enc, src_ascii, v);
             out.extend_from_slice(&to_s(v).map_err(|_| UNDEF)?);
         }
         last_begin = Some(b);
@@ -539,7 +639,7 @@ pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<V
         if e == b {
             // empty match: copy one char and move on
             if e < src.len() {
-                let ch_len = t[e..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                let ch_len = t.step(e);
                 out.extend_from_slice(&src[e..e + ch_len]);
                 last_end = e + ch_len;
                 start = e + ch_len;
@@ -563,10 +663,11 @@ pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<V
     if rep.is_some() {
         // $~ is the last match (as in CRuby): found again from where it began
         if let Some(pos) = search(re, &t, last_begin) {
-            set_last(matchdata_new(re, t.into_bytes(), pos));
+            let bin = t.bin;
+            set_last(matchdata_new(re, t.into_bytes(), bin, pos));
         }
     }
-    Ok(Some(out))
+    Ok(Some((out, enc)))
 }
 
 pub fn scan(s: V, re: V, blk: V) -> V {
@@ -579,20 +680,20 @@ pub fn scan(s: V, re: V, blk: V) -> V {
         let (b, e) = (pos[0] as usize, pos[1] as usize);
         let item = if pos.len() > 2 {
             let groups: Vec<V> = (1..pos.len() / 2)
-                .map(|i| if pos[i * 2] >= 0 { str_new(src[pos[i * 2] as usize..pos[i * 2 + 1] as usize].to_vec()) } else { QNIL })
+                .map(|i| if pos[i * 2] >= 0 { t.str(&src[pos[i * 2] as usize..pos[i * 2 + 1] as usize]) } else { QNIL })
                 .collect();
             ary_new(groups)
         } else {
-            str_new(src[b..e].to_vec())
+            t.str(&src[b..e])
         };
-        let m = matchdata_new(re, src.clone(), pos);
+        let m = matchdata_new(re, src.clone(), t.bin, pos);
         set_last(m);
         if is_proc(blk) {
             tri!(call_block(blk, &[item]));
         } else {
             out.push(item);
         }
-        start = if e == b { e + t[e..].chars().next().map(|c| c.len_utf8()).unwrap_or(1) } else { e };
+        start = if e == b { e + t.step(e) } else { e };
     }
     if is_proc(blk) { s } else { ary_new(out.take()) }
 }
@@ -617,26 +718,26 @@ pub fn split(s: V, re: V, limit: i64) -> V {
                 break;
             }
             if b == field_start {
-                start = b + t[b..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                start = b + t.step(b);
                 if b == 0 {
                     continue;
                 }
                 // split between chars
-                parts.push(str_new(src[field_start..b].to_vec()));
+                parts.push(t.str(&src[field_start..b]));
                 field_start = b;
                 continue;
             }
         }
-        parts.push(str_new(src[field_start..b].to_vec()));
+        parts.push(t.str(&src[field_start..b]));
         for i in 1..pos.len() / 2 {
             if pos[i * 2] >= 0 {
-                parts.push(str_new(src[pos[i * 2] as usize..pos[i * 2 + 1] as usize].to_vec()));
+                parts.push(t.str(&src[pos[i * 2] as usize..pos[i * 2 + 1] as usize]));
             }
         }
         field_start = e;
-        start = if e == b { e + t[e..].chars().next().map(|c| c.len_utf8()).unwrap_or(1) } else { e };
+        start = if e == b { e + t.step(e) } else { e };
     }
-    parts.push(str_new(src[field_start..].to_vec()));
+    parts.push(t.str(&src[field_start..]));
     if limit == 0 {
         while parts.last().is_some_and(|p| rstr(*p).b.is_empty()) {
             parts.pop();
@@ -656,7 +757,7 @@ pub fn match_index(re: V, s: V) -> V {
         return QNIL;
     }
     let pos = md_pos(m);
-    mkfix(char_index(&rstr(md_str(m)).b, pos[0] as usize) as i64)
+    mkfix(md_char_index(m, pos[0] as usize) as i64)
 }
 
 pub fn str_index(s: V, re: V, from: usize) -> V {
@@ -664,29 +765,26 @@ pub fn str_index(s: V, re: V, from: usize) -> V {
     if m == QNIL {
         return QNIL;
     }
-    mkfix(char_index(&rstr(md_str(m)).b, md_pos(m)[0] as usize) as i64)
+    mkfix(md_char_index(m, md_pos(m)[0] as usize) as i64)
 }
 
 /// String#rindex(regexp, pos): the last match starting at character `pos` or before
 /// (a backward search, as CRuby's).
 pub fn str_rindex(s: V, re: V, pos: usize) -> V {
     let t = text(s);
-    let start = byte_index(&t, pos);
+    let start = t.byte_index(pos);
     let r = re_of(re);
     let mut region = Region::new();
-    let found = if r.binary {
-        r.re.search_with_encoding(onig::EncodedBytes::ascii(t.as_bytes()), start, 0, SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some()
-    } else {
-        r.re.search_with_options(&t, start, 0, SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some()
-    };
-    if !found {
+    if !search_range(r, &t, start, 0, Some(&mut region)) {
         set_last(QNIL);
         return QNIL;
     }
     let p = region_pos(&region);
     let at = p[0] as usize;
-    set_last(matchdata_new(re, t.into_bytes(), p));
-    mkfix(char_index(&rstr(s).b, at) as i64)
+    let bin = t.bin;
+    let m = matchdata_new(re, t.into_bytes(), bin, p);
+    set_last(m);
+    mkfix(md_char_index(m, at) as i64)
 }
 
 /// byteindex/byterindex with a Regexp: the byte offset of the first match at `from` or
@@ -696,18 +794,14 @@ pub fn str_byte_search(s: V, re: V, from: usize, back: bool) -> V {
     let r = re_of(re);
     let mut region = Region::new();
     let range = if back { 0 } else { t.len() };
-    let found = if r.binary {
-        r.re.search_with_encoding(onig::EncodedBytes::ascii(t.as_bytes()), from, range, SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some()
-    } else {
-        r.re.search_with_options(&t, from, range, SearchOptions::SEARCH_OPTION_NONE, Some(&mut region)).is_some()
-    };
-    if !found {
+    if !search_range(r, &t, from, range, Some(&mut region)) {
         set_last(QNIL);
         return QNIL;
     }
     let p = region_pos(&region);
     let at = p[0];
-    set_last(matchdata_new(re, t.into_bytes(), p));
+    let bin = t.bin;
+    set_last(matchdata_new(re, t.into_bytes(), bin, p));
     mkfix(at)
 }
 
@@ -742,10 +836,10 @@ pub fn partition(s: V, re: V, last: bool) -> V {
     match found {
         Some(p) => {
             let (b, e) = (p[0] as usize, p[1] as usize);
-            ary_new(vec![str_new(src[..b].to_vec()), str_new(src[b..e].to_vec()), str_new(src[e..].to_vec())])
+            ary_new(vec![t.str(&src[..b]), t.str(&src[b..e]), t.str(&src[e..])])
         }
-        None if last => ary_new(vec![str_new(vec![]), str_new(vec![]), str_new(src.to_vec())]),
-        None => ary_new(vec![str_new(src.to_vec()), str_new(vec![]), str_new(vec![])]),
+        None if last => ary_new(vec![t.str(&[]), t.str(&[]), t.str(src)]),
+        None => ary_new(vec![t.str(src), t.str(&[]), t.str(&[])]),
     }
 }
 
@@ -815,8 +909,8 @@ pub extern "C" fn kn_backref(c: u64) -> V {
     let b = rstr(md_str(m)).b.clone();
     match c as u8 {
         b'&' => md_group(m, 0),
-        b'`' => str_new(b[..pos[0] as usize].to_vec()),
-        b'\'' => str_new(b[pos[1] as usize..].to_vec()),
+        b'`' => md_piece(m, &b[..pos[0] as usize]),
+        b'\'' => md_piece(m, &b[pos[1] as usize..]),
         _ => {
             // $+ : last matched group
             let n = pos.len() / 2;
@@ -1017,8 +1111,8 @@ pub fn init() {
         let re = ivar_get(s, sym("@__re"));
         ary_new(re_of(re).names.iter().map(|(n, _)| str_from(n)).collect())
     });
-    defn(md, "pre_match", 0, 0, |s, _, _| str_new(rstr(md_str(s)).b[..md_pos(s)[0] as usize].to_vec()));
-    defn(md, "post_match", 0, 0, |s, _, _| str_new(rstr(md_str(s)).b[md_pos(s)[1] as usize..].to_vec()));
+    defn(md, "pre_match", 0, 0, |s, _, _| md_piece(s, &rstr(md_str(s)).b[..md_pos(s)[0] as usize]));
+    defn(md, "post_match", 0, 0, |s, _, _| md_piece(s, &rstr(md_str(s)).b[md_pos(s)[1] as usize..]));
     fn group_index(s: V, k: V) -> Option<usize> {
         if is_fix(k) {
             Some(fix(k) as usize)
@@ -1030,11 +1124,11 @@ pub fn init() {
         }
     }
     defn(md, "begin", 1, 1, |s, a, _| match group_index(s, a[0]) {
-        Some(i) if md_pos(s).get(i * 2).is_some_and(|b| *b >= 0) => mkfix(char_index(&rstr(md_str(s)).b, md_pos(s)[i * 2] as usize) as i64),
+        Some(i) if md_pos(s).get(i * 2).is_some_and(|b| *b >= 0) => mkfix(md_char_index(s, md_pos(s)[i * 2] as usize) as i64),
         _ => QNIL,
     });
     defn(md, "end", 1, 1, |s, a, _| match group_index(s, a[0]) {
-        Some(i) if md_pos(s).get(i * 2).is_some_and(|b| *b >= 0) => mkfix(char_index(&rstr(md_str(s)).b, md_pos(s)[i * 2 + 1] as usize) as i64),
+        Some(i) if md_pos(s).get(i * 2).is_some_and(|b| *b >= 0) => mkfix(md_char_index(s, md_pos(s)[i * 2 + 1] as usize) as i64),
         _ => QNIL,
     });
     defn(md, "offset", 1, 1, |s, a, _| {

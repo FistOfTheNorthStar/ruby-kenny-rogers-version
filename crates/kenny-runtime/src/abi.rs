@@ -143,7 +143,7 @@ fn report_uncaught() -> i32 {
     let msg = match pending {
         Throw::Raise(e) => {
             if is_a(e, r.c.exception) && class_name(real_class(e)) == "SystemExit" {
-                return 0;
+                return crate::kernel::system_exit_status(e);
             }
             // CRuby loads did_you_mean at startup; here it loads when first needed, so an
             // uncaught NameError still says "Did you mean?"
@@ -1029,6 +1029,9 @@ struct Autoload {
     loader: Option<CompiledFn>,
     flag: *mut V,
     path: String,
+    /// The thread running it right now (0: none): to that thread the constant isn't defined
+    /// yet (`defined?(X)` is nil inside X's own file, as in CRuby)
+    loading: u64,
 }
 
 /// Autoloads running right now (see settle_autoload).
@@ -1080,7 +1083,12 @@ fn autoloads() -> crate::mt::LGuard<'static, std::collections::HashMap<(usize, u
 /// A pending autoload for `id` directly in `k`.
 pub fn has_autoload(k: *mut Class, id: u32) -> bool {
     let a = autoloads();
-    (!a.is_empty() && a.contains_key(&(k as usize, id))) || (k == rt().c.object && implicit_const(id).is_some())
+    if !a.is_empty() {
+        if let Some(e) = a.get(&(k as usize, id)) {
+            return e.loading == 0 || e.loading != crate::thread::current_token();
+        }
+    }
+    k == rt().c.object && implicit_const(id).is_some()
 }
 /// The compiled file that defines `id`, one of the constants CRuby has without a require
 /// (see `const_missing_in`), if it is in this program. Like an autoload on Object.
@@ -1103,7 +1111,7 @@ fn implicit_const(id: u32) -> Option<&'static str> {
 }
 pub fn register_autoload(owner: *mut Class, id: u32, path: String, loader: Option<CompiledFn>, flag: *mut V) {
     bump_const_serial();
-    autoloads().insert((owner as usize, id), Autoload { loader, flag, path });
+    autoloads().insert((owner as usize, id), Autoload { loader, flag, path, loading: 0 });
 }
 pub fn autoload_path(owner: *mut Class, id: u32) -> Option<String> {
     autoloads().get(&(owner as usize, id)).map(|a| a.path.clone())
@@ -1260,7 +1268,10 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
             }
             return send(c as V, sym("const_missing"), &[mksym(id)], QNIL);
         };
-        let a = Autoload { loader: a.0, flag: a.1, path: a.2 };
+        let a = Autoload { loader: a.0, flag: a.1, path: a.2, loading: 0 };
+        if let Some(e) = autoloads().get_mut(&(owner as usize, id)) {
+            e.loading = crate::thread::current_token();
+        }
         match a.loader {
             Some(f) => {
                 LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -1293,6 +1304,21 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
                 let r = crate::compat::require_compiled(&a.path);
                 LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 r.is_some()
+            } => {
+                autoloads().remove(&(owner as usize, id));
+                if pst().pending_is_set() {
+                    return UNDEF;
+                }
+                if let Some(v) = after_autoload(owner, c, id) {
+                    return v;
+                }
+            }
+            // an absolute path that isn't compiled in: compiled from disk, as `require` does
+            None if {
+                LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let r = crate::compat::require_from_disk(&a.path);
+                LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                r.is_some_and(|r| r != UNDEF || pst().pending_is_set())
             } => {
                 autoloads().remove(&(owner as usize, id));
                 if pst().pending_is_set() {
@@ -1488,7 +1514,7 @@ fn autoload_before_define(outer: *mut Class, id: u32) -> bool {
             }
         }
     }
-    let Some(a) = autoloads().get(&(outer as usize, id)).map(|a| Autoload { loader: a.loader, flag: a.flag, path: a.path.clone() }) else { return true };
+    let Some(a) = autoloads().get(&(outer as usize, id)).map(|a| Autoload { loader: a.loader, flag: a.flag, path: a.path.clone(), loading: a.loading }) else { return true };
     // the entry goes once the file has run: while it runs (this `class` statement may be the
     // file's own), other threads that find the constant wait for it (settle_autoload)
     let done = |flag: *mut V| unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire) == 1;
@@ -1502,10 +1528,26 @@ fn autoload_before_define(outer: *mut Class, id: u32) -> bool {
                 return false;
             }
         }
-        None => {
-            if crate::compat::require_compiled(&a.path).is_some() && pst().pending_is_set() {
-                autoloads().remove(&(outer as usize, id));
+        // (as in const_missing_in: an overridden `require` sees the autoload, e.g. Zeitwerk's)
+        None if require_overridden() => {
+            let r = send(rt().main_obj, sym("require"), &[str_from(&a.path)], QNIL);
+            autoloads().remove(&(outer as usize, id));
+            if r == UNDEF {
                 return false;
+            }
+        }
+        None => {
+            if crate::compat::require_compiled(&a.path).is_some() {
+                if pst().pending_is_set() {
+                    autoloads().remove(&(outer as usize, id));
+                    return false;
+                }
+            } else if let Some(r) = crate::compat::require_from_disk(&a.path) {
+                autoloads().remove(&(outer as usize, id));
+                if r == UNDEF || pst().pending_is_set() {
+                    return false;
+                }
+                return true;
             }
             if crate::compat::compiled_entry(&a.path).is_none_or(|(_, flag)| done(flag)) {
                 autoloads().remove(&(outer as usize, id));
@@ -1671,6 +1713,24 @@ pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn
     id
 }
 
+/// Call a Ruby-defined `method_added` (or, on a singleton class, `singleton_method_added`)
+/// hook for a method just defined in `cls` by define_method, attr_* or alias.
+pub fn fire_method_added(cls: *mut Class, id: u32) -> V {
+    if unsafe { (*cls).is_singleton } {
+        let att = unsafe { (*cls).attached };
+        let hook = find_method(class_of(att), sym("singleton_method_added"));
+        if !hook.is_null() && !matches!(unsafe { &(*hook).body }, Body::Native(..)) {
+            return invoke(hook, att, &[mksym(id)], QNIL);
+        }
+    } else {
+        let hook = find_method(class_of(cls as V), sym("method_added"));
+        if !hook.is_null() && !matches!(unsafe { &(*hook).body }, Body::Native(..)) {
+            return invoke(hook, cls as V, &[mksym(id)], QNIL);
+        }
+    }
+    QNIL
+}
+
 pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
     let mut m = find_method(c, old);
     if m.is_null() {
@@ -1689,12 +1749,16 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
         return raise(rt().c.name_error, &format!("undefined method '{}' for class '{}'", sym_str(old), class_name(c)));
     }
     let body = crate::kernel::clone_body(unsafe { &(*m).body });
-    let nm = Box::into_raw(Box::new(Method { fast: unsafe { (*m).fast }, body, owner: unsafe { (*m).owner }, name: new, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
+    // a define_method body keeps its original name: its `super` looks for that one, as in
+    // CRuby (rspec's `alias_method :only_failures?, :only_failures` of a reader that calls super)
+    let name = if matches!(body, Body::Proc(_)) { unsafe { (*m).name } } else { new };
+    let nm = Box::into_raw(Box::new(Method { fast: unsafe { (*m).fast }, body, owner: unsafe { (*m).owner }, name, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
     if unsafe { (*c).methods.insert(new, nm) }.is_none() {
         crate::core::method_name_count(new, true);
     }
     crate::core::touch_method_name(c, new);
     bump_serial();
+    tri!(fire_method_added(c, new));
     mksym(new)
 }
 #[unsafe(no_mangle)]
@@ -2095,18 +2159,46 @@ pub extern "C" fn kn_using(scope: u64, m: V, parent: u64) -> V {
     refine_scopes().insert(scope, list);
     QNIL
 }
+/// The body of a `refine` block in module `m`: its call sites see m's refinements (all of
+/// them, as m has them when the call runs) and then those of the enclosing scope.
+static REFINE_MODS: crate::mt::L<std::collections::HashMap<u64, (V, u64), FxBuild>> = crate::mt::L::new(std::collections::HashMap::with_hasher(FxBuild::new()));
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_refine_scope(scope: u64, m: V, parent: u64) -> V {
+    if is_class(m) {
+        REFINE_MODS.get().insert(scope, (m, parent));
+    }
+    QNIL
+}
+fn scope_refinements(scope: u64) -> Option<Vec<(*mut Class, *mut Class)>> {
+    if let Some(list) = refine_scopes().get(&scope) {
+        return Some(list.clone());
+    }
+    let (m, parent) = *REFINE_MODS.get().get(&scope)?;
+    let mut list = refinements_of(m);
+    if parent != 0 {
+        list.extend(scope_refinements(parent).unwrap_or_default());
+    }
+    Some(list)
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_send_refined(cache: *mut CallCache, scope: u64, recv: V, mid: V, argc: u64, argv: *const V, blk: V) -> V {
-    if let Some(list) = refine_scopes().get(&scope) {
+    if let Some(list) = scope_refinements(scope) {
         if !list.is_empty() {
             let id = sym_id(mid);
             let k = class_of(recv);
-            let anc = ancestors(k);
-            for (target, r) in list.clone() {
-                if anc.contains(&target) {
-                    if let Some(&m) = unsafe { (*r).methods.get(&id) } {
-                        return invoke(m, recv, unsafe { args_slice(argc, argv) }, blk);
+            // as CRuby: along the receiver's ancestors, each class's refinements come before
+            // its own methods (so `refine Array` beats `refine Object` for an Array, and a
+            // method Array defines itself beats `refine Object`)
+            for a in ancestors(k) {
+                for &(target, r) in list.iter() {
+                    if target == a {
+                        if let Some(&m) = unsafe { (*r).methods.get(&id) } {
+                            return invoke(m, recv, unsafe { args_slice(argc, argv) }, blk);
+                        }
                     }
+                }
+                if unsafe { (*a).methods.get(&id) }.is_some_and(|&m| !matches!(unsafe { &(*m).body }, Body::Undefined)) {
+                    break;
                 }
             }
         }
@@ -2124,13 +2216,32 @@ pub extern "C" fn kn_ary_ptr(a: V) -> *const V {
 pub unsafe extern "C" fn kn_super_blk(procp: V, owner_slot: *const V, self_: V, mid: V, args: V, blk: V) -> V {
     if let Some(&m) = pst().dm_stack.last() {
         if let Body::Proc(p) = unsafe { &(*m).body } {
-            if *p == procp {
+            if *p == procp || nested_in(procp, *p) {
                 return kn_super_dyn(self_, args, blk);
             }
         }
     }
     let a = rary(args).v.clone();
     unsafe { kn_super(owner_slot, self_, mid, a.len() as u64, a.as_ptr(), blk) }
+}
+/// Whether block `inner` is written inside block `outer`'s body (`define_method(n) { each { super() } }`):
+/// its chain of environments reaches the one `outer` closed over.
+fn nested_in(inner: V, outer: V) -> bool {
+    if !is_proc(inner) || !is_proc(outer) {
+        return false;
+    }
+    let target = unsafe { (*(outer as *const RProc)).env };
+    if target.is_null() {
+        return false;
+    }
+    let mut e = unsafe { (*(inner as *const RProc)).env };
+    while !e.is_null() {
+        if e == target {
+            return true;
+        }
+        e = unsafe { (*e).parent };
+    }
+    false
 }
 /// `super(...)` inside a define_method block.
 #[unsafe(no_mangle)]
