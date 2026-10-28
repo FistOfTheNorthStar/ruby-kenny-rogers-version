@@ -4,11 +4,30 @@ module Forwardable
   VERSION = "1.3.3"
   FORWARDABLE_VERSION = VERSION
 
-  def self._target(obj, accessor)
-    if accessor.start_with?("@")
-      obj.instance_variable_get(accessor)
-    else
-      obj.__send__(accessor)
+  # The accessor as the stdlib accepts it (it evals it): "@ivar", "@@cvar", "method",
+  # "Const::Path", "self", and chains of those with "." ("self.class", "@a.b"). Parsed
+  # once, when the delegator is defined.
+  def self._path(accessor)
+    accessor.split(".").map.with_index do |part, i|
+      if part == "self" && i == 0 then [:self]
+      elsif part.start_with?("@@") then [:cvar, part.to_sym]
+      elsif part.start_with?("@") then [:ivar, part.to_sym]
+      elsif i == 0 && part.match?(/\A(::)?[A-Z]/) then [:const, part.delete_prefix("::")]
+      else [:call, part.to_sym]
+      end
+    end
+  end
+
+  def self._target(obj, path)
+    path = _path(path) if path.is_a?(String)
+    path.inject(obj) do |cur, (kind, name)|
+      case kind
+      when :self then obj
+      when :ivar then cur.instance_variable_get(name)
+      when :cvar then (cur.is_a?(Module) ? cur : cur.class).class_variable_get(name)
+      when :const then Object.const_get(name)
+      else cur.__send__(name)
+      end
     end
   end
 
@@ -26,7 +45,7 @@ module Forwardable
   end
 
   def def_instance_delegator(accessor, method, ali = method)
-    accessor = accessor.to_s
+    accessor = Forwardable._path(accessor.to_s)
     method = method.to_sym
     define_method(ali) do |*args, &block|
       Forwardable._target(self, accessor).__send__(method, *args, &block)
@@ -51,7 +70,7 @@ module SingleForwardable
   end
 
   def def_single_delegator(accessor, method, ali = method)
-    accessor = accessor.to_s
+    accessor = Forwardable._path(accessor.to_s)
     method = method.to_sym
     define_singleton_method(ali) do |*args, &block|
       Forwardable._target(self, accessor).__send__(method, *args, &block)

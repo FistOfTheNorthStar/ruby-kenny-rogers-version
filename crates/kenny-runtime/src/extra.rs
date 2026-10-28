@@ -2253,7 +2253,42 @@ pub fn init() {
         if is_hash(h) { send0(h, "keys") } else { ary_new(vec![]) }
     });
     defn(th, "pending_interrupt?", 0, 1, |_, _, _| QFALSE);
-    defn(th, "group", 0, 0, |_, _, _| QNIL);
+    // ThreadGroup: a thread is in ThreadGroup::Default until added to another group
+    // (the timeout gem moves its watcher thread into Default)
+    let tg = new_class("ThreadGroup", rt().c.object);
+    set_global_const("ThreadGroup", tg as V);
+    const_set(tg, sym("Default"), object_new(tg));
+    defn(th, "group", 0, 0, |s, _, _| {
+        let g = ivar_get(s, sym("@__group"));
+        if g != QNIL {
+            return g;
+        }
+        const_lookup(const_lookup(rt().c.object, sym("ThreadGroup")).unwrap() as *mut Class, sym("Default")).unwrap_or(QNIL)
+    });
+    defn(tg, "add", 1, 1, |s, a, _| {
+        if truthy(ivar_get(s, sym("@__enclosed"))) {
+            let te = const_lookup(rt().c.object, sym("ThreadError")).unwrap() as *mut Class;
+            return raise(te, "can't move to the enclosed thread group");
+        }
+        ivar_set(a[0], sym("@__group"), s);
+        s
+    });
+    defn(tg, "list", 0, 0, |s, _, _| {
+        let all = tri!(send(class_of(rt().main_obj) as V, sym("const_get"), &[mksym(sym("Thread"))], QNIL));
+        let all = tri!(send(all, sym("list"), &[], QNIL));
+        let mut out = Vec::new();
+        for &t in rary(all).v.clone().iter() {
+            if tri!(send(t, sym("group"), &[], QNIL)) == s {
+                out.push(t);
+            }
+        }
+        ary_new(out)
+    });
+    defn(tg, "enclose", 0, 0, |s, _, _| {
+        ivar_set(s, sym("@__enclosed"), QTRUE);
+        s
+    });
+    defn(tg, "enclosed?", 0, 0, |s, _, _| bool_v(truthy(ivar_get(s, sym("@__enclosed")))));
     defs(th, "handle_interrupt", 1, 1, |_, _, b| call_block(b, &[]));
     defs(th, "pending_interrupt?", 0, 1, |_, _, _| QFALSE);
     defs(th, "kill", 1, 1, |_, a, _| send0(a[0], "kill"));

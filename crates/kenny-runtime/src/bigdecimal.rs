@@ -1424,11 +1424,9 @@ fn init_bigdecimal() {
         if d.k != Kd::Fin {
             return domain_error(&d);
         }
-        let Some(r) = const_lookup(rt().c.object, sym("Rational")) else {
-            return raise(rt().c.not_implemented_error, "Rational is not available");
-        };
         let (n, den) = if d.e >= 0 { (d.signed() * pow10(d.e), BigInt::one()) } else { (d.signed(), pow10(-d.e)) };
-        send(r, sym("new"), &[int_from_big(n), int_from_big(den)], QNIL)
+        // Kernel#Rational reduces (Rational has no public `new`)
+        send(rt().main_obj, sym("Rational"), &[int_from_big(n), int_from_big(den)], QNIL)
     });
     defn(c, "hash", 0, 0, |s, _, _| send0(s, "__kn_hash"));
 

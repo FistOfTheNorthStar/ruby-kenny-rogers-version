@@ -1651,6 +1651,10 @@ pub fn init() {
     for k in ["host_os", "target_os"] {
         crate::hash::hset(cfg, str_from(k), str_from(&os));
     }
+    // "arm64-darwin27" / "x86_64-linux", as CRuby names its platform
+    let cpu = if cfg!(target_arch = "aarch64") { if cfg!(target_os = "macos") { "arm64" } else { "aarch64" } } else { "x86_64" };
+    let arch = format!("{cpu}-{os}");
+    crate::hash::hset(cfg, str_from("arch"), str_from(&arch));
     let rel = ruby_release();
     let (abi, major, minor, teeny, patchlevel) =
         (format!("{}.{}.0", rel.major, rel.minor), rel.major.to_string(), rel.minor.to_string(), rel.teeny.to_string(), rel.patchlevel.to_string());
@@ -1661,7 +1665,6 @@ pub fn init() {
         ("TEENY", teeny.as_str()),
         ("PATCHLEVEL", patchlevel.as_str()),
         ("host_cpu", if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" }),
-        ("arch", if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" }),
         ("EXEEXT", ""),
         ("DLEXT", "bundle"),
         ("ruby_install_name", "ruby"),
@@ -1677,12 +1680,12 @@ pub fn init() {
     const_set(rbc, sym("MAKEFILE_CONFIG"), cfg);
     defs(rbc, "ruby", 0, 0, |_, _, _| str_from("ruby"));
     set_global_const("RUBY_VERSION", str_from(&rel.version));
-    set_global_const("RUBY_PLATFORM", str_from(if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" }));
+    set_global_const("RUBY_PLATFORM", str_from(&arch));
     set_global_const("RUBY_ENGINE", str_from("kenny"));
     set_global_const("RUBY_PATCHLEVEL", mkfix(rel.patchlevel));
     set_global_const("RUBY_RELEASE_DATE", str_from(&rel.release_date));
     set_global_const("RUBY_COPYRIGHT", str_from("Kenny Ruby"));
-    let platform = if cfg!(target_os = "macos") { "arm64-darwin" } else { "x86_64-linux" };
+    let platform = arch.as_str();
     let description = format!("kenny (ruby {} compatible) [{platform}]", rel.version);
     set_global_const("RUBY_DESCRIPTION", str_from(&description));
     // Ruby 4.0's `Ruby` module: the same facts as the RUBY_* constants

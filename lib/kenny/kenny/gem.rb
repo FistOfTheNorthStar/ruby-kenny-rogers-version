@@ -162,7 +162,17 @@ module Gem
     def rubygems_version = Version.new(VERSION)
     def win_platform? = false
     def java_platform? = false
-    def platforms = []
+    def platforms = (@platforms ||= [Platform::RUBY, Platform.local])
+    def platforms=(list)
+      @platforms = list
+    end
+    def target_rbconfig = RbConfig::CONFIG
+
+    # [file, line] of a caller (Gem::Deprecate's notes)
+    def location_of_caller(depth = 1)
+      loc = caller_locations(depth + 1, 1)&.first
+      loc ? [loc.path, loc.lineno] : [nil, 0]
+    end
     def path = @path
     def paths = @path
     def dir = @path.first || ""
@@ -173,4 +183,9 @@ module Gem
     def try_activate(_path) = false
     def suffixes = ["", ".rb"]
   end
+
+  # RubyGems' own Gem::Deprecate (addressable extends it) and Gem::Platform (Platform.local:
+  # the AWS SDK's user agent), from the stdlib when first used
+  autoload :Deprecate, "rubygems/deprecate"
+  autoload :Platform, "rubygems/platform"
 end
