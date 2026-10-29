@@ -1,0 +1,120 @@
+Psych::Nodes::Stream
+1
+Psych::Nodes::Document
+Psych::Nodes::Mapping
+---
+name: demo
+list:
+- 1
+- 2.5
+-
+- true
+- :sym
+text: |
+  a
+  b
+q: "="
+empty: []
+h: {}
+---
+name: demo
+list:
+- 1
+- 2.5
+-
+- true
+- :sym
+text: |
+    a
+    b
+q: "="
+empty: []
+h: {}
+---
+a:
+- x
+- "y"
+b:
+- x
+- "y"
+eq: '='
+---
+a: &1
+- x
+- "y"
+b: *1
+---
+- !ruby/object:Point
+  x: 1
+  "y": 2
+- :a: 3
+[Point, 1, 2]
+%YAML 1.1
+%TAG !e! tag:example.com,2000:
+--- &anc
+k: [one, !e!t 'tag:example.com,2000:x']
+lit: |
+  l1
+  l2
+again: *anc
+"implicit\n"
+"implicit\n--- x\n...\n"
+Psych::Nodes::Stream
+2
+[[1, 1], false, false, false]
+Psych::Nodes::Mapping
+6
+["base", nil, 1, 2]
+[["x", 1, true, false], ["y", 3, false, true], ["z", 2, false, true]]
+Psych::Nodes::Alias
+"base"
+"tag:yaml.org,2002:str"
+"3"
+4
+"!ruby/object:Point"
+[2, 0, 2]
+"foo"
+FalseClass
+{"a" => 1, "b" => ["x", "y", "z"], "c" => "3", "d" => "block\n"}
+5
+["base", "derived", "tagged"]
+[1, 2.0, true, nil, 31]
+["sym", "2001-02-03"]
+"expected STREAM-START"
+%YAML 1.1
+---
+base: &base
+  a: 1
+  b: [x, "y", 'z']
+derived:
+  <<: *base
+  c: !!str 3
+  d: |
+    block
+tagged: !ruby/object:Point
+  x: 5
+  y: 6
+...
+--- second
+3
+["1", "two"]
+[:start_stream, 1]
+[:start_document, [], [], false]
+[:start_sequence, "a", nil, true, 1]
+[:scalar, "1", nil, "!foo", false, false, 1]
+[:alias, "a"]
+[:start_mapping, nil, nil, true, 2]
+[:scalar, "x", nil, nil, true, false, 1]
+[:scalar, "y", nil, nil, false, true, 2]
+[:end_mapping]
+[:end_sequence]
+[:end_document, true]
+[:end_stream]
+Psych::SyntaxError
+"f.yml"
+"---\nkey: ! 'value with: colon'\n"
+"---\na: 1\n...\n---\n- 2\n- 3\n...\n"
+Psych::Nodes::Stream
+"{\"a\": 1, \"b\": [1, \"x\", null, true], \"c\": 2.5}\n"
+true
+true

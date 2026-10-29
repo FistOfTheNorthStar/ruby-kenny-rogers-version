@@ -62,6 +62,7 @@ const OVERLAY: &[(&str, &str)] = &[
     ("pp.rb", include_str!("../../../lib/kenny/pp.rb")),
     ("yaml.rb", include_str!("../../../lib/kenny/yaml.rb")),
     ("psych.rb", include_str!("../../../lib/kenny/psych.rb")),
+    ("kenny/psych_tree.rb", include_str!("../../../lib/kenny/kenny/psych_tree.rb")),
     ("bigdecimal.rb", include_str!("../../../lib/kenny/bigdecimal.rb")),
     ("bigdecimal/util.rb", include_str!("../../../lib/kenny/bigdecimal/util.rb")),
     ("racc/parser.rb", include_str!("../../../lib/kenny/racc/parser.rb")),

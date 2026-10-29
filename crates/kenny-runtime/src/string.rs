@@ -1372,7 +1372,16 @@ pub fn init() {
         Some(ch) => mkfix(ch as i64),
         None => arg_error("empty string"),
     });
-    defn(c, "sum", 0, 0, |s, _, _| mkfix(rstr(s).b.iter().map(|x| *x as i64).sum()));
+    // String#sum(bits = 16): the bytes' sum modulo 2**bits (bits <= 0: the whole sum)
+    defn(c, "sum", 0, 1, |s, a, _| {
+        let bits = match a.first() {
+            Some(v) if is_fix(*v) => fix(*v),
+            Some(v) => return type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(*v)))),
+            None => 16,
+        };
+        let total: i64 = rstr(s).b.iter().map(|x| *x as i64).sum();
+        mkfix(if bits > 0 && bits < 63 { total & ((1i64 << bits) - 1) } else { total })
+    });
     fn pad(s: V, a: &[V], mode: u8) -> V {
         let w = fix(a[0]).max(0) as usize;
         let padc: Vec<char> = match a.get(1) {

@@ -8,6 +8,10 @@
 //!
 //! The Ruby-level API (`Psych.load`, `YAML.dump`, exception classes, `Psych::Coder`) lives in
 //! the overlay file `lib/kenny/psych.rb`, which calls `Psych.__kn_load` / `Psych.__kn_dump`.
+//! The tree API (`Psych.parse`, `Psych::Nodes`, `Psych::Visitors::YAMLTree` ...) is psych's
+//! own Ruby code, loaded on first use by `lib/kenny/kenny/psych_tree.rb`, on the two native
+//! pieces libyaml is to CRuby's psych: parse events (`Psych.__kn_events`) and the emitter
+//! (`Psych.__kn_emit`, one document's events at a time).
 
 use crate::core::*;
 use crate::gc::RVec;
@@ -1619,11 +1623,17 @@ fn analyze_scalar(v: &str) -> ScalarData {
     d
 }
 
-/// (handle, suffix) per yaml_emitter_analyze_tag with the default tag directives.
-fn analyze_tag(tag: &str) -> (Option<&'static str>, String) {
-    for (h, prefix) in [("!", "!"), ("!!", "tag:yaml.org,2002:")] {
+/// (handle, suffix) per yaml_emitter_analyze_tag: the document's tag directives (`dirs`),
+/// then the default ones for the handles they don't redefine.
+fn analyze_tag(tag: &str, dirs: &[(String, String)]) -> (Option<String>, String) {
+    let defaults = [("!", "!"), ("!!", "tag:yaml.org,2002:")];
+    let all = dirs
+        .iter()
+        .map(|(h, p)| (h.as_str(), p.as_str()))
+        .chain(defaults.into_iter().filter(|(h, _)| !dirs.iter().any(|(dh, _)| dh == h)));
+    for (h, prefix) in all {
         if prefix.len() < tag.len() && tag.starts_with(prefix) {
-            return (Some(h), tag[prefix.len()..].to_string());
+            return (Some(h.to_string()), tag[prefix.len()..].to_string());
         }
     }
     (None, tag.to_string())
@@ -1643,6 +1653,8 @@ struct Em<'a> {
     simple_key_ctx: bool,
     best_indent: i64,
     best_width: i64,
+    /// the current document's %TAG directives (handle, prefix)
+    dirs: Vec<(String, String)>,
 }
 
 impl Em<'_> {
@@ -1753,7 +1765,7 @@ impl Em<'_> {
     }
 
     /// Tag data (handle, suffix) and whether the node is a simple key candidate.
-    fn tag_data(&self, n: &DN) -> (Option<&'static str>, Option<String>) {
+    fn tag_data(&self, n: &DN) -> (Option<String>, Option<String>) {
         let use_tag = match &n.k {
             DK::Scalar { plain, quoted, .. } => !*plain && !*quoted,
             DK::Seq(..) | DK::Map(..) => !n.implicit,
@@ -1761,7 +1773,7 @@ impl Em<'_> {
         };
         match (&n.tag, use_tag) {
             (Some(t), true) => {
-                let (h, s) = analyze_tag(t);
+                let (h, s) = analyze_tag(t, &self.dirs);
                 (h, Some(s))
             }
             _ => (None, None),
@@ -1771,7 +1783,7 @@ impl Em<'_> {
         let n = &self.nodes[idx];
         let alen = n.anchor.as_ref().map(|a| a.len()).unwrap_or(0);
         let (h, s) = self.tag_data(n);
-        let tlen = h.map(|h| h.len()).unwrap_or(0) + s.map(|s| s.len()).unwrap_or(0);
+        let tlen = h.as_ref().map(|h| h.len()).unwrap_or(0) + s.map(|s| s.len()).unwrap_or(0);
         let len = match &n.k {
             DK::Alias(a) => a.len(),
             DK::Scalar { v, .. } => {
@@ -1828,10 +1840,10 @@ impl Em<'_> {
                     st = Sty::Double;
                 }
                 if no_tag && !*quoted && st != Sty::Plain {
-                    handle = Some("!");
+                    handle = Some("!".to_string());
                 }
                 self.process_anchor(n);
-                self.process_tag(handle, suffix.as_deref());
+                self.process_tag(handle.as_deref(), suffix.as_deref());
                 self.increase_indent(true, false);
                 let allow_breaks = !self.simple_key_ctx;
                 match st {
@@ -1846,7 +1858,7 @@ impl Em<'_> {
             DK::Seq(ch, flow) => {
                 let (h, s) = self.tag_data(n);
                 self.process_anchor(n);
-                self.process_tag(h, s.as_deref());
+                self.process_tag(h.as_deref(), s.as_deref());
                 if self.flow_level > 0 || *flow || ch.is_empty() {
                     self.write_indicator("[", true, true, false);
                     self.increase_indent(true, false);
@@ -1877,7 +1889,7 @@ impl Em<'_> {
             DK::Map(ch, flow) => {
                 let (h, s) = self.tag_data(n);
                 self.process_anchor(n);
-                self.process_tag(h, s.as_deref());
+                self.process_tag(h.as_deref(), s.as_deref());
                 if self.flow_level > 0 || *flow || ch.is_empty() {
                     self.write_indicator("{", true, true, false);
                     self.increase_indent(true, false);
@@ -2164,26 +2176,57 @@ impl Em<'_> {
     }
 
     fn emit_document(&mut self, root: usize, version: Option<(i64, i64)>) {
-        if let Some((maj, min)) = version {
-            if self.open_ended > 0 {
-                self.write_indicator("...", true, false, false);
-                self.write_indent();
-            }
-            self.open_ended = 0;
-            self.write_indicator("%YAML", true, false, false);
-            self.write_indicator(&format!("{maj}.{min}"), true, false, false);
+        let version = version.map(|(maj, min)| format!("{maj}.{min}"));
+        self.emit_document_full(root, version.as_deref(), &[], false, true, false);
+    }
+    /// yaml_emitter_emit_document_start / _content / _end. `implicit` (no `---`) holds only
+    /// for the first document of a stream with no directives; `implicit_end` false writes `...`.
+    fn emit_document_full(&mut self, root: usize, version: Option<&str>, tags: &[(String, String)], mut implicit: bool, implicit_end: bool, first: bool) {
+        self.dirs = tags.to_vec();
+        if !first {
+            implicit = false;
+        }
+        if (version.is_some() || !tags.is_empty()) && self.open_ended > 0 {
+            self.write_indicator("...", true, false, false);
             self.write_indent();
         }
         self.open_ended = 0;
-        self.write_indent();
-        self.write_indicator("---", true, false, false);
+        if let Some(v) = version {
+            implicit = false;
+            self.write_indicator("%YAML", true, false, false);
+            self.write_indicator(v, true, false, false);
+            self.write_indent();
+        }
+        if !tags.is_empty() {
+            implicit = false;
+            for (h, p) in tags {
+                self.write_indicator("%TAG", true, false, false);
+                if !self.whitespace {
+                    self.put(' ');
+                }
+                self.write_raw(h);
+                if !self.whitespace {
+                    self.put(' ');
+                }
+                self.write_tag_content(p);
+                self.write_indent();
+            }
+        }
+        if !implicit {
+            self.write_indent();
+            self.write_indicator("---", true, false, false);
+        }
         self.open_ended = 0;
         self.emit_node(root, true, false, false, false);
-        // implicit document end
         self.write_indent();
-        if self.open_ended == 0 {
+        if !implicit_end {
+            self.write_indicator("...", true, false, false);
+            self.open_ended = 0;
+            self.write_indent();
+        } else if self.open_ended == 0 {
             self.open_ended = 1;
         }
+        self.dirs.clear();
     }
     fn end_stream(&mut self) {
         if self.open_ended == 2 {
@@ -2266,12 +2309,337 @@ fn kn_dump(objs: V, opts: V) -> V {
         simple_key_ctx: false,
         best_indent,
         best_width,
+        dirs: Vec::new(),
     };
     for r in roots {
         em.emit_document(r, version);
     }
     em.end_stream();
     str_from(&em.out)
+}
+
+// ---------------------------------------------------------------------------
+// The tree API's native halves (lib/kenny/psych_tree.rb): Psych::Emitter's documents run
+// through the emitter above, and Psych::Parser's events come from the parser below.
+// ---------------------------------------------------------------------------
+
+/// Psych.__kn_emit(events, [indentation, line_width, first, open_ended]) -> [yaml, open_ended]
+/// for one document's events, as Psych::Emitter collects them:
+/// [0, version, tag_directives, implicit] start_document, [1, implicit] end_document,
+/// [2, value, anchor, tag, plain, quoted, style] scalar, [3 | 5, anchor, tag, implicit, style]
+/// start_sequence | start_mapping, [4] / [6] their ends, [7, anchor] alias.
+fn kn_emit(evs: V, conf: V) -> V {
+    let c = if is_ary(conf) { rary(conf).v.clone() } else { Vec::new() };
+    let geti = |i: usize, d: i64| c.get(i).copied().filter(|v| is_fix(*v)).map(fix).unwrap_or(d);
+    // yaml_emitter_emit_stream_start's defaults
+    let mut best_indent = geti(0, 2);
+    if !(2..=9).contains(&best_indent) {
+        best_indent = 2;
+    }
+    let mut best_width = geti(1, 0);
+    if best_width >= 0 && best_width <= best_indent * 2 {
+        best_width = 80;
+    }
+    if best_width < 0 {
+        best_width = i64::MAX;
+    }
+    let first = c.get(2).is_some_and(|v| truthy(*v));
+    let open_ended = geti(3, 0).clamp(0, 2) as u8;
+    let opt_s = |v: V| if v == QNIL { None } else { Some(rstring(v)) };
+    let evs = if is_ary(evs) { rary(evs).v.clone() } else { Vec::new() };
+    let mut nodes: Vec<DN> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut root = None;
+    let (mut version, mut tags, mut implicit, mut implicit_end) = (None, Vec::new(), false, true);
+    for e in evs {
+        if !is_ary(e) {
+            continue;
+        }
+        let a = rary(e).v.clone();
+        let g = |i: usize| a.get(i).copied().unwrap_or(QNIL);
+        let code = if is_fix(g(0)) { fix(g(0)) } else { -1 };
+        let node = match code {
+            0 => {
+                let v = g(1);
+                if is_ary(v) && !rary(v).v.is_empty() {
+                    let parts: Vec<i64> = rary(v).v.iter().map(|x| if is_fix(*x) { fix(*x) } else { 0 }).collect();
+                    let (maj, min) = (parts[0], parts.get(1).copied().unwrap_or(0));
+                    if maj != 1 || (min != 1 && min != 2) {
+                        return raise(rt().c.runtime_error, "incompatible %YAML directive");
+                    }
+                    version = Some(if min == 1 { "1.1" } else { "1.2" });
+                }
+                let t = g(2);
+                if is_ary(t) {
+                    for pair in rary(t).v.clone() {
+                        if !is_ary(pair) || rary(pair).v.len() != 2 {
+                            return raise(rt().c.runtime_error, "tag tuple must be of length 2");
+                        }
+                        let p = rary(pair).v.clone();
+                        tags.push((rstring(p[0]), rstring(p[1])));
+                    }
+                }
+                implicit = truthy(g(3));
+                None
+            }
+            1 => {
+                implicit_end = truthy(g(1));
+                None
+            }
+            2 => Some(DN {
+                k: DK::Scalar { v: rstring(g(1)), plain: truthy(g(4)), quoted: truthy(g(5)), style: sty_of(g(6)) },
+                tag: opt_s(g(3)),
+                implicit: false,
+                anchor: opt_s(g(2)),
+            }),
+            3 | 5 => {
+                let flow = is_fix(g(4)) && fix(g(4)) == 2;
+                let k = if code == 3 { DK::Seq(Vec::new(), flow) } else { DK::Map(Vec::new(), flow) };
+                Some(DN { k, tag: opt_s(g(2)), implicit: truthy(g(3)), anchor: opt_s(g(1)) })
+            }
+            4 | 6 => {
+                stack.pop();
+                None
+            }
+            7 => Some(DN { k: DK::Alias(rstring(g(1))), tag: None, implicit: false, anchor: None }),
+            _ => None,
+        };
+        if let Some(n) = node {
+            let open = matches!(n.k, DK::Seq(..) | DK::Map(..));
+            let i = nodes.len();
+            nodes.push(n);
+            match stack.last() {
+                Some(&p) => match &mut nodes[p].k {
+                    DK::Seq(ch, _) | DK::Map(ch, _) => ch.push(i),
+                    _ => {}
+                },
+                None if root.is_none() => root = Some(i),
+                None => return raise(rt().c.runtime_error, "expected DOCUMENT-END"),
+            }
+            if open {
+                stack.push(i);
+            }
+        }
+    }
+    let Some(root) = root else {
+        return raise(rt().c.runtime_error, "expected SCALAR, SEQUENCE-START, MAPPING-START, or ALIAS");
+    };
+    let mut em = Em {
+        nodes: &nodes,
+        out: String::new(),
+        column: 0,
+        whitespace: true,
+        indention: true,
+        open_ended,
+        indent: -1,
+        indents: Vec::new(),
+        flow_level: 0,
+        mapping_ctx: false,
+        simple_key_ctx: false,
+        best_indent,
+        best_width,
+        dirs: Vec::new(),
+    };
+    em.emit_document_full(root, version, &tags, implicit, implicit_end, first);
+    let open = em.open_ended as i64;
+    ary_new(vec![str_from(&em.out), mkfix(open)])
+}
+
+/// The anchor (and start) of a node whose anchor/tag properties come before `pos`, the
+/// position the parser reports for the node itself: `&a !t node`, `!t &a node`, or the
+/// properties on the line above a block collection (comments in between are skipped).
+fn node_props(chars: &[char], mut pos: usize) -> (Option<String>, usize) {
+    let mut anchor = None;
+    let mut start = pos;
+    for _ in 0..2 {
+        // back over blanks, line breaks and the comments of the lines crossed
+        loop {
+            while pos > 0 && chars[pos - 1].is_whitespace() {
+                pos -= 1;
+            }
+            let ls = chars[..pos].iter().rposition(|c| *c == '\n').map(|i| i + 1).unwrap_or(0);
+            let comment = (ls..pos).find(|&i| chars[i] == '#' && (i == ls || chars[i - 1].is_whitespace()));
+            match comment {
+                Some(i) if i < pos && !chars[ls..i].iter().any(|c| *c == '"' || *c == '\'') => pos = i,
+                _ => break,
+            }
+        }
+        let end = pos;
+        while pos > 0 && !chars[pos - 1].is_whitespace() && !"[{,".contains(chars[pos - 1]) {
+            pos -= 1;
+        }
+        let tok: String = chars[pos..end].iter().collect();
+        if let Some(name) = tok.strip_prefix('&') {
+            if anchor.is_none() {
+                anchor = Some(name.to_string());
+                start = pos;
+                continue;
+            }
+        } else if tok.starts_with('!') {
+            start = pos;
+            continue;
+        }
+        break;
+    }
+    (anchor, start)
+}
+
+/// Psych.__kn_events(yaml, path) -> [events, error]: the parse events Psych::Parser hands
+/// its handler, each [name, args, start_line, start_column, end_line, end_column], and the
+/// Psych::SyntaxError.new arguments of a parse error that stopped them (else nil).
+fn kn_events(src: V, path: V) -> V {
+    if !is_str(src) {
+        return type_error("YAML source must be a String");
+    }
+    let mut text = s_of(src);
+    if text.starts_with('\u{feff}') {
+        text.remove(0);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut line_starts = vec![0usize];
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let lines: Vec<String> = text.split('\n').map(String::from).collect();
+    // (marks: 1-based lines, 0-based columns in characters)
+    let pos = |m: &saphyr_parser::Marker| -> usize {
+        line_starts.get(m.line().saturating_sub(1)).map(|s| (s + m.col()).min(chars.len())).unwrap_or(chars.len())
+    };
+    let loc = |p: usize| -> (i64, i64) {
+        let l = line_starts.partition_point(|s| *s <= p).saturating_sub(1);
+        (l as i64, (p - line_starts[l]) as i64)
+    };
+    let out = ary_new(Vec::new());
+    let push = |name: &str, args: Vec<V>, s: usize, e: usize| {
+        let ((sl, sc), (el, ec)) = (loc(s), loc(e.max(s)));
+        let ev = ary_new(vec![mksym(sym(name)), ary_new(args), mkfix(sl), mkfix(sc), mkfix(el), mkfix(ec)]);
+        rary(out).v.push(ev);
+    };
+    let opt_str = |s: &Option<String>| s.as_deref().map(str_from).unwrap_or(QNIL);
+    let mut p = Parser::new_from_str(&text);
+    let mut anchors: HashMap<usize, String> = HashMap::new();
+    let mut flow: Vec<bool> = Vec::new();
+    let mut dir_from = 0usize;
+    let mut err = QNIL;
+    loop {
+        let (ev, span) = match p.next_event() {
+            None => break,
+            Some(Ok(e)) => e,
+            Some(Err(e)) => {
+                let mk = e.marker();
+                let info = e.info().to_string();
+                let (problem, context) = match info.split_once(", ") {
+                    Some((ctx, prob)) if ctx.starts_with("while ") => (prob.to_string(), Some(ctx.to_string())),
+                    _ => (info, None),
+                };
+                err = ary_new(vec![
+                    path,
+                    mkfix(mk.line() as i64),
+                    mkfix(mk.col() as i64 + 1),
+                    mkfix(mk.index() as i64),
+                    str_from(&problem),
+                    opt_str(&context),
+                ]);
+                break;
+            }
+        };
+        let (s, e) = (pos(&span.start), pos(&span.end));
+        let map = matches!(ev, Event::MappingStart(..) | Event::MappingEnd);
+        let tag_s = |t: &Option<std::borrow::Cow<saphyr_parser::Tag>>| t.as_ref().map(|t| format!("{}{}", t.handle, t.suffix));
+        let mut props = |id: usize, tagged: bool| -> (Option<String>, usize) {
+            if id == 0 && !tagged {
+                return (None, s);
+            }
+            let (a, start) = node_props(&chars, s);
+            if id == 0 {
+                return (None, start);
+            }
+            let name = a.unwrap_or_else(|| id.to_string());
+            anchors.insert(id, name.clone());
+            (Some(name), start)
+        };
+        match ev {
+            Event::Nothing => {}
+            Event::StreamStart => push("start_stream", vec![mkfix(1)], s, e),
+            Event::StreamEnd => push("end_stream", vec![], s, e),
+            Event::DocumentStart(explicit) => {
+                let mut version = Vec::new();
+                let mut tags = Vec::new();
+                let upto = span.start.line().saturating_sub(1);
+                if explicit {
+                    for l in lines.iter().take(upto).skip(dir_from) {
+                        let mut w = l.split_whitespace();
+                        match w.next() {
+                            Some("%YAML") => {
+                                if let Some((a, b)) = w.next().and_then(|v| v.split_once('.')) {
+                                    version = vec![mkfix(a.parse().unwrap_or(1)), mkfix(b.parse().unwrap_or(1))];
+                                }
+                            }
+                            Some("%TAG") => {
+                                if let (Some(h), Some(pf)) = (w.next(), w.next()) {
+                                    tags.push(ary_new(vec![str_from(h), str_from(pf)]));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let implicit = !explicit;
+                push("start_document", vec![ary_new(version), ary_new(tags), bool_v(implicit)], s, if explicit { e } else { s });
+            }
+            Event::DocumentEnd => {
+                let explicit = chars[s..].starts_with(&['.', '.', '.']);
+                dir_from = if explicit { span.start.line() } else { span.start.line().saturating_sub(1) };
+                push("end_document", vec![bool_v(!explicit)], s, if explicit { e } else { s });
+            }
+            Event::Alias(id) => {
+                let name = anchors.get(&id).cloned().unwrap_or_else(|| {
+                    chars[s..].iter().skip(1).take_while(|c| !c.is_whitespace() && !",[]{}".contains(**c)).collect()
+                });
+                push("alias", vec![str_from(&name)], s, e);
+            }
+            Event::Scalar(v, style, id, tag) => {
+                let t = tag_s(&tag);
+                let (anchor, start) = props(id, t.is_some());
+                let plain = matches!(style, ScalarStyle::Plain);
+                let plain_implicit = (plain && t.is_none()) || t.as_deref() == Some("!");
+                let quoted_implicit = !plain_implicit && t.is_none();
+                let st = match style {
+                    ScalarStyle::Plain => 1,
+                    ScalarStyle::SingleQuoted => 2,
+                    ScalarStyle::DoubleQuoted => 3,
+                    ScalarStyle::Literal => 4,
+                    ScalarStyle::Folded => 5,
+                };
+                push(
+                    "scalar",
+                    vec![str_from(&v), opt_str(&anchor), opt_str(&t), bool_v(plain_implicit), bool_v(quoted_implicit), mkfix(st)],
+                    start,
+                    e,
+                );
+            }
+            Event::SequenceStart(id, tag) | Event::MappingStart(id, tag) => {
+                let t = tag_s(&tag);
+                let (anchor, start) = props(id, t.is_some());
+                let implicit = t.is_none() || t.as_deref() == Some("!");
+                let is_flow = flow.last().copied().unwrap_or(false) || matches!(chars.get(s), Some('[') | Some('{'));
+                flow.push(is_flow);
+                push(
+                    if map { "start_mapping" } else { "start_sequence" },
+                    vec![opt_str(&anchor), opt_str(&t), bool_v(implicit), mkfix(if is_flow { 2 } else { 1 })],
+                    start,
+                    e,
+                );
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                flow.pop();
+                push(if map { "end_mapping" } else { "end_sequence" }, vec![], s, e);
+            }
+        }
+    }
+    ary_new(vec![out, err])
 }
 
 /// Registers the native half of Psych, loaded by `require "kenny/psych.so"` in lib/kenny/psych.rb.
@@ -2290,4 +2658,15 @@ fn init_psych() {
     };
     defs(p, "__kn_load", 2, 2, |_, a, _| kn_load(a[0], a[1]));
     defs(p, "__kn_dump", 2, 2, |_, a, _| kn_dump(a[0], a[1]));
+    defs(p, "__kn_emit", 2, 2, |_, a, _| kn_emit(a[0], a[1]));
+    defs(p, "__kn_events", 2, 2, |_, a, _| kn_events(a[0], a[1]));
+    // psych's build_exception: an exception with its message set, initialize not called
+    defs(p, "__kn_build_exception", 2, 2, |_, a, _| {
+        let e = send0(a[0], "allocate");
+        if e == UNDEF {
+            return UNDEF;
+        }
+        ivar_set(e, sym("@__message"), a[1]);
+        e
+    });
 }
