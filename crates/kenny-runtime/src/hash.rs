@@ -268,7 +268,16 @@ pub fn init() {
     defn(c, "entries", 0, 0, |s, _, _| ary_new(pair_ary(s)));
     defn(c, "to_h", 0, 0, |s, _, b| {
         if !is_proc(b) {
-            return s;
+            if real_class(s) == rt().c.hash {
+                return s;
+            }
+            // a subclass's: a new Hash
+            let out = hash_new();
+            merge_into(out, s, QNIL);
+            crate::gc::wb_obj(out);
+            rhash(out).default = rhash(s).default;
+            rhash(out).default_proc = rhash(s).default_proc;
+            return out;
         }
         let out = hash_new();
         for (k, v) in pairs(s) {
