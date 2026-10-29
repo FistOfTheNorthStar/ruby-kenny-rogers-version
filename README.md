@@ -183,9 +183,17 @@ Working:
   name resolution blocks); FFI bindings load (their
   declarations work) but calling a C function through FFI raises NotImplementedError. As with
   the ffi gem, `ffi_lib` raises LoadError when the library isn't installed, so optional native
-  dependencies (Active Storage's libvips) are skipped. `require "ripper"` gives Ripper's
-  constants and event tables (enough for gems that load it), but parsing with it raises
-  NotImplementedError.
+  dependencies (Active Storage's libvips) are skipped.
+- **Prism and Ripper at runtime:** the prism gem's C extension is replaced by the libprism
+  Kenny's compiler parses with (linked only into programs that load Prism or Ripper), so
+  `Prism.parse`/`lex`/`dump`, rubocop-ast and RuboCop work. Its parse is serialized for the
+  gem's Ruby library, whose version must be libprism's (1.9.0): `kenny build` uses the
+  Gemfile.lock's prism, else an installed prism 1.9.0 gem in place of the standard library's
+  (Ruby 3.4 ships 1.5), and otherwise `require "prism"` raises LoadError (with a build
+  warning). Ripper runs on Prism (`Prism::Translation::Ripper` sends Ripper's parser events,
+  `Prism.lex_compat` gives `Ripper.lex` its tokens), so `Ripper.sexp`, `Ripper.lex` and
+  Ripper subclasses work; lexer states of some tokens (spaces, heredoc ends) can differ from
+  CRuby's, and `Ripper#state`/`#token` are nil.
 - **Built-in HTTP server** for Rack apps: one process serves requests on every core
   (`rack.multithread` is true); `WEB_CONCURRENCY=n` forks n processes instead. `rack.hijack`
   (full and partial) hands the connection's socket to the app.

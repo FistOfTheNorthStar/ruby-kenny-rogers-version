@@ -294,6 +294,23 @@ fn kahan_sum(init: V, vals: &[V]) -> V {
             let mut c = 0.0;
             while i < vals.len() {
                 let Some(f) = crate::fmt::num_to_f(vals[i]) else { break };
+                i += 1;
+                // (as CRuby: NaN and infinities skip the compensation, which they'd turn into
+                // NaN: `[1, Float::INFINITY].sum` is Infinity)
+                if sum.is_nan() {
+                    continue;
+                }
+                if f.is_nan() {
+                    sum = f;
+                    continue;
+                }
+                if f.is_infinite() {
+                    sum = if sum.is_infinite() && f.is_sign_negative() != sum.is_sign_negative() { f64::NAN } else { f };
+                    continue;
+                }
+                if sum.is_infinite() {
+                    continue;
+                }
                 let t = sum + f;
                 if sum.abs() >= f.abs() {
                     c += (sum - t) + f;
@@ -301,9 +318,8 @@ fn kahan_sum(init: V, vals: &[V]) -> V {
                     c += (f - t) + sum;
                 }
                 sum = t;
-                i += 1;
             }
-            acc = float_new(sum + c);
+            acc = float_new(if sum.is_finite() { sum + c } else { sum });
             continue;
         }
         acc = tri!(if is_fix(acc) || is_big(acc) { arith(Op::Add, acc, x) } else { send1(acc, "+", x) });

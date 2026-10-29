@@ -497,6 +497,8 @@ pub struct Output {
     pub object: Vec<u8>,
     pub needs_jit: bool,
     pub warnings: Vec<String>,
+    /// every file compiled in (canonical paths)
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Default, Clone)]
@@ -641,6 +643,7 @@ impl Compiler<ObjectModule> {
     fn finish(mut self, toplevel: FuncId) -> Result<Output, String> {
         let needs_jit = self.needs_jit;
         let warnings = std::mem::take(&mut self.warnings);
+        let files: Vec<PathBuf> = self.loaded.keys().cloned().collect();
         let e = |x: cranelift_module::ModuleError| x.to_string();
         // main(argc, argv) -> kn_start(...)
         let mut sig = self.module.make_signature();
@@ -800,7 +803,7 @@ impl Compiler<ObjectModule> {
         self.module.define_data(script_id, &d).map_err(e)?;
         let product = self.module.finish();
         let object = product.emit().map_err(|x| x.to_string())?;
-        Ok(Output { object, needs_jit, warnings })
+        Ok(Output { object, needs_jit, warnings, files })
     }
 }
 
