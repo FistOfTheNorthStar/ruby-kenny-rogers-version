@@ -11,6 +11,7 @@
 mod dom;
 mod entities;
 mod html;
+mod sax;
 mod ser;
 mod xml;
 mod xpath;
@@ -1912,6 +1913,7 @@ fn init_nokogiri() {
     set("LIBXML2_PATCHES", patches);
     set("LIBXSLT_PATCHES", ary_new(vec![str_from("0001-update-config.guess-and-config.sub-for-libxslt.patch")]));
 
+    sax::init(xmlm);
     init_node(node);
     init_document(document, html_document);
     init_leaf_nodes();

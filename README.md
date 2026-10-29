@@ -145,8 +145,9 @@ Working:
   strscan, digest, zlib, openssl (digests, HMAC, ciphers, RSA keys and signatures; no TLS, X509
   certificates or EC keys), Marshal (byte-compatible format 4.8),
   cgi/escape, erb/escape (Rails' `html_escape`), plus `Gem::Version`/`Gem::Requirement`.
-  Nokogiri is native too (html5ever and quick-xml underneath, its own XPath 1.0 engine, and
-  nokogiri's Ruby layer on top), so loofah and the Rails HTML sanitizers work without libxml2.
+  Nokogiri is native too (html5ever and quick-xml underneath, its own XPath 1.0 engine, a SAX
+  scanner that reports what libxml2's does, and nokogiri's Ruby layer on top), so loofah, the
+  Rails HTML sanitizers and the AWS SDK's XML parsing work without libxml2.
   The `sqlite3` gem's C extension is native too (on the bundled SQLite library, for both the
   1.x and 2.x gem APIs); the gem's own Ruby files load on top of it.
 - **Asset pipeline without Ruby or Node:** the `sassc` gem's API runs on a native Sass

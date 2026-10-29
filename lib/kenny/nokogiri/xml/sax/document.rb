@@ -161,6 +161,13 @@ module Nokogiri
         # +content+ is the value of the instruction
         def processing_instruction(name, content)
         end
+
+        ###
+        # Kenny: from Nokogiri 1.17. Called after the text of an entity declared in the
+        # document's DTD, unless the parser context replaces entities.
+        # +name+ is the entity's name, +content+ its replacement text
+        def reference(name, content)
+        end
       end
     end
   end
