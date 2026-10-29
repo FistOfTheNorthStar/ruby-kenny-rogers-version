@@ -25,6 +25,17 @@ pub struct Bundle {
     pub without: Vec<String>,
     /// version of a psych gem in the lock file
     pub psych_version: Option<String>,
+    /// the C extensions of the gems compiled in (`ext/<name>/extconf.rb`), except those
+    /// Kenny replaces (`NATIVE`)
+    pub exts: Vec<GemExt>,
+}
+
+/// A gem's C extension: built into the binary (crate::cext).
+pub struct GemExt {
+    /// "msgpack 1.8.5"
+    pub gem: String,
+    /// the directory of its extconf.rb
+    pub dir: PathBuf,
 }
 
 #[derive(Default, Clone)]
@@ -55,6 +66,16 @@ enum Source {
 /// Gems whose job the Kenny binary does itself: Rack application servers (the binary has its
 /// own HTTP server). They are not compiled in, and `Bundler.require` skips them.
 const REPLACED: &[&str] = &["puma", "unicorn", "thin", "passenger", "falcon", "webrick", "pitchfork", "iodine"];
+
+/// Gems whose C extensions Kenny replaces (natively in the runtime, or by an overlay file
+/// that doesn't load the extension), or whose extensions need CRuby's VM internals: their
+/// `ext/` sources are not built.
+const NATIVE: &[&str] = &[
+    "nokogiri", "racc", "bigdecimal", "json", "date", "strscan", "sqlite3", "openssl", "psych", "stringio",
+    "io-console", "io-wait", "io-nonblock", "nio4r", "digest", "zlib", "etc", "erb", "cgi", "pathname", "ripper",
+    "prism", "ffi", "fiddle", "bootsnap", "byebug", "debug", "debug_inspector", "puma", "monitor", "socket", "pty",
+    "fcntl", "syslog", "readline-ext", "objspace", "coverage",
+];
 
 /// Project directories that are never compiled in (tests, generated files, vendored gems).
 const SKIP_DIRS: &[&str] = &["test", "spec", "tmp", "log", "node_modules", "vendor", "bin", "public", "storage", "coverage", "features"];
@@ -126,6 +147,7 @@ pub fn resolve(lockfile: &Path) -> Result<Bundle, String> {
     let mut spec_rows = Vec::new();
     let mut missing = Vec::new();
     let mut engine_dirs = Vec::new();
+    let mut exts = Vec::new();
     for name in &order {
         // Kenny provides Bundler itself (lib/kenny/bundler.rb)
         if *name == "bundler" {
@@ -140,7 +162,15 @@ pub fn resolve(lockfile: &Path) -> Result<Bundle, String> {
             }
         }
         match found {
-            Some((s, Located::Dir(dir, req))) => {
+            Some((s, Located::Dir(dir, req, ext))) => {
+                if !NATIVE.contains(&s.name.as_str()) {
+                    for e in ext.iter().filter(|e| e.ends_with("extconf.rb")) {
+                        let d = dir.join(e);
+                        if let Some(p) = d.parent().filter(|_| d.is_file()) {
+                            exts.push(GemExt { gem: format!("{} {}", s.name, s.version), dir: p.to_path_buf() });
+                        }
+                    }
+                }
                 let paths: Vec<PathBuf> = req.iter().map(|r| dir.join(r)).filter(|p| p.is_dir()).collect();
                 if dir.join("app").is_dir() {
                     engine_dirs.extend(["app", "config"].iter().map(|d| dir.join(d)).filter(|d| d.is_dir()));
@@ -214,7 +244,7 @@ pub fn resolve(lockfile: &Path) -> Result<Bundle, String> {
     rb.push_str("    ].freeze\n  end\nend\n");
     let without = without.into_iter().filter(|g| !with.contains(g)).collect();
     let psych_version = specs.iter().find(|s| s.name == "psych").map(|s| s.version.split('-').next().unwrap_or("").to_string());
-    Ok(Bundle { root, load_paths, project_dirs, engine_dirs, ruby: rb, without, psych_version })
+    Ok(Bundle { root, load_paths, project_dirs, engine_dirs, ruby: rb, without, psych_version, exts })
 }
 
 fn rstr(s: &str) -> String {
@@ -324,7 +354,8 @@ fn parse_lock(text: &str, root: &Path) -> (Vec<Spec>, Vec<(String, Vec<String>)>
 // ---------- installed gems ----------
 
 enum Located {
-    Dir(PathBuf, Vec<String>),
+    /// the gem's directory, its require paths and its extensions (extconf.rb paths)
+    Dir(PathBuf, Vec<String>, Vec<String>),
     Default,
 }
 
@@ -370,7 +401,7 @@ fn gem_dirs() -> Vec<PathBuf> {
 pub fn installed_gem(name: &str, version: &str) -> Option<Vec<PathBuf>> {
     let s = Spec { name: name.into(), version: version.into(), deps: Vec::new(), source: Source::Gem };
     match locate(&s, &gem_dirs(), Path::new(".")) {
-        Some(Located::Dir(dir, req)) => Some(req.iter().map(|r| dir.join(r)).filter(|p| p.is_dir()).collect()),
+        Some(Located::Dir(dir, req, _)) => Some(req.iter().map(|r| dir.join(r)).filter(|p| p.is_dir()).collect()),
         _ => None,
     }
 }
@@ -380,7 +411,9 @@ fn locate(s: &Spec, gem_dirs: &[PathBuf], _root: &Path) -> Option<Located> {
     match &s.source {
         Source::Path(dir) => {
             let req = gemspec_in(dir).map(|g| require_paths(&g)).unwrap_or_else(|| vec!["lib".into()]);
-            return Some(Located::Dir(dir.canonicalize().unwrap_or(dir.clone()), req));
+            let dir = dir.canonicalize().unwrap_or(dir.clone());
+            let ext = find_extconfs(&dir);
+            return Some(Located::Dir(dir, req, ext));
         }
         Source::Git { revision } => {
             let short: String = revision.chars().take(12).collect();
@@ -388,7 +421,8 @@ fn locate(s: &Spec, gem_dirs: &[PathBuf], _root: &Path) -> Option<Located> {
                 let dir = d.join("bundler/gems").join(format!("{}-{}", s.name, short));
                 if dir.is_dir() {
                     let req = gemspec_in(&dir).map(|g| require_paths(&g)).unwrap_or_else(|| vec!["lib".into()]);
-                    return Some(Located::Dir(dir, req));
+                    let ext = find_extconfs(&dir);
+                    return Some(Located::Dir(dir, req, ext));
                 }
             }
             return None;
@@ -399,7 +433,7 @@ fn locate(s: &Spec, gem_dirs: &[PathBuf], _root: &Path) -> Option<Located> {
         let dir = d.join("gems").join(&full);
         if dir.is_dir() {
             let spec = std::fs::read_to_string(d.join("specifications").join(format!("{full}.gemspec"))).unwrap_or_default();
-            return Some(Located::Dir(dir, require_paths(&spec)));
+            return Some(Located::Dir(dir, require_paths(&spec), spec_list(&spec, ".extensions").unwrap_or_default()));
         }
     }
     for d in gem_dirs {
@@ -418,17 +452,40 @@ fn gemspec_in(dir: &Path) -> Option<String> {
 
 /// `s.require_paths = ["lib".freeze]` from an installed gemspec (default: lib).
 fn require_paths(spec: &str) -> Vec<String> {
+    spec_list(spec, ".require_paths").filter(|v| !v.is_empty()).unwrap_or_else(|| vec!["lib".into()])
+}
+
+/// A list attribute of an installed gemspec: `s.extensions = ["ext/x/extconf.rb".freeze]`.
+fn spec_list(spec: &str, attr: &str) -> Option<Vec<String>> {
     for line in spec.lines() {
         if let Some((lhs, rhs)) = line.split_once('=') {
-            if lhs.trim().ends_with(".require_paths") {
-                let v: Vec<String> = rhs.split('"').skip(1).step_by(2).map(|s| s.to_string()).collect();
-                if !v.is_empty() {
-                    return v;
-                }
+            if lhs.trim().ends_with(attr) {
+                return Some(rhs.split('"').skip(1).step_by(2).map(|s| s.to_string()).collect());
             }
         }
     }
-    vec!["lib".into()]
+    None
+}
+
+/// The extconf.rb files under a source checkout's ext/ (a path or git gem, whose gemspec is
+/// Ruby code that isn't evaluated).
+fn find_extconfs(dir: &Path) -> Vec<String> {
+    fn walk(d: &Path, rel: &str, depth: usize, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for p in entries {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            if p.is_dir() && depth < 3 {
+                walk(&p, &format!("{rel}/{name}"), depth + 1, out);
+            } else if name == "extconf.rb" {
+                out.push(format!("{rel}/{name}"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&dir.join("ext"), "ext", 0, &mut out);
+    out
 }
 
 // ---------- Gemfile (read statically with Prism) ----------

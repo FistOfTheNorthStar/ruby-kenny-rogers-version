@@ -72,7 +72,7 @@ anywhere, `=0` off. The gems' files always come from the binary.
 | HTTP | Built into the runtime: a Rack `config.ru` is the entry point, no Puma needed |
 
 Notable choices:
-- **Tagged values** use the same layout as CRuby (Fixnum, Symbol, nil/true/false), so a C-extension API shim stays possible later.
+- **Tagged values** use the same layout as CRuby (Fixnum, Symbol, nil/true/false), so C extensions run on a thin API shim.
 - **Floats are immediates ("flonums")** when their exponent is in range, with CRuby's encoding (low bits `10`, the
   double rotated by 3); +0.0 has its own flonum, and -0.0, NaN, Infinity and very large or small values stay heap
   objects. `ruby.h` mirrors the encoding (`FLONUM_P`, `RFLOAT_VALUE`, `rb_float_new`).
@@ -136,7 +136,13 @@ Working:
   freed once nothing can run them (no method, block, frame or Method object refers to them), so
   code that evals a new string per request doesn't grow memory. `binding` captures `self` (not
   locals), so `ERB#result(binding)` works.
-- **C extensions:** a CRuby-compatible `ruby.h` and C API, built with `kenny build --ext dir`.
+- **C extensions:** a CRuby-compatible `ruby.h` and C API. The C (and C++) extensions of the
+  gems in Gemfile.lock are compiled into the binary, with the flags and `HAVE_*` defines of the
+  Makefile their `extconf.rb` made (msgpack and unf_ext, for example), so `require` of the
+  extension runs its `Init_` function; `kenny build --ext dir` adds one of your own. Gems the
+  runtime has a native replacement for (nokogiri, json, date, sqlite3, ...) keep using it. An
+  extension that doesn't compile or link against Kenny's API is left out with a warning
+  (`require` of it then raises `LoadError`); `KENNY_NO_GEM_EXTS=1` leaves them all out.
 - **Libraries:** `require` / `require_relative` / `autoload` / `load` compile gems and the stdlib
   into the binary (`-I dir`; the stdlib of the Ruby built against is found automatically, and
   without a Gemfile so are the gems that Ruby bundles in place of former stdlib parts, such as

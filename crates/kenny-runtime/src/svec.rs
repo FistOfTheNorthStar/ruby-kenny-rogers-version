@@ -379,6 +379,14 @@ impl<T: Copy> SVec<T> {
         self.extend_from_slice(other);
         other.clear();
     }
+    /// Set the length within the capacity, keeping the buffer's bytes: a C extension writes
+    /// into a String's buffer (`RSTRING_PTR`), then sets its length (`rb_str_set_len`).
+    pub fn set_len_in_capacity(&mut self, k: usize) {
+        self.wb();
+        let cap = self.lock();
+        self.len.store(k.min(cap), Release);
+        self.unlock(cap);
+    }
     pub fn reserve(&mut self, extra: usize) {
         let cap = self.lock();
         let n = self.len.load(Relaxed).min(cap);

@@ -19,6 +19,9 @@ pub struct Ruby {
     /// where this Ruby keeps its bundled and default gems
     pub default_gem_dir: Option<PathBuf>,
     pub gem_path: Vec<PathBuf>,
+    /// the ruby executable, and the GEM_HOME / GEM_PATH it runs with (None: inherited)
+    pub exe: PathBuf,
+    gem_env: Option<(PathBuf, Vec<PathBuf>)>,
 }
 
 static RUBY: OnceLock<Option<Ruby>> = OnceLock::new();
@@ -148,12 +151,8 @@ fn rvm_gem_env(exe: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
     Some((own, path))
 }
 
-fn query(exe: &Path, gem_env: Option<(PathBuf, Vec<PathBuf>)>) -> Option<Ruby> {
+fn ruby_command(exe: &Path, gem_env: &Option<(PathBuf, Vec<PathBuf>)>) -> Command {
     let mut cmd = Command::new(exe);
-    cmd.args([
-        "-e",
-        "puts RUBY_VERSION, RUBY_PATCHLEVEL, RUBY_RELEASE_DATE, RbConfig::CONFIG['ruby_version'], RbConfig::CONFIG['rubylibdir'], (Gem.default_dir rescue ''), (Gem.path.join(File::PATH_SEPARATOR) rescue '')",
-    ]);
     match gem_env {
         Some((home, path)) => {
             cmd.env("GEM_HOME", home);
@@ -165,6 +164,15 @@ fn query(exe: &Path, gem_env: Option<(PathBuf, Vec<PathBuf>)>) -> Option<Ruby> {
         }
         None => {}
     }
+    cmd
+}
+
+fn query(exe: &Path, gem_env: Option<(PathBuf, Vec<PathBuf>)>) -> Option<Ruby> {
+    let mut cmd = ruby_command(exe, &gem_env);
+    cmd.args([
+        "-e",
+        "puts RUBY_VERSION, RUBY_PATCHLEVEL, RUBY_RELEASE_DATE, RbConfig::CONFIG['ruby_version'], RbConfig::CONFIG['rubylibdir'], (Gem.default_dir rescue ''), (Gem.path.join(File::PATH_SEPARATOR) rescue '')",
+    ]);
     let out = cmd.output().ok().filter(|o| o.status.success())?;
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut l = text.lines();
@@ -176,10 +184,15 @@ fn query(exe: &Path, gem_env: Option<(PathBuf, Vec<PathBuf>)>) -> Option<Ruby> {
     let libdir = dir(l.next());
     let default_gem_dir = dir(l.next());
     let gem_path = l.next().map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
-    Some(Ruby { version, patchlevel, release_date, abi, libdir, default_gem_dir, gem_path })
+    Some(Ruby { version, patchlevel, release_date, abi, libdir, default_gem_dir, gem_path, exe: exe.to_path_buf(), gem_env })
 }
 
 impl Ruby {
+    /// A command running this Ruby (with its gem directories).
+    pub fn command(&self) -> Command {
+        ruby_command(&self.exe, &self.gem_env)
+    }
+
     /// "3.4", "4.0"
     pub fn minor_version(&self) -> String {
         self.version.split('.').take(2).collect::<Vec<_>>().join(".")

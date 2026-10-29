@@ -535,7 +535,7 @@ fn not_a_tail_call() {
 }
 /// C extension functions running on any thread (see call_native).
 pub static C_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-fn call_native_c(f: *const std::ffi::c_void, arity: i32, recv: V, args: &[V]) -> V {
+pub fn call_native_c(f: *const std::ffi::c_void, arity: i32, recv: V, args: &[V]) -> V {
     C_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let r = crate::capi::call_cfunc(f, arity, recv, args);
     C_CALLS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -649,6 +649,17 @@ fn sym_probe(t: &SymTable, h: u64, name: &[u8]) -> Result<u32, usize> {
     }
 }
 pub fn intern(name: &[u8]) -> u32 {
+    // The one-character names come first, so a symbol's id is its character, as CRuby's IDs
+    // are: C extensions call operators by char (`rb_funcall(x, '+', 1, y)`).
+    static ONE_CHAR: std::sync::Once = std::sync::Once::new();
+    ONE_CHAR.call_once(|| {
+        for c in 0..128u8 {
+            intern_name(&[c]);
+        }
+    });
+    intern_name(name)
+}
+fn intern_name(name: &[u8]) -> u32 {
     use std::sync::atomic::Ordering;
     let h = sym_hash(name);
     let t = SYM_TABLE.load(Ordering::Acquire);
@@ -1925,7 +1936,9 @@ pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
         }
         Body::CFunc(f, arity) => {
             pst().current_block.push(blk);
+            crate::capi::enter_frame((*m).name, recv);
             let r = call_native_c(*f, *arity, recv, args);
+            crate::capi::leave_frame();
             pst().current_block.pop();
             r
         }
