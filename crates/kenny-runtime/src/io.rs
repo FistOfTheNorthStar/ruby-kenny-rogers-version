@@ -4739,6 +4739,24 @@ static WARNING: G<V> = G::new(QNIL);
 static WARNING_CATEGORIES: std::sync::Mutex<[(&str, bool); 4]> =
     std::sync::Mutex::new([("deprecated", false), ("experimental", true), ("performance", false), ("strict_unused_block", false)]);
 
+/// `Warning[:deprecated]`, readable without the lock (core.rs `unchill` asks on every first
+/// change of a String literal).
+static WARN_DEPRECATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn warn_deprecated() -> bool {
+    WARN_DEPRECATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// `Warning.warn(msg, category: cat)`, as CRuby's own warnings of a category are issued.
+pub fn warn_category(msg: V, cat: &str) {
+    let w = *WARNING.get();
+    if w == QNIL {
+        return;
+    }
+    let kw = hash_new();
+    crate::hash::hset(kw, mksym(sym("category")), mksym(sym(cat)));
+    hdr(kw).flags |= FL_KWHASH;
+    let _ = send(w, sym("warn"), &[msg, kw], QNIL);
+}
+
 fn warning_category_enabled(cat: V) -> Result<bool, V> {
     let name = if is_sym(cat) { String::from_utf8_lossy(sym_name(sym_id(cat))).into_owned() } else { String::new() };
     let cats = WARNING_CATEGORIES.lock().unwrap_or_else(|e| e.into_inner());
@@ -4768,6 +4786,9 @@ fn init_warning() {
         let mut cats = WARNING_CATEGORIES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cats.iter_mut().find(|(n, _)| *n == name) {
             c.1 = truthy(a[1]);
+            if name == "deprecated" {
+                WARN_DEPRECATED.store(c.1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         a[1]
     });

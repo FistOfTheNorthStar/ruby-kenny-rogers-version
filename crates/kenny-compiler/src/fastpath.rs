@@ -1547,6 +1547,37 @@ impl<M: Module> Compiler<M> {
         fx.b.ins().load(I64, f, addr, 0)
     }
 
+    /// The chilled literal `b` of `recv << "b"` (chilled.rs): the frozen literal when `recv`
+    /// is a plain String, whose `<<` only copies the bytes; else (an Array keeps it) a new
+    /// chilled String.
+    pub(crate) fn append_lit(&mut self, fx: &mut Fx, recv: Value, b: &[u8]) -> Value {
+        let f = mem();
+        let lit_b = fx.b.create_block();
+        let chill_b = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        let r = fx.b.ins().rotr_imm_s(recv, 3);
+        let r = fx.b.ins().iadd_imm_s(r, -2);
+        let heap = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, r, (1i64 << 61) - 2);
+        let b0 = fx.b.create_block();
+        fx.b.ins().brif(heap, b0, &[], chill_b, &[]);
+        fx.b.switch_to_block(b0);
+        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+        let dir = fx.b.ins().symbol_value(I64, gv);
+        let k = fx.b.ins().load(I64, f, recv, 0);
+        let sk = fx.b.ins().load(I64, f, dir, KD_STRING_CLASS);
+        let is_str = fx.b.ins().icmp(IntCC::Equal, k, sk);
+        fx.b.ins().brif(is_str, lit_b, &[], chill_b, &[]);
+        fx.b.switch_to_block(lit_b);
+        let v = self.str_lit(fx, b);
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(chill_b);
+        let v = self.str_chilled(fx, b);
+        fx.b.ins().jump(done, &[v.into()]);
+        fx.b.switch_to_block(done);
+        fx.b.block_params(done)[0]
+    }
+
     /// `recv.getbyte(i)` (`val` None) or `recv.setbyte(i, val)` without a call when `recv` is
     /// a plain String (its class is String itself) whose getbyte and setbyte are the builtins
     /// (`KN_DIRECT.flags`) and `i` (and `val`) Integers: the byte (nil past the end), or for a
@@ -1580,8 +1611,9 @@ impl<M: Module> Compiler<M> {
         let mut bad = fx.b.ins().bor(other, no_bits);
         bad = fx.b.ins().bor(bad, not_fix);
         if val.is_some() {
+            // (a chilled literal is changed by the runtime: it warns, and copies the bytes)
             let fl = fx.b.ins().uload32(f, recv, OBJ_FLAGS);
-            let fr = fx.b.ins().band_imm_s(fl, FL_FROZEN);
+            let fr = fx.b.ins().band_imm_s(fl, FL_FROZEN | FL_CHILLED);
             bad = fx.b.ins().bor(bad, fr);
         }
         let cont = fx.b.create_block();
@@ -1590,6 +1622,11 @@ impl<M: Module> Compiler<M> {
         // the byte (capacity first, as SVec::snap does); a negative index counts from the end
         let cap_addr = fx.b.ins().iadd_imm_s(recv, STR_CAP as i64);
         let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
+        if val.is_some() {
+            // bytes shared with a literal are copied before a write (svec.rs `shared`)
+            let sh = fx.b.ins().band_imm_s(cap, SVEC_SHARED);
+            self.require_zero(fx, sh, slow_b);
+        }
         let ptr = fx.b.ins().load(I64, f, recv, STR_PTR);
         let len = fx.b.ins().load(I64, f, recv, STR_LEN);
         let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
@@ -2830,8 +2867,12 @@ const OBJ_IVARS_PTR: i32 = 24;
 const OBJ_IVARS_LEN: i32 = 32;
 const OBJ_IVARS_CAP: i32 = 40;
 const FL_FROZEN: i64 = 1;
+/// kenny-runtime core.rs `FL_CHILLED`
+const FL_CHILLED: i64 = 1 << 13;
 const SVEC_CAP_MASK: i64 = (1 << 56) - 1;
 const SVEC_OLD: i64 = 1 << 62;
+/// kenny-runtime svec.rs `SHARED`
+const SVEC_SHARED: i64 = 1 << 58;
 const SVEC_FLAGS: i64 = (1 << 62) | (1 << 61);
 const CC_ATTR: i32 = 16;
 

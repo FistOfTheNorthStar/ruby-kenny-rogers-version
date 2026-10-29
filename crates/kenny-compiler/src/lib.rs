@@ -23,6 +23,7 @@ mod ispec;
 mod cfold;
 mod felem;
 mod hoist;
+mod chilled;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -226,6 +227,13 @@ pub struct Compiler<M: Module> {
     /// Cache slots whose first word points to a heap entry the runtime allocates (word
     /// offset, OWNED_CALL / OWNED_CONST): freed with an eval unit.
     pub(crate) owned_caches: Vec<(u32, u8)>,
+    /// chilled.rs: the chilled String literals of the unit being compiled that may be frozen,
+    /// and those of the (never freed) copies of files that inlined methods come from
+    pub(crate) shared_lits: HashSet<usize>,
+    pub(crate) shared_lits_kept: HashSet<usize>,
+    /// (literal, receiver) of the `recv << "lit"` whose argument is being compiled
+    /// (fastpath.rs `append_lit`)
+    pub(crate) append_recv: Option<(usize, Value)>,
     /// statics.rs: the program's `def`s with predeclared fast entries, by name
     pub(crate) static_defs: HashMap<Vec<u8>, Vec<statics::StaticDef>>,
     /// keyword `def`s of the program by name (statics.rs `KwDef`)
@@ -348,6 +356,9 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_yield", &[I64, I64, I64], &[I64]),
     ("kn_yield_splat", &[I64, I64], &[I64]),
     ("kn_str_lit", &[I64, I64, I64], &[I64]),
+    ("kn_str_chilled", &[I64, I64, I64], &[I64]),
+    ("kn_str_lit_eval", &[I64, I64, I64], &[I64]),
+    ("kn_str_chilled_eval", &[I64, I64], &[I64]),
     ("kn_str_new", &[I64, I64], &[I64]),
     ("kn_str_append_raw", &[I64, I64, I64], &[I64]),
     ("kn_str_append", &[I64, I64], &[I64]),
@@ -585,6 +596,9 @@ impl<M: Module> Compiler<M> {
             str_offsets: HashMap::new(),
             cache_words: 0,
             owned_caches: Vec::new(),
+            shared_lits: HashSet::new(),
+            shared_lits_kept: HashSet::new(),
+            append_recv: None,
             static_defs: HashMap::new(),
             kw_defs: HashMap::new(),
             static_defined: HashSet::new(),
@@ -992,11 +1006,27 @@ impl<M: Module> Compiler<M> {
         let l = fx.b.ins().iconst(I64, b.len() as i64);
         (p, l)
     }
-    /// Frozen, cached string literal.
+    /// Frozen, cached string literal. (Eval'd code may be freed: its literals' bytes are
+    /// their own, not kept for the whole run.)
     pub(crate) fn str_lit(&mut self, fx: &mut Fx, b: &[u8]) -> Value {
         let slot = self.cache_ptr(fx, 1);
         let (p, l) = self.str_ptr(fx, b);
-        self.call(fx, "kn_str_lit", &[slot, p, l])
+        self.call(fx, if self.eval_unit { "kn_str_lit_eval" } else { "kn_str_lit" }, &[slot, p, l])
+    }
+    /// A chilled string literal (chilled.rs): a new String each time.
+    pub(crate) fn str_chilled(&mut self, fx: &mut Fx, b: &[u8]) -> Value {
+        let (p, l) = self.str_ptr(fx, b);
+        if self.eval_unit {
+            return self.call(fx, "kn_str_chilled_eval", &[p, l]);
+        }
+        let slot = self.cache_ptr(fx, 1);
+        self.call(fx, "kn_str_chilled", &[slot, p, l])
+    }
+    /// A literal with neither `frozen_string_literal` comment is chilled, unless the program
+    /// can't tell it from the frozen literal (chilled.rs `shared_lits`).
+    pub(crate) fn stays_chilled(&self, s: &ruby_prism::StringNode) -> bool {
+        let k = crate::chilled::key(s);
+        !self.shared_lits.contains(&k) && !self.shared_lits_kept.contains(&k)
     }
     pub(crate) fn args_buf(&mut self, fx: &mut Fx, vals: &[Value]) -> Value {
         if vals.is_empty() {

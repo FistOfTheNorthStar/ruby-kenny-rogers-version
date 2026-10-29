@@ -92,6 +92,7 @@ fn mutate(s: V) -> Result<&'static mut SVec<u8>, V> {
         let e = check_frozen(s);
         return Err(e);
     }
+    unchill(s);
     Ok(b(s))
 }
 
@@ -126,6 +127,8 @@ pub extern "C" fn kn_str_append_own(s: V, e: V, own: u64) -> V {
         return UNDEF;
     }
     if own != 0 && s != e && hdr(s).klass == rt().c.string && !is_frozen(s) {
+        // (`s + e` would have made a String that is no literal)
+        hdr(s).flags &= !FL_CHILLED;
         let add: &[u8] = &rstr(e).b;
         if !crate::transcode::same_native(s, e) {
             match crate::transcode::concat_enc(s, add, crate::transcode::enc_of(e)) {
@@ -721,7 +724,8 @@ pub fn init() {
     defn(c, "size", 0, 0, |s, _, _| mkfix(char_len(s) as i64));
     defn(c, "bytesize", 0, 0, |s, _, _| mkfix(rstr(s).b.len() as i64));
     defn(c, "empty?", 0, 0, |s, _, _| bool_v(rstr(s).b.is_empty()));
-    defn(c, "+@", 0, 0, |s, _, _| if is_frozen(s) { str_new(rstr(s).b.clone()) } else { s });
+    // (a chilled literal too: CRuby 3.4 copies it)
+    defn(c, "+@", 0, 0, |s, _, _| if hdr(s).flags & (FL_FROZEN | FL_CHILLED) != 0 { str_copy(s) } else { s });
     defn(c, "-@", 0, 0, |s, _, _| {
         if is_frozen(s) {
             return s;
@@ -1053,9 +1057,7 @@ pub fn init() {
     });
     // bytesplice(index, length, str [, str_index, str_length]) / (range, str [, str_range])
     defn(c, "bytesplice", 2, 5, |s, a, _| {
-        if is_frozen(s) {
-            return check_frozen(s);
-        }
+        crate::tri!(check_frozen(s));
         let n = rstr(s).b.len() as i64;
         let span = |r: V, n: i64| -> Option<(usize, usize)> {
             let (st, len) = range_bounds(r, n)?;
