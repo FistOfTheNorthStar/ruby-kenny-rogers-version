@@ -9,7 +9,7 @@ use crate::tri;
 /// String keys are copied and frozen on insert, like CRuby.
 pub fn key_dup(k: V) -> V {
     if is_str(k) && !is_frozen(k) {
-        let n = str_new(rstr(k).b.clone());
+        let n = str_copy(k);
         hdr(n).flags |= FL_FROZEN;
         n
     } else {
@@ -39,11 +39,13 @@ pub fn hset(h: V, k: V, v: V) -> V {
     if is_frozen(h) {
         return check_frozen(h);
     }
-    rhash(h).m.insert(HKey(store_key(h, k)), v);
+    let ident = rhash(h).m.is_ident();
+    rhash(h).m.insert_with(HKey(k), v, |k| if ident { k } else { key_dup(k) });
     v
 }
 /// The key a store into `h` keeps: String keys copied and frozen, except in a
-/// `compare_by_identity` hash (there the key is that very object).
+/// `compare_by_identity` hash (there the key is that very object). (`hset` copies only a
+/// key not in `h` yet, as CRuby does: `counts[w] += 1` doesn't copy `w` each time.)
 fn store_key(h: V, k: V) -> V {
     if rhash(h).m.is_ident() { k } else { key_dup(k) }
 }

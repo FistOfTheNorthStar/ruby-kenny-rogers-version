@@ -434,13 +434,19 @@ impl KMap {
     }
 
     pub fn insert(&mut self, k: HKey, v: V) -> Option<V> {
+        self.insert_with(k, v, |x| x)
+    }
+    /// `insert`, the key kept being `new_key(k)` when `k` is not in the map yet (Hash#[]=
+    /// copies a String key only then). `new_key` may allocate: it runs before the lock.
+    pub fn insert_with(&mut self, k: HKey, v: V, new_key: impl Fn(V) -> V) -> Option<V> {
         self.wb();
-        let key = k.0;
-        let h = self.kh(key);
+        let orig = k.0;
+        let h = self.kh(orig);
         loop {
             let t = self.tab.load(Acquire);
             let n0 = if t.is_null() { 0 } else { unsafe { (*t).n.load(Acquire) } };
-            let found = if t.is_null() { None } else { unsafe { (*t).find(h, key, self.is_ident()) } };
+            let found = if t.is_null() { None } else { unsafe { (*t).find(h, orig, self.is_ident()) } };
+            let key = if found.is_none() { new_key(orig) } else { orig };
             self.lock();
             if self.tab.load(Relaxed) != t || (!t.is_null() && unsafe { (*t).n.load(Relaxed) } != n0) {
                 self.unlock();

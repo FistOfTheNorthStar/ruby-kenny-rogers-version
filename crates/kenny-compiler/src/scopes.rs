@@ -134,7 +134,15 @@ impl<M: Module> Compiler<M> {
             return Err("syntax errors".into());
         }
         let node = result.node();
-        self.scan_defs(&node);
+        // (this unit's literals; restored after, as their addresses may be reused)
+        let outer_lits = std::mem::replace(&mut self.shared_lits, crate::chilled::shared_lits(&node));
+        let r = self.compile_unit_node(&node, path, kind);
+        self.shared_lits = outer_lits;
+        r
+    }
+
+    fn compile_unit_node(&mut self, node: &Node, path: &Path, kind: ScopeKind) -> Result<FuncId, String> {
+        self.scan_defs(node);
         let prog = node.as_program_node().unwrap();
         let stmts = prog.statements().as_node();
         let slot = self.cache_alloc(2);

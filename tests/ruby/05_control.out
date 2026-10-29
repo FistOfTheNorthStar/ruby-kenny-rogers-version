@@ -43,4 +43,3 @@ nil
 "constant"
 false
 true
-FrozenError: can't modify frozen String: "frozen"

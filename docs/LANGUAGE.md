@@ -43,7 +43,18 @@ which call sites come after it, and only those sites use a refinement-aware look
 
 ## Rule 3: defaults that differ from CRuby
 
-- **Frozen string literals by default** (Ruby is heading here already).
+- **String literals are chilled, as in Ruby 3.4 and 4.0, except where nothing can tell.** With
+  `# frozen_string_literal: true` a literal is one frozen String for the whole run (no
+  allocation); with `false`, a new String each time. Without the comment it is *chilled*: a new
+  String each time, not frozen (`"a".equal?("a")` and `"a".frozen?` are false), and its first
+  change warns under `Warning[:deprecated] = true` (as CRuby does). A chilled String shares the
+  literal's bytes until it is changed, so it costs one small object. Where the compiler sees that
+  the String is only read by the call it is passed to (an operand of `==` or `+`,
+  `h["key"]`, `h["key"] = v`, `s.start_with?("x")`, `s.split(",")`, `"%d" % n`, `puts "..."`,
+  `"abc".size`, `"x".freeze`, `s << "x"` onto a String, ...), it is the frozen literal instead,
+  costing nothing. Those calls are recognised by method name, so a method of the program with
+  one of those names that keeps or changes such an argument gets a frozen String where CRuby
+  would pass a chilled one.
 - **Metaprogramming is free during boot, slower after.** `define_method`, `class_eval`, `include`,
   `extend` work any time; after boot they invalidate caches and take a slow path.
 - **`$~` / `$1`** are tracked only in methods that reference them.

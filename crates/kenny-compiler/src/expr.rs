@@ -397,6 +397,11 @@ impl<M: Module> Compiler<M> {
                 if s.is_mutable() {
                     let (p, l) = self.str_ptr(fx, &bytes);
                     self.call(fx, "kn_str_new", &[p, l])
+                } else if !s.is_frozen() && self.stays_chilled(&s) {
+                    match self.append_recv.take() {
+                        Some((k, recv)) if k == crate::chilled::key(&s) => self.append_lit(fx, recv, &bytes),
+                        _ => self.str_chilled(fx, &bytes),
+                    }
                 } else {
                     self.str_lit(fx, &bytes)
                 }
@@ -508,8 +513,17 @@ impl<M: Module> Compiler<M> {
                 self.call(fx, "kn_range_new", &[lo, hi, ex])
             }
             Node::SourceFileNode { .. } => {
+                // (frozen, chilled or new as a String literal is)
+                let sf = node.as_source_file_node().unwrap();
                 let f = self.file.display().to_string();
-                self.str_lit(fx, f.as_bytes())
+                if sf.is_mutable() {
+                    let (p, l) = self.str_ptr(fx, f.as_bytes());
+                    self.call(fx, "kn_str_new", &[p, l])
+                } else if sf.is_frozen() {
+                    self.str_lit(fx, f.as_bytes())
+                } else {
+                    self.str_chilled(fx, f.as_bytes())
+                }
             }
             Node::SourceLineNode { .. } => {
                 let l = self.line_of(at) as i64;

@@ -519,7 +519,14 @@ impl<M: Module> Compiler<M> {
         } else if let Some(r) = self.yield_inline_site(fx, c, recv, &name, &arg_nodes, at_loc) {
             r
         } else {
+            // `s << "lit"` (chilled.rs, `append_lit`)
+            if name == b"<<" && arg_nodes.len() == 1 && recv_node.is_some() {
+                if let Some(sn) = arg_nodes[0].as_string_node().filter(|s| !s.is_frozen() && !s.is_mutable()) {
+                    self.append_recv = Some((crate::chilled::key(&sn), recv));
+                }
+            }
             let args = self.eval_args(fx, c.arguments());
+            self.append_recv = None;
             // an eval'd string sees the caller's locals: a snapshot, handed to the runtime with
             // the source string it is for
             if crate::analysis::sees_locals(c) && args.splat.is_none() && !args.vals.is_empty() {

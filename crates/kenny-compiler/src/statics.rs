@@ -803,6 +803,7 @@ impl<M: Module> Compiler<M> {
         }
         let src: &'static [u8] = Box::leak(self.src.clone().into_boxed_slice());
         let pr: &'static ruby_prism::ParseResult<'static> = Box::leak(Box::new(ruby_prism::parse(src)));
+        self.shared_lits_kept.extend(crate::chilled::shared_lits(&pr.node()));
         let want: HashSet<usize> = cands.iter().map(|c| c.1).collect();
         let mut fd = FindDefs { want: &want, found: Vec::new() };
         fd.visit(&pr.node());

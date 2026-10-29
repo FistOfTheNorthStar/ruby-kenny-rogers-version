@@ -349,13 +349,12 @@ fn str_mutate(s: V) -> Result<&'static mut SVec<u8>, V> {
     if is_frozen(s) {
         return Err(check_frozen(s));
     }
+    unchill(s);
     Ok(&mut rstr(s).b)
 }
 /// `name!` in terms of `name`: replace the receiver's bytes, nil when nothing changed.
 fn bang(s: V, name: &str, a: &[V], b: V, always_self: bool) -> V {
-    if is_frozen(s) {
-        return check_frozen(s);
-    }
+    crate::tri!(check_frozen(s));
     let r = tri!(send(s, sym(name), a, b));
     if !is_str(r) {
         return r;
@@ -1062,7 +1061,9 @@ fn init_encoding(st: *mut Class, enc: *mut Class) {
     defn(st, "force_encoding", 1, 1, |s, a, _| {
         let Some(n) = enc_name_of(a[0]) else { return no_conv(a[0], "String") };
         let Some(e) = crate::transcode::lookup(&n) else { return arg_error(&format!("unknown encoding name - {n}")) };
-        // applies to frozen strings too: Kenny freezes literals that CRuby code expects to be mutable
+        // (applies to frozen Strings too, as it always has in Kenny; a chilled literal stops
+        // being one, as in CRuby)
+        unchill(s);
         crate::transcode::set_enc(s, e);
         s
     });

@@ -1,0 +1,77 @@
+false
+false
+false
+"ab"
+false
+false
+false
+false
+false
+false
+tests/ruby/chilled_strings.rb:9: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+tests/ruby/chilled_strings.rb:9: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+false
+false
+false
+tests/ruby/chilled_strings.rb:12: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+false
+true
+tests/ruby/chilled_strings.rb:15: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+false
+tests/ruby/chilled_strings.rb:16: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+tests/ruby/chilled_strings.rb:17: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+false
+tests/ruby/chilled_strings.rb:21: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+true
+false
+tests/ruby/chilled_strings.rb:23: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+true
+tests/ruby/chilled_strings.rb:24: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+"yo!"
+tests/ruby/chilled_strings.rb:26: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+tests/ruby/chilled_strings.rb:27: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+"A"
+tests/ruby/chilled_strings.rb:28: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+"t"
+tests/ruby/chilled_strings.rb:29: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+"loop0"
+tests/ruby/chilled_strings.rb:29: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+"loop1"
+tests/ruby/chilled_strings.rb:29: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+"loop2"
+tests/ruby/chilled_strings.rb:30: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+["el!", "el"]
+"abab"
+false
+false
+false
+true
+true
+false
+true
+[false]
+48
+3
+true
+true
+["a", "b"]
+"00042"
+true
+1
+1
+true
+1
+[true, true]
+"1, 2"
+["a", "b"]
+true
+false
+false
+false
+false
+false
+false
+true
+false
+"abc"
+"abcd"

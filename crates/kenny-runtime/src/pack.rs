@@ -1058,9 +1058,7 @@ pub fn init() {
         };
         match kw_get(&a[1..], "buffer") {
             Some(buf) if is_str(buf) => {
-                if is_frozen(buf) {
-                    return check_frozen(buf);
-                }
+                crate::tri!(check_frozen(buf));
                 rstr(buf).b.extend_from_slice(&bytes);
                 buf
             }

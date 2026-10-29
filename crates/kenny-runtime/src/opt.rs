@@ -336,6 +336,7 @@ unsafe fn send1_found(m: *const Method, recv: V, mid: V, a: V, explicit: u64) ->
             }
         }
         OPT_STR_APPEND if is_str(a) && !is_frozen(recv) && crate::transcode::same_native(recv, a) => {
+            unchill(recv);
             if a == recv {
                 let add = rstr(a).b.clone();
                 rstr(recv).b.extend_from_slice(&add);
@@ -365,6 +366,7 @@ pub unsafe extern "C" fn kn_send2(cache: *mut CallCache, recv: V, mid: V, a: V, 
     let m = unsafe { dispatch(cache, recv, mid) };
     match opt_of(m, explicit) {
         OPT_STR_SETBYTE if is_fix(a) && is_fix(b) && !is_frozen(recv) => {
+            unchill(recv);
             let s = &mut rstr(recv).b;
             let i = fix(a);
             let j = if i < 0 { i + s.len() as i64 } else { i };

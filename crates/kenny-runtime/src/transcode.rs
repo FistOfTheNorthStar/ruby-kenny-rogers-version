@@ -115,7 +115,7 @@ pub fn set_enc(v: V, e: Enc) {
         Codec::Binary => h.flags |= FL_BINARY,
         _ => {
             h.flags |= FL_BINARY;
-            // (force_encoding applies to frozen Strings too: Kenny's literals are frozen)
+            // (force_encoding applies to frozen Strings too: extra.rs)
             gen_ivar_set(v, enc_ivar(), str_from(e.name));
             return;
         }
@@ -718,9 +718,7 @@ pub fn encode(s: V, a: &[V], bang: bool) -> V {
         }
     };
     if bang {
-        if is_frozen(s) {
-            return check_frozen(s);
-        }
+        crate::tri!(check_frozen(s));
         rstr(s).b.set(out);
         set_enc(s, dst);
         return s;
