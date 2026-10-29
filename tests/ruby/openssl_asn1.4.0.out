@@ -1,0 +1,104 @@
+#<OpenSSL::ASN1::Integer:0x? @tag=2, @value=1, @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>
+#<OpenSSL::ASN1::BitString:0x? @tag=3, @value="ab", @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false, @unused_bits=0>
+#<OpenSSL::ASN1::Integer:0x? @tag=2, @value=#<OpenSSL::BN:0x?>, @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>
+#<OpenSSL::BN:0x?>
+#<OpenSSL::ASN1::Sequence:0x? @tag=16, @value=[#<OpenSSL::ASN1::Null:0x? @tag=5, @value=nil, @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>], @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>
+OpenSSL::ASN1::ASN1Error: Type mismatch. Total bytes read: 3 Bytes available: 4 Offset: 3
+OpenSSL::ASN1::ASN1Error: too long
+OpenSSL::ASN1::ASN1Error: illegal zero content
+OpenSSL::ASN1::ASN1Error: too long
+OpenSSL::ASN1::ASN1Error: EOC missing in indefinite length encoding
+#<OpenSSL::ASN1::Sequence:0x? @tag=16, @value=[#<OpenSSL::ASN1::Integer:0x? @tag=2, @value=#<OpenSSL::BN:0x?>, @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>], @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=true>
+OpenSSL::ASN1::ASN1Error: invalid length for BOOLEAN
+OpenSSL::ASN1::ASN1Error: d2i_ASN1_OBJECT: invalid object encoding
+OpenSSL::ASN1::ASN1Error: null is wrong length
+OpenSSL::ASN1::ASN1Error: utctime is too short
+OpenSSL::ASN1::ASN1Error: too small
+OpenSSL::ASN1::ASN1Error: header too long
+OpenSSL::ASN1::ASN1Error: header too long
+#<OpenSSL::ASN1::Constructive:0x? @tag=4, @value=[#<OpenSSL::ASN1::OctetString:0x? @tag=4, @value="a", @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>], @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=true>
+OpenSSL::ASN1::ASN1Error: invalid OBJECT ID foo: first num too large
+OpenSSL::ASN1::ASN1Error: invalid OBJECT ID 3.5: first num too large
+OpenSSL::ASN1::ASN1Error: nil expected
+TypeError: Can't convert nil into Boolean
+TypeError: Cannot convert into OpenSSL::BN
+TypeError: Can't convert nil into Integer
+OpenSSL::ASN1::ASN1Error: unused_bits for a bitstring value must be in the range 0 to 7
+OpenSSL::ASN1::ASN1Error: explicit tagging of unknown tag
+OpenSSL::ASN1::ASN1Error: illegal EOC octets in value
+OpenSSL::ASN1::ASN1Error: indefinite length form cannot be used with primitive encoding
+OpenSSL::ASN1::ASN1Error: 
+OpenSSL::ASN1::ASN1Error: 
+"\x18\x0F19490102030405Z"
+"\x17\r700101000005Z"
+ArgumentError: invalid value for Integer(): "x"
+OpenSSL::ASN1::ASN1Error: must specify tag number
+OpenSSL::ASN1::ASN1Error: must specify tag number
+OpenSSL::ASN1::ASN1Error: invalid tagging method
+OpenSSL::ASN1::ASN1Error: invalid tag class
+OpenSSL::ASN1::ASN1Error: invalid tag class
+OpenSSL::ASN1::ASN1Error: invalid tag class
+OpenSSL::ASN1::ASN1Error: must specify tag number
+"\x02\x01x"
+TypeError: no implicit conversion of Integer into String
+"\xDFd\x01x"
+"ff648201300482012c78"
+#<OpenSSL::ASN1::ASN1Data:0x? @tag=100, @value="x", @tag_class=:PRIVATE, @indefinite_length=false>
+-128
+#<OpenSSL::ASN1::BitString:0x? @tag=3, @value="\x80", @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false, @unused_bits=7>
+#<OpenSSL::ASN1::BitString:0x? @tag=3, @value="", @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false, @unused_bits=0>
+OpenSSL::ASN1::ASN1Error: d2i_ASN1_BIT_STRING: string too short
+OpenSSL::ASN1::ASN1Error: utctime is too short
+2049-12-31 23:59:59 UTC
+1950-01-01 00:00:00 UTC
+1999-01-01 00:00:00 UTC
+1999-01-01 00:00:00 UTC
+"1.2.3.4"
+#<OpenSSL::ASN1::ObjectId:0x? @tag=6, @value="CN", @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>
+#<Encoding:BINARY (ASCII-8BIT)>
+"2.5.4.3"
+"CN"
+"commonName"
+nil
+true
+true
+false
+OpenSSL::ASN1::ASN1Error: invalid OBJECT ID nonsense: first num too large
+true
+"kennyTest"
+"kennyTest"
+OpenSSL::ASN1::ASN1Error: oid exists
+#<OpenSSL::ASN1::Integer:0x? @tag=2, @value=5, @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>
+true
+true
+true
+false
+[[0, 0, 2, 8, true, :UNIVERSAL, 16]]
+[[1, 2, 2, 1, false, :UNIVERSAL, 2]]
+[[1, 5, 2, 3, true, :UNIVERSAL, 17]]
+[[2, 7, 2, 1, false, :UNIVERSAL, 1]]
+[#<OpenSSL::ASN1::Integer:0x? @tag=2, @value=#<OpenSSL::BN:0x?>, @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>, #<OpenSSL::ASN1::Null:0x? @tag=5, @value=nil, @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>]
+OpenSSL::ASN1::ASN1Error: header too long
+OpenSSL::ASN1::Sequence
+[1]
+"\f\x02\xC3\xA9"
+"\n\x02\xFF\x7F"
+"\x02\x02\x00\xFF"
+"\x02\x01\x80"
+"\x02\x01\x00"
+"\x02\t@\x00\x00\x00\x00\x00\x00\x00\x00"
+-129
+"\x01\x01\xFF"
+"\xA2\x03\x02\x01\x01"
+"\xA2\x051\x03\x02\x01\x01"
+"\xA2\x800\x80\x02\x01\x01\x00\x00\x00\x00"
+#<OpenSSL::ASN1::ASN1Data:0x? @tag=2, @value=[#<OpenSSL::ASN1::Sequence:0x? @tag=16, @value=[#<OpenSSL::ASN1::Integer:0x? @tag=2, @value=#<OpenSSL::BN:0x?>, @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>], @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=true>], @tag_class=:CONTEXT_SPECIFIC, @indefinite_length=true>
+true
+"\x00\x00"
+#<OpenSSL::ASN1::EndOfContent:0x? @tag=0, @value="", @tagging=nil, @tag_class=:UNIVERSAL, @indefinite_length=false>
+"\xA0\x03\x02\x01\x01"
+false
+true
+true
+true
+["RSA-SHA256", "OCSP", "subjectAltName"]
