@@ -33,6 +33,8 @@ rquickjs = "=0.14.0"
 unicode-normalization = "0.1.26"
 # `prism/prism` (src/prism.rs): the libprism the compiler parses with
 ruby-prism-sys = "1.9.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ring = "0.17"
 
 [lib]
 crate-type = ["staticlib", "rlib"]
