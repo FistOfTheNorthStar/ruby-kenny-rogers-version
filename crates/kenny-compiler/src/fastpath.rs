@@ -633,6 +633,16 @@ impl<M: Module> Compiler<M> {
     /// `lazy`: the result may stay unboxed (it feeds another operator or a shadowed local);
     /// otherwise it is boxed on the Float path itself.
     pub(crate) fn num_expr(&mut self, fx: &mut Fx, node: &Node, lazy: bool) -> Num {
+        if self.cov.is_none() {
+            return self.num_expr_node(fx, node, lazy);
+        }
+        let c = self.cov_enter(fx, node);
+        let v = self.num_expr_node(fx, node, lazy);
+        self.cov_leave(fx, c);
+        v
+    }
+
+    fn num_expr_node(&mut self, fx: &mut Fx, node: &Node, lazy: bool) -> Num {
         if let Some(f) = node.as_float_node() {
             let f = f.value();
             let boxed = self.float_lit(fx, f);

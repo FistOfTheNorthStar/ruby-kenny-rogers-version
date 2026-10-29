@@ -135,7 +135,7 @@ impl<M: Module> Compiler<M> {
     pub(crate) fn hoist_enter(&mut self, fx: &mut Fx, lp: Option<&Node>) -> Option<HashMap<String, Value>> {
         let lp = lp?;
         let at = lp.location().start_offset();
-        if !self.hoist_on(fx) || fx.stmt_at != at || std::env::var_os("KENNY_NO_HOIST").is_some() {
+        if !self.hoist_on(fx) || fx.stmt_at != at || self.cov.is_some() || std::env::var_os("KENNY_NO_HOIST").is_some() {
             return None;
         }
         let mut w = Writes::default();

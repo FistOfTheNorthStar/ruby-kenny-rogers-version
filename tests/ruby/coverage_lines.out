@@ -1,0 +1,385 @@
+false
+true
+:running
+:a
+:b
+:c
+:f
+:zero
+:pos
+:neg
+"no"
+"yes"
+"num"
+"digits"
+"str"
+"ab"
+"other"
+-1
+0
+nil
+3
+"KENNY"
+"ab"
+nil
+:unknown
+12
+3
+nil
+false
+true
+1
+2
+6
+6
+10
+"CovShape(2x3)"
+area: 6
+sides: 2
+[2, 3, 2, 3]
+:ok
+"bad"
+3
+2
+1
+[2, 3, 2]
+[2, 4, 6]
+-1
+3
+8
+0
+2
+[10, 20, 30]
+[5]
+false
+:idle
+true
+== control.rb [:lines, :branches, :methods]
+ nil   1: # Branches and loops of every kind (measured by coverage_lines.rb).
+   1   2: module CovControl
+   1   3:   def self.grade(n)
+   4   4:     if n > 90
+   1   5:       :a
+   3   6:     elsif n > 75
+   1   7:       :b
+   2   8:     elsif n > 50 then :c
+ nil   9:     else
+   1  10:       :f
+ nil  11:     end
+ nil  12:   end
+ nil  13: 
+   1  14:   def self.sign(n)
+   3  15:     return :zero if n == 0
+   2  16:     n > 0 ? :pos : :neg
+ nil  17:   end
+ nil  18: 
+   1  19:   def self.check(x)
+   2  20:     unless x
+   1  21:       "no"
+ nil  22:     else
+   1  23:       "yes"
+ nil  24:     end
+ nil  25:   end
+ nil  26: 
+   1  27:   def self.kind(v)
+   5  28:     case v
+ nil  29:     when Integer, Float
+   1  30:       "num"
+ nil  31:     when /\A\d+\z/
+   1  32:       "digits"
+   1  33:     when String then "str"
+ nil  34:     when *[:a, :b]
+   1  35:       "ab"
+ nil  36:     else
+   1  37:       "other"
+ nil  38:     end
+ nil  39:   end
+ nil  40: 
+   1  41:   def self.bare(n)
+ nil  42:     case
+   4  43:     when n < 0 then -1
+ nil  44:     when n.zero?
+   1  45:       0
+ nil  46:     end
+ nil  47:   end
+ nil  48: 
+   1  49:   def self.shape(v)
+   5  50:     case v
+ nil  51:     in [Integer => a, Integer => b]
+   1  52:       a + b
+ nil  53:     in {name: String => nm} if nm.size > 3
+   1  54:       nm.upcase
+ nil  55:     in {name:}
+   1  56:       name
+ nil  57:     in nil
+   1  58:       nil
+ nil  59:     else
+   1  60:       :unknown
+ nil  61:     end
+ nil  62:   end
+ nil  63: 
+   1  64:   def self.loops(n)
+   1  65:     i = 0
+   1  66:     total = 0
+   1  67:     while i < n
+   4  68:       total += i
+   4  69:       i += 1
+ nil  70:     end
+   1  71:     until i == 0
+   4  72:       i -= 1
+ nil  73:     end
+   1  74:     begin
+   3  75:       i += 2
+ nil  76:     end while i < 5
+   1  77:     for x in [1, 2, 3]
+   3  78:       total += x
+ nil  79:     end
+   1  80:     total
+ nil  81:   end
+ nil  82: 
+   1  83:   def self.safe(o)
+   2  84:     o&.length
+ nil  85:   end
+ nil  86: 
+   1  87:   def self.logic(a, b)
+   2  88:     a && b || !a
+ nil  89:   end
+ nil  90: 
+   1  91:   def self.mods(x)
+   2  92:     y = 0
+   2  93:     y += 1 if x
+   2  94:     y += 2 unless x
+   2  95:     y -= 1 while y > 5
+   2  96:     y
+ nil  97:   end
+ nil  98: 
+   1  99:   def self.never
+   0 100:     1.times do
+   0 101:       :never
+ nil 102:     end
+ nil 103:   end
+ nil 104: end
+ nil 105: 
+   1 106: p CovControl.grade(95), CovControl.grade(80), CovControl.grade(60), CovControl.grade(10)
+   1 107: p CovControl.sign(0), CovControl.sign(3), CovControl.sign(-3)
+   1 108: p CovControl.check(nil), CovControl.check(1)
+   1 109: p CovControl.kind(1), CovControl.kind("12"), CovControl.kind("x"), CovControl.kind(:a), CovControl.kind([])
+   1 110: p CovControl.bare(-5), CovControl.bare(0), CovControl.bare(5)
+   1 111: p CovControl.shape([1, 2]), CovControl.shape({name: "kenny"}), CovControl.shape({name: "ab"}), CovControl.shape(nil), CovControl.shape(3)
+   1 112: p CovControl.loops(4)
+   1 113: p CovControl.safe("abc"), CovControl.safe(nil)
+   1 114: p CovControl.logic(true, false), CovControl.logic(false, true)
+   1 115: p CovControl.mods(true), CovControl.mods(false)
+true
+[:if, 0, 4, 4, 11, 7]
+  [:then, 1, 5, 6, 5, 8] => 1
+  [:else, 2, 6, 4, 11, 7] => 3
+[:if, 3, 6, 4, 11, 7]
+  [:then, 4, 7, 6, 7, 8] => 1
+  [:else, 5, 8, 4, 11, 7] => 2
+[:if, 6, 8, 4, 11, 7]
+  [:then, 7, 8, 22, 8, 24] => 1
+  [:else, 8, 10, 6, 10, 8] => 1
+[:if, 9, 15, 4, 15, 26]
+  [:then, 10, 15, 4, 15, 16] => 1
+  [:else, 11, 15, 4, 15, 26] => 2
+[:if, 12, 16, 4, 16, 23]
+  [:then, 13, 16, 12, 16, 16] => 1
+  [:else, 14, 16, 19, 16, 23] => 1
+[:unless, 15, 20, 4, 24, 7]
+  [:else, 16, 23, 6, 23, 11] => 1
+  [:then, 17, 21, 6, 21, 10] => 1
+[:case, 18, 28, 4, 38, 7]
+  [:when, 19, 30, 6, 30, 11] => 1
+  [:when, 20, 32, 6, 32, 14] => 1
+  [:when, 21, 33, 21, 33, 26] => 1
+  [:when, 22, 35, 6, 35, 10] => 1
+  [:else, 23, 37, 6, 37, 13] => 1
+[:case, 24, 42, 4, 46, 7]
+  [:when, 25, 43, 20, 43, 22] => 1
+  [:when, 26, 45, 6, 45, 7] => 1
+  [:else, 27, 42, 4, 46, 7] => 1
+[:case, 28, 50, 4, 61, 7]
+  [:in, 29, 52, 6, 52, 11] => 1
+  [:in, 30, 54, 6, 54, 15] => 1
+  [:in, 31, 56, 6, 56, 10] => 1
+  [:in, 32, 58, 6, 58, 9] => 1
+  [:else, 33, 60, 6, 60, 14] => 1
+[:while, 34, 67, 4, 70, 7]
+  [:body, 35, 68, 6, 69, 12] => 4
+[:until, 36, 71, 4, 73, 7]
+  [:body, 37, 72, 6, 72, 12] => 4
+[:while, 38, 74, 4, 76, 19]
+  [:body, 39, 74, 4, 76, 7] => 3
+[:"&.", 40, 84, 4, 84, 13]
+  [:then, 41, 84, 4, 84, 13] => 1
+  [:else, 42, 84, 4, 84, 13] => 1
+[:if, 43, 93, 4, 93, 15]
+  [:then, 44, 93, 4, 93, 10] => 1
+  [:else, 45, 93, 4, 93, 15] => 1
+[:unless, 46, 94, 4, 94, 19]
+  [:else, 47, 94, 4, 94, 19] => 1
+  [:then, 48, 94, 4, 94, 10] => 1
+[:while, 49, 95, 4, 95, 22]
+  [:body, 50, 95, 4, 95, 10] => 0
+["#<Class:CovControl>", :grade, 3, 2, 12, 5, 4]
+["#<Class:CovControl>", :sign, 14, 2, 17, 5, 3]
+["#<Class:CovControl>", :check, 19, 2, 25, 5, 2]
+["#<Class:CovControl>", :kind, 27, 2, 39, 5, 5]
+["#<Class:CovControl>", :bare, 41, 2, 47, 5, 3]
+["#<Class:CovControl>", :shape, 49, 2, 62, 5, 5]
+["#<Class:CovControl>", :loops, 64, 2, 81, 5, 1]
+["#<Class:CovControl>", :safe, 83, 2, 85, 5, 2]
+["#<Class:CovControl>", :logic, 87, 2, 89, 5, 2]
+["#<Class:CovControl>", :mods, 91, 2, 97, 5, 2]
+["#<Class:CovControl>", :never, 99, 2, 103, 5, 0]
+== shapes.rb [:lines, :branches, :methods]
+ nil   1: # Statements spread over lines, literals, blocks, methods of every kind (coverage_lines.rb).
+   1   2: class CovShape
+   1   3:   attr_reader :w, :h
+ nil   4: 
+   1   5:   SIDES = {
+ nil   6:     square: 4,
+ nil   7:     triangle: 3,
+ nil   8:   }.freeze
+ nil   9: 
+ nil  10:   NAMES = %w[
+   1  11:     a b
+ nil  12:   ]
+ nil  13: 
+   1  14:   def initialize(w, h = w * 2, scale: 1)
+   4  15:     @w = w * scale
+   4  16:     @h = h *
+ nil  17:       scale
+ nil  18:   end
+ nil  19: 
+   1  20:   def area = w * h
+ nil  21: 
+   1  22:   def to_s
+   1  23:     "#{self.class.name}(" \
+ nil  24:       "#{w}x#{h})"
+ nil  25:   end
+ nil  26: 
+   1  27:   def report
+   1  28:     <<~TXT
+ nil  29:       area: #{area}
+ nil  30:       sides: #{SIDES.size}
+ nil  31:     TXT
+ nil  32:   end
+ nil  33: 
+   1  34:   def each_side
+   3  35:     return enum_for(:each_side) unless block_given?
+   2  36:     [w, h, w, h].each do |s|
+   8  37:       yield s
+ nil  38:     end
+ nil  39:   end
+ nil  40: 
+   1  41:   def risky(n)
+ nil  42:     begin
+   2  43:       raise ArgumentError, "bad" if n < 0
+   1  44:       :ok
+ nil  45:     rescue ArgumentError => e
+   1  46:       e.message
+ nil  47:     ensure
+   2  48:       @checked = true
+ nil  49:     end
+ nil  50:   end
+ nil  51: 
+   1  52:   def retrying
+   1  53:     tries = 0
+ nil  54:     begin
+   3  55:       tries += 1
+   3  56:       raise "again" if tries < 3
+   1  57:       tries
+ nil  58:     rescue
+   2  59:       retry
+ nil  60:     end
+ nil  61:   end
+ nil  62: 
+   1  63:   def self.build(*args)
+   1  64:     new(*args)
+ nil  65:   end
+ nil  66: 
+   1  67:   class << self
+   1  68:     def unit
+   1  69:       new(1, 1)
+ nil  70:     end
+ nil  71:   end
+ nil  72: 
+   1  73:   define_method(:perimeter) do
+   1  74:     2 * (w + h)
+ nil  75:   end
+ nil  76: 
+   1  77:   alias surface area
+ nil  78: 
+   1  79:   def multi
+ nil  80:     a, b =
+   1  81:       w, h
+   1  82:     x = a
+ nil  83:     x = x
+   1  84:     [a, b, x]
+ nil  85:   end
+ nil  86: 
+   1  87:   def lazy_chain
+   1  88:     [3, 1, 2]
+ nil  89:       .sort
+   3  90:       .map { |v| v * w }
+ nil  91:       .select(&:even?)
+ nil  92:   end
+ nil  93: 
+   1  94:   def fallback
+   1  95:     Integer("zz") rescue -1
+ nil  96:   end
+ nil  97: 
+   1  98:   def unused_method
+   0  99:     :never
+ nil 100:   end
+ nil 101: end
+ nil 102: 
+   1 103: s = CovShape.new(2, 3)
+   1 104: p s.area, s.surface, s.perimeter, s.to_s
+   1 105: puts s.report
+   1 106: p s.each_side.to_a
+   5 107: s.each_side { |v| v }
+   1 108: p s.risky(1), s.risky(-1)
+   1 109: p s.retrying
+   1 110: p CovShape.build(1).h, CovShape.unit.area
+   1 111: p s.multi, s.lazy_chain, s.fallback
+   1 112: p CovShape.new(1, scale: 3).w
+   1 113: lam = ->(x) {
+   1 114:   x * 2
+ nil 115: }
+   1 116: p lam.(4)
+   1 117: pr = proc do |x|
+   2 118:   next 0 if x.nil?
+   1 119:   x + 1
+ nil 120: end
+   1 121: p pr.call(nil), pr.call(1)
+   5 122: p [1, 2, 3].map { _1 * 10 }, [4].map { it + 1 }
+true
+[:unless, 0, 35, 4, 35, 51]
+  [:else, 1, 35, 4, 35, 51] => 2
+  [:then, 2, 35, 4, 35, 31] => 1
+[:if, 3, 43, 6, 43, 41]
+  [:then, 4, 43, 6, 43, 32] => 1
+  [:else, 5, 43, 6, 43, 41] => 1
+[:if, 6, 56, 6, 56, 32]
+  [:then, 7, 56, 6, 56, 19] => 2
+  [:else, 8, 56, 6, 56, 32] => 1
+[:if, 9, 118, 2, 118, 18]
+  [:then, 10, 118, 2, 118, 8] => 1
+  [:else, 11, 118, 2, 118, 18] => 1
+["CovShape", :initialize, 14, 2, 18, 5, 4]
+["CovShape", :area, 20, 2, 20, 18, 4]
+["CovShape", :to_s, 22, 2, 25, 5, 1]
+["CovShape", :report, 27, 2, 32, 5, 1]
+["CovShape", :each_side, 34, 2, 39, 5, 3]
+["CovShape", :risky, 41, 2, 50, 5, 2]
+["CovShape", :retrying, 52, 2, 61, 5, 1]
+["#<Class:CovShape>", :build, 63, 2, 65, 5, 1]
+["#<Class:CovShape>", :unit, 68, 4, 70, 7, 1]
+["CovShape", :perimeter, 73, 28, 75, 5, 1]
+["CovShape", :multi, 79, 2, 85, 5, 1]
+["CovShape", :lazy_chain, 87, 2, 92, 5, 1]
+["CovShape", :fallback, 94, 2, 96, 5, 1]
+["CovShape", :unused_method, 98, 2, 100, 5, 0]

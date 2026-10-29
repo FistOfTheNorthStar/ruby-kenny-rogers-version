@@ -51,6 +51,8 @@ pub(crate) struct DefParts<'pr> {
     pub offset: usize,
     pub singleton: bool,
     pub bt_label: Option<String>,
+    /// coverage.rs: the method's key (its `def`, or the `define_method` block)
+    cov_key: usize,
 }
 
 /// Method#parameters descriptor: "req:a,opt:b,rest:c,keyreq:d,key:e,keyrest:f,block:g".
@@ -136,15 +138,17 @@ impl<M: Module> Compiler<M> {
         let node = result.node();
         // (this unit's literals; restored after, as their addresses may be reused)
         let outer_lits = std::mem::replace(&mut self.shared_lits, crate::chilled::shared_lits(&node));
-        let r = self.compile_unit_node(&node, path, kind);
+        let r = self.compile_unit_node(src, &node, path, kind);
         self.shared_lits = outer_lits;
         r
     }
 
-    fn compile_unit_node(&mut self, node: &Node, path: &Path, kind: ScopeKind) -> Result<FuncId, String> {
+    fn compile_unit_node(&mut self, src: &[u8], node: &Node, path: &Path, kind: ScopeKind) -> Result<FuncId, String> {
         self.scan_defs(node);
         let prog = node.as_program_node().unwrap();
         let stmts = prog.statements().as_node();
+        // (the file's counters: the coverage library measures it from here)
+        let cov_saved = if kind == ScopeKind::Top { self.cov_begin(src, &prog, path) } else { None };
         let slot = self.cache_alloc(2);
         if kind == ScopeKind::Top {
             self.cfold_scan(slot, &prog);
@@ -164,7 +168,11 @@ impl<M: Module> Compiler<M> {
             ret_hops: None,
             entry_check: false,
         };
-        Ok(self.build_fn(spec, |c, fx| {
+        let covered = cov_saved.is_some();
+        let fid = self.build_fn(spec, |c, fx| {
+            if covered {
+                c.cov_file_start(fx);
+            }
             // `BEGIN { ... }` (only at the top level): runs before the rest of the file
             if let Some(list) = stmts.as_statements_node() {
                 for n in list.body().iter() {
@@ -175,7 +183,9 @@ impl<M: Module> Compiler<M> {
                 }
             }
             c.expr(fx, &stmts)
-        }))
+        });
+        self.cov_end(cov_saved);
+        Ok(fid)
     }
 
     /// `require_relative "x"`: compile the file into its own top-level function (once).
@@ -488,6 +498,8 @@ impl<M: Module> Compiler<M> {
                 cref_slot: spec.cref_slot,
                 method: spec.method,
                 funcs: HashMap::new(),
+                cov_gv: None,
+                cov_loop: None,
                 scope: self.scopes.len() - 1,
                 zsuper: Vec::new(),
                 redo_block: None,
@@ -1435,6 +1447,7 @@ impl<M: Module> Compiler<M> {
             offset: d.location().start_offset(),
             singleton: d.receiver().is_some(),
             bt_label,
+            cov_key: d.location().start_offset(),
         };
         self.def_parts(fx, parts)
     }
@@ -1459,6 +1472,7 @@ impl<M: Module> Compiler<M> {
             offset: c.location().start_offset(),
             singleton: false,
             bt_label: Some(crate::statics::block_label(&parent)),
+            cov_key: blk.location().start_offset(),
         };
         let r = self.def_parts(fx, parts);
         // 0: `define_method` isn't the builtin one here
@@ -1477,7 +1491,7 @@ impl<M: Module> Compiler<M> {
     }
 
     fn def_parts(&mut self, fx: &mut Fx, d: DefParts) -> Value {
-        let DefParts { name, target, kind, params, body, locals, offset, singleton, bt_label } = d;
+        let DefParts { name, target, kind, params, body, locals, offset, singleton, bt_label, cov_key } = d;
         let wrapper_label = bt_label.clone().unwrap_or_else(|| String::from_utf8_lossy(&name).into_owned());
         let owner_slot = self.cache_alloc(1);
         let params_node = params.as_ref().map(|p| p.as_node());
@@ -1532,7 +1546,7 @@ impl<M: Module> Compiler<M> {
         };
         // a small integer method calling itself: an integer copy too (ispec.rs)
         let ispec = match (spec.predeclared, &claim, &body) {
-            (Some(fid), Some(_), Some(b)) => crate::ispec::eligible(&name, &params, b).map(|ps| (fid, self.ispec_build(fid, &name, &ps, b))),
+            (Some(fid), Some(_), Some(b)) if self.cov.is_none() => crate::ispec::eligible(&name, &params, b).map(|ps| (fid, self.ispec_build(fid, &name, &ps, b))),
             _ => None,
         };
         let def_line = self.line_of(offset) as u32;
@@ -1543,6 +1557,7 @@ impl<M: Module> Compiler<M> {
         self.def_cref.insert((self.file.clone(), offset), fx.cref_slot);
         let fid = self.build_fn(spec, |c, fx| {
             c.bind_method_params(fx, params);
+            c.cov_method(fx, cov_key);
             if let Some((fid, copy)) = ispec {
                 let args = fx.fast_args.clone().unwrap_or_default();
                 c.ispec_enter(fx, fid, copy, &args);
@@ -1564,6 +1579,7 @@ impl<M: Module> Compiler<M> {
             }
             None => (fid, self.iconst(fx, 0)),
         };
+        self.cov_method_fn(fid, cov_key);
         let addr = self.fn_addr(fx, fid);
         let k = self.iconst(fx, kind);
         let s = self.sym_val(fx, &name);
@@ -1675,12 +1691,18 @@ impl<M: Module> Compiler<M> {
                 fx.b.ins().jump(start, &[]);
                 fx.b.switch_to_block(start);
                 fx.redo_block = Some(start);
+                if bmethod {
+                    c.cov_method(fx, offset);
+                }
                 match &body {
                     Some(b) => c.expr(fx, b),
                     None => c.nil(fx),
                 }
             })
         };
+        if bmethod {
+            self.cov_method_fn(fid, offset);
+        }
         let desc = block_params_desc(params.as_ref());
         if !desc.is_empty() && !self.eval_unit {
             self.block_params.push((fid, desc));

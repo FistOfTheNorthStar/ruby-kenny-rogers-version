@@ -41,6 +41,26 @@ Refinements were on this list at first, but real gems (Rack among them) use them
 supported in a way that costs nothing elsewhere: `using` is lexical, so the compiler knows exactly
 which call sites come after it, and only those sites use a refinement-aware lookup.
 
+`Coverage` (the `coverage` library, which SimpleCov uses) works the same way despite the
+`TracePoint` row: a program that requires `coverage` is compiled with counters (a load, add and
+store into its file's table at each line event, branch target and method entry); any other
+program's code is unchanged. `setup` / `start` (`lines:`, `oneshot_lines:`, `branches:`,
+`methods:`, `eval:`, `:all`, or none for the plain lines array), `resume`, `suspend`,
+`result(stop:, clear:)`, `peek_result`, `running?`, `state`, `supported?` and `line_stub` act as
+in CRuby 3.4, with the same errors. Which lines count (`nil` or a number), the branch keys and
+ids, and the method keys are those of CRuby's compiler: a file starts being measured when it is
+loaded after `setup`, as in CRuby. The differences:
+
+- Code compiled at runtime (`eval`, and files the JIT compiles) isn't measured, `eval: true`
+  notwithstanding; native code (`--ext`, and Kenny's built-in replacements for stdlib files) has
+  no Ruby lines to measure.
+- Methods are found in the class tables, not the heap: a method removed or redefined after it
+  ran is missing. A `module_function` method's two copies share a counter, so the module's copy
+  counts calls through either (CRuby counts only calls through that copy).
+- `line_stub` of a file that wasn't compiled in gives `nil` for every line.
+- Counts follow what Kenny runs: where Kenny's library runs other code than CRuby's (Bundler
+  is resolved at build time, for one) those files' counts differ.
+
 ## Rule 3: defaults that differ from CRuby
 
 - **String literals are chilled, as in Ruby 3.4 and 4.0, except where nothing can tell.** With

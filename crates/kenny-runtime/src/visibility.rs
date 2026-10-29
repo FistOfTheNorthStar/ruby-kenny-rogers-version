@@ -65,6 +65,8 @@ fn set_vis(c: *mut Class, names: &[u32], vis: u8) -> V {
                     (*(nm as *mut Method)).vis = vis;
                     (*(nm as *mut Method)).params = (*m).params;
                 }
+                // (CRuby's ZSUPER entry, not a method of its own: method coverage skips it)
+                crate::coverage::vis_copy(nm);
             }
         }
     }
