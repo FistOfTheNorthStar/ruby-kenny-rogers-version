@@ -214,9 +214,14 @@ module OpenSSL
   end
 
   module PKey
-    class ECError < PKeyError; end
-    class DSAError < PKeyError; end
-    class DHError < PKeyError; end
+    if RUBY_VERSION >= "4"
+      # (the openssl gem 4.0: other names of PKeyError)
+      ECError = DSAError = DHError = PKeyError
+    else
+      class ECError < PKeyError; end
+      class DSAError < PKeyError; end
+      class DHError < PKeyError; end
+    end
 
     # PEM or DER text: a String, an IO (a File), or anything with #to_der
     def self.__kenny_input(data)

@@ -21,6 +21,10 @@ The gems must be installed for the Ruby the tests run against (`bundle install` 
 SAX parsers (`nokogiri-sax`) to 84, and `gem-fixes-2` (sockets, json 3.x, Psych's tree API,
 Prism and Ripper, C extensions from the lock, chilled string literals, `Coverage`) to 97.
 
+Built against Ruby 4.0.9 (`KENNY_RUBY=/path/to/ruby-4.0/bin/ruby tests/gems/run.sh`, with each gem
+directory's `bundle install` run for that Ruby) the result is the same: 97 of 100, the same three
+failing.
+
 Pass: actioncable, actionmailer, actionpack, actionview, activejob, activemodel, activerecord, activestorage, activesupport, addressable, ast, aws-eventstream, aws-partitions, aws-sdk-core, aws-sdk-kms, aws-sdk-s3, aws-sigv4, base64, bigdecimal, builder, bundler, coderay, concurrent-ruby, connection_pool, crass, diff-lcs, docile, domain_name, dotenv, erubi, excon, faraday, faraday-net_http, globalid, googleauth, http-cookie, httpclient, i18n, jmespath, json, jwt, loofah, mail, method_source, mime-types, mime-types-data, mini_mime, mini_portile2, minitest, msgpack, multi_json, multi_xml, multipart-post, netrc, nio4r, nokogiri, parallel, parser, public_suffix, racc, rack, rack-protection, rack-test, rails, rails-dom-testing, rails-html-sanitizer, railties, rainbow, rake, rb-fsevent, redis, regexp_parser, rexml, rspec, rspec-core, rspec-expectations, rspec-mocks, rspec-support, rubocop, rubocop-ast, ruby-progressbar, rubygems-update, rubyzip, signet, simplecov, sprockets, sprockets-rails, thor, thread_safe, tilt, tzinfo, unf, unf_ext, unicode-display_width, websocket-driver, websocket-extensions, zeitwerk.
 
 ### Still failing
