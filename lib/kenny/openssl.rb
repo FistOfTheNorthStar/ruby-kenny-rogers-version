@@ -396,45 +396,6 @@ class Integer
 end
 
 module OpenSSL
-  # No TLS sockets in Kenny; the classes exist so `io.is_a?(OpenSSL::SSL::SSLSocket)` checks
-  # (nio4r's selector, Net::HTTP) work and gems that name them load.
-  module SSL
-    class SSLError < OpenSSL::OpenSSLError; end unless const_defined?(:SSLError, false)
-
-    class SSLErrorWaitReadable < SSLError
-      include IO::WaitReadable
-    end
-
-    class SSLErrorWaitWritable < SSLError
-      include IO::WaitWritable
-    end
-
-    {
-      OP_ALL: 0x80000850, OP_LEGACY_SERVER_CONNECT: 4, OP_TLSEXT_PADDING: 16, OP_SAFARI_ECDHE_ECDSA_BUG: 64,
-      OP_IGNORE_UNEXPECTED_EOF: 128, OP_ALLOW_CLIENT_RENEGOTIATION: 256, OP_DISABLE_TLSEXT_CA_NAMES: 512,
-      OP_ALLOW_NO_DHE_KEX: 1024, OP_DONT_INSERT_EMPTY_FRAGMENTS: 2048, OP_NO_TICKET: 16384,
-      OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION: 65536, OP_NO_COMPRESSION: 131072,
-      OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION: 262144, OP_NO_ENCRYPT_THEN_MAC: 524288,
-      OP_ENABLE_MIDDLEBOX_COMPAT: 1048576, OP_PRIORITIZE_CHACHA: 2097152, OP_CIPHER_SERVER_PREFERENCE: 4194304,
-      OP_TLS_ROLLBACK_BUG: 8388608, OP_NO_ANTI_REPLAY: 16777216, OP_NO_SSLv3: 33554432, OP_NO_TLSv1: 67108864,
-      OP_NO_TLSv1_2: 134217728, OP_NO_TLSv1_1: 268435456, OP_NO_TLSv1_3: 536870912, OP_NO_RENEGOTIATION: 1073741824,
-      OP_NO_SSLv2: 0, OP_SINGLE_DH_USE: 0, OP_SINGLE_ECDH_USE: 0, OP_EPHEMERAL_RSA: 0,
-      SSL3_VERSION: 768, TLS1_VERSION: 769, TLS1_1_VERSION: 770, TLS1_2_VERSION: 771, TLS1_3_VERSION: 772
-    }.each { |k, v| const_set(k, v) unless const_defined?(k, false) }
-
-    class SSLSocket
-      def initialize(*)
-        raise NotImplementedError, "TLS sockets (OpenSSL::SSL::SSLSocket) are not supported by Kenny"
-      end
-    end
-
-    class SSLContext
-      def initialize(*)
-        raise NotImplementedError, "TLS (OpenSSL::SSL::SSLContext) is not supported by Kenny"
-      end
-    end unless const_defined?(:SSLContext, false)
-  end
-
   # No certificate handling in Kenny. A Store records what it's given (httpclient and
   # aws-sdk build one up front); parsing or verifying certificates raises NotImplementedError.
   module X509
@@ -507,3 +468,7 @@ module OpenSSL
     end
   end
 end
+
+# TLS: openssl.so's half (lib/kenny/kenny/openssl_ssl.rb), then the openssl gem's own Ruby half
+require "kenny/openssl_ssl"
+require "openssl/ssl"

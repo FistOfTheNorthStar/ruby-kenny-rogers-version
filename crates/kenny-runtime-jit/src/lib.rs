@@ -113,6 +113,7 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_catch_return", kenny_runtime::abi::kn_catch_return as *const u8),
         ("kn_raise_msg", kenny_runtime::abi::kn_raise_msg as *const u8),
         ("kn_respond_to", kenny_runtime::abi::kn_respond_to as *const u8),
+        ("kn_respond_to_pub", kenny_runtime::abi::kn_respond_to_pub as *const u8),
         ("kn_ivar_defined", kenny_runtime::abi::kn_ivar_defined as *const u8),
         ("kn_gvar_defined", kenny_runtime::abi::kn_gvar_defined as *const u8),
         ("kn_gvar_alias", kenny_runtime::abi::kn_gvar_alias as *const u8),

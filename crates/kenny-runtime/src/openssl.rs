@@ -1195,6 +1195,8 @@ fn init_cipher(ossl: *mut Class) {
 // (after get! and the helpers it uses: macros are in scope from their definition on)
 #[path = "openssl_pkey.rs"]
 mod pkey;
+#[path = "openssl_tls.rs"]
+mod tls;
 
 // ---------- OpenSSL module ----------
 
@@ -1255,6 +1257,7 @@ fn init_openssl() -> V {
     init_kdf(ossl);
     init_cipher(ossl);
     pkey::init_pkey(ossl);
+    tls::init_tls(ssl);
     ossl as V
 }
 

@@ -35,6 +35,7 @@ const CAPI_SHIM: &str = include_str!("../../../include/kenny_capi.c");
 const OVERLAY: &[(&str, &str)] = &[
     ("forwardable.rb", include_str!("../../../lib/kenny/forwardable.rb")),
     ("openssl.rb", include_str!("../../../lib/kenny/openssl.rb")),
+    ("kenny/openssl_ssl.rb", include_str!("../../../lib/kenny/kenny/openssl_ssl.rb")),
     ("securerandom.rb", include_str!("../../../lib/kenny/securerandom.rb")),
     ("random/formatter.rb", include_str!("../../../lib/kenny/random/formatter.rb")),
     ("json.rb", include_str!("../../../lib/kenny/json.rb")),

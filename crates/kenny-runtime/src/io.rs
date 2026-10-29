@@ -3370,8 +3370,20 @@ pub fn init() {
         let mut ready_r = Vec::new();
         let mut ready_w = Vec::new();
         let mut pfds = Vec::new();
+        // (an object that isn't an IO is waited on through its #to_io, like an SSLSocket, and
+        // reported as itself)
+        let st_of = |x: V| {
+            if try_st(x).is_none() && respond_to(x, sym("to_io")) {
+                let io = send0(x, "to_io");
+                if io == UNDEF {
+                    return Err(UNDEF);
+                }
+                return st(io);
+            }
+            st(x)
+        };
         for &x in &rs {
-            let s = ok!(st(x));
+            let s = ok!(st_of(x));
             if s.avail() > 0 || s.mem.is_some() {
                 ready_r.push(x);
             }
@@ -3379,7 +3391,7 @@ pub fn init() {
             pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.fd }, events: libc::POLLIN, revents: 0 });
         }
         for &x in &ws {
-            let s = ok!(st(x));
+            let s = ok!(st_of(x));
             pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.wfd }, events: libc::POLLOUT, revents: 0 });
         }
         let n = if ready_r.is_empty() {
