@@ -49,15 +49,25 @@ pub unsafe extern "C" fn kn_register_ext(name: *const c_char, init: unsafe exter
     EXTS.get().push((n, init));
 }
 
-/// `require "name"` of a linked-in extension: run Init_name once.
+/// `require "feature"` of a linked-in extension: run its Init function once. An extension
+/// registered as "msgpack/msgpack" is found by that name, also under a directory
+/// ("3.4/unf_ext.so", as gems that ship one binary per Ruby version ask for it).
 pub fn require_ext(name: &str) -> Option<V> {
-    let base = name.rsplit('/').next().unwrap_or(name).trim_end_matches(".so").trim_end_matches(".bundle");
-    let init = EXTS.get().iter().find(|(n, _)| n == base).map(|(_, f)| *f)?;
-    if LOADED_EXTS.get().iter().any(|n| n == base) {
+    let base = name.trim_end_matches(".so").trim_end_matches(".bundle");
+    let (feature, init) = EXTS.get().iter().find(|(n, _)| base == n || base.strip_suffix(n.as_str()).is_some_and(|d| d.ends_with('/'))).map(|(n, f)| (n.clone(), *f))?;
+    if LOADED_EXTS.get().iter().any(|n| *n == feature) {
         return Some(QFALSE);
     }
-    LOADED_EXTS.get().push(base.to_string());
-    unsafe { init() };
+    LOADED_EXTS.get().push(feature);
+    enter_frame(sym("require"), rt().main_obj);
+    if CFUNC_CALLER.get().is_some() {
+        // (through the C shim: an exception the Init function raises longjmps back to it)
+        let _ = crate::core::call_native_c(init as *const c_void, 0, QNIL, &[]);
+    } else {
+        // only the runtime's own native parts (kenny_assets, ...): Rust, no longjmp
+        unsafe { init() };
+    }
+    leave_frame();
     if !matches!(pst().pending, Throw::None) {
         return Some(UNDEF);
     }
@@ -109,12 +119,24 @@ globals!(
     rb_eArgError, rb_eTypeError, rb_eNameError, rb_eNoMethodError, rb_eIndexError, rb_eKeyError, rb_eRangeError,
     rb_eZeroDivError, rb_eNotImpError, rb_eIOError, rb_eStopIteration, rb_eFrozenError, rb_eNoMemError,
     rb_eScriptError, rb_eFloatDomainError, rb_eEncodingError, rb_eLocalJumpError, rb_eSecurityError,
+    rb_cBinding, rb_cComplex, rb_cData, rb_cDir, rb_cEncoding, rb_cEnumerator, rb_cFile, rb_cMatch, rb_cMethod, rb_cRandom, rb_cRational, rb_cRegexp, rb_cSet, rb_cThread, rb_cUnboundMethod, rb_eEncCompatError, rb_eEOFError, rb_eFatal, rb_eInterrupt, rb_eLoadError, rb_eMathDomainError, rb_eNoMatchingPatternError, rb_eNoMatchingPatternKeyError, rb_eRegexpError, rb_eSignal, rb_eSyntaxError, rb_eSystemCallError, rb_eSystemExit, rb_eThreadError, rb_mErrno, rb_mGC, rb_mMath, rb_mProcess,
 );
 
 pub fn init() {
     crate::gc::heap().extra_roots.push(static_roots);
     let c = rt().c;
     let get = |n: &str| const_lookup(c.object, sym(n)).unwrap_or(c.standard_error as V);
+    // (a class the runtime lacks is Object, so a C extension's reference to it still links)
+    let path = |p: &str| {
+        let mut k = c.object as V;
+        for n in p.split("::") {
+            match const_lookup(cls(k), sym(n)) {
+                Some(v) if is_class(v) => k = v,
+                _ => return c.object as V,
+            }
+        }
+        k
+    };
     unsafe {
         rb_cObject = c.object as V;
         rb_cBasicObject = c.basic_object as V;
@@ -159,6 +181,39 @@ pub fn init() {
         rb_eEncodingError = get("EncodingError");
         rb_eLocalJumpError = c.local_jump_error as V;
         rb_eSecurityError = get("SecurityError");
+        rb_cBinding = path("Binding");
+        rb_cComplex = path("Complex");
+        rb_cData = path("Object");
+        rb_cDir = path("Dir");
+        rb_cEncoding = path("Encoding");
+        rb_cEnumerator = path("Enumerator");
+        rb_cFile = path("File");
+        rb_cMatch = path("MatchData");
+        rb_cMethod = path("Method");
+        rb_cRandom = path("Random");
+        rb_cRational = path("Rational");
+        rb_cRegexp = path("Regexp");
+        rb_cSet = path("Set");
+        rb_cThread = path("Thread");
+        rb_cUnboundMethod = path("UnboundMethod");
+        rb_eEncCompatError = path("Encoding::CompatibilityError");
+        rb_eEOFError = path("EOFError");
+        rb_eFatal = path("Exception");
+        rb_eInterrupt = path("Interrupt");
+        rb_eLoadError = path("LoadError");
+        rb_eMathDomainError = path("Math::DomainError");
+        rb_eNoMatchingPatternError = path("NoMatchingPatternError");
+        rb_eNoMatchingPatternKeyError = path("NoMatchingPatternKeyError");
+        rb_eRegexpError = path("RegexpError");
+        rb_eSignal = path("SignalException");
+        rb_eSyntaxError = path("SyntaxError");
+        rb_eSystemCallError = path("SystemCallError");
+        rb_eSystemExit = path("SystemExit");
+        rb_eThreadError = path("ThreadError");
+        rb_mErrno = path("Errno");
+        rb_mGC = path("GC");
+        rb_mMath = path("Math");
+        rb_mProcess = path("Process");
     }
 }
 
@@ -332,6 +387,9 @@ pub extern "C" fn rb_type(v: V) -> c_int {
     if is_fix(v) {
         return T_FIXNUM;
     }
+    if is_flonum(v) {
+        return T_FLOAT;
+    }
     match v {
         QNIL => return T_NIL,
         QTRUE => return T_TRUE,
@@ -469,17 +527,24 @@ pub unsafe extern "C" fn kn_capi_num2long(v: V, ok: *mut c_int) -> i64 {
     if is_fix(v) {
         return fix(v);
     }
-    if is_big(v) {
-        if let Some(i) = rbig(v).n.to_i64() {
-            return i;
+    if is_float(v) {
+        let f = float_val(v);
+        if f >= -9.223372036854776e18 && f < 9.223372036854776e18 {
+            return f as i64;
         }
-        raise(rt().c.range_error, "bignum too big to convert into 'long'");
-    } else if is_float(v) {
-        return float_val(v) as i64;
-    } else if v == QNIL {
-        type_error("no implicit conversion from nil to integer");
-    } else {
-        type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(v))));
+        raise(rt().c.range_error, &format!("float {} out of range of integer", crate::fmt::inspect_lossy(v)));
+        unsafe { *ok = 0 };
+        return 0;
+    }
+    match num_to_int(v) {
+        Some(i) if is_fix(i) => return fix(i),
+        Some(i) => {
+            if let Some(i) = rbig(i).n.to_i64() {
+                return i;
+            }
+            raise(rt().c.range_error, "bignum too big to convert into 'long'");
+        }
+        None => {}
     }
     unsafe { *ok = 0 };
     0
@@ -497,33 +562,113 @@ pub unsafe extern "C" fn kn_capi_num2dbl(v: V, ok: *mut c_int) -> f64 {
 
 // ---------- strings ----------
 
+unsafe fn bytes_of<'a>(p: *const c_char, len: c_long) -> &'a [u8] {
+    if p.is_null() || len <= 0 { &[] } else { unsafe { std::slice::from_raw_parts(p as *const u8, len as usize) } }
+}
+/// A new String of `len` bytes from `p` (zeros if `p` is null) in encoding `idx`.
+unsafe fn str_with(p: *const c_char, len: c_long, idx: c_int) -> V {
+    let s = if p.is_null() { str_new(vec![0; len.max(0) as usize]) } else { str_new(unsafe { bytes_of(p, len) }.to_vec()) };
+    set_enc_index(s, idx);
+    s
+}
+fn cstr_len(p: *const c_char) -> c_long {
+    if p.is_null() { 0 } else { unsafe { CStr::from_ptr(p) }.to_bytes().len() as c_long }
+}
+/// rb_str_new: an ASCII-8BIT String, as in CRuby (rb_utf8_str_new for UTF-8).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rb_str_new(p: *const c_char, len: c_long) -> V {
-    if p.is_null() {
-        return str_new(vec![0; len.max(0) as usize]);
-    }
-    str_new(unsafe { std::slice::from_raw_parts(p as *const u8, len.max(0) as usize) }.to_vec())
+    unsafe { str_with(p, len, ENC_BINARY) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rb_str_new_cstr(p: *const c_char) -> V {
-    str_new(unsafe { CStr::from_ptr(p) }.to_bytes().to_vec())
+    unsafe { str_with(p, cstr_len(p), ENC_BINARY) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rb_utf8_str_new(p: *const c_char, len: c_long) -> V {
-    unsafe { rb_str_new(p, len) }
+    unsafe { str_with(p, len, ENC_UTF8) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rb_utf8_str_new_cstr(p: *const c_char) -> V {
-    unsafe { rb_str_new_cstr(p) }
+    unsafe { str_with(p, cstr_len(p), ENC_UTF8) }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rb_str_cat(s: V, p: *const c_char, len: c_long) -> V {
-    rstr(s).b.extend_from_slice(unsafe { std::slice::from_raw_parts(p as *const u8, len.max(0) as usize) });
+pub unsafe extern "C" fn rb_usascii_str_new(p: *const c_char, len: c_long) -> V {
+    unsafe { str_with(p, len, ENC_USASCII) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_usascii_str_new_cstr(p: *const c_char) -> V {
+    unsafe { str_with(p, cstr_len(p), ENC_USASCII) }
+}
+// (the default external, locale and filesystem encodings are UTF-8)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_external_str_new(p: *const c_char, len: c_long) -> V {
+    unsafe { str_with(p, len, ENC_UTF8) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_external_str_new_cstr(p: *const c_char) -> V {
+    unsafe { str_with(p, cstr_len(p), ENC_UTF8) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_locale_str_new(p: *const c_char, len: c_long) -> V {
+    unsafe { str_with(p, len, ENC_UTF8) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_locale_str_new_cstr(p: *const c_char) -> V {
+    unsafe { str_with(p, cstr_len(p), ENC_UTF8) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_filesystem_str_new(p: *const c_char, len: c_long) -> V {
+    unsafe { str_with(p, len, ENC_UTF8) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_filesystem_str_new_cstr(p: *const c_char) -> V {
+    unsafe { str_with(p, cstr_len(p), ENC_UTF8) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_enc_str_new(p: *const c_char, len: c_long, enc: *const KnEncoding) -> V {
+    unsafe { str_with(p, len, if enc.is_null() { ENC_BINARY } else { (*enc).index }) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_enc_str_new_cstr(p: *const c_char, enc: *const KnEncoding) -> V {
+    unsafe { rb_enc_str_new(p, cstr_len(p), enc) }
+}
+/// A frozen String (CRuby's are deduplicated; Kenny's `-"str"` doesn't deduplicate either).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_enc_interned_str(p: *const c_char, len: c_long, enc: *const KnEncoding) -> V {
+    let s = unsafe { rb_enc_str_new(p, len, enc) };
+    hdr(s).flags |= FL_FROZEN;
     s
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rb_str_cat_cstr(s: V, p: *const c_char) -> V {
-    rstr(s).b.extend_from_slice(unsafe { CStr::from_ptr(p) }.to_bytes());
+pub unsafe extern "C" fn rb_enc_interned_str_cstr(p: *const c_char, enc: *const KnEncoding) -> V {
+    unsafe { rb_enc_interned_str(p, cstr_len(p), enc) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_interned_str(p: *const c_char, len: c_long) -> V {
+    let s = unsafe { str_with(p, len, ENC_USASCII) };
+    if !rstr(s).b.is_ascii() {
+        set_enc_index(s, ENC_BINARY);
+    }
+    hdr(s).flags |= FL_FROZEN;
+    s
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_interned_str_cstr(p: *const c_char) -> V {
+    unsafe { rb_interned_str(p, cstr_len(p)) }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_fstring(s: V) -> V {
+    if is_frozen(s) {
+        return s;
+    }
+    let d = rb_str_dup(s);
+    hdr(d).flags |= FL_FROZEN;
+    d
+}
+/// (rb_str_cat: the C side checks that the String isn't frozen)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_capi_str_cat(s: V, p: *const c_char, len: c_long) -> V {
+    rstr(s).b.extend_from_slice(unsafe { bytes_of(p, len) });
     s
 }
 #[unsafe(no_mangle)]
@@ -534,30 +679,86 @@ pub extern "C" fn rb_str_append(s: V, o: V) -> V {
     }
     s
 }
+/// A copy with the same encoding and class.
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_dup(s: V) -> V {
-    str_new(rstr(s).b.clone())
+    let d = str_new(rstr(s).b.clone());
+    crate::transcode::set_enc(d, crate::transcode::enc_of(s));
+    let k = real_class(s);
+    if k != rt().c.string {
+        hdr(d).klass = k;
+    }
+    d
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_str_new_frozen(s: V) -> V {
+    rb_fstring(s)
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_str_new_with_class(obj: V, p: *const c_char, len: c_long) -> V {
+    let s = unsafe { rb_str_new(p, len) };
+    if is_str(obj) {
+        crate::transcode::set_enc(s, crate::transcode::enc_of(obj));
+        hdr(s).klass = real_class(obj);
+    }
+    s
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_str_capacity(s: V) -> usize {
+    rstr(s).b.capacity()
+}
+/// (CRuby: a byte range of the String, sharing its buffer; here a copy)
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_str_subseq(s: V, beg: c_long, len: c_long) -> V {
+    let b = &rstr(s).b;
+    let beg = (beg.max(0) as usize).min(b.len());
+    let end = (beg + len.max(0) as usize).min(b.len());
+    let d = str_new(b[beg..end].to_vec());
+    crate::transcode::set_enc(d, crate::transcode::enc_of(s));
+    d
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_str_cmp(a: V, b: V) -> c_int {
+    match rstr(a).b.as_slice().cmp(rstr(b).b.as_slice()) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_str_hash(s: V) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    rstr(s).b.as_slice().hash(&mut h);
+    h.finish() as usize
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_str_reserve(s: V, extra: c_long) {
+    rstr(s).b.reserve(extra.max(0) as usize);
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_resize(s: V, len: c_long) -> V {
     rstr(s).b.resize(len.max(0) as usize, 0);
     s
 }
+/// The new length of a String whose buffer C code wrote into: what is there stays (within
+/// its capacity; growing past it zero-fills).
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_set_len(s: V, len: c_long) {
-    rstr(s).b.resize(len.max(0) as usize, 0);
+    let b = &mut rstr(s).b;
+    let len = len.max(0) as usize;
+    if len <= b.capacity() {
+        b.set_len_in_capacity(len);
+    } else {
+        b.resize(len, 0);
+    }
 }
+/// An empty ASCII-8BIT String with room for `cap` bytes.
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_buf_new(cap: c_long) -> V {
-    str_new(Vec::with_capacity(cap.max(0) as usize))
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn rb_str_modify(s: V) {
-    let _ = s;
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn rb_str_modify_expand(s: V, extra: c_long) {
-    rstr(s).b.reserve(extra.max(0) as usize);
+    let s = str_new(Vec::with_capacity(cap.max(0) as usize + 1));
+    set_enc_index(s, ENC_BINARY);
+    s
 }
 /// RSTRING_PTR: a NUL-terminated view of the bytes (capacity reserved for the terminator).
 #[unsafe(no_mangle)]
@@ -710,18 +911,32 @@ pub extern "C" fn rb_hash_size(h: V) -> V {
 pub extern "C" fn rb_hash_keys(h: V) -> V {
     ary_new(rhash(h).m.keys().map(|k| k.0).collect())
 }
-/// rb_hash_foreach: callback returns 0 (ST_CONTINUE), 1 (ST_STOP), 2 (ST_DELETE).
+/// The pairs of a Hash as a flat Array [k0, v0, k1, v1 ...] (rb_hash_foreach iterates over
+/// it on the C side: its callback may raise, and that unwinds through C frames only).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rb_hash_foreach(h: V, f: unsafe extern "C" fn(V, V, V) -> c_int, arg: V) {
-    for (k, v) in crate::hash::pairs(h) {
-        match unsafe { f(k, v, arg) } {
-            1 => break,
-            2 => {
-                rhash(h).m.shift_remove(&HKey(k));
-            }
-            _ => {}
-        }
-    }
+pub extern "C" fn kn_capi_hash_pairs(h: V) -> V {
+    ary_new(rhash(h).m.iter().flat_map(|(k, v)| [k.0, *v]).collect())
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_hash_new_capa(_capa: c_long) -> V {
+    hash_new()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_hash_size_num(h: V) -> usize {
+    rhash(h).m.len()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_hash_values(h: V) -> V {
+    ary_new(rhash(h).m.values().copied().collect())
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_hash_ifnone(h: V) -> V {
+    rhash(h).default
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_hash_set_ifnone(h: V, v: V) -> V {
+    rhash(h).default = v;
+    h
 }
 
 // ---------- calling Ruby ----------
@@ -888,8 +1103,21 @@ pub extern "C" fn rb_data_object_wrap(klass: V, ptr: *mut c_void, mark: Option<u
 pub unsafe extern "C" fn rb_data_typed_object_wrap(klass: V, ptr: *mut c_void, ty: *const RbDataType) -> V {
     let t = unsafe { &*ty };
     let v = data_new(klass, ptr, t.dmark, t.dfree);
-    ivar_set(v, sym("@__type"), mkfix(ty as i64 >> 1));
+    ivar_set(v, type_ivar(), mkfix(ty as i64 >> 1));
     v
+}
+fn type_ivar() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| sym("@__type"))
+}
+/// The rb_data_type_t of a TypedData object (null for anything else).
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_kn_typeddata_type(v: V) -> *const RbDataType {
+    if !is_heap(v) || !is_kind(v, Kind::Data) {
+        return std::ptr::null();
+    }
+    let t = ivar_get(v, type_ivar());
+    if is_fix(t) { (fix(t) << 1) as usize as *const RbDataType } else { std::ptr::null() }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rb_data_typed_object_zalloc(klass: V, size: usize, ty: *const RbDataType) -> V {
@@ -901,9 +1129,26 @@ pub extern "C" fn rb_kn_data_ptr_ref(v: V) -> *mut *mut c_void {
     unsafe { &mut (*(v as *mut RData)).data }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn kn_capi_check_typeddata(v: V, ty: *const RbDataType) -> *mut c_void {
-    if !is_kind(v, Kind::Data) {
-        type_error(&format!("wrong argument type {} (expected {})", class_name(real_class(v)), cstr(unsafe { (*ty).wrap_struct_name })));
+pub unsafe extern "C" fn kn_capi_check_typeddata(v: V, ty: *const RbDataType, ok: *mut c_int) -> *mut c_void {
+    unsafe { *ok = 1 };
+    let mut t = rb_kn_typeddata_type(v);
+    let actual = t;
+    while !t.is_null() && t != ty {
+        t = unsafe { (*t).parent };
+    }
+    if t.is_null() {
+        let what = if actual.is_null() {
+            match v {
+                QNIL => "nil".to_string(),
+                QTRUE => "true".to_string(),
+                QFALSE => "false".to_string(),
+                _ => class_name(real_class(v)),
+            }
+        } else {
+            cstr(unsafe { (*actual).wrap_struct_name })
+        };
+        type_error(&format!("wrong argument type {what} (expected {})", cstr(unsafe { (*ty).wrap_struct_name })));
+        unsafe { *ok = 0 };
         return std::ptr::null_mut();
     }
     unsafe { (*(v as *mut RData)).data }
@@ -912,9 +1157,12 @@ pub unsafe extern "C" fn kn_capi_check_typeddata(v: V, ty: *const RbDataType) ->
 pub extern "C" fn rb_gc_mark(v: V) {
     crate::gc::mark_from_extension(v);
 }
+/// (a word that may not be an object: marked only if it is one)
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_gc_mark_maybe(v: V) {
-    crate::gc::mark_from_extension(v);
+    if !is_heap(v) || crate::gc::is_object(v as usize) {
+        crate::gc::mark_from_extension(v);
+    }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_gc_register_address(p: *const V) {
@@ -923,6 +1171,10 @@ pub extern "C" fn rb_gc_register_address(p: *const V) {
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_global_variable(p: *const V) {
     GLOBAL_ROOTS.get().push(p);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_gc_unregister_address(p: *const V) {
+    GLOBAL_ROOTS.get().retain(|x| *x != p);
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_gc_register_mark_object(v: V) {
@@ -945,4 +1197,549 @@ pub extern "C" fn rb_const_defined(klass: V, id: V) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_attr_get(obj: V, id: V) -> V {
     ivar_get(obj, id as u32)
+}
+
+// ---------- the running C method (rb_frame_this_func, rb_current_receiver) ----------
+
+thread_local! {
+    static FRAMES: std::cell::RefCell<Vec<(u32, V)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+/// A C method is called (its name and receiver; the receiver is also on the caller's stack).
+pub fn enter_frame(name: u32, recv: V) {
+    FRAMES.with(|f| f.borrow_mut().push((name, recv)));
+}
+pub fn leave_frame() {
+    FRAMES.with(|f| f.borrow_mut().pop());
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_frame_this_func() -> V {
+    FRAMES.with(|f| f.borrow().last().map_or(0, |x| x.0 as V))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_frame_callee() -> V {
+    rb_frame_this_func()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_current_receiver() -> V {
+    FRAMES.with(|f| f.borrow().last().map_or(rt().main_obj, |x| x.1))
+}
+
+// ---------- encodings ----------
+//
+// rb_encoding is a small struct per encoding (name, index, min/max character length), at
+// CRuby's indexes for the three Kenny strings carry natively: 0 ASCII-8BIT, 1 UTF-8,
+// 2 US-ASCII; then every other encoding CRuby has (enc_table.rs).
+
+#[repr(C)]
+pub struct KnEncoding {
+    pub name: *const c_char,
+    pub index: c_int,
+    pub min_len: c_int,
+    pub max_len: c_int,
+    pub ascii_compat: c_int,
+    pub dummy: c_int,
+}
+unsafe impl Sync for KnEncoding {}
+unsafe impl Send for KnEncoding {}
+pub const ENC_BINARY: c_int = 0;
+pub const ENC_UTF8: c_int = 1;
+pub const ENC_USASCII: c_int = 2;
+
+fn encodings() -> &'static [KnEncoding] {
+    static T: std::sync::OnceLock<Vec<KnEncoding>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut names: Vec<(&'static str, bool, bool)> = vec![("ASCII-8BIT", true, false), ("UTF-8", true, false), ("US-ASCII", true, false)];
+        for &(n, _, _, dummy, ascii) in crate::enc_table::ENCODINGS {
+            names.push((n, ascii, dummy));
+        }
+        names
+            .into_iter()
+            .enumerate()
+            .map(|(i, (n, ascii, dummy))| {
+                let up = n.to_ascii_uppercase();
+                let single = i == 0
+                    || i == 2
+                    || ["ISO-8859", "WINDOWS-125", "IBM", "CP85", "CP86", "KOI8", "MAC", "TIS-620", "ASCII"].iter().any(|p| up.starts_with(p));
+                let (min, max) = if up.starts_with("UTF-16") {
+                    (2, 4)
+                } else if up.starts_with("UTF-32") {
+                    (4, 4)
+                } else if single {
+                    (1, 1)
+                } else {
+                    (if ascii { 1 } else { 2 }, if up.contains("UTF") || up.contains("CESU") || up.contains("GB18030") || up.contains("EUC") { 4 } else { 2 })
+                };
+                let name = Box::leak(std::ffi::CString::new(n).unwrap().into_boxed_c_str()).as_ptr();
+                KnEncoding { name, index: i as c_int, min_len: min, max_len: max, ascii_compat: ascii as c_int, dummy: dummy as c_int }
+            })
+            .collect()
+    })
+}
+fn enc_ptr(i: c_int) -> *const KnEncoding {
+    encodings().get(i.max(0) as usize).map_or(std::ptr::null(), |e| e as *const KnEncoding)
+}
+fn enc_index_of(e: crate::transcode::Enc) -> c_int {
+    if e.codec == crate::transcode::Codec::Binary {
+        return ENC_BINARY;
+    }
+    encodings().iter().position(|x| cstr(x.name) == e.name).map_or(ENC_BINARY, |i| i as c_int)
+}
+fn enc_at(i: c_int) -> Option<crate::transcode::Enc> {
+    let e = encodings().get(usize::try_from(i).ok()?)?;
+    crate::transcode::lookup(&cstr(e.name))
+}
+/// Give String `s` the encoding at index `idx`.
+pub fn set_enc_index(s: V, idx: c_int) {
+    if is_str(s) {
+        if let Some(e) = enc_at(idx) {
+            crate::transcode::set_enc(s, e);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_ascii8bit_encoding() -> *const KnEncoding {
+    enc_ptr(ENC_BINARY)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_utf8_encoding() -> *const KnEncoding {
+    enc_ptr(ENC_UTF8)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_usascii_encoding() -> *const KnEncoding {
+    enc_ptr(ENC_USASCII)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_locale_encoding() -> *const KnEncoding {
+    enc_ptr(ENC_UTF8)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_filesystem_encoding() -> *const KnEncoding {
+    enc_ptr(ENC_UTF8)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_ascii8bit_encindex() -> c_int {
+    ENC_BINARY
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_utf8_encindex() -> c_int {
+    ENC_UTF8
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_usascii_encindex() -> c_int {
+    ENC_USASCII
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_locale_encindex() -> c_int {
+    ENC_UTF8
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_filesystem_encindex() -> c_int {
+    ENC_UTF8
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_enc_from_index(i: c_int) -> *const KnEncoding {
+    if i < 0 { std::ptr::null() } else { enc_ptr(i) }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_enc_find_index(name: *const c_char) -> c_int {
+    crate::transcode::lookup(&cstr(name)).map_or(-1, enc_index_of)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_enc_find(name: *const c_char) -> *const KnEncoding {
+    rb_enc_from_index(rb_enc_find_index(name))
+}
+/// The encoding index of a String or Symbol (-1 for objects without one).
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_enc_get_index(v: V) -> c_int {
+    if is_str(v) {
+        enc_index_of(crate::transcode::enc_of(v))
+    } else if is_sym(v) {
+        if sym_name(sym_id(v)).is_ascii() { ENC_USASCII } else { ENC_UTF8 }
+    } else {
+        -1
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_enc_get(v: V) -> *const KnEncoding {
+    rb_enc_from_index(rb_enc_get_index(v))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_enc_set_index(v: V, i: c_int) {
+    set_enc_index(v, i)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_enc_associate_index(v: V, i: c_int) -> V {
+    set_enc_index(v, i);
+    v
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_enc_associate(v: V, e: *const KnEncoding) -> V {
+    set_enc_index(v, if e.is_null() { ENC_BINARY } else { unsafe { (*e).index } });
+    v
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_enc_copy(dst: V, src: V) {
+    if is_str(dst) && is_str(src) {
+        crate::transcode::set_enc(dst, crate::transcode::enc_of(src));
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_enc_from_encoding(e: *const KnEncoding) -> V {
+    if e.is_null() {
+        return QNIL;
+    }
+    match enc_at(unsafe { (*e).index }) {
+        Some(x) => crate::transcode::encoding_obj(x),
+        None => QNIL,
+    }
+}
+/// An Encoding object or name → its index (-1: not an encoding).
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_to_encoding_index(v: V) -> c_int {
+    if !is_str(v) && !is_heap(v) {
+        return -1;
+    }
+    match crate::transcode::enc_arg(v) {
+        Ok(e) => enc_index_of(e),
+        Err(_) => -1,
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_enc_str_coderange(s: V) -> c_int {
+    const CR_7BIT: c_int = 1 << 20;
+    const CR_VALID: c_int = 1 << 21;
+    const CR_BROKEN: c_int = CR_7BIT | CR_VALID;
+    let b = &rstr(s).b;
+    if b.is_ascii() {
+        return CR_7BIT;
+    }
+    match rb_enc_get_index(s) {
+        ENC_UTF8 => {
+            if std::str::from_utf8(b).is_ok() {
+                CR_VALID
+            } else {
+                CR_BROKEN
+            }
+        }
+        ENC_USASCII => CR_BROKEN,
+        _ => {
+            if send(s, sym("valid_encoding?"), &[], QNIL) == QFALSE {
+                CR_BROKEN
+            } else {
+                CR_VALID
+            }
+        }
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_enc_str_asciionly_p(s: V) -> c_int {
+    rstr(s).b.is_ascii() as c_int
+}
+/// The encoding two Strings combine to, or null (rb_enc_check raises then).
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_enc_compatible(a: V, b: V) -> *const KnEncoding {
+    let (ia, ib) = (rb_enc_get_index(a), rb_enc_get_index(b));
+    if ia < 0 || ib < 0 {
+        return std::ptr::null();
+    }
+    if ia == ib {
+        return enc_ptr(ia);
+    }
+    let ascii = |v: V| !is_str(v) || rstr(v).b.is_ascii();
+    let compat = |i: c_int| encodings().get(i as usize).is_some_and(|e| e.ascii_compat != 0);
+    if is_str(b) && rstr(b).b.is_empty() {
+        return enc_ptr(ia);
+    }
+    if is_str(a) && rstr(a).b.is_empty() {
+        return enc_ptr(if compat(ia) && ascii(b) { ia } else { ib });
+    }
+    if !compat(ia) || !compat(ib) {
+        return std::ptr::null();
+    }
+    if ascii(b) {
+        return enc_ptr(ia);
+    }
+    if ascii(a) {
+        return enc_ptr(ib);
+    }
+    std::ptr::null()
+}
+
+// ---------- symbols ----------
+
+/// The name of a Symbol as a frozen String (US-ASCII when it is ASCII, as CRuby's).
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_sym2str(s: V) -> V {
+    rb_id2str(sym_id(s) as V)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_id2str(id: V) -> V {
+    let b = sym_name(id as u32).to_vec();
+    let ascii = b.is_ascii();
+    let s = str_new(b);
+    set_enc_index(s, if ascii { ENC_USASCII } else { ENC_UTF8 });
+    hdr(s).flags |= FL_FROZEN;
+    s
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_intern_str(s: V) -> V {
+    intern(&rstr(s).b.clone()) as V
+}
+
+// ---------- numbers ----------
+
+fn num_to_int(v: V) -> Option<V> {
+    if is_int(v) {
+        return Some(v);
+    }
+    if is_float(v) {
+        let f = float_val(v);
+        if f.is_nan() || f.is_infinite() {
+            raise(rt().c.float_domain_error, &crate::fmt::inspect_lossy(v));
+            return None;
+        }
+        return Some(int_from_f64(f.trunc()));
+    }
+    if v == QNIL {
+        type_error("no implicit conversion from nil to integer");
+        return None;
+    }
+    if is_heap(v) && !is_str(v) && respond_to(v, sym("to_int")) {
+        let r = send0(v, "to_int");
+        if r == UNDEF {
+            return None;
+        }
+        if is_int(r) {
+            return Some(r);
+        }
+        type_error(&format!("can't convert {} to Integer", class_name(real_class(v))));
+        return None;
+    }
+    type_error(&format!("no implicit conversion of {} into Integer", describe_type(v)));
+    None
+}
+fn describe_type(v: V) -> String {
+    match v {
+        QNIL => "nil".into(),
+        QTRUE => "true".into(),
+        QFALSE => "false".into(),
+        _ => class_name(real_class(v)),
+    }
+}
+fn int_from_f64(f: f64) -> V {
+    if f.abs() < 4.0e18 {
+        mkfix(f as i64)
+    } else {
+        use num_traits::FromPrimitive;
+        match num_bigint::BigInt::from_f64(f) {
+            Some(b) => int_from_big(b),
+            None => mkfix(0),
+        }
+    }
+}
+/// NUM2ULONG: 0..ULONG_MAX, and negative values down to LONG_MIN (wrapped), as CRuby.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_capi_num2ulong(v: V, ok: *mut c_int) -> u64 {
+    use num_traits::ToPrimitive;
+    unsafe { *ok = 1 };
+    let Some(i) = num_to_int(v) else {
+        unsafe { *ok = 0 };
+        return 0;
+    };
+    if is_fix(i) {
+        return fix(i) as u64;
+    }
+    let n = &rbig(i).n;
+    if let Some(u) = n.to_u64() {
+        return u;
+    }
+    if let Some(s) = n.to_i64() {
+        return s as u64;
+    }
+    raise(rt().c.range_error, "bignum out of range of unsigned long");
+    unsafe { *ok = 0 };
+    0
+}
+/// 1 for a positive (or zero) Integer, 0 for a negative one.
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_big_sign(v: V) -> c_int {
+    if is_fix(v) {
+        return (fix(v) >= 0) as c_int;
+    }
+    (rbig(v).n.sign() != num_bigint::Sign::Minus) as c_int
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_capi_big2ull(v: V, ok: *mut c_int) -> u64 {
+    use num_traits::ToPrimitive;
+    unsafe { *ok = 1 };
+    if is_fix(v) {
+        return fix(v) as u64;
+    }
+    if is_big(v) {
+        let n = &rbig(v).n;
+        if let Some(u) = n.to_u64() {
+            return u;
+        }
+        if let Some(s) = n.to_i64() {
+            return s as u64;
+        }
+    }
+    raise(rt().c.range_error, "bignum too big to convert into 'unsigned long long'");
+    unsafe { *ok = 0 };
+    0
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_capi_big2ll(v: V, ok: *mut c_int) -> i64 {
+    use num_traits::ToPrimitive;
+    unsafe { *ok = 1 };
+    if is_fix(v) {
+        return fix(v);
+    }
+    if let Some(s) = is_big(v).then(|| rbig(v).n.to_i64()).flatten() {
+        return s;
+    }
+    raise(rt().c.range_error, "bignum too big to convert into 'long long'");
+    unsafe { *ok = 0 };
+    0
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_big2dbl(v: V) -> f64 {
+    use num_traits::ToPrimitive;
+    if is_fix(v) {
+        return fix(v) as f64;
+    }
+    rbig(v).n.to_f64().unwrap_or(f64::INFINITY)
+}
+/// The bytes |v| takes, and (in *nlz) the unused high bits of the top byte.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_absint_size(v: V, nlz: *mut c_int) -> usize {
+    let bits = if is_fix(v) { 64 - fix(v).unsigned_abs().leading_zeros() as u64 } else { rbig(v).n.bits() };
+    let bytes = bits.div_ceil(8);
+    if !nlz.is_null() {
+        unsafe { *nlz = (bytes * 8 - bits) as c_int };
+    }
+    bytes as usize
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_absint_singlebit_p(v: V) -> c_int {
+    if is_fix(v) {
+        return fix(v).unsigned_abs().is_power_of_two() as c_int;
+    }
+    let m = rbig(v).n.magnitude();
+    (m.count_ones() == 1) as c_int
+}
+
+// ---------- classes, methods, objects ----------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_singleton_class(v: V) -> V {
+    singleton_class(v) as V
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_class_real(c: V) -> V {
+    let mut k = cls(c);
+    while !k.is_null() && unsafe { (*k).is_singleton } {
+        k = unsafe { (*k).superclass };
+    }
+    k as V
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_class_new(sup: V) -> V {
+    new_class("", cls(sup)) as V
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_module_new() -> V {
+    new_module("") as V
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_define_method_id(klass: V, id: V, f: *const c_void, argc: c_int) {
+    add_method(cls(klass), id as u32, Body::CFunc(f, argc));
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_undef(klass: V, id: V) {
+    add_method(cls(klass), id as u32, Body::Undefined);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_undef_method(klass: V, name: *const c_char) {
+    add_method(cls(klass), sym(&cstr(name)), Body::Undefined);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_alias(klass: V, new: V, old: V) {
+    crate::abi::alias(cls(klass), new as u32, old as u32);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_attr(klass: V, id: V, read: c_int, write: c_int, _ex: c_int) {
+    let n = String::from_utf8_lossy(sym_name(id as u32)).into_owned();
+    let c = std::ffi::CString::new(n).unwrap_or_default();
+    rb_define_attr(klass, c.as_ptr(), read, write);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_const_set(klass: V, id: V, v: V) {
+    const_set(cls(klass), id as u32, v);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_obj_respond_to(v: V, id: V, _private: c_int) -> c_int {
+    respond_to(v, id as u32) as c_int
+}
+/// Whether `v` is a Hash passed as keyword arguments.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_is_kwhash(v: V) -> c_int {
+    (is_hash(v) && hdr(v).flags & FL_KWHASH != 0) as c_int
+}
+/// Mark a Hash as keyword arguments (rb_funcallv_kw and friends).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_kwhash(v: V) -> V {
+    if is_hash(v) {
+        hdr(v).flags |= FL_KWHASH;
+    }
+    v
+}
+
+// ---------- blocks ----------
+
+/// A Proc whose body is the C function `func` (rb_block_call_func: yielded_arg, data2, argc,
+/// argv, blockarg), called through the C trampoline.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_proc_new(func: *const c_void, data2: V) -> V {
+    let f = func as usize;
+    let p = proc_new_native_rooted(
+        Box::new(move |_s, args, blk| {
+            let mut a = args.to_vec();
+            a.push(blk);
+            crate::core::call_native_c(f as *const c_void, -3, data2, &a)
+        }),
+        0,
+        -1,
+        vec![data2],
+    );
+    rproc(p).autosplat = false;
+    p
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_push_block(b: V) {
+    pst().current_block.push(b);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_pop_block() {
+    pst().current_block.pop();
+}
+
+/// rb_protect / rb_ensure: set aside a non-exception unwind (break, throw, ...) in flight, as a
+/// handle; kn_capi_restore_throw resumes it (rb_jump_tag).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_save_throw() -> V {
+    match std::mem::replace(&mut pst().pending, Throw::None) {
+        Throw::None => 0,
+        t => crate::gc::save_throw(t) as V,
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_restore_throw(h: V) {
+    if h != 0 {
+        let t = crate::gc::take_throw(h as u64);
+        if !matches!(t, Throw::None) {
+            pst().pending = t;
+        }
+    }
 }
