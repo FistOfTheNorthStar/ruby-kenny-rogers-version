@@ -1,0 +1,97 @@
+[IO::EAGAINWaitReadable, IO::WaitReadable, Errno::EAGAIN]
+IO::EAGAINWaitWritable
+Errno::EINPROGRESS
+#<Encoding:BINARY (ASCII-8BIT)>
+[80, "127.0.0.1"]
+[8080, "::1"]
+[1, "0.0.0.0"]
+#<ArgumentError: not an AF_INET/AF_INET6 sockaddr>
+"/tmp/x"
+#<ArgumentError: not an AF_UNIX sockaddr>
+#<SocketError: unknown socket domain: FOO>
+#<SocketError: unknown socket type: FOO>
+Errno::EOPNOTSUPP
+[Socket::ResolutionError, true]
+Errno::ECONNREFUSED
+"Connection refused - connect(2) for 127.0.0.1:PORT"
+:wait_readable
+IO::EAGAINWaitReadable
+"Resource temporarily unavailable - accept(2) would block"
+IO::EINPROGRESSWaitWritable
+"Operation now in progress - connect(2) would block"
+true
+:isconn
+0
+Socket
+Addrinfo
+"127.0.0.1"
+true
+true
+"127.0.0.1"
+Socket::Option
+true
+true
+true
+#<Socket::Option: INET SOCKET TYPE SOCK_STREAM>
+#<Socket::Option: INET SOCKET KEEPALIVE 0>
+true
+"hello"
+:wait_readable
+nil
+IO::EAGAINWaitReadable
+"Resource temporarily unavailable - read would block"
+true
+Socket
+"#<Addrinfo: 127.0.0.1:PORT TCP>"
+#<Addrinfo: 127.0.0.1:80 TCP>
+#<Addrinfo: 127.0.0.1:53 UDP>
+#<Addrinfo: 127.0.0.1>
+#<Addrinfo: ::1>
+#<Addrinfo: /tmp/s SOCK_STREAM>
+#<Addrinfo: /tmp/s SOCK_DGRAM>
+#<Addrinfo: [::1]:1>
+#<Addrinfo: 127.0.0.1:80 TCP>
+#<Addrinfo: 127.0.0.1:80 (x)>
+true
+true
+true
+true
+true
+false
+false
+["127.0.0.1", 80]
+true
+"127.0.0.1:80"
+true
+[["AF_INET", 0, "127.0.0.1", "127.0.0.1"]]
+#<Socket::Option: INET SOCKET KEEPALIVE 1>
+#<Socket::Option: INET TCP NODELAY 1>
+#<Socket::Option: UNSPEC SOCKET LINGER on 5sec>
+[true, 5]
+UNIXSocket
+["AF_UNIX", ""]
+["AF_UNIX", ""]
+#<Addrinfo: empty-path-AF_UNIX-sockaddr SOCK_STREAM>
+#<Socket::Option: UNIX SOCKET TYPE SOCK_STREAM>
+"ping"
+:wait_readable
+""
+Socket
+Socket
+UNIXSocket
+true
+:wait_readable
+UNIXSocket
+true
+""
+true
+"x"
+Errno::EADDRINUSE
+"Address already in use - connect(2) for PATH"
+Errno::ENOENT
+"No such file or directory - connect(2) for PATH"
+1
+true
+"x"
+nil
+true

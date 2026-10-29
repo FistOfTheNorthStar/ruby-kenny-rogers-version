@@ -193,6 +193,20 @@ pub fn raise_errno(e: i32, func: Option<&str>, detail: &[u8]) -> V {
     ivar_set(ex, sym("@__errno"), mkfix(e as i64));
     raise_exc(ex)
 }
+/// Raise what a `*_nonblock` call raises when it would block: IO::EAGAINWaitReadable
+/// ("Resource temporarily unavailable - read would block"), IO::EINPROGRESSWaitWritable, ...
+pub(crate) fn raise_would_block(e: i32, write: bool, what: &str) -> V {
+    let name = match (e, write) {
+        (libc::EAGAIN, false) => "EAGAINWaitReadable",
+        (libc::EAGAIN, true) => "EAGAINWaitWritable",
+        (libc::EINPROGRESS, false) => "EINPROGRESSWaitReadable",
+        _ => "EINPROGRESSWaitWritable",
+    };
+    let cls = const_get_under(rt().c.io, sym(name)).map(|k| k as *mut Class).unwrap_or_else(|| errno_class(e));
+    let ex = exc_new(cls, &format!("{} - {what} would block", strerror(e)));
+    ivar_set(ex, sym("@__errno"), mkfix(e as i64));
+    raise_exc(ex)
+}
 fn io_fail(e: &std::io::Error, func: Option<&str>, detail: &[u8]) -> V {
     raise_errno(e.raw_os_error().unwrap_or(libc::EIO), func, detail)
 }
@@ -2628,6 +2642,24 @@ pub fn init() {
         let m = new_module(&format!("IO::{name}"));
         const_set(io, sym(name), m as V);
     }
+    // IO::EAGAINWaitReadable < Errno::EAGAIN (including IO::WaitReadable) and friends: what
+    // the *_nonblock methods raise. EWOULDBLOCK is EAGAIN here, so its names are aliases.
+    for (name, e, wait) in [
+        ("EAGAINWaitReadable", libc::EAGAIN, "WaitReadable"),
+        ("EAGAINWaitWritable", libc::EAGAIN, "WaitWritable"),
+        ("EINPROGRESSWaitReadable", libc::EINPROGRESS, "WaitReadable"),
+        ("EINPROGRESSWaitWritable", libc::EINPROGRESS, "WaitWritable"),
+    ] {
+        let k = new_class(&format!("IO::{name}"), errno_class(e));
+        let m = const_get_under(io, sym(wait)).unwrap() as *mut Class;
+        unsafe { (*k).includes.push(m) };
+        const_set(k, sym("Errno"), mkfix(e as i64));
+        const_set(io, sym(name), k as V);
+        if e == libc::EAGAIN {
+            const_set(io, sym(&name.replace("EAGAIN", "EWOULDBLOCK")), k as V);
+        }
+    }
+    bump_serial();
 
     let mk_std = |fd: i32, std: u8, r: bool, w: bool| {
         let mut s = IoState::new(fd, r, w);
@@ -2713,8 +2745,20 @@ pub fn init() {
         mkfix(b.len() as i64)
     });
     defn(io, "write_nonblock", 1, 2, |s, a, _| {
-        let b = ok!(to_s_bytes(a[0]));
+        let (a, kw) = split_kw(a);
+        let Some(&data) = a.first() else { return arity_error(0, 1, 2) };
+        let b = ok!(to_s_bytes(data));
         let stt = ok!(st(s));
+        ok!(stt.check_writable());
+        if stt.std == 0 && stt.wbuf.is_empty() && !b.is_empty() && !is_regular_file(stt.wfd) {
+            let mut p = libc::pollfd { fd: stt.wfd, events: libc::POLLOUT, revents: 0 };
+            if unsafe { libc::poll(&mut p, 1, 0) } == 0 {
+                if kw_get(kw, "exception") == Some(QFALSE) {
+                    return mksym(sym("wait_writable"));
+                }
+                return raise_would_block(libc::EAGAIN, true, "write");
+            }
+        }
         ok!(stt.write(&b));
         ok!(stt.flush());
         mkfix(b.len() as i64)
@@ -2834,7 +2878,7 @@ pub fn init() {
                 if !exc {
                     return mksym(sym("wait_readable"));
                 }
-                return raise_errno(libc::EAGAIN, None, b"read would block");
+                return raise_would_block(libc::EAGAIN, false, "read");
             }
         }
         let b = ok!(stt.read_partial(n.max(0) as usize));
@@ -3015,8 +3059,31 @@ pub fn init() {
     defn(io, "internal_encoding", 0, 0, |_, _, _| QNIL);
     defn(io, "fcntl", 1, 2, |_, _, _| mkfix(0));
     defn(io, "advise", 1, 3, |_, _, _| QNIL);
-    defn(io, "wait_readable", 0, 1, |s, _, _| s);
-    defn(io, "wait_writable", 0, 1, |s, _, _| s);
+    // io/wait: self once the IO is ready, nil when the timeout passes first (the thread
+    // parks meanwhile, as in IO.select)
+    fn wait_ready(s: V, a: &[V], write: bool) -> V {
+        let stt = ok!(st(s));
+        ok!(stt.check_open());
+        if !write && (stt.avail() > 0 || stt.mem.is_some()) {
+            return s;
+        }
+        let timeout = match a.first().copied().filter(|t| *t != QNIL) {
+            Some(t) => match num_to_f(t) {
+                Some(f) => Some(ok!(time_interval(f))),
+                None => return type_error(&format!("can't convert {} into time interval", class_desc(t))),
+            },
+            None => None,
+        };
+        let fd = if stt.std != 0 { stt.std as i32 } else if write { stt.wfd } else { stt.fd };
+        let mut p = [libc::pollfd { fd, events: if write { libc::POLLOUT } else { libc::POLLIN }, revents: 0 }];
+        match poll_wait(&mut p, timeout) {
+            Ok(n) if n > 0 => s,
+            Ok(_) => QNIL,
+            Err(e) => e,
+        }
+    }
+    defn(io, "wait_readable", 0, 1, |s, a, _| wait_ready(s, a, false));
+    defn(io, "wait_writable", 0, 1, |s, a, _| wait_ready(s, a, true));
     defn(io, "stat", 0, 0, |s, _, _| {
         let stt = ok!(st(s));
         ok!(stt.check_open());

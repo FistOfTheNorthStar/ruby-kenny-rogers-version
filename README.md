@@ -175,7 +175,10 @@ Working:
   running code: compiled code keeps frame pointers and the binary carries a table of each
   call's source line, so a backtrace is a walk of the native stack, taken only when needed.
 - **Bundler, socket, FFI:** Bundler's runtime API on gems resolved at build time;
-  `TCPSocket`/`TCPServer`/`Socket` name resolution (blocking); FFI bindings load (their
+  the socket library: `TCPSocket`/`TCPServer`, `UNIXSocket`/`UNIXServer` (and `.pair`),
+  `Socket` on sockaddr strings (`connect`/`connect_nonblock`/`bind`/`listen`/`accept`),
+  `Addrinfo`, `Socket::Option` (UDP's `sendto`/`recvfrom` and `send_io`: not yet;
+  name resolution blocks); FFI bindings load (their
   declarations work) but calling a C function through FFI raises NotImplementedError. As with
   the ffi gem, `ffi_lib` raises LoadError when the library isn't installed, so optional native
   dependencies (Active Storage's libvips) are skipped. `require "ripper"` gives Ripper's
