@@ -142,7 +142,8 @@ Working:
   without a Gemfile so are the gems that Ruby bundles in place of former stdlib parts, such as
   `csv` and `bigdecimal` in 3.4).
 - **Native stdlib extensions** (Rust instead of C): date, json (2.x or 3.x, as the lock file
-  says), yaml (Psych API), bigdecimal,
+  says), yaml (Psych API; its tree API, `Psych.parse`, `Psych::Nodes`, `YAMLTree` ..., is psych's
+  Ruby code on native parse events and a port of libyaml's emitter), bigdecimal,
   strscan, digest, zlib, openssl (digests, HMAC, ciphers, RSA keys and signatures; no TLS, X509
   certificates or EC keys), Marshal (byte-compatible format 4.8),
   cgi/escape, erb/escape (Rails' `html_escape`), plus `Gem::Version`/`Gem::Requirement`.
