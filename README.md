@@ -185,8 +185,9 @@ Working:
   the ffi gem, `ffi_lib` raises LoadError when the library isn't installed, so optional native
   dependencies (Active Storage's libvips) are skipped.
 - **Prism and Ripper at runtime:** the prism gem's C extension is replaced by the libprism
-  Kenny's compiler parses with (linked only into programs that load Prism or Ripper), so
-  `Prism.parse`/`lex`/`dump`, rubocop-ast and RuboCop work. Its parse is serialized for the
+  Kenny's compiler parses with (linked only into programs that load Prism or name Ripper's
+  parser: `require "ripper"` alone costs nothing), so `Prism.parse`/`lex`/`dump`, rubocop-ast
+  and RuboCop work. Its parse is serialized for the
   gem's Ruby library, whose version must be libprism's (1.9.0): `kenny build` uses the
   Gemfile.lock's prism, else an installed prism 1.9.0 gem in place of the standard library's
   (Ruby 3.4 ships 1.5), and otherwise `require "prism"` raises LoadError (with a build

@@ -660,6 +660,9 @@ impl<M: Module> Compiler<M> {
             }
             Node::ConstantReadNode { .. } => {
                 let n = node.as_constant_read_node().unwrap();
+                if n.name().as_slice() == b"Ripper" {
+                    self.note_ripper();
+                }
                 if let Some(v) = self.cfold_read(fx, n.name().as_slice(), |c, fx| {
                     let crefp = c.slot_ptr(fx, fx.cref_slot);
                     let s = c.sym_val(fx, n.name().as_slice());
@@ -681,11 +684,18 @@ impl<M: Module> Compiler<M> {
             }
             Node::ConstantPathNode { .. } => {
                 let n = node.as_constant_path_node().unwrap();
-                let parent = match n.parent() {
-                    Some(p) => self.expr(fx, &p),
-                    None => self.call(fx, "kn_object_class", &[]),
-                };
                 let name = n.name().map(|x| x.as_slice().to_vec()).unwrap_or_default();
+                let parent = match n.parent() {
+                    // (`Ripper::EVENTS` ...: Ripper's data, not its parser)
+                    Some(p) if crate::ripper::is_data_const(&name) && crate::ripper::is_ripper(&p) => self.ripper_quietly(|c| c.expr(fx, &p)),
+                    Some(p) => self.expr(fx, &p),
+                    None => {
+                        if name == b"Ripper" {
+                            self.note_ripper();
+                        }
+                        self.call(fx, "kn_object_class", &[])
+                    }
+                };
                 let s = self.sym_val(fx, &name);
                 self.callc(fx, "kn_const_get_under", &[parent, s])
             }

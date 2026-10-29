@@ -442,6 +442,8 @@ impl<M: Module> Compiler<M> {
         }
 
         let recv = match &recv_node {
+            // (`Ripper.lex_state_name(..)`: not Ripper's parser)
+            Some(r) if crate::ripper::is_data_method(&name) && crate::ripper::is_ripper(r) => self.ripper_quietly(|c| c.expr(fx, r)),
             Some(r) => self.expr(fx, r),
             None => self.self_val(fx),
         };

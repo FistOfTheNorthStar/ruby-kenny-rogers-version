@@ -4,9 +4,9 @@
 # object, so the stdlib's subclasses (Ripper::SexpBuilder for `Ripper.sexp`, ActionView's render
 # parser ...) work; `Ripper.lex` and Ripper::Lexer use Prism.lex_compat, Prism's Ripper-compatible
 # token stream (the tree walk doesn't produce every scanner event). The backend is
-# kenny/ripper_prism.rb, which `kenny build` writes: Prism's Ruby library must be the version
-# of the libprism Kenny links (see crates/kenny/src/main.rs), else parsing raises
-# NotImplementedError.
+# kenny/ripper_prism.rb, compiled in only when the program can parse with Ripper (see
+# `__kenny_backend`); Prism's Ruby library must be the version of the libprism Kenny links
+# (see crates/kenny/src/prism.rs), else parsing raises NotImplementedError.
 class Ripper
   Version = "0.1.0"
   PARSER_EVENT_TABLE = {
@@ -78,7 +78,7 @@ class Ripper
   end
 
   def parse
-    require "kenny/ripper_prism"
+    __kenny_backend
     parser = KennyParser.new(self, __kenny_source, @__filename, @__lineno)
     @__kenny_parser = parser
     begin
@@ -120,6 +120,21 @@ class Ripper
   end
 
   attr_accessor :yydebug, :debug_output
+
+  # The parser's backend, kenny/ripper_prism.rb (it loads Prism). `kenny build` compiles it in
+  # only when the program's code names Ripper's parser (Ripper.sexp, Ripper.lex, a subclass ...,
+  # see crates/kenny-compiler/src/ripper.rs), so it isn't required by a literal path here.
+  BACKEND = "kenny/ripper_prism"
+  private_constant :BACKEND
+
+  private def __kenny_backend
+    require BACKEND
+  rescue LoadError => e
+    raise NotImplementedError, "Ripper's parser isn't compiled into this program: `kenny build` adds it " \
+      "(with Prism) when the program's code names Ripper's parsing API (Ripper.sexp, Ripper.lex, " \
+      "Ripper.new, a Ripper subclass ...), and here it is only reached dynamically (const_get, eval ...); " \
+      "name it in the code, e.g. `Ripper.sexp` (#{e.message})"
+  end
 
   # The source as a String (Ripper also takes an IO, anything with `gets`, or with `to_str`).
   def __kenny_source
@@ -175,7 +190,7 @@ class Ripper
   class Lexer < ::Ripper
     module KennyLex
       def parse(raise_errors: false)
-        require "kenny/ripper_prism"
+        __kenny_backend
         __kenny_lex(raise_errors)
       end
     end
