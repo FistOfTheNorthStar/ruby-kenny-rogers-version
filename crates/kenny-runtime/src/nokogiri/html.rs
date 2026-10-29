@@ -348,7 +348,7 @@ pub fn parse_document(src: &str, html4: bool) -> Parsed {
     let mut dom = sink.dom.into_inner();
     if html4 {
         html4_common_fixups(&mut dom, src, &synthetic);
-        html4_fixups(&mut dom);
+        html4_fixups(&mut dom, &synthetic);
     }
     Parsed { dom, quirks, errors }
 }
@@ -415,10 +415,42 @@ fn html4_common_fixups(dom: &mut Dom, src: &str, synthetic: &[u32]) {
     }
 }
 
-fn html4_fixups(dom: &mut Dom) {
+fn html4_fixups(dom: &mut Dom, synthetic: &[u32]) {
+    implied_p(dom, synthetic);
     let has_doctype = dom.children(0).iter().any(|&c| dom.t(c) == T::DocType);
     if !has_doctype {
         add_default_dtd(dom);
+    }
+}
+
+/// Start tags that end an open <p> in libxml2's HTML parser.
+const CLOSES_P: &[&str] = &[
+    "address", "article", "aside", "blockquote", "center", "dd", "details", "dialog", "dir", "div", "dl", "dt", "fieldset",
+    "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "li", "listing",
+    "main", "menu", "nav", "ol", "p", "pre", "section", "summary", "table", "ul", "xmp",
+];
+
+/// Text that comes before the body has begun (at the top, or inside <html> or <head>) makes
+/// libxml2 start an implied <p>, which holds that text and what follows it up to an element
+/// that ends a paragraph. (The HTML5 algorithm puts the text straight into an implied body.)
+fn implied_p(dom: &mut Dom, synthetic: &[u32]) {
+    let el = |dom: &Dom, parent: u32, name: &str| dom.children(parent).into_iter().find(|&c| dom.t(c) == T::Element && dom.n(c).name == name);
+    let Some(body) = el(dom, 0, "html").and_then(|h| el(dom, h, "body")) else { return };
+    if !synthetic.contains(&body) {
+        return;
+    }
+    let kids = dom.children(body);
+    match kids.first() {
+        Some(&f) if dom.t(f) == T::Text && !dom.n(f).content.trim().is_empty() => {}
+        _ => return,
+    }
+    let p = dom.add(Node::new(T::Element, "p", ""));
+    dom.insert_before(kids[0], p);
+    for k in kids {
+        if dom.t(k) == T::Element && CLOSES_P.contains(&dom.n(k).name.as_str()) {
+            break;
+        }
+        dom.append(p, k);
     }
 }
 
