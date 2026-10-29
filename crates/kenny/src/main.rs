@@ -348,7 +348,9 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<(kenny_compiler::Options,
     // every file of the -I dirs goes in (runtime-computed requires/autoloads, e.g. Rails)
     let pairing = prism::pair(&mut load_paths, stdlib.as_deref(), overlay)?;
     let ruby = ruby::get().map(|r| r.release_line()).unwrap_or_default();
-    Ok((kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs, ruby, coverage: false }, pairing, gem_exts))
+    // Ripper's Prism backend: compiled in only when the program's code names Ripper's parser
+    let ripper_backend = Some(overlay.join("kenny/ripper_prism.rb"));
+    Ok((kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs, ruby, coverage: false, ripper_backend }, pairing, gem_exts))
 }
 
 /// Returns whether the asset compilers were linked in (see `needs_assets`).

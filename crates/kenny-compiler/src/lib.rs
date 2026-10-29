@@ -25,6 +25,7 @@ pub mod coverage;
 mod felem;
 mod hoist;
 mod chilled;
+mod ripper;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -294,6 +295,10 @@ pub struct Compiler<M: Module> {
     pub(crate) load_paths: Vec<PathBuf>,
     /// see `Options::ruby`
     pub(crate) ruby: String,
+    /// see `Options::ripper_backend`; set once a compiled file names Ripper's parser
+    pub(crate) ripper_backend: Option<PathBuf>,
+    pub(crate) ripper_used: bool,
+    pub(crate) ripper_quiet: bool,
     /// Canonical load paths and dependency directories (code compiled with gem semantics).
     pub(crate) dep_roots: Vec<PathBuf>,
     pub warnings: Vec<String>,
@@ -544,6 +549,9 @@ pub struct Options {
     /// Instrument the program for the coverage library (coverage.rs). Set by `compile_with`
     /// itself when the program requires "coverage".
     pub coverage: bool,
+    /// Ripper's parsing backend (Kenny's kenny/ripper_prism.rb, which loads Prism): compiled in
+    /// only when the program's code names Ripper's parser (see ripper.rs).
+    pub ripper_backend: Option<PathBuf>,
 }
 
 pub fn compile_file(path: &Path) -> Result<Output, Vec<String>> {
@@ -566,11 +574,17 @@ pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, V
     }
     c.load_paths = opts.load_paths.clone();
     c.ruby = opts.ruby.clone();
+    c.ripper_backend = opts.ripper_backend.clone();
     c.dep_roots = opts.load_paths.iter().chain(opts.dep_dirs.iter()).map(|p| p.canonicalize().unwrap_or(p.clone())).collect();
     let top = c.compile_program(src, path);
     c.embed(&opts.embed_dirs);
     for f in &opts.embed_files {
         c.require_file(f.clone(), 0);
+    }
+    if c.ripper_used {
+        if let Some(b) = &opts.ripper_backend {
+            c.require_file(b.clone(), 0);
+        }
     }
     if !c.errors.is_empty() {
         return Err(c.errors);
@@ -661,6 +675,9 @@ impl<M: Module> Compiler<M> {
             src_hashes: HashMap::new(),
             load_paths: Vec::new(),
             ruby: String::new(),
+            ripper_backend: None,
+            ripper_used: false,
+            ripper_quiet: false,
             dep_roots: Vec::new(),
             warnings: Vec::new(),
             refine_scope: None,
