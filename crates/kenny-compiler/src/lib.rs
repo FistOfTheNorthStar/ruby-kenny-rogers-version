@@ -21,6 +21,7 @@ mod licm;
 mod owned;
 mod ispec;
 mod cfold;
+pub mod coverage;
 mod felem;
 mod hoist;
 #[cfg(feature = "jit")]
@@ -103,6 +104,10 @@ pub(crate) struct MethodCtx {
 
 pub(crate) struct Fx<'a> {
     pub b: FunctionBuilder<'a>,
+    /// coverage.rs: this function's reference to its file's counters word
+    pub cov_gv: Option<ir::GlobalValue>,
+    /// coverage.rs: the loop `while_core` compiles next (its body is a branch target)
+    pub cov_loop: Option<coverage::Key>,
     pub kind: ScopeKind,
     pub lambda: bool,
     /// a method's own fast entry (statics.rs: the `def`'s static target), in its body
@@ -311,6 +316,10 @@ pub struct Compiler<M: Module> {
     pub(crate) block_params: Vec<(FuncId, String)>,
     /// Start offset of every line of the current source (for `line_of`), keyed by the source.
     line_index: (PathBuf, usize, usize, Vec<usize>),
+    /// coverage.rs: the program is instrumented for the coverage library
+    pub(crate) cov: Option<Box<coverage::Build>>,
+    /// a `require "coverage"` was compiled (see `compile_with`)
+    pub(crate) uses_coverage: bool,
 }
 
 /// Backtrace information of one compiled function: its file and label (offsets into the
@@ -491,6 +500,10 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_float_unbox", &[I64], &[ir::types::F64]),
     ("kn_is_float", &[I64], &[I64]),
     ("kn_vobj_fill", &[I64, I64, I64, I64, I64], &[I64]),
+    ("kn_cov_register", &[I64, I64, I64, I64, I64], &[]),
+    ("kn_cov_methods", &[I64, I64], &[]),
+    ("kn_cov_file_start", &[I64], &[]),
+    ("kn_cov_first", &[I64, I64], &[]),
 ];
 
 pub struct Output {
@@ -515,6 +528,9 @@ pub struct Options {
     /// runtime's default, Ruby 3.4). The program reports it (RUBY_VERSION ...) and gets that
     /// version's behavior where 3.4 and 4.0 differ.
     pub ruby: String,
+    /// Instrument the program for the coverage library (coverage.rs). Set by `compile_with`
+    /// itself when the program requires "coverage".
+    pub coverage: bool,
 }
 
 pub fn compile_file(path: &Path) -> Result<Output, Vec<String>> {
@@ -532,6 +548,9 @@ pub fn compile(src: &[u8], path: &Path) -> Result<Output, Vec<String>> {
 
 pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, Vec<String>> {
     let mut c = Compiler::new_object(path, src).map_err(|e| vec![e])?;
+    if opts.coverage {
+        c.cov = Some(Box::default());
+    }
     c.load_paths = opts.load_paths.clone();
     c.ruby = opts.ruby.clone();
     c.dep_roots = opts.load_paths.iter().chain(opts.dep_dirs.iter()).map(|p| p.canonicalize().unwrap_or(p.clone())).collect();
@@ -542,6 +561,13 @@ pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, V
     }
     if !c.errors.is_empty() {
         return Err(c.errors);
+    }
+    // the program uses the coverage library: compiled again, measuring itself (programs
+    // that don't are compiled exactly as without it)
+    if c.uses_coverage && !opts.coverage {
+        let mut o = opts.clone();
+        o.coverage = true;
+        return compile_with(src, path, &o);
     }
     let top = top.map_err(|e| vec![e])?;
     c.finish(top).map_err(|e| vec![e])
@@ -633,6 +659,8 @@ impl<M: Module> Compiler<M> {
             def_line_next: 0,
             block_params: Vec::new(),
             line_index: (PathBuf::new(), 0, 0, Vec::new()),
+            cov: None,
+            uses_coverage: false,
         })
     }
 }
@@ -754,6 +782,43 @@ impl Compiler<ObjectModule> {
                 let n = b.ins().iconst(I64, debug_fns.len() as i64);
                 let cp = gv(&mut self.module, &mut b, calls_id);
                 b.ins().call(reg_dbg, &[fp, n, cp, strs_base]);
+            }
+            // coverage: each file's counters and description, the methods' counters
+            if let Some(cov) = self.cov.take() {
+                let reg = self.rt_id("kn_cov_register");
+                let reg = self.module.declare_func_in_func(reg, b.func);
+                for (id, path, meta) in &cov.files {
+                    let w = gv(&mut self.module, &mut b, *id);
+                    let mo = self.str_offset(meta.as_bytes());
+                    let mp = b.ins().iadd_imm_s(strs_base, mo as i64);
+                    let ml = b.ins().iconst(I64, meta.len() as i64);
+                    let po = self.str_offset(path.as_bytes());
+                    let pp = b.ins().iadd_imm_s(strs_base, po as i64);
+                    let pl = b.ins().iconst(I64, path.len() as i64);
+                    b.ins().call(reg, &[w, mp, ml, pp, pl]);
+                }
+                let id = self.module.declare_data("__kn_cov_methods", Linkage::Local, false, false).map_err(e)?;
+                let mut d = DataDescription::new();
+                let mut bytes = Vec::with_capacity(cov.methods.len() * 24);
+                for (i, (fid, word, ctr)) in cov.methods.iter().enumerate() {
+                    let fr = self.module.declare_func_in_data(*fid, &mut d);
+                    d.write_function_addr((i * 24) as u32, fr);
+                    let wr = self.module.declare_data_in_data(*word, &mut d);
+                    d.write_data_addr((i * 24 + 8) as u32, wr, 0);
+                    bytes.extend_from_slice(&0u64.to_le_bytes());
+                    bytes.extend_from_slice(&0u64.to_le_bytes());
+                    bytes.extend_from_slice(&(*ctr as u64).to_le_bytes());
+                }
+                bytes.resize(bytes.len().max(24), 0);
+                d.define(bytes.into_boxed_slice());
+                d.set_align(8);
+                self.module.define_data(id, &d).map_err(e)?;
+                let f = self.rt_id("kn_cov_methods");
+                let f = self.module.declare_func_in_func(f, b.func);
+                let tp = gv(&mut self.module, &mut b, id);
+                let n = b.ins().iconst(I64, cov.methods.len() as i64);
+                b.ins().call(f, &[tp, n]);
+                cov.report_unemitted();
             }
             let top_ref = self.module.declare_func_in_func(toplevel, b.func);
             let top = b.ins().func_addr(I64, top_ref);

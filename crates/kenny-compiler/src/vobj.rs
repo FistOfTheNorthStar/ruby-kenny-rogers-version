@@ -252,7 +252,7 @@ impl<M: Module> Compiler<M> {
     /// their variables declared (and defined: not virtual) at the current point of `b`.
     pub(crate) fn vobj_plan(&self, b: &mut FunctionBuilder, locals: &HashMap<Vec<u8>, Local>, nodes: &[&Node]) -> HashMap<Vec<u8>, Rc<VLocal>> {
         let mut out = HashMap::new();
-        if self.refine_scope.is_some() || self.in_dependency() || self.eval_unit || std::env::var_os("KENNY_NO_VOBJ").is_some() {
+        if self.refine_scope.is_some() || self.in_dependency() || self.eval_unit || self.cov.is_some() || std::env::var_os("KENNY_NO_VOBJ").is_some() {
             return out;
         }
         let mut u = Uses::default();

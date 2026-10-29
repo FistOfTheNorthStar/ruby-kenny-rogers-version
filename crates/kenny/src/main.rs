@@ -58,6 +58,7 @@ const OVERLAY: &[(&str, &str)] = &[
     ("execjs.rb", include_str!("../../../lib/kenny/execjs.rb")),
     ("kenny/assets_precompile.rb", include_str!("../../../lib/kenny/kenny/assets_precompile.rb")),
     ("socket.rb", include_str!("../../../lib/kenny/socket.rb")),
+    ("coverage.rb", include_str!("../../../lib/kenny/coverage.rb")),
     ("nio.rb", include_str!("../../../lib/kenny/nio.rb")),
     ("pp.rb", include_str!("../../../lib/kenny/pp.rb")),
     ("yaml.rb", include_str!("../../../lib/kenny/yaml.rb")),
@@ -386,7 +387,7 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, 
     }
     // every file of the -I dirs goes in (runtime-computed requires/autoloads, e.g. Rails)
     let ruby = ruby::get().map(|r| r.release_line()).unwrap_or_default();
-    Ok(kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs, ruby })
+    Ok(kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs, ruby, coverage: false })
 }
 
 /// Returns whether the asset compilers were linked in (see `needs_assets`).
@@ -711,6 +712,19 @@ fn main() {
     };
     match args.get(1).map(|s| s.as_str()) {
         Some("--version") | Some("-v") => println!("kenny {} (Ruby 3.4 syntax via Prism, Cranelift backend)", env!("CARGO_PKG_VERSION")),
+        // (a debugging aid: the coverage structure of files, as CRuby's Coverage.peek_result
+        // reports it for a file compiled with lines and branches, or lines only)
+        Some("--coverage-dump") => {
+            let lines_only = std::env::var_os("KENNY_COV_LINES_ONLY").is_some();
+            for f in &args[2..] {
+                let p = Path::new(f);
+                let p = p.canonicalize().unwrap_or(p.to_path_buf());
+                match std::fs::read(&p) {
+                    Ok(src) => print!("{}", kenny_compiler::coverage::dump(&src, &p, !lines_only)),
+                    Err(e) => eprintln!("{f}: {e}"),
+                }
+            }
+        }
         Some("build") => {
             let o = parse(&args[2..]).unwrap_or_else(|e| fail(e));
             let out = o.out.clone().unwrap_or_else(|| PathBuf::from(o.src.file_stem().unwrap_or_default()));

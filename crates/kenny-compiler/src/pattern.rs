@@ -247,14 +247,18 @@ impl<M: Module> Compiler<M> {
         };
         let done = fx.b.create_block();
         fx.b.append_block_param(done, I64);
+        let mut in_i = 0u8;
         for c in n.conditions().iter() {
             let Some(inn) = c.as_in_node() else { continue };
             let fail = fx.b.create_block();
             self.in_clause(fx, &inn.pattern(), subj, fail);
+            self.cov_branch(fx, &n.as_node(), in_i);
+            in_i += 1;
             let v = self.stmts(fx, inn.statements());
             fx.b.ins().jump(done, &[v.into()]);
             fx.b.switch_to_block(fail);
         }
+        self.cov_branch(fx, &n.as_node(), in_i);
         let v = match n.else_clause() {
             Some(e) => self.stmts(fx, e.statements()),
             None => {

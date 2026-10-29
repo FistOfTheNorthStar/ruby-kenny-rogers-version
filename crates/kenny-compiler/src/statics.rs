@@ -886,7 +886,7 @@ impl<M: Module> Compiler<M> {
 
     /// The method `inline_call` would inline (with a literal block when `with_block`).
     pub(crate) fn inline_target(&self, fx: &Fx, name: &[u8], n: usize, explicit: bool, with_block: bool) -> Option<(StaticDef, std::rc::Rc<InlineDef>)> {
-        if self.refine_scope.is_some() || self.in_dependency() || self.eval_unit || !may_be_ruby_method(name) || self.inline_ctx.len() >= MAX_INLINE_DEPTH {
+        if self.refine_scope.is_some() || self.in_dependency() || self.eval_unit || self.cov.is_some() || !may_be_ruby_method(name) || self.inline_ctx.len() >= MAX_INLINE_DEPTH {
             return None;
         }
         let sd = if explicit {
@@ -1100,7 +1100,7 @@ impl<M: Module> Compiler<M> {
     /// `initialize` is that `def` and it makes plain objects, allocate here and inline the
     /// `initialize` body. Else `dynamic`.
     pub(crate) fn inline_new(&mut self, fx: &mut Fx, recv: Value, cname: &[u8], vals: &[Value], dynamic: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Option<Value> {
-        if self.refine_scope.is_some() || self.in_dependency() || self.eval_unit || self.inline_ctx.len() >= MAX_INLINE_DEPTH {
+        if self.refine_scope.is_some() || self.in_dependency() || self.eval_unit || self.cov.is_some() || self.inline_ctx.len() >= MAX_INLINE_DEPTH {
             return None;
         }
         let n = vals.len();
@@ -1179,7 +1179,7 @@ impl<M: Module> Compiler<M> {
 
     /// The keyword `def` a call `name(npos positional, keys)` would inline, if any.
     pub(crate) fn kw_target(&self, fx: &Fx, name: &[u8], npos: usize, keys: &[Vec<u8>], explicit: bool) -> Option<(KwDef, std::rc::Rc<InlineDef>)> {
-        if self.refine_scope.is_some() || self.in_dependency() || self.eval_unit || !may_be_ruby_method(name) || self.inline_ctx.len() >= MAX_INLINE_DEPTH {
+        if self.refine_scope.is_some() || self.in_dependency() || self.eval_unit || self.cov.is_some() || !may_be_ruby_method(name) || self.inline_ctx.len() >= MAX_INLINE_DEPTH {
             return None;
         }
         let defs = self.kw_defs.get(name)?;

@@ -19,6 +19,7 @@ pub mod cmap;
 pub mod cgi_escape;
 pub mod compat;
 pub mod core;
+pub mod coverage;
 pub mod date;
 pub mod digest;
 pub mod fmt;

@@ -264,6 +264,16 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn expr_void(&mut self, fx: &mut Fx, node: &Node) -> Value {
+        if self.cov.is_none() {
+            return self.expr_void_node(fx, node);
+        }
+        let c = self.cov_enter(fx, node);
+        let v = self.expr_void_node(fx, node);
+        self.cov_leave(fx, c);
+        v
+    }
+
+    fn expr_void_node(&mut self, fx: &mut Fx, node: &Node) -> Value {
         if !fx.owned.is_empty() && fx.inline_levels.is_empty() {
             if let Some(name) = crate::owned::append_target(node) {
                 if let Some(&ov) = fx.owned.get(&name) {
@@ -330,10 +340,20 @@ impl<M: Module> Compiler<M> {
                 }
             }
         }
-        self.expr(fx, node)
+        self.expr_node(fx, node)
     }
 
     pub(crate) fn expr(&mut self, fx: &mut Fx, node: &Node) -> Value {
+        if self.cov.is_none() {
+            return self.expr_node(fx, node);
+        }
+        let c = self.cov_enter(fx, node);
+        let v = self.expr_node(fx, node);
+        self.cov_leave(fx, c);
+        v
+    }
+
+    fn expr_node(&mut self, fx: &mut Fx, node: &Node) -> Value {
         let at = node.location().start_offset();
         self.cur_offset = at;
         self.set_srcloc(fx);

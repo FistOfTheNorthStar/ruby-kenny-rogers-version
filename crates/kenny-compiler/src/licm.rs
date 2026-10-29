@@ -291,7 +291,7 @@ impl<M: Module> Compiler<M> {
     /// Before a loop: the reads to remember that an enclosing loop doesn't already, flags
     /// cleared. Returns how many entries to drop after the loop.
     pub(crate) fn licm_enter(&mut self, fx: &mut Fx, pred: &Node, body: Option<&StatementsNode>) -> usize {
-        if self.refine_scope.is_some() || std::env::var_os("KENNY_NO_LICM").is_some() {
+        if self.refine_scope.is_some() || self.cov.is_some() || std::env::var_os("KENNY_NO_LICM").is_some() {
             return 0;
         }
         let level = self.inline_ctx.len();
