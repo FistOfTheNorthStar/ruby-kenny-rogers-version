@@ -141,10 +141,11 @@ Working:
   into the binary (`-I dir`; the stdlib of the Ruby built against is found automatically, and
   without a Gemfile so are the gems that Ruby bundles in place of former stdlib parts, such as
   `csv` and `bigdecimal` in 3.4).
-- **Native stdlib extensions** (Rust instead of C): date, json, yaml (Psych API), bigdecimal,
-  strscan, digest, zlib, openssl (digests, HMAC, ciphers, RSA keys and signatures; no TLS, X509
-  certificates or EC keys), Marshal (byte-compatible format 4.8),
-  cgi/escape, erb/escape (Rails' `html_escape`), plus `Gem::Version`/`Gem::Requirement`.
+- **Native stdlib extensions** (Rust instead of C): date, json, yaml (Psych API; of the tree
+  API, parsing into nodes and `to_ruby`, not emitting nodes), bigdecimal, strscan, digest, zlib,
+  openssl (digests, HMAC, ciphers, RSA keys and signatures; no TLS, X509 certificates or EC
+  keys), Marshal (byte-compatible format 4.8), cgi/escape, erb/escape (Rails' `html_escape`),
+  plus `Gem::Version`/`Gem::Requirement`.
   Nokogiri is native too (html5ever and quick-xml underneath, its own XPath 1.0 engine, a SAX
   scanner that reports what libxml2's does, and nokogiri's Ruby layer on top), so loofah, the
   Rails HTML sanitizers and the AWS SDK's XML parsing work without libxml2.
@@ -178,9 +179,17 @@ Working:
   `TCPSocket`/`TCPServer`/`Socket` name resolution (blocking); FFI bindings load (their
   declarations work) but calling a C function through FFI raises NotImplementedError. As with
   the ffi gem, `ffi_lib` raises LoadError when the library isn't installed, so optional native
-  dependencies (Active Storage's libvips) are skipped. `require "ripper"` gives Ripper's
-  constants and event tables (enough for gems that load it), but parsing with it raises
-  NotImplementedError.
+  dependencies (Active Storage's libvips) are skipped.
+- **Prism and Ripper at runtime:** the prism gem's C extension is replaced by the libprism
+  Kenny's compiler parses with (linked only into programs that load Prism or Ripper), so
+  `Prism.parse`/`lex`/`dump`, rubocop-ast and RuboCop work. Its parse is serialized for the
+  gem's Ruby library, whose version must be libprism's (1.9.0): `kenny build` uses the
+  Gemfile.lock's prism, else an installed prism 1.9.0 gem in place of the standard library's
+  (Ruby 3.4 ships 1.5), and otherwise `require "prism"` raises LoadError (with a build
+  warning). Ripper runs on Prism (`Prism::Translation::Ripper` sends Ripper's parser events,
+  `Prism.lex_compat` gives `Ripper.lex` its tokens), so `Ripper.sexp`, `Ripper.lex` and
+  Ripper subclasses work; lexer states of some tokens (spaces, heredoc ends) can differ from
+  CRuby's, and `Ripper#state`/`#token` are nil.
 - **Built-in HTTP server** for Rack apps: one process serves requests on every core
   (`rack.multithread` is true); `WEB_CONCURRENCY=n` forks n processes instead. `rack.hijack`
   (full and partial) hands the connection's socket to the app.

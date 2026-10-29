@@ -366,6 +366,15 @@ fn gem_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// The require paths of an installed gem (`name-version` in a gem directory), if it is installed.
+pub fn installed_gem(name: &str, version: &str) -> Option<Vec<PathBuf>> {
+    let s = Spec { name: name.into(), version: version.into(), deps: Vec::new(), source: Source::Gem };
+    match locate(&s, &gem_dirs(), Path::new(".")) {
+        Some(Located::Dir(dir, req)) => Some(req.iter().map(|r| dir.join(r)).filter(|p| p.is_dir()).collect()),
+        _ => None,
+    }
+}
+
 fn locate(s: &Spec, gem_dirs: &[PathBuf], _root: &Path) -> Option<Located> {
     let full = format!("{}-{}", s.name, s.version);
     match &s.source {

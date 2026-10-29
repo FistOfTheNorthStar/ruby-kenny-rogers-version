@@ -660,6 +660,7 @@ dependencies = [
  "flate2",
  "kenny-compiler",
  "ruby-prism",
+ "ruby-prism-sys",
 ]
 
 [[package]]
@@ -702,6 +703,7 @@ dependencies = [
  "quick-xml",
  "rquickjs",
  "rsa",
+ "ruby-prism-sys",
  "rustc-hash",
  "saphyr-parser",
  "sha1",

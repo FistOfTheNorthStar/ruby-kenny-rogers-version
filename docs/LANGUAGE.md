@@ -58,6 +58,15 @@ which call sites come after it, and only those sites use a refinement-aware look
 - **`YAML.load` follows the psych of the Ruby the program is built against** (or of a psych
   gem in the lock file): with psych 3 (Ruby ≤ 3.0) it is a full load that accepts aliases and
   any class, as older gems expect; with psych 4+ it is a safe load.
+- **Prism at runtime is the compiler's libprism, Ripper runs on it.** `require "prism"` loads the
+  prism gem's Ruby library on libprism 1.9.0 (linked into the binary only when Prism or Ripper is
+  loaded), so it needs that library at 1.9.0: the Gemfile.lock's prism, else an installed prism
+  1.9.0 gem replaces the standard library's (Ruby 3.4 ships 1.5.x, so `Prism::VERSION` is newer
+  than under CRuby); otherwise `kenny build` warns and `require "prism"` raises LoadError.
+  Ripper is `Prism::Translation::Ripper` sending Ripper's parser events (and `Prism.lex_compat`
+  giving `Ripper.lex` its tokens): `Ripper.sexp`, `Ripper.lex` and subclasses work, but the lexer
+  state of some tokens (spaces, heredoc ends) differs from CRuby's, and `Ripper#state` and
+  `#token` are nil. `require "ripper"` alone (as Rails does) costs nothing.
 - **Trailing-Hash keyword arguments in dependencies.** Methods and blocks defined in files found
   via load paths (gems, the stdlib) and in `eval`'d strings take a trailing positional Hash with
   Symbol keys as their keywords — older gems still pass options that way. The app's own code

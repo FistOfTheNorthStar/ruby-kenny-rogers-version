@@ -284,6 +284,14 @@ pub extern "C" fn kn_binding_new(self_: V) -> V {
 /// `binding` with the locals visible where it is called ([name Symbol, value, ...]).
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_binding_new_l(self_: V, locals: V) -> V {
+    // (the compiler makes every receiverless `binding` this call: when self has a `binding`
+    // method of its own, such as an attr_reader, that is what it calls)
+    let mid = sym("binding");
+    let m = find_method(class_of(self_), mid);
+    let kernel = unsafe { (*rt().c.kernel).methods.get(&mid).copied() };
+    if !m.is_null() && kernel.is_some_and(|k| k as *const Method != m) {
+        return send(self_, mid, &[], QNIL);
+    }
     let b = kn_binding_new(self_);
     let h = hash_new();
     if is_ary(locals) {

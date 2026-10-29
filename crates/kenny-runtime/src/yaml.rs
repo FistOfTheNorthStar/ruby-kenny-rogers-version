@@ -980,6 +980,200 @@ fn names_of(v: V) -> Vec<String> {
         .collect()
 }
 
+/// The name of the anchor `&name` that a node starting at byte `at` of `src` carries (the
+/// parser numbers anchors; Psych's events name them): the `&name` just before it on its line.
+fn anchor_name(src: &str, at: usize, id: usize) -> String {
+    let at = at.min(src.len());
+    let take = |s: &str| s.chars().take_while(|c| !c.is_whitespace() && !",[]{}".contains(*c)).collect::<String>();
+    if let Some(rest) = src.get(at..).and_then(|s| s.strip_prefix('&')) {
+        return take(rest);
+    }
+    let line_start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+    if let Some(i) = src[line_start..at].rfind('&') {
+        return take(&src[line_start + i + 1..]);
+    }
+    id.to_string()
+}
+
+/// Psych.__kn_events(yaml, filename) -> the parse as Psych::Handler events, for Kenny's
+/// Psych::Parser (lib/kenny/kenny/psych_parser.rb): [name, start_line, start_column, end_line,
+/// end_column, *args] each, lines and columns from 0, args as Psych's handler methods take them.
+fn kn_events(src: V, file: V) -> V {
+    if !is_str(src) {
+        return type_error("YAML source must be a String");
+    }
+    let mut text = s_of(src);
+    if text.starts_with('\u{feff}') {
+        text.remove(0);
+    }
+    // (the events as Rust values first: the Ruby objects are made at the end, each kept alive)
+    enum A {
+        S(String),
+        Nil,
+        B(bool),
+        I(i64),
+        Empty,
+    }
+    let mut events: Vec<(&'static str, [usize; 4], Vec<A>)> = Vec::new();
+    // (a syntax error ends the events: line, column, offset, problem, context)
+    let mut error: Option<(usize, usize, usize, String, Option<String>)> = None;
+    let mut p = Parser::new_from_str(&text);
+    let mut anchors: HashMap<usize, String> = HashMap::new();
+    let mut open_doc = false;
+    loop {
+        let (ev, span) = match p.next_event() {
+            None => break,
+            Some(Ok(e)) => e,
+            Some(Err(e)) => {
+                let mk = e.marker();
+                let info = e.info().to_string();
+                let (problem, context) = match info.split_once(", ") {
+                    Some((ctx, prob)) if ctx.starts_with("while ") => (prob.to_string(), Some(ctx.to_string())),
+                    _ => (info, None),
+                };
+                error = Some((mk.line(), mk.col() + 1, mk.index(), problem, context));
+                break;
+            }
+        };
+        let mut pos = [span.start.line().saturating_sub(1), span.start.col(), span.end.line().saturating_sub(1), span.end.col()];
+        let mut start = span.start.index();
+        // libyaml's events start at an alias's `*` and at a block scalar's `|` / `>`, which
+        // this parser's spans leave out
+        let indicator = match &ev {
+            Event::Alias(_) => Some(b'*'),
+            Event::Scalar(_, ScalarStyle::Literal | ScalarStyle::Folded, _, _) => Some(b'|'),
+            _ => None,
+        };
+        // ... and at a node's anchor `&name`
+        let anchored = matches!(&ev, Event::Scalar(_, _, id, _) | Event::SequenceStart(id, _) | Event::MappingStart(id, _) if *id != 0);
+        if anchored && indicator.is_none() {
+            let line_start = text[..start.min(text.len())].rfind('\n').map_or(0, |j| j + 1);
+            if let Some(j) = text[line_start..start.min(text.len())].rfind('&') {
+                let i = line_start + j;
+                pos[1] = text[line_start..i].chars().count();
+                start = i;
+            }
+        }
+        if let Some(ind) = indicator {
+            let b = text.as_bytes();
+            let mut i = start.min(b.len());
+            if ind == b'*' {
+                while i > 0 && b[i - 1] != b'\n' && b[i.min(b.len() - 1)] != b'*' {
+                    i -= 1;
+                }
+            } else {
+                while i > 0 && (b[i - 1] as char).is_ascii_whitespace() {
+                    i -= 1;
+                }
+                while i > 0 && (b[i - 1] == b'-' || b[i - 1] == b'+' || b[i - 1].is_ascii_digit()) {
+                    i -= 1;
+                }
+                i = i.saturating_sub(1);
+            }
+            let ok = b.get(i).is_some_and(|&c| if ind == b'*' { c == b'*' } else { c == b'|' || c == b'>' });
+            if ok && i < start {
+                let line_start = text[..i].rfind('\n').map_or(0, |j| j + 1);
+                pos[0] = text[..i].matches('\n').count();
+                pos[1] = text[line_start..i].chars().count();
+                start = i;
+            }
+        }
+        let mut anchor = |id: usize| -> A {
+            if id == 0 {
+                return A::Nil;
+            }
+            A::S(anchors.entry(id).or_insert_with(|| anchor_name(&text, start, id)).clone())
+        };
+        let tag = |t: &Option<std::borrow::Cow<saphyr_parser::Tag>>| t.as_ref().map(|t| format!("{}{}", t.handle, t.suffix));
+        let flow = text.as_bytes().get(span.start.index()).is_some_and(|&c| c == b'[' || c == b'{');
+        let (name, args): (&'static str, Vec<A>) = match ev {
+            Event::Nothing => continue,
+            // (encoding: Psych::Parser::UTF8)
+            Event::StreamStart => ("start_stream", vec![A::I(1)]),
+            Event::StreamEnd => {
+                if open_doc {
+                    events.push(("end_document", pos, vec![A::B(true)]));
+                    open_doc = false;
+                }
+                ("end_stream", vec![])
+            }
+            Event::DocumentStart(explicit) => {
+                open_doc = true;
+                ("start_document", vec![A::Empty, A::Empty, A::B(!explicit)])
+            }
+            Event::DocumentEnd => {
+                open_doc = false;
+                let explicit = text.get(start..).is_some_and(|s| s.starts_with("..."));
+                ("end_document", vec![A::B(!explicit)])
+            }
+            Event::Alias(id) => ("alias", vec![anchor(id)]),
+            Event::Scalar(v, style, id, t) => {
+                let tg = tag(&t);
+                let sty = match style {
+                    ScalarStyle::Plain => 1,
+                    ScalarStyle::SingleQuoted => 2,
+                    ScalarStyle::DoubleQuoted => 3,
+                    ScalarStyle::Literal => 4,
+                    ScalarStyle::Folded => 5,
+                };
+                // (as libyaml: an untagged plain scalar is plain-implicit, any other untagged
+                // one quoted-implicit)
+                let plain = sty == 1;
+                let untagged = tg.is_none();
+                let a = anchor(id);
+                ("scalar", vec![A::S(v.into_owned()), a, tg.map_or(A::Nil, A::S), A::B(plain && untagged), A::B(!plain && untagged), A::I(sty)])
+            }
+            Event::SequenceStart(id, t) => {
+                let tg = tag(&t);
+                let implicit = tg.is_none();
+                let a = anchor(id);
+                ("start_sequence", vec![a, tg.map_or(A::Nil, A::S), A::B(implicit), A::I(if flow { 2 } else { 1 })])
+            }
+            Event::SequenceEnd => ("end_sequence", vec![]),
+            Event::MappingStart(id, t) => {
+                let tg = tag(&t);
+                let implicit = tg.is_none();
+                let a = anchor(id);
+                ("start_mapping", vec![a, tg.map_or(A::Nil, A::S), A::B(implicit), A::I(if flow { 2 } else { 1 })])
+            }
+            Event::MappingEnd => ("end_mapping", vec![]),
+        };
+        events.push((name, pos, args));
+    }
+    let out = ary_new(Vec::new());
+    let mut keep = RVec::new();
+    keep.push(out);
+    for (name, pos, args) in events {
+        let mut row = RVec::new();
+        row.push(str_from(name));
+        row.extend(pos.iter().map(|&x| mkfix(x as i64)));
+        for a in args {
+            let v = match a {
+                A::S(s) => str_from(&s),
+                A::Nil => QNIL,
+                A::B(b) => bool_v(b),
+                A::I(i) => mkfix(i),
+                A::Empty => ary_new(Vec::new()),
+            };
+            row.push(v);
+        }
+        let r = ary_new(row.to_vec());
+        crate::tri!(send1(out, "push", r));
+    }
+    // (the parser raises Psych::SyntaxError with these after sending the events before it)
+    if let Some((line, col, offset, problem, context)) = error {
+        let mut row = RVec::new();
+        row.push(str_from("__error"));
+        row.push(if file == QNIL { QNIL } else { crate::tri!(send0(file, "to_s")) });
+        row.extend([mkfix(line as i64), mkfix(col as i64), mkfix(offset as i64)]);
+        row.push(str_from(&problem));
+        row.push(context.as_deref().map(str_from).unwrap_or(QNIL));
+        let r = ary_new(row.to_vec());
+        crate::tri!(send1(out, "push", r));
+    }
+    out
+}
+
 /// Psych.__kn_load(yaml, opts) -> Array of documents.
 /// opts: filename:, unsafe:, permitted_classes:, permitted_symbols:, aliases:,
 ///       symbolize_names:, freeze:, strict_integer:, first_only:
@@ -2290,4 +2484,5 @@ fn init_psych() {
     };
     defs(p, "__kn_load", 2, 2, |_, a, _| kn_load(a[0], a[1]));
     defs(p, "__kn_dump", 2, 2, |_, a, _| kn_dump(a[0], a[1]));
+    defs(p, "__kn_events", 2, 2, |_, a, _| kn_events(a[0], a[1]));
 }

@@ -49,6 +49,7 @@ pub mod string;
 pub mod strscan;
 pub mod svec;
 pub mod poller;
+pub mod prism;
 pub mod thread;
 pub mod transcode;
 pub mod vfs;

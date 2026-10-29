@@ -51,30 +51,33 @@ module Psych
     end
   end
 
+  # The tree API's parsing half: the standard library's handlers, nodes and ToRuby visitor
+  # (Node#to_ruby), on Kenny's Psych::Parser (kenny/psych_parser.rb). Emitting nodes (Node#yaml,
+  # the YAMLTree and Emitter visitors) isn't supported.
+  autoload :Handler, "psych/handler"
+  autoload :TreeBuilder, "psych/tree_builder"
+  autoload :Parser, "kenny/psych_parser"
+  autoload :ClassLoader, "kenny/psych_to_ruby"
+  autoload :ScalarScanner, "kenny/psych_to_ruby"
+
+  module Handlers
+    autoload :DocumentStream, "psych/handlers/document_stream"
+  end
+
+  module Visitors
+    autoload :Visitor, "psych/visitors/visitor"
+    autoload :DepthFirst, "psych/visitors/depth_first"
+    autoload :ToRuby, "kenny/psych_to_ruby"
+  end
+
   module Nodes
-    class Node
-    end
-
-    class Scalar < Node
-      ANY = 0
-      PLAIN = 1
-      SINGLE_QUOTED = 2
-      DOUBLE_QUOTED = 3
-      LITERAL = 4
-      FOLDED = 5
-    end
-
-    class Sequence < Node
-      ANY = 0
-      BLOCK = 1
-      FLOW = 2
-    end
-
-    class Mapping < Node
-      ANY = 0
-      BLOCK = 1
-      FLOW = 2
-    end
+    autoload :Node, "psych/nodes/node"
+    autoload :Stream, "psych/nodes/stream"
+    autoload :Document, "psych/nodes/document"
+    autoload :Sequence, "psych/nodes/sequence"
+    autoload :Scalar, "psych/nodes/scalar"
+    autoload :Mapping, "psych/nodes/mapping"
+    autoload :Alias, "psych/nodes/alias"
   end
 
   class Coder
@@ -238,6 +241,36 @@ module Psych
     def to_json(object)
       require "json"
       JSON.generate(object)
+    end
+
+    # The tree API (as psych.rb's).
+    def parser
+      Psych::Parser.new(TreeBuilder.new)
+    end
+
+    def parse_stream(yaml, filename: nil, &block)
+      if block_given?
+        parser = Psych::Parser.new(Handlers::DocumentStream.new(&block))
+        parser.parse yaml, filename
+      else
+        parser = self.parser
+        parser.parse yaml, filename
+        parser.handler.root
+      end
+    end
+
+    def parse(yaml, filename: nil)
+      parse_stream(yaml, filename: filename) do |node|
+        return node
+      end
+      false
+    end
+
+    def parse_file(filename, fallback: false)
+      result = File.open filename, "r:bom|utf-8" do |f|
+        parse f, filename: filename
+      end
+      result || fallback
     end
 
     if VERSION.to_i < 4

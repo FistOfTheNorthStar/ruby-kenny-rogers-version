@@ -6,4 +6,6 @@ edition = "2024"
 [dependencies]
 kenny-compiler = { version = "0.1.0", path = "../kenny-compiler" }
 ruby-prism = "1.9.0"
+# (its pm_version: the libprism the runtime links, see src/prism.rs)
+ruby-prism-sys = "1.9.0"
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
