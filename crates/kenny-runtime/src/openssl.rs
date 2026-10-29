@@ -1,6 +1,7 @@
 //! Native subset of Ruby's OpenSSL extension (what Rails' message signing and
 //! encryption need) built on pure-Rust crypto: digests, HMAC, PBKDF2/HKDF,
-//! AES in ECB/CBC/CTR/GCM modes, RSA keys (openssl_pkey.rs) and the OS random source. Also hosts
+//! AES in ECB/CBC/CTR/GCM modes, RSA keys (openssl_pkey.rs), X509 signature checks
+//! (openssl_x509.rs) and the OS random source. Also hosts
 //! `Random::Formatter` (the formatting half of SecureRandom).
 //!
 //! `require "openssl"` compiles the overlay `lib/kenny/openssl.rb`, which calls
@@ -1197,6 +1198,8 @@ fn init_cipher(ossl: *mut Class) {
 mod pkey;
 #[path = "openssl_tls.rs"]
 mod tls;
+#[path = "openssl_x509.rs"]
+mod x509;
 
 // ---------- OpenSSL module ----------
 
@@ -1258,6 +1261,7 @@ fn init_openssl() -> V {
     init_cipher(ossl);
     pkey::init_pkey(ossl);
     tls::init_tls(ssl);
+    x509::init_x509(ossl);
     ossl as V
 }
 
