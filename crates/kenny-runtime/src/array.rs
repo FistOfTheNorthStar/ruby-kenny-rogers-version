@@ -65,7 +65,7 @@ pub fn cmp(a: V, b: V) -> Result<Ordering, V> {
     if is_fix(r) {
         return Ok(fix(r).cmp(&0));
     }
-    Err(arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), inspect_lossy(b))))
+    Err(arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), crate::kernel::cmperr_desc(b))))
 }
 fn cmp_blk(blk: V, a: V, b: V) -> Result<Ordering, V> {
     let r = call_block(blk, &[a, b]);
@@ -75,7 +75,7 @@ fn cmp_blk(blk: V, a: V, b: V) -> Result<Ordering, V> {
     if is_fix(r) {
         Ok(fix(r).cmp(&0))
     } else {
-        Err(arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), inspect_lossy(b))))
+        Err(arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), crate::kernel::cmperr_desc(b))))
     }
 }
 
@@ -790,37 +790,39 @@ pub fn init() {
     }
     defn(c, "min", 0, 1, |s, a, b| {
         if a.is_empty() && !is_proc(b) {
-            let mut best = QNIL;
+            // (as CRuby: `best <=> x`, and nil elements are values like any other)
+            let mut best: Option<V> = None;
             for x in snapshot(s) {
-                if best == QNIL {
-                    best = x;
+                let Some(b) = best else {
+                    best = Some(x);
                     continue;
-                }
-                match cmp(x, best) {
-                    Ok(Ordering::Less) => best = x,
+                };
+                match cmp(b, x) {
+                    Ok(Ordering::Greater) => best = Some(x),
                     Ok(_) => {}
                     Err(e) => return e,
                 }
             }
-            return best;
+            return best.unwrap_or(QNIL);
         }
         minmax_impl(s, a, b, Ordering::Less)
     });
     defn(c, "max", 0, 1, |s, a, b| {
         if a.is_empty() && !is_proc(b) {
-            let mut best = QNIL;
+            // (as CRuby: `best <=> x`, and nil elements are values like any other)
+            let mut best: Option<V> = None;
             for x in snapshot(s) {
-                if best == QNIL {
-                    best = x;
+                let Some(b) = best else {
+                    best = Some(x);
                     continue;
-                }
-                match cmp(x, best) {
-                    Ok(Ordering::Greater) => best = x,
+                };
+                match cmp(b, x) {
+                    Ok(Ordering::Less) => best = Some(x),
                     Ok(_) => {}
                     Err(e) => return e,
                 }
             }
-            return best;
+            return best.unwrap_or(QNIL);
         }
         minmax_impl(s, a, b, Ordering::Greater)
     });
@@ -841,30 +843,29 @@ pub fn init() {
             None => v.first().copied().unwrap_or(QNIL),
         }
     }
-    defn(c, "min_by", 0, 1, |s, a, b| enum_or(s, "min_by", a, b, || by(s, a, b, false)));
+    // the first minimal (Less) / maximal (Greater) element by key, comparing `key <=> best`
+    // as CRuby does
+    fn best_by(s: V, b: V, want: Ordering) -> V {
+        let mut best: Option<(V, V)> = None;
+        for x in snapshot(s) {
+            let k = tri!(call_block(b, &[x]));
+            let Some((_, bk)) = best else {
+                best = Some((x, k));
+                continue;
+            };
+            match cmp(k, bk) {
+                Ok(o) if o == want => best = Some((x, k)),
+                Ok(_) => {}
+                Err(e) => return e,
+            }
+        }
+        best.map_or(QNIL, |(x, _)| x)
+    }
+    defn(c, "min_by", 0, 1, |s, a, b| enum_or(s, "min_by", a, b, || if a.is_empty() { best_by(s, b, Ordering::Less) } else { by(s, a, b, false) }));
     defn(c, "max_by", 0, 1, |s, a, b| {
         enum_or(s, "max_by", a, b, || {
             if a.is_empty() {
-                // first maximal element, like CRuby
-                let mut best = QNIL;
-                let mut bestk = QNIL;
-                for x in snapshot(s) {
-                    let k = tri!(call_block(b, &[x]));
-                    if best == QNIL && bestk == QNIL {
-                        best = x;
-                        bestk = k;
-                        continue;
-                    }
-                    match cmp(k, bestk) {
-                        Ok(Ordering::Greater) => {
-                            best = x;
-                            bestk = k
-                        }
-                        Ok(_) => {}
-                        Err(e) => return e,
-                    }
-                }
-                return best;
+                return best_by(s, b, Ordering::Greater);
             }
             by(s, a, b, true)
         })

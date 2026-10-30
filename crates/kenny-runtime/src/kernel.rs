@@ -299,7 +299,7 @@ fn cmp_int(a: V, b: V) -> Result<Option<i64>, ()> {
     if r == QNIL { Ok(None) } else if is_fix(r) { Ok(Some(fix(r))) } else { Ok(None) }
 }
 fn cmp_fail(a: V, b: V) -> V {
-    arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), inspect_lossy(b)))
+    arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), crate::kernel::cmperr_desc(b)))
 }
 
 pub fn parse_int(b: &[u8], strict: bool) -> Option<V> {
@@ -1659,24 +1659,7 @@ pub fn init() {
         };
         bool_v(lo >= 0 && hi <= 0)
     });
-    defn(cm, "clamp", 1, 2, |s, a, _| {
-        let (lo, hi) = if a.len() == 2 { (a[0], a[1]) } else if is_range(a[0]) { (rrange(a[0]).lo, rrange(a[0]).hi) } else { return type_error("wrong argument type") };
-        if lo != QNIL {
-            if let Ok(Some(o)) = cmp_int(s, lo) {
-                if o < 0 {
-                    return lo;
-                }
-            }
-        }
-        if hi != QNIL {
-            if let Ok(Some(o)) = cmp_int(s, hi) {
-                if o > 0 {
-                    return hi;
-                }
-            }
-        }
-        s
-    });
+    defn(cm, "clamp", 1, 2, |s, a, _| clamp(s, a));
 
     // --- Exception ---
     let ex = c.exception;
@@ -2048,4 +2031,58 @@ pub fn init_system_exit() {
         if v == QNIL { mkfix(0) } else { v }
     });
     defn(c, "success?", 0, 0, |s, _, _| bool_v(system_exit_status(s) == 0));
+}
+
+/// How a comparison error names the other operand (CRuby's rb_cmperr): special constants
+/// (nil, true, false, small Integers, Symbols, Floats) by inspect, the rest by class.
+pub fn cmperr_desc(b: V) -> String {
+    if b == QNIL || b == QTRUE || b == QFALSE || is_fix(b) || is_sym(b) || is_float(b) {
+        inspect_lossy(b)
+    } else {
+        class_name(real_class(b))
+    }
+}
+
+/// Comparable#clamp(min, max) / clamp(range), as CRuby's cmp_clamp.
+pub fn clamp(s: V, a: &[V]) -> V {
+    let (lo, hi) = if a.len() == 2 {
+        (a[0], a[1])
+    } else if is_range(a[0]) {
+        let r = rrange(a[0]);
+        if r.hi != QNIL && r.excl {
+            return arg_error("cannot clamp with an exclusive range");
+        }
+        (r.lo, r.hi)
+    } else {
+        return type_error(&format!("wrong argument type {} (expected Range)", class_name(real_class(a[0]))));
+    };
+    let c = |x: V, y: V| -> Result<i64, V> {
+        match cmp_int(x, y).map_err(|_| UNDEF)? {
+            Some(o) => Ok(o),
+            None => Err(cmp_fail(x, y)),
+        }
+    };
+    if lo != QNIL && hi != QNIL {
+        match c(lo, hi) {
+            Ok(o) if o > 0 => return arg_error("min argument must be less than or equal to max argument"),
+            Ok(_) => {}
+            Err(e) => return e,
+        }
+    }
+    if lo != QNIL {
+        match c(s, lo) {
+            Ok(0) => return s,
+            Ok(o) if o < 0 => return lo,
+            Ok(_) => {}
+            Err(e) => return e,
+        }
+    }
+    if hi != QNIL {
+        match c(s, hi) {
+            Ok(o) if o > 0 => return hi,
+            Ok(_) => {}
+            Err(e) => return e,
+        }
+    }
+    s
 }

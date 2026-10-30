@@ -494,6 +494,26 @@ pub fn escape(b: &[u8]) -> String {
     out
 }
 
+/// A regexp's source as to_s and inspect show it: a `/` not already escaped gets a backslash
+/// (CRuby's rb_reg_expr_str).
+fn slash_escaped(src: &[u8]) -> String {
+    let mut out = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        match src[i] {
+            b'\\' if i + 1 < src.len() => {
+                out.extend_from_slice(&src[i..i + 2]);
+                i += 2;
+                continue;
+            }
+            b'/' => out.extend_from_slice(b"\\/"),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn opts_str(o: u32) -> String {
     let mut s = String::new();
     if o & OPT_M != 0 {
@@ -984,17 +1004,25 @@ pub fn init() {
     });
     defs(rc, "union", 0, -1, |_, a, _| {
         let items: Vec<V> = if a.len() == 1 && is_ary(a[0]) { rary(a[0]).v.clone() } else { a.to_vec() };
-        let parts: Vec<String> = items
-            .iter()
-            .map(|x| {
-                if is_regexp(*x) {
-                    let r = re_of(*x);
-                    format!("(?{}-mix:{})", opts_str(r.opts), String::from_utf8_lossy(&r.source))
-                } else {
-                    escape(&crate::fmt::to_s(*x).unwrap_or_default())
-                }
-            })
-            .collect();
+        // (no patterns: a regexp that never matches; one Regexp: itself)
+        if items.is_empty() {
+            return regexp_new(b"(?!)", 0);
+        }
+        if items.len() == 1 && is_regexp(items[0]) {
+            return items[0];
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for x in &items {
+            if is_regexp(*x) {
+                let t = tri!(send0(*x, "to_s"));
+                parts.push(String::from_utf8_lossy(&rstr(t).b).into_owned());
+            } else if is_sym(*x) {
+                parts.push(escape(sym_str(sym_id(*x)).as_bytes()));
+            } else {
+                let sv = tri!(crate::regex::to_str_arg(*x));
+                parts.push(escape(&rstr(sv).b));
+            }
+        }
         regexp_new(parts.join("|").as_bytes(), 0)
     });
     defs(rc, "last_match", 0, 1, |_, a, _| {
@@ -1009,11 +1037,11 @@ pub fn init() {
         let r = re_of(s);
         let on = opts_str(r.opts);
         let off: String = "mix".chars().filter(|c| !on.contains(*c)).collect();
-        new_str_v(format!("(?{}{}{}:{})", on, if off.is_empty() { "" } else { "-" }, off, String::from_utf8_lossy(&r.source)))
+        new_str_v(format!("(?{}{}{}:{})", on, if off.is_empty() { "" } else { "-" }, off, slash_escaped(&r.source)))
     });
     defn(rc, "inspect", 0, 0, |s, _, _| {
         let r = re_of(s);
-        new_str_v(format!("/{}/{}", String::from_utf8_lossy(&r.source), opts_str(r.opts)))
+        new_str_v(format!("/{}/{}", slash_escaped(&r.source), opts_str(r.opts)))
     });
     defn(rc, "options", 0, 0, |s, _, _| mkfix(re_of(s).opts as i64));
     defn(rc, "casefold?", 0, 0, |s, _, _| bool_v(re_of(s).opts & OPT_I != 0));
@@ -1166,6 +1194,16 @@ pub fn init() {
 
 /// String#match / match?'s pattern: a String is compiled as a regexp source, not quoted
 /// (CRuby's get_pat; sub, scan, index and the rest take a String literally)
+/// A String argument (or one with to_str), else TypeError: UNDEF on error.
+pub fn to_str_arg(v: V) -> V {
+    if is_str(v) {
+        return v;
+    }
+    if is_heap(v) && respond_to(v, sym("to_str")) {
+        return send0(v, "to_str");
+    }
+    type_error(&format!("no implicit conversion of {} into String", if v == QNIL { "nil".to_string() } else { class_name(real_class(v)) }))
+}
 pub fn pattern_arg(v: V) -> Result<V, V> {
     if is_str(v) {
         return tri_r(regexp_new(&rstr(v).b, 0));

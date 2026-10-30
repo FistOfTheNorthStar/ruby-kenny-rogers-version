@@ -290,9 +290,9 @@ fn cmp_or_fail(a: V, b: V, f: fn(std::cmp::Ordering) -> bool) -> V {
                 if r == UNDEF {
                     return UNDEF;
                 }
-                if is_fix(r) { bool_v(f(fix(r).cmp(&0))) } else { arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), inspect_lossy(b))) }
+                if is_fix(r) { bool_v(f(fix(r).cmp(&0))) } else { arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), crate::kernel::cmperr_desc(b))) }
             } else {
-                arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), inspect_lossy(b)))
+                arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), crate::kernel::cmperr_desc(b)))
             }
         }
     }
@@ -496,16 +496,7 @@ pub fn init() {
             }
             s
         });
-        defn(c, "clamp", 1, 2, |s, a, _| {
-            let (lo, hi) = if a.len() == 2 { (a[0], a[1]) } else if is_range(a[0]) { (rrange(a[0]).lo, rrange(a[0]).hi) } else { return type_error("wrong argument type") };
-            if lo != QNIL && num_cmp(s, lo) == Some(std::cmp::Ordering::Less) {
-                return lo;
-            }
-            if hi != QNIL && num_cmp(s, hi) == Some(std::cmp::Ordering::Greater) {
-                return hi;
-            }
-            s
-        });
+        defn(c, "clamp", 1, 2, |s, a, _| crate::kernel::clamp(s, a));
         defn(c, "between?", 2, 2, |s, a, _| {
             bool_v(num_cmp(s, a[0]).is_some_and(|o| o.is_ge()) && num_cmp(s, a[1]).is_some_and(|o| o.is_le()))
         });
