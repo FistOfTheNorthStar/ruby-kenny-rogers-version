@@ -1,0 +1,51 @@
+trusted CA: ok verify_result=0 ["echo hi\n", "/CN=localhost", ["/CN=localhost"], nil]
+  server: []
+verify_hostname: ok verify_result=0 ["echo hi\n", "/CN=localhost", ["/CN=localhost"], nil]
+  server: []
+no store: OpenSSL::SSL::SSLError: SSL_connect returned=1 errno=0 peeraddr=- state=error: certificate verify failed (unable to get local issuer certificate) verify_result=nil
+  server: ["OpenSSL::SSL::SSLError: SSL_accept returned=1 errno=0 peeraddr=- state=error: tlsv1 alert unknown ca (SSL alert number 48)"]
+VERIFY_NONE: ok verify_result=20 ["echo hi\n", "/CN=localhost", ["/CN=localhost"], nil]
+  server: []
+callback accepts: ok verify_result=0 ["echo hi\n", "/CN=localhost", ["/CN=localhost"], nil]
+  server: []
+callback rejects: OpenSSL::SSL::SSLError: SSL_connect returned=1 errno=0 peeraddr=- state=error: certificate verify failed (certificate rejected) verify_result=nil
+  server: ["OpenSSL::SSL::SSLError: SSL_accept returned=1 errno=0 peeraddr=- state=error: ssl/tls alert bad certificate (SSL alert number 42)"]
+hostname mismatch: OpenSSL::SSL::SSLError: SSL_connect returned=1 errno=0 peeraddr=- state=error: certificate verify failed (hostname mismatch) verify_result=nil
+  server: ["OpenSSL::SSL::SSLError: SSL_accept returned=1 errno=0 peeraddr=- state=error: ssl/tls alert bad certificate (SSL alert number 42)"]
+callback sees: ok verify_result=0 nil
+[[true, 0, 1, "/CN=TLS Test CA"], [true, 0, 0, "/CN=localhost"]]
+self-signed, not trusted: OpenSSL::SSL::SSLError: SSL_connect returned=1 errno=0 peeraddr=- state=error: certificate verify failed (self-signed certificate) verify_result=nil
+  server: ["OpenSSL::SSL::SSLError: SSL_accept returned=1 errno=0 peeraddr=- state=error: tlsv1 alert unknown ca (SSL alert number 48)"]
+self-signed in the store: ok verify_result=0 nil
+expired: OpenSSL::SSL::SSLError: SSL_connect returned=1 errno=0 peeraddr=- state=error: certificate verify failed (certificate has expired) verify_result=nil
+  server: ["OpenSSL::SSL::SSLError: SSL_accept returned=1 errno=0 peeraddr=- state=error: ssl/tls alert certificate expired (SSL alert number 45)"]
+no client cert: OpenSSL::SSL::SSLError: SSL_read: tlsv13 alert certificate required (SSL alert number 116) verify_result=0
+  server: peer=nil ["OpenSSL::SSL::SSLError: SSL_accept returned=1 errno=0 peeraddr=- state=error: peer did not return a certificate"]
+client cert: ok verify_result=0 "echo x\n"
+  server: peer="/CN=client" []
+GET /one HTTP/1.1 nil TLSv1.3
+POST /two HTTP/1.1 "data=1" TLSv1.3
+Net::HTTP without the CA: SSL_connect returned=1 errno=0 peeraddr=- state=error: certificate verify failed (unable to get local issuer certificate)
+  server: ["OpenSSL::SSL::SSLError: SSL_accept returned=1 errno=0 peeraddr=- state=error: tlsv1 alert unknown ca (SSL alert number 48)"]
+["h2", "http/1.1"]
+alpn: ok verify_result=20 ["http/1.1", "[\"http/1.1\", \"TLSv1.3\"]"]
+TLS 1.2: ok verify_result=20 ["TLSv1.2", "ECDHE-RSA-AES256-GCM-SHA384", "[nil, \"TLSv1.2\"]"]
+TLS 1.2 ChaCha20: ok verify_result=20 [["ECDHE-RSA-CHACHA20-POLY1305", "TLSv1.2", 256, 256], "[nil, \"TLSv1.2\"]"]
+TLS 1.3: ok verify_result=20 ["TLSv1.3", ["TLS_AES_256_GCM_SHA384", "TLSv1.3", 256, 256], "[nil, \"TLSv1.3\"]"]
+OpenSSL::SSL::SSLSocket
+OpenSSL::SSL::SSLErrorWaitReadable
+[200000, "baba", #<Encoding:UTF-8>]
+"line one\n"
+"line two\n"
+"tail"
+nil
+#<EOFError: end of file reached>
+true
+[false, OpenSSL::SSL::Session, Integer, true]
+true
+[0, false, 1179648, 2, 2, nil]
+[1, true, OpenSSL::X509::Store]
+true
+FrozenError
+true
+["PINIT", 0, 0, nil]

@@ -206,6 +206,8 @@ struct Cfg {
     /// the context's certificates and keys (add_certificate, cert/key), for a server or for
     /// client authentication
     keys: Vec<Arc<CertifiedKey>>,
+    /// the same Arc for every connection (see ClientVerifier)
+    client_keys: Arc<Keys>,
     alpn: Vec<Vec<u8>>,
     verify_mode: i64,
     client_sessions: Arc<dyn ClientSessionStore>,
@@ -213,9 +215,66 @@ struct Cfg {
     ticketer: Option<Arc<dyn rustls::server::ProducesTickets>>,
 }
 
-/// The session cache a Session object carries (SSLSocket#session=: the next connection
-/// resumes from it, as Net::HTTP's reconnects do).
-struct Sessions(Arc<dyn ClientSessionStore>);
+/// The session cache a Session object carries, and the server name its connection used
+/// (SSLSocket#session=: the next connection resumes from it, as Net::HTTP's reconnects do).
+struct Sessions(Arc<dyn ClientSessionStore>, ServerName<'static>);
+
+/// A context's session cache as a connection sees it: sessions go in (for the Session
+/// objects that `session=` hands to a later connection) but aren't looked up, since an
+/// OpenSSL client resumes only the session it is given.
+#[derive(Debug)]
+struct SaveOnly(Arc<dyn ClientSessionStore>);
+impl ClientSessionStore for SaveOnly {
+    fn set_kx_hint(&self, n: ServerName<'static>, g: rustls::NamedGroup) {
+        self.0.set_kx_hint(n, g)
+    }
+    fn kx_hint(&self, n: &ServerName<'_>) -> Option<rustls::NamedGroup> {
+        self.0.kx_hint(n)
+    }
+    fn set_tls12_session(&self, n: ServerName<'static>, v: rustls::client::Tls12ClientSessionValue) {
+        self.0.set_tls12_session(n, v)
+    }
+    fn tls12_session(&self, _: &ServerName<'_>) -> Option<rustls::client::Tls12ClientSessionValue> {
+        None
+    }
+    fn remove_tls12_session(&self, n: &ServerName<'static>) {
+        self.0.remove_tls12_session(n)
+    }
+    fn insert_tls13_ticket(&self, n: ServerName<'static>, v: rustls::client::Tls13ClientSessionValue) {
+        self.0.insert_tls13_ticket(n, v)
+    }
+    fn take_tls13_ticket(&self, _: &ServerName<'static>) -> Option<rustls::client::Tls13ClientSessionValue> {
+        None
+    }
+}
+
+/// A session cache seen under one server name: OpenSSL resumes the session given to
+/// `session=` whatever the new connection's hostname, where rustls looks it up by name.
+#[derive(Debug)]
+struct Pinned(Arc<dyn ClientSessionStore>, ServerName<'static>);
+impl ClientSessionStore for Pinned {
+    fn set_kx_hint(&self, _: ServerName<'static>, g: rustls::NamedGroup) {
+        self.0.set_kx_hint(self.1.clone(), g)
+    }
+    fn kx_hint(&self, _: &ServerName<'_>) -> Option<rustls::NamedGroup> {
+        self.0.kx_hint(&self.1)
+    }
+    fn set_tls12_session(&self, _: ServerName<'static>, v: rustls::client::Tls12ClientSessionValue) {
+        self.0.set_tls12_session(self.1.clone(), v)
+    }
+    fn tls12_session(&self, _: &ServerName<'_>) -> Option<rustls::client::Tls12ClientSessionValue> {
+        self.0.tls12_session(&self.1)
+    }
+    fn remove_tls12_session(&self, _: &ServerName<'static>) {
+        self.0.remove_tls12_session(&self.1)
+    }
+    fn insert_tls13_ticket(&self, _: ServerName<'static>, v: rustls::client::Tls13ClientSessionValue) {
+        self.0.insert_tls13_ticket(self.1.clone(), v)
+    }
+    fn take_tls13_ticket(&self, _: &ServerName<'static>) -> Option<rustls::client::Tls13ClientSessionValue> {
+        self.0.take_tls13_ticket(&self.1)
+    }
+}
 
 fn cfg_new(a: &[V]) -> V {
     // (tls12, tls13, ciphers, ciphersuites, [[cert_ders, key_der], ...], alpn, verify_mode, tickets)
@@ -272,6 +331,7 @@ fn cfg_new(a: &[V]) -> V {
         Cfg {
             provider: Arc::new(provider),
             versions,
+            client_keys: if keys.is_empty() { no_keys() } else { Arc::new(Keys(keys.clone())) },
             keys,
             alpn,
             verify_mode,
@@ -296,46 +356,74 @@ impl std::fmt::Debug for VerifyState {
     }
 }
 
+/// A server's check of client certificates: one per connection.
 #[derive(Debug)]
 struct Verifier {
     sock: RubyRef,
     algs: WebPkiSupportedAlgorithms,
     state: Arc<VerifyState>,
-    /// (server side) VERIFY_PEER / VERIFY_FAIL_IF_NO_PEER_CERT
+    /// VERIFY_PEER / VERIFY_FAIL_IF_NO_PEER_CERT
     offer: bool,
     mandatory: bool,
 }
 
+/// `SSLSocket#__kn_verify(ders)`: nil to go on, or the X509 error code to reject with.
+fn run_verify(sock: RubyRef, state: &VerifyState, ee: &CertificateDer<'_>, rest: &[CertificateDer<'_>]) -> Result<(), Error> {
+    let mut ders = vec![bin(ee.as_ref().to_vec())];
+    ders.extend(rest.iter().map(|c| bin(c.as_ref().to_vec())));
+    let r = send1(sock.0, "__kn_verify", ary_new(ders));
+    if r == UNDEF {
+        // (an exception from the verify callback: it stays pending and the handshake fails)
+        return Err(Error::General("verify callback raised".into()));
+    }
+    if r == QNIL || r == QTRUE {
+        return Ok(());
+    }
+    state.rejected.store(true, Ordering::SeqCst);
+    let code = if is_fix(r) { fix(r) } else { 1 };
+    // (the alert OpenSSL sends for that error: ssl_x509err2alert)
+    Err(Error::InvalidCertificate(match code {
+        2 | 18 | 19 | 20 | 21 => CertificateError::UnknownIssuer,
+        10 => CertificateError::Expired,
+        9 => CertificateError::NotValidYet,
+        23 => CertificateError::Revoked,
+        7 | 8 => CertificateError::BadSignature,
+        // (bad_certificate, as OpenSSL sends for these)
+        28 | 62..=64 => CertificateError::BadEncoding,
+        50 => CertificateError::ApplicationVerificationFailure,
+        _ => CertificateError::Other(rustls::OtherError(Arc::new(std::io::Error::other("certificate verify failed")))),
+    }))
+}
+
 impl Verifier {
-    /// `SSLSocket#__kn_verify(ders)`: nil to go on, or the X509 error code to reject with.
     fn verify(&self, ee: &CertificateDer<'_>, rest: &[CertificateDer<'_>]) -> Result<(), Error> {
-        let mut ders = vec![bin(ee.as_ref().to_vec())];
-        ders.extend(rest.iter().map(|c| bin(c.as_ref().to_vec())));
-        let r = send1(self.sock.0, "__kn_verify", ary_new(ders));
-        if r == UNDEF {
-            // (an exception from the verify callback: it stays pending and the handshake fails)
-            return Err(Error::General("verify callback raised".into()));
-        }
-        if r == QNIL || r == QTRUE {
-            return Ok(());
-        }
-        self.state.rejected.store(true, Ordering::SeqCst);
-        let code = if is_fix(r) { fix(r) } else { 1 };
-        // (the alert OpenSSL sends for that error: ssl_x509err2alert)
-        Err(Error::InvalidCertificate(match code {
-            2 | 18 | 19 | 20 | 21 => CertificateError::UnknownIssuer,
-            10 => CertificateError::Expired,
-            9 => CertificateError::NotValidYet,
-            23 => CertificateError::Revoked,
-            7 | 8 => CertificateError::BadSignature,
-            62..=64 => CertificateError::NotValidForName,
-            50 => CertificateError::ApplicationVerificationFailure,
-            _ => CertificateError::Other(rustls::OtherError(Arc::new(std::io::Error::other("certificate verify failed")))),
-        }))
+        run_verify(self.sock, &self.state, ee, rest)
     }
 }
 
-impl ServerCertVerifier for Verifier {
+thread_local! {
+    /// The client connection a step is driving, for the shared ClientVerifier.
+    static CURRENT: std::cell::RefCell<Option<(RubyRef, Arc<VerifyState>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A client's check of the server's certificates, the same for every connection: rustls
+/// resumes a session only under the verifier it was made with, and Net::HTTP resumes on a
+/// new SSLContext. It verifies for the connection the current step drives.
+#[derive(Debug)]
+struct ClientVerifier(WebPkiSupportedAlgorithms);
+
+fn client_verifier() -> Arc<ClientVerifier> {
+    static V: std::sync::OnceLock<Arc<ClientVerifier>> = std::sync::OnceLock::new();
+    V.get_or_init(|| Arc::new(ClientVerifier(rustls::crypto::ring::default_provider().signature_verification_algorithms)))
+        .clone()
+}
+/// The client certificate resolver of a context without one, shared for the same reason.
+fn no_keys() -> Arc<Keys> {
+    static K: std::sync::OnceLock<Arc<Keys>> = std::sync::OnceLock::new();
+    K.get_or_init(|| Arc::new(Keys(Vec::new()))).clone()
+}
+
+impl ServerCertVerifier for ClientVerifier {
     fn verify_server_cert(
         &self,
         ee: &CertificateDer<'_>,
@@ -344,16 +432,19 @@ impl ServerCertVerifier for Verifier {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        self.verify(ee, rest).map(|_| ServerCertVerified::assertion())
+        let Some((sock, state)) = CURRENT.with(|c| c.borrow().clone()) else {
+            return Err(Error::General("no connection to verify for".into()));
+        };
+        run_verify(sock, &state, ee, rest).map(|_| ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
-        rustls::crypto::verify_tls12_signature(m, c, d, &self.algs)
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0)
     }
     fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
-        rustls::crypto::verify_tls13_signature(m, c, d, &self.algs)
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0)
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algs.supported_schemes()
+        self.0.supported_schemes()
     }
 }
 
@@ -413,7 +504,7 @@ struct St {
     conn: Conn,
     sock: RubyRef,
     verify: Arc<VerifyState>,
-    sessions: Option<Arc<dyn ClientSessionStore>>,
+    sessions: Option<(Arc<dyn ClientSessionStore>, ServerName<'static>)>,
     /// the TLS stream ended (close_notify, or the peer closed the connection)
     eof: bool,
 }
@@ -528,20 +619,24 @@ fn fd_nonblocking(fd: i32, f: impl FnOnce() -> isize) -> std::io::Result<usize> 
     r
 }
 
-/// OpenSSL's text for a TLS alert (the reason strings of SSL_R_SSLV3_ALERT_* / SSL_R_TLSV1_ALERT_*)
+/// OpenSSL 3's text for a TLS alert received (the reason strings of SSL_R_SSLV3_ALERT_* /
+/// SSL_R_TLSV1_ALERT_*, with the alert's number as OpenSSL adds it)
 fn alert_text(a: AlertDescription) -> String {
+    format!("{} (SSL alert number {})", alert_reason(a), u8::from(a))
+}
+fn alert_reason(a: AlertDescription) -> String {
     use AlertDescription as A;
     match a {
-        A::CloseNotify => "sslv3 alert close notify".into(),
-        A::UnexpectedMessage => "sslv3 alert unexpected message".into(),
-        A::BadRecordMac => "sslv3 alert bad record mac".into(),
-        A::HandshakeFailure => "sslv3 alert handshake failure".into(),
-        A::BadCertificate => "sslv3 alert bad certificate".into(),
-        A::UnsupportedCertificate => "sslv3 alert unsupported certificate".into(),
-        A::CertificateRevoked => "sslv3 alert certificate revoked".into(),
-        A::CertificateExpired => "sslv3 alert certificate expired".into(),
-        A::CertificateUnknown => "sslv3 alert certificate unknown".into(),
-        A::IllegalParameter => "sslv3 alert illegal parameter".into(),
+        A::CloseNotify => "ssl/tls alert close notify".into(),
+        A::UnexpectedMessage => "ssl/tls alert unexpected message".into(),
+        A::BadRecordMac => "ssl/tls alert bad record mac".into(),
+        A::HandshakeFailure => "ssl/tls alert handshake failure".into(),
+        A::BadCertificate => "ssl/tls alert bad certificate".into(),
+        A::UnsupportedCertificate => "ssl/tls alert unsupported certificate".into(),
+        A::CertificateRevoked => "ssl/tls alert certificate revoked".into(),
+        A::CertificateExpired => "ssl/tls alert certificate expired".into(),
+        A::CertificateUnknown => "ssl/tls alert certificate unknown".into(),
+        A::IllegalParameter => "ssl/tls alert illegal parameter".into(),
         A::UnknownCA => "tlsv1 alert unknown ca".into(),
         A::AccessDenied => "tlsv1 alert access denied".into(),
         A::DecodeError => "tlsv1 alert decode error".into(),
@@ -625,16 +720,30 @@ fn flush(conn: &mut Connection, fd: i32) -> Result<bool, i32> {
     Ok(true)
 }
 
-/// Feed what the descriptor has to rustls. Ok(false): nothing there yet.
+/// Feed what the descriptor has to rustls. Ok(false): nothing there yet (and nothing that
+/// came before is left to process: rustls decrypts records as its plaintext buffer allows,
+/// so records read earlier can still be waiting when the socket has nothing new).
 fn fill(st: &mut St, fd: i32) -> Result<bool, Step<()>> {
     let Conn::Ready(conn) = &mut st.conn else { return Err(Step::Fail("SSL session is not started yet".into())) };
+    let mut idle = false;
     match conn.read_tls(&mut Fd(fd)) {
         Ok(0) => st.eof = true,
         Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => idle = true,
         Err(e) => return Err(Step::Sys(e.raw_os_error().unwrap_or(libc::EIO))),
     }
-    if let Err(e) = conn.process_new_packets() {
+    let handshaking = conn.is_handshaking();
+    let r = conn.process_new_packets();
+    if idle {
+        if let Ok(io) = &r
+            && io.plaintext_bytes_to_read() == 0
+            && io.tls_bytes_to_write() == 0
+            && conn.is_handshaking() == handshaking
+        {
+            return Ok(false);
+        }
+    }
+    if let Err(e) = r {
         let _ = flush(conn, fd);
         st.conn = Conn::Failed;
         if pst().pending_is_set() {
@@ -654,6 +763,8 @@ fn drive<T>(s: V, nonblock: bool, mut step: impl FnMut(&mut St, i32) -> Step<T>,
             let Some(mut g) = tls.lock() else {
                 return ary_new(vec![str_from("SSL connection in use by a callback")]);
             };
+            let cur = (g.sock, g.verify.clone());
+            CURRENT.with(|c| *c.borrow_mut() = Some(cur));
             step(&mut g, tls.fd)
         };
         match r {
@@ -845,7 +956,7 @@ fn write_step(st: &mut St, fd: i32, data: &[u8], done: &mut usize, partial: bool
     }
 }
 
-fn new_tls(fd: i32, sock: V, conn: Conn, sessions: Option<Arc<dyn ClientSessionStore>>, verify: Arc<VerifyState>) -> V {
+fn new_tls(fd: i32, sock: V, conn: Conn, sessions: Option<(Arc<dyn ClientSessionStore>, ServerName<'static>)>, verify: Arc<VerifyState>) -> V {
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
     unsafe {
         let one: libc::c_int = 1;
@@ -892,38 +1003,38 @@ pub(super) fn init_tls(ssl: *mut Class) {
         let sock = a[2];
         let host = okv!(opt_str(a[3]));
         let ip = okv!(opt_str(a[4]));
-        let sessions = if a[5] != QNIL { Some(okv!(unwrap::<Sessions>(*STORE_CLASS.get(), a[5])).0.clone()) } else { None };
+        let given = if a[5] != QNIL { Some(okv!(unwrap::<Sessions>(*STORE_CLASS.get(), a[5]))) } else { None };
+        let sessions = given.map(|ss| Arc::new(Pinned(ss.0.clone(), ss.1.clone())) as Arc<dyn ClientSessionStore>);
         let verify = Arc::new(VerifyState::default());
-        let verifier = Arc::new(Verifier {
-            sock: RubyRef(sock),
-            algs: cfg.provider.signature_verification_algorithms,
-            state: verify.clone(),
-            offer: false,
-            mandatory: false,
-        });
         let b = match rustls::ClientConfig::builder_with_provider(cfg.provider.clone()).with_protocol_versions(&cfg.versions) {
             Ok(b) => b,
             Err(e) => return raise(ssl_error(), &err_text(&e)),
         };
-        let b = b.dangerous().with_custom_certificate_verifier(verifier);
-        let mut cc = if cfg.keys.is_empty() { b.with_no_client_auth() } else { b.with_client_cert_resolver(Arc::new(Keys(cfg.keys.clone()))) };
+        let b = b.dangerous().with_custom_certificate_verifier(client_verifier());
+        let mut cc = b.with_client_cert_resolver(cfg.client_keys.clone());
         cc.alpn_protocols = cfg.alpn.clone();
-        let store = sessions.unwrap_or_else(|| cfg.client_sessions.clone());
-        cc.resumption = Resumption::store(store.clone());
+        // (what a Session of this connection resumes from: the given session's cache, or the context's)
+        let store = sessions.clone().unwrap_or_else(|| cfg.client_sessions.clone());
+        cc.resumption = Resumption::store(match sessions {
+            Some(pinned) => pinned,
+            None => Arc::new(SaveOnly(cfg.client_sessions.clone())),
+        });
         // SNI: the hostname (none for an IP address, or without one, as OpenSSL)
         let name: ServerName<'static> = match host.as_deref().map(|h| h.trim_end_matches('.').to_string()) {
             Some(h) if h.parse::<std::net::IpAddr>().is_err() && ServerName::try_from(h.clone()).is_ok() => ServerName::try_from(h).unwrap(),
             Some(h) if h.parse::<std::net::IpAddr>().is_ok() => ServerName::IpAddress(h.parse::<std::net::IpAddr>().unwrap().into()),
+            // (resuming a session without a hostname: the session's, which a server checks)
+            None if given.is_some() => given.unwrap().1.clone(),
             _ => {
                 let addr = ip.and_then(|i| i.parse::<std::net::IpAddr>().ok()).unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
                 ServerName::IpAddress(addr.into())
             }
         };
-        let conn = match rustls::ClientConnection::new(Arc::new(cc), name) {
+        let conn = match rustls::ClientConnection::new(Arc::new(cc), name.clone()) {
             Ok(c) => c,
             Err(e) => return raise(ssl_error(), &err_text(&e)),
         };
-        new_tls(fd, sock, Conn::Ready(Connection::Client(conn)), Some(store), verify)
+        new_tls(fd, sock, Conn::Ready(Connection::Client(conn)), Some((store, name)), verify)
     });
     // (cfg, fd, sock)
     defs(ssl, "__kn_server", 3, 3, |_, a, _| {
@@ -997,7 +1108,7 @@ pub(super) fn init_tls(ssl: *mut Class) {
         let tls = okv!(tls_of(s));
         let Some(g) = tls.lock() else { return QNIL };
         match &g.sessions {
-            Some(st) => wrap(*STORE_CLASS.get(), Sessions(st.clone())),
+            Some((st, name)) => wrap(*STORE_CLASS.get(), Sessions(st.clone(), name.clone())),
             None => QNIL,
         }
     });

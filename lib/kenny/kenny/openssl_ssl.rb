@@ -191,6 +191,15 @@ module OpenSSL
 
       def __kn_no_protocols? = @__kn_no_protocols
 
+      # (openssl 4.0's C methods; 3.x's openssl/ssl.rb replaces them with its own)
+      def min_version=(v)
+        @__kn_min = __kn_proto_version(v)
+      end
+
+      def max_version=(v)
+        @__kn_max = __kn_proto_version(v)
+      end
+
       private
 
       def set_minmax_proto_version(min, max)

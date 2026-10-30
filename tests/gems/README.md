@@ -97,6 +97,18 @@ On `gem-fixes-2`:
 - `Coverage` (lines, branches, methods, oneshot_lines), compiled in only for programs that
   require it (simplecov); `Range#minmax` on endless ranges, `Array#sum` with NaN/Infinity.
 
-Not yet: OpenSSL TLS/X509 certificates/EC keys/ASN1, UDP `sendto`/`recvfrom`,
+On `openssl-tls`:
+- OpenSSL TLS (`SSLContext`, `SSLSocket`, `SSLServer`, `Session`) on rustls, with CRuby's own
+  `openssl/ssl.rb` and `openssl/buffering.rb` on top: verification with OpenSSL's errors and
+  alerts, `verify_callback`, hostname checks, client certificates, ALPN, session resumption
+  (Net::HTTP's), non-blocking IO. TLS 1.2/1.3 with rustls' AES-GCM/ChaCha20 suites.
+- `OpenSSL::ASN1`, `OpenSSL::X509` (certificates, names, extensions, CSRs, CRLs, a `Store`
+  that verifies as OpenSSL 3.6), `PKey::EC` public keys; CRuby's `openssl/x509.rb` on top.
+- Fixes found on the way: `Zlib::Inflate#inflate`/`Deflate#deflate` with a block (Net::HTTP's
+  gzip bodies), `String#index`/`rindex` offsets in binary Strings (chunked responses),
+  `IO.select` on objects with `#to_io`, `defined?(obj.private_method)`.
+
+Not yet: OpenSSL EC private keys/DSA/DH, TLS session serialization (`Session#to_der`),
+UDP `sendto`/`recvfrom`,
 `JSON::ResumableParser`, C extensions that use CRuby's internal headers (rbs), `Module.nesting`
 (always `[]`).
