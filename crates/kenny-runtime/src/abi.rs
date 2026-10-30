@@ -1545,6 +1545,9 @@ pub fn const_added(c: *mut Class, id: u32) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_const_set(cref: V, id: V, v: V) -> V {
     let c = cref_class(cref);
+    if check_frozen_definee(c) == UNDEF {
+        return UNDEF;
+    }
     const_set(c, sym_id(id), v);
     if !const_added(c, sym_id(id)) {
         return UNDEF;
@@ -1711,6 +1714,9 @@ pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn
             }
         },
     };
+    if check_frozen_definee(cls) == UNDEF {
+        return UNDEF;
+    }
     let name = sym_str(sym_id(id));
     if (cls == r.c.integer || cls == r.c.float) && PROTECTED_OPS.contains(&name.as_str()) {
         return raise(

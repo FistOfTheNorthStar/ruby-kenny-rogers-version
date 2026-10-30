@@ -478,6 +478,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_last_match", &[], &[I64]),
     ("kn_match_save", &[], &[I64]),
     ("kn_dm_name", &[I64], &[I64]),
+    ("kn_dm_name_for", &[I64, I64, I64], &[I64]),
     ("kn_match_restore", &[I64], &[]),
     ("kn_pm_deconstruct", &[I64], &[I64]),
     ("kn_pm_deconstruct_keys", &[I64, I64], &[I64]),

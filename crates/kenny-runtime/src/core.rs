@@ -628,6 +628,23 @@ pub fn is_frozen(v: V) -> bool {
 }
 /// Before changing `v`: FrozenError if it is frozen, else nil (and a chilled String stops
 /// being one: `unchill`).
+/// Before defining a method or constant in `c`: FrozenError when it is frozen (a singleton
+/// class: when its object is), else nil.
+pub fn check_frozen_definee(c: *mut Class) -> V {
+    let k = unsafe { &*c };
+    let who = if k.is_singleton && is_heap(k.attached) && hdr(k.attached).flags & FL_FROZEN != 0 {
+        k.attached
+    } else if hdr(c as V).flags & FL_FROZEN != 0 {
+        c as V
+    } else {
+        return QNIL;
+    };
+    let what = if is_class(who) { if rclass(who).is_module { "module" } else { "class" } } else { "object" };
+    let msg = format!("can't modify frozen {what}: {}", crate::fmt::inspect_lossy(who));
+    let e = exc_new(rt().c.frozen_error, &msg);
+    ivar_set(e, sym("@receiver"), who);
+    raise_exc(e)
+}
 pub fn check_frozen(v: V) -> V {
     if is_frozen(v) {
         let msg = format!("can't modify frozen {}: {}", class_name(class_of(v)), crate::fmt::inspect_lossy(v));
@@ -2205,7 +2222,8 @@ pub fn ivar_index_for(shape: *mut Class, id: u32) -> u32 {
     i
 }
 pub fn ivar_set(v: V, id: u32, val: V) -> V {
-    if !is_heap(v) || hdr(v).flags & (FL_FROZEN | FL_CHILLED) != 0 {
+    // (the runtime's own hidden `@__` bookkeeping goes on frozen objects too)
+    if (!is_heap(v) || hdr(v).flags & (FL_FROZEN | FL_CHILLED) != 0) && !(is_heap(v) && sym_name(id).starts_with(b"@__")) {
         let r = check_frozen(v);
         if r == UNDEF {
             return UNDEF;

@@ -578,10 +578,18 @@ impl<M: Module> Compiler<M> {
             let c = self.iconst(fx, callee as i64);
             return self.call(fx, "kn_dm_name", &[c]);
         }
-        match fx.method.clone() {
+        let lexical = match fx.method.clone() {
             Some(m) => self.sym_val(fx, &m.name),
             None => self.nil(fx),
+        };
+        // a block may still become a method body at runtime (`define_method(name, &blk)`,
+        // sorbet-runtime's sig wrappers): then it's that method's name
+        if let (ScopeKind::Block, Some(pv)) = (fx.kind, fx.proc_v) {
+            let p = fx.b.use_var(pv);
+            let c = self.iconst(fx, callee as i64);
+            return self.call(fx, "kn_dm_name_for", &[p, c, lexical]);
         }
+        lexical
     }
 
     /// Leaving a method that saved its caller's `$~` (backref.rs): put it back.

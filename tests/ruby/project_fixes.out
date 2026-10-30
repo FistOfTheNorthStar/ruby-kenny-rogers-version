@@ -56,3 +56,14 @@ String
 true
 :top_level
 :adm
+true
+false
+false
+true
+FrozenError
+FrozenError
+true
+:foo
+:bar
+#<Encoding:BINARY (ASCII-8BIT)>
+7

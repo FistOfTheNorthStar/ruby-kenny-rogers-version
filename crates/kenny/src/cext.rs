@@ -446,6 +446,11 @@ pub fn compile(exts: Vec<Ext>, work: &Path, ruby_h: &str, shim: &str) -> Result<
                 let mut c = if j.cxx { Command::new(std::env::var("CXX").unwrap_or_else(|_| "c++".into())) } else { crate::cc() };
                 c.args([if j.cxx { "-std=gnu++17" } else { "-std=gnu17" }, "-O2", "-fPIC", "-w", "-c"]);
                 c.arg("-I").arg(&inc).args(&j.flags).arg(&j.src).arg("-o").arg(&j.obj);
+                // `__FILE__` relative to the source's directory, as in a mkmf build (ox's
+                // error messages say "[parse.c:687]")
+                if let Some(d) = j.src.parent() {
+                    c.arg(format!("-fmacro-prefix-map={}/=", d.display()));
+                }
                 let r = match c.output() {
                     Ok(o) if o.status.success() => Ok(()),
                     Ok(o) => Err(format!("compiling {} failed:\n{}", j.src.display(), tail(&String::from_utf8_lossy(&o.stderr), 20))),

@@ -1,0 +1,14 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    sorbet-runtime (0.6.13610)
+
+PLATFORMS
+  arm64-darwin-27
+  ruby
+
+DEPENDENCIES
+  sorbet-runtime
+
+BUNDLED WITH
+   2.6.9

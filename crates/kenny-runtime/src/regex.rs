@@ -981,6 +981,18 @@ pub extern "C" fn kn_dm_name(callee: i64) -> V {
     }
     mksym(name)
 }
+/// `__method__`/`__callee__` in a block not known to be a define_method body: the running
+/// method's name when it is this block (passed on to define_method), else `lexical`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_dm_name_for(proc_: V, callee: i64, lexical: V) -> V {
+    let Some(&m) = pst().dm_stack.last() else { return lexical };
+    if let Body::Proc(p) = unsafe { &(*m).body } {
+        if *p == proc_ || (is_proc(*p) && is_proc(proc_) && rproc(*p).func as usize == rproc(proc_).func as usize && rproc(*p).env == rproc(proc_).env) {
+            return kn_dm_name(callee);
+        }
+    }
+    lexical
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_match_restore(saved: V) {
     pst().last_match = saved;

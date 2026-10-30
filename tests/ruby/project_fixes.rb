@@ -109,3 +109,29 @@ end
 module Adm
   p Trx
 end
+
+# frozen modules
+m = Module.new.freeze
+p m.frozen?, m.dup.equal?(m), m.dup.frozen?, Class.new.freeze.frozen?
+begin; m.const_set(:X, 1); rescue => e; p e.class; end
+begin; def m.x; end; rescue => e; p e.class; end
+o = Object.new.freeze
+p o.singleton_class.frozen?
+
+# __callee__ in a block that becomes a method through &blk
+class CK
+  def self.repl(name, &blk) = define_method(name, &blk)
+  def self.outer
+    repl(:foo) { Kernel.__callee__ }
+    repl(:bar) { __method__ }
+  end
+end
+CK.outer
+p CK.new.foo, CK.new.bar
+
+# writing text into a binary StringIO
+require "stringio"
+b = StringIO.new.binmode
+b << "abc" << "\xff\xfe".b
+b.write("é")
+p b.string.encoding, b.string.bytesize

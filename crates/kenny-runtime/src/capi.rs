@@ -484,7 +484,18 @@ pub extern "C" fn rb_obj_is_instance_of(v: V, c: V) -> V {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_respond_to(v: V, id: V) -> c_int {
-    respond_to(v, id as u32) as c_int
+    // as `obj.respond_to?(name)`: private methods don't count (ox's SAX handler base class
+    // has every callback as a private no-op)
+    let m = find_method(class_of(v), id as u32);
+    if !m.is_null() && unsafe { (*m).vis } != VIS_PRIVATE && !crate::kernel::is_user_method(v, "respond_to?") {
+        return 1;
+    }
+    let r = send(v, sym("respond_to?"), &[mksym(id as u32)], QNIL);
+    if r == UNDEF {
+        pst().pending = Throw::None;
+        return 0;
+    }
+    truthy(r) as c_int
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_obj_freeze(v: V) -> V {

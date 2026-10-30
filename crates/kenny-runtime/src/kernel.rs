@@ -942,7 +942,10 @@ pub fn init() {
         tri!(check_singleton_ok(s));
         singleton_class(s) as V
     });
-    defn(k, "frozen?", 0, 0, |s, _, _| bool_v(is_frozen(s)));
+    defn(k, "frozen?", 0, 0, |s, _, _| {
+        // (a singleton class is frozen with its object)
+        bool_v(is_frozen(s) || is_class(s) && rclass(s).is_singleton && is_heap(rclass(s).attached) && is_frozen(rclass(s).attached))
+    });
     defn(k, "freeze", 0, 0, |s, _, _| {
         if is_heap(s) {
             hdr(s).flags = (hdr(s).flags | FL_FROZEN) & !FL_CHILLED;
@@ -1455,6 +1458,7 @@ pub fn init() {
     });
     defn(md, "const_set", 2, 2, |s, a, _| match sym_arg(a[0]) {
         Ok(id) => {
+            tri!(check_frozen_definee(s as *mut Class));
             const_set(s as *mut Class, id, a[1]);
             if !crate::abi::const_added(s as *mut Class, id) {
                 return UNDEF;
@@ -1596,7 +1600,10 @@ pub fn init() {
         Ok(id) => bool_v(ancestors(s as *mut Class).iter().any(|c| unsafe { (**c).cvars.contains_key(&id) })),
         Err(e) => e,
     });
-    defn(md, "freeze", 0, 0, |s, _, _| s);
+    defn(md, "freeze", 0, 0, |s, _, _| {
+        hdr(s).flags |= FL_FROZEN;
+        s
+    });
     // `Module.new { }`, and `Sub.new(args)` for subclasses of Module (ActiveModel's
     // `AcceptsMultiparameterTime < Module` defines `initialize(defaults: {})`).
     defs(md, "new", 0, -1, |s, a, b| {

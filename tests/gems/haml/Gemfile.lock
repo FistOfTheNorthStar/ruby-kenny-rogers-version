@@ -1,0 +1,23 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    haml (7.5.1)
+      prism (>= 1.1.0)
+      temple (>= 0.8.2)
+      thor
+      tilt
+    prism (1.9.0)
+    temple (0.10.7)
+    thor (1.5.0)
+    tilt (2.9.0)
+
+PLATFORMS
+  arm64-darwin-27
+  ruby
+
+DEPENDENCIES
+  haml
+  prism (= 1.9.0)
+
+BUNDLED WITH
+   2.6.9
