@@ -1541,7 +1541,13 @@ pub fn class_name(c: *mut Class) -> String {
         if (*c).is_singleton {
             return format!("#<Class:{}>", crate::fmt::inspect_lossy((*c).attached));
         }
-        if (*c).name.is_empty() { format!("#<Class:0x{:016x}>", c as usize) } else { (*c).name.clone() }
+        if !(*c).name.is_empty() {
+            (*c).name.clone()
+        } else if (*c).is_module {
+            format!("#<Module:0x{:016x}>", c as usize)
+        } else {
+            format!("#<Class:0x{:016x}>", c as usize)
+        }
     }
 }
 
@@ -1990,7 +1996,7 @@ pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
         }
         Body::CFunc(f, arity) => {
             pst().current_block.push(blk);
-            crate::capi::enter_frame((*m).name, recv);
+            crate::capi::enter_frame((*m).name, recv, (*m).owner);
             let r = call_native_c(*f, *arity, recv, args);
             crate::capi::leave_frame();
             pst().current_block.pop();
@@ -2063,7 +2069,7 @@ pub fn describe_recv(v: V) -> String {
         "main".into()
     } else if is_class(v) {
         let c = rclass(v);
-        if c.is_module { format!("module {}", c.name) } else { format!("class {}", class_name(v as *mut Class)) }
+        if c.is_module { format!("module {}", class_name(v as *mut Class)) } else { format!("class {}", class_name(v as *mut Class)) }
     } else {
         format!("an instance of {}", class_name(real_class(v)))
     }
@@ -2316,16 +2322,34 @@ pub fn const_get_under(c: *mut Class, id: u32) -> Option<V> {
     }
     None
 }
+/// Classes and modules whose name is a temporary one (Module#set_temporary_name): the
+/// first constant they're assigned to names them for good, as it does an anonymous one.
+pub static TEMP_NAMED: std::sync::Mutex<Option<rustc_hash::FxHashSet<usize>>> = std::sync::Mutex::new(None);
+pub fn temp_named(c: *mut Class) -> bool {
+    TEMP_NAMED.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(c as usize)))
+}
+pub fn set_temp_named(c: *mut Class, on: bool) {
+    let mut g = TEMP_NAMED.lock().unwrap();
+    let s = g.get_or_insert_with(Default::default);
+    if on {
+        s.insert(c as usize);
+    } else {
+        s.remove(&(c as usize));
+    }
+}
 pub fn const_set(c: *mut Class, id: u32, v: V) {
     unsafe {
         if is_class(v) {
             let k = rclass(v);
-            if k.name.is_empty() && !k.is_singleton {
+            if (k.name.is_empty() || temp_named(v as *mut Class)) && !k.is_singleton {
                 k.name = if c == rt().c.object || c.is_null() {
                     sym_str(id)
                 } else {
-                    format!("{}::{}", (*c).name, sym_str(id))
+                    format!("{}::{}", class_name(c), sym_str(id))
                 };
+                // (under an anonymous or temporarily named module, the name is temporary too)
+                let parent_temp = !c.is_null() && c != rt().c.object && ((*c).name.is_empty() || temp_named(c));
+                set_temp_named(v as *mut Class, parent_temp);
             }
         }
         (*c).consts.insert(id, v);

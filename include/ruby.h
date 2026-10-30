@@ -23,6 +23,7 @@
 #include <strings.h>
 #ifndef __cplusplus
 #include <stdbool.h>
+#include <math.h>
 #endif
 
 #ifdef __cplusplus
@@ -49,6 +50,13 @@ typedef st_data_t st_index_t;
 #define HAVE_RUBY_VERSION_H 1
 
 #define RUBY_EXTERN extern
+/* old-style prototypes: `void f _((int));` (ruby/backward/2/stdarg.h) */
+#ifndef _
+#define _(args) args
+#endif
+#ifndef __
+#define __(args) args
+#endif
 #ifdef __cplusplus
 #define ANYARGS ...
 #else
@@ -203,7 +211,7 @@ RUBY_EXTERN VALUE rb_eException, rb_eStandardError, rb_eRuntimeError, rb_eArgErr
     rb_eFloatDomainError, rb_eEncodingError, rb_eLocalJumpError, rb_eSecurityError, rb_eEOFError,
     rb_eThreadError, rb_eSystemCallError, rb_eRegexpError, rb_eSyntaxError, rb_eLoadError,
     rb_eInterrupt, rb_eSignal, rb_eFatal, rb_eSystemExit, rb_eMathDomainError,
-    rb_eEncCompatError, rb_eNoMatchingPatternError, rb_eNoMatchingPatternKeyError;
+    rb_eEncCompatError, rb_eNoMatchingPatternError, rb_eNoMatchingPatternKeyError, rb_eSysStackError;
 #define rb_cFixnum rb_cInteger
 #define rb_cBignum rb_cInteger
 
@@ -441,6 +449,7 @@ VALUE rb_str_export_to_enc(VALUE str, rb_encoding *enc);
 VALUE rb_str_conv_enc(VALUE str, rb_encoding *from, rb_encoding *to);
 VALUE rb_str_encode(VALUE str, VALUE to, int ecflags, VALUE ecopts);
 #define rb_enc_asciicompat_p rb_enc_asciicompat
+#define ENCODING_INLINE_MAX 127
 #define ENCODING_GET(obj) rb_enc_get_index(obj)
 #define ENCODING_GET_INLINED(obj) rb_enc_get_index(obj)
 #define ENCODING_SET(obj, i) rb_enc_set_index((obj), (i))
@@ -537,6 +546,29 @@ VALUE rb_str_subseq(VALUE s, long beg, long len);
 VALUE rb_str_equal(VALUE a, VALUE b);
 int rb_str_cmp(VALUE a, VALUE b);
 st_index_t rb_str_hash(VALUE s);
+/* hashing helpers (CRuby's st_hash_* family; the values differ from CRuby's, as its are
+   seeded per process anyway) */
+static inline st_index_t st_hash_uint(st_index_t h, st_index_t i) {
+    h ^= i + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+}
+static inline st_index_t st_hash_uint32(st_index_t h, uint32_t i) { return st_hash_uint(h, (st_index_t)i); }
+static inline st_index_t st_hash_end(st_index_t h) {
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
+    return h;
+}
+static inline st_index_t st_hash_start(st_index_t h) { return h ^ 0x2545f4914f6cdd1dULL; }
+static inline st_index_t st_hash(const void *ptr, size_t len, st_index_t h) {
+    const unsigned char *p = (const unsigned char *)ptr;
+    st_index_t x = h ^ 0xcbf29ce484222325ULL;
+    for (size_t k = 0; k < len; k++) { x ^= p[k]; x *= 0x100000001b3ULL; }
+    return st_hash_end(x);
+}
+static inline st_index_t rb_memhash(const void *ptr, long len) { return st_hash(ptr, (size_t)len, 0); }
+static inline st_index_t rb_hash_start(st_index_t h) { return st_hash_start(h); }
+#define rb_hash_uint32(h, i) st_hash_uint32((h), (i))
+#define rb_hash_uint(h, i) st_hash_uint((h), (i))
+#define rb_hash_end(h) st_hash_end(h)
 VALUE rb_str_length(VALUE s);
 long rb_str_strlen(VALUE s);
 VALUE rb_str_intern(VALUE s);
@@ -941,9 +973,12 @@ void ruby_xfree(void *p);
 #define xfree ruby_xfree
 #define ALLOC(type) ((type *)ruby_xmalloc(sizeof(type)))
 #define ALLOC_N(type, n) ((type *)ruby_xmalloc2((n), sizeof(type)))
+#define RB_ALLOC(type) ALLOC(type)
+#define RB_ALLOC_N(type, n) ALLOC_N(type, n)
 #define ZALLOC(type) ((type *)ruby_xcalloc(1, sizeof(type)))
 #define ZALLOC_N(type, n) ((type *)ruby_xcalloc((n), sizeof(type)))
 #define REALLOC_N(var, type, n) ((var) = (type *)ruby_xrealloc2((void *)(var), (n), sizeof(type)))
+#define RB_REALLOC_N(var, type, n) REALLOC_N(var, type, n)
 #define ALLOCA_N(type, n) ((type *)__builtin_alloca(sizeof(type) * (n)))
 #define ALLOCV(v, n) ((v) = 0, __builtin_alloca(n))
 #define ALLOCV_N(type, v, n) ((v) = 0, (type *)__builtin_alloca(sizeof(type) * (n)))
@@ -997,6 +1032,7 @@ int rb_during_gc(void);
 
 /* threads (Kenny runs C extension code like any native method; no GVL to release) */
 void *rb_thread_call_without_gvl(void *(*func)(void *), void *data1, void (*ubf)(void *), void *data2);
+int ruby_thread_has_gvl_p(void);
 void *rb_thread_call_without_gvl2(void *(*func)(void *), void *data1, void (*ubf)(void *), void *data2);
 void *rb_thread_call_with_gvl(void *(*func)(void *), void *data1);
 void *rb_nogvl(void *(*func)(void *), void *data1, void (*ubf)(void *), void *data2, int flags);
@@ -1021,6 +1057,23 @@ VALUE rb_time_new(time_t sec, long usec);
 VALUE rb_time_nano_new(time_t sec, long nsec);
 struct timeval rb_time_timeval(VALUE time);
 struct timespec rb_time_timespec(VALUE time);
+/* offset: seconds east of UTC, INT_MAX for local time, INT_MAX-1 for UTC */
+VALUE rb_time_timespec_new(const struct timespec *ts, int offset);
+int rb_obj_method_arity(VALUE obj, ID mid);
+int rb_mod_method_arity(VALUE mod, ID mid);
+/* whether klass has the method (ex: public and protected ones only) */
+int rb_method_boundp(VALUE klass, ID mid, int ex);
+VALUE rb_call_super(int argc, const VALUE *argv);
+VALUE rb_obj_method(VALUE obj, VALUE name);
+VALUE rb_sym_to_s(VALUE sym);
+void rb_copy_generic_ivar(VALUE clone, VALUE obj);
+/* waiting on an IO (rb_io_wait: the events ready, or false on timeout) */
+enum rb_io_event { RUBY_IO_READABLE = 1, RUBY_IO_PRIORITY = 2, RUBY_IO_WRITABLE = 4 };
+VALUE rb_io_wait(VALUE io, VALUE events, VALUE timeout);
+void rb_ivar_foreach(VALUE obj, int (*func)(ID key, VALUE val, st_data_t arg), st_data_t arg);
+st_index_t rb_ivar_count(VALUE obj);
+VALUE rb_check_symbol_cstr(const char *ptr, long len, rb_encoding *enc);
+#define rb_array_len(a) RARRAY_LEN(a)
 
 #ifdef __cplusplus
 }

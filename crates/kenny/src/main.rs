@@ -378,6 +378,21 @@ fn build(o: &Opts, out: &Path) -> Result<bool, String> {
         // the binary can precompile its own assets (see precompile_assets)
         opts.embed_files.push(work.join("overlay/kenny/assets_precompile.rb"));
     }
+    // the C extensions, and the Ruby files their C code requires (oj's Init_oj does
+    // `rb_require("date")`): compiled in, as the program's own requires are
+    let exts = match ext_list(o, &gem_exts, &work) {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(e);
+        }
+    };
+    for f in cext::required_features(&exts) {
+        let found = opts.load_paths.iter().map(|d| d.join(format!("{f}.rb"))).find(|p| p.is_file());
+        if let Some(p) = found.filter(|p| !opts.embed_files.contains(p)) {
+            opts.embed_files.push(p);
+        }
+    }
     let compiled = match kenny_compiler::compile_file_with(&o.src, &opts) {
         Ok(c) => c,
         Err(errs) => {
@@ -398,7 +413,6 @@ fn build(o: &Opts, out: &Path) -> Result<bool, String> {
     std::fs::write(&obj, &compiled.object).map_err(|e| format!("{}: {e}", obj.display()))?;
     let result = (|| {
         let mut objs = vec![obj.clone()];
-        let exts = ext_list(o, &gem_exts, &work)?;
         let mut exts = if exts.is_empty() { None } else { Some(cext::compile(exts, &work, RUBY_H, CAPI_SHIM)?) };
         if assets {
             objs.push(ext_stub(&work, "kenny_assets")?);

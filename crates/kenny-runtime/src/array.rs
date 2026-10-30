@@ -293,7 +293,15 @@ fn kahan_sum(init: V, vals: &[V]) -> V {
             let mut sum = crate::fmt::num_to_f(acc).unwrap();
             let mut c = 0.0;
             while i < vals.len() {
-                let Some(f) = crate::fmt::num_to_f(vals[i]) else { break };
+                // (Rationals join the Float sum, as in CRuby; anything else is added with `+`)
+                let f = match crate::fmt::num_to_f(vals[i]) {
+                    Some(f) => f,
+                    None if crate::rational::is_rational(vals[i]) => match crate::fmt::num_to_f(tri!(send0(vals[i], "to_f"))) {
+                        Some(f) => f,
+                        None => break,
+                    },
+                    None => break,
+                };
                 i += 1;
                 // (as CRuby: NaN and infinities skip the compensation, which they'd turn into
                 // NaN: `[1, Float::INFINITY].sum` is Infinity)
@@ -320,6 +328,12 @@ fn kahan_sum(init: V, vals: &[V]) -> V {
                 sum = t;
             }
             acc = float_new(if sum.is_finite() { sum + c } else { sum });
+            if i == vals.len() {
+                break;
+            }
+            // a non-Float-able value (a Complex, ...): `+` on it, then on
+            acc = tri!(send1(acc, "+", vals[i]));
+            i += 1;
             continue;
         }
         acc = tri!(if is_fix(acc) || is_big(acc) { arith(Op::Add, acc, x) } else { send1(acc, "+", x) });

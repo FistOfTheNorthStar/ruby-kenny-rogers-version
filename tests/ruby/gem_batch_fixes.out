@@ -1,0 +1,52 @@
+"http://"
+true
+"a"
+nil
+RegexpError
+1
+"a!c"
+["a", "b"]
+"boom"
+{a: 1}
+:b
+"no key is available"
+"no receiver is available"
+"unknown keyword: :foo"
+:zz
+{}
+Date
+true
+Time
+true
+Rational
+"no implicit conversion of Range into Integer"
+true
+"fake<1>"
+"fake<1>"
+"my_class"
+"my_class"
+nil
+"the temporary name must not be a constant path to avoid confusion"
+"the temporary name must not be a constant path to avoid confusion"
+"empty class/module name"
+nil
+"TempNamedClass"
+"can't change permanent name"
+"outer<x>::Inner"
+"TempNamedOuter"
+"#<Module:0xX>"
+"#<Module:0xX>"
+"#<Module:0xX>::I"
+"undefined method 'new' for module #<Module:0xX>"
+1
+2
+4
+4
+nil
+nil
+1
+1
+true
+true
+true
+nil

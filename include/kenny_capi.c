@@ -1180,6 +1180,8 @@ void *rb_thread_call_without_gvl2(void *(*func)(void *), void *data1, void (*ubf
   return rb_thread_call_without_gvl(func, data1, ubf, data2);
 }
 void *rb_thread_call_with_gvl(void *(*func)(void *), void *data1) { return func(data1); }
+/* (the functions given rb_thread_call_without_gvl run as they are: the GVL is never released) */
+int ruby_thread_has_gvl_p(void) { return 1; }
 void *rb_nogvl(void *(*func)(void *), void *data1, void (*ubf)(void *), void *data2, int flags) {
   (void)flags;
   return rb_thread_call_without_gvl(func, data1, ubf, data2);
@@ -1203,6 +1205,60 @@ VALUE rb_mutex_synchronize(VALUE m, VALUE (*func)(VALUE), VALUE arg) {
 VALUE rb_time_new(time_t sec, long usec) { return rb_funcall(rb_cTime, rb_intern("at"), 2, LL2NUM((long long)sec), LONG2NUM(usec)); }
 VALUE rb_time_nano_new(time_t sec, long nsec) {
   return rb_funcall(rb_cTime, rb_intern("at"), 3, LL2NUM((long long)sec), LONG2NUM(nsec), ID2SYM(rb_intern("nsec")));
+}
+VALUE rb_time_timespec_new(const struct timespec *ts, int offset) {
+  VALUE t = rb_time_nano_new(ts->tv_sec, ts->tv_nsec);
+  if (offset == INT_MAX - 1) return rb_funcall(t, rb_intern("utc"), 0);
+  if (offset != INT_MAX) return rb_funcall(t, rb_intern("localtime"), 1, INT2NUM(offset));
+  return t;
+}
+int rb_obj_method_arity(VALUE obj, ID mid) {
+  return NUM2INT(rb_funcall(rb_funcall(obj, rb_intern("method"), 1, ID2SYM(mid)), rb_intern("arity"), 0));
+}
+int rb_mod_method_arity(VALUE mod, ID mid) {
+  return NUM2INT(rb_funcall(rb_funcall(mod, rb_intern("instance_method"), 1, ID2SYM(mid)), rb_intern("arity"), 0));
+}
+VALUE rb_obj_method(VALUE obj, VALUE name) { return rb_funcall(obj, rb_intern("method"), 1, name); }
+VALUE rb_sym_to_s(VALUE sym) { return rb_funcall(sym, rb_intern("to_s"), 0); }
+void rb_copy_generic_ivar(VALUE clone, VALUE obj) {
+  VALUE names = rb_funcall(obj, rb_intern("instance_variables"), 0);
+  for (long i = 0; i < RARRAY_LEN(names); i++) {
+    ID id = SYM2ID(rb_ary_entry(names, i));
+    rb_ivar_set(clone, id, rb_ivar_get(obj, id));
+  }
+}
+VALUE rb_io_wait(VALUE io, VALUE events, VALUE timeout) {
+  int ev = NUM2INT(events);
+  VALUE one = rb_ary_new_from_args(1, io);
+  VALUE r = rb_funcall(rb_cIO, rb_intern("select"), 4, (ev & (RUBY_IO_READABLE | RUBY_IO_PRIORITY)) ? one : rb_ary_new(),
+                       (ev & RUBY_IO_WRITABLE) ? one : rb_ary_new(), Qnil, timeout);
+  if (NIL_P(r)) return Qfalse;
+  int ready = 0;
+  if (RARRAY_LEN(rb_ary_entry(r, 0)) > 0) ready |= ev & (RUBY_IO_READABLE | RUBY_IO_PRIORITY);
+  if (RARRAY_LEN(rb_ary_entry(r, 1)) > 0) ready |= RUBY_IO_WRITABLE;
+  return INT2NUM(ready);
+}
+int rb_method_boundp(VALUE klass, ID mid, int ex) {
+  VALUE name = ID2SYM(mid);
+  if (RTEST(rb_funcall(klass, rb_intern("method_defined?"), 1, name))) return 1;
+  return !ex && RTEST(rb_funcall(klass, rb_intern("private_method_defined?"), 1, name));
+}
+void rb_ivar_foreach(VALUE obj, int (*func)(ID key, VALUE val, st_data_t arg), st_data_t arg) {
+  VALUE names = rb_funcall(obj, rb_intern("instance_variables"), 0);
+  long n = RARRAY_LEN(names);
+  for (long i = 0; i < n; i++) {
+    ID id = SYM2ID(rb_ary_entry(names, i));
+    int r = func(id, rb_ivar_get(obj, id), arg);
+    if (r == ST_STOP) break;
+  }
+}
+st_index_t rb_ivar_count(VALUE obj) {
+  return (st_index_t)RARRAY_LEN(rb_funcall(obj, rb_intern("instance_variables"), 0));
+}
+/* (CRuby returns nil for a name no Symbol has; Kenny interns it) */
+VALUE rb_check_symbol_cstr(const char *ptr, long len, rb_encoding *enc) {
+  (void)enc;
+  return ID2SYM(rb_intern2(ptr, len));
 }
 struct timespec rb_time_timespec(VALUE time) {
   struct timespec t;

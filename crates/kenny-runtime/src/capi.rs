@@ -59,7 +59,7 @@ pub fn require_ext(name: &str) -> Option<V> {
         return Some(QFALSE);
     }
     LOADED_EXTS.get().push(feature);
-    enter_frame(sym("require"), rt().main_obj);
+    enter_frame(sym("require"), rt().main_obj, std::ptr::null_mut());
     if CFUNC_CALLER.get().is_some() {
         // (through the C shim: an exception the Init function raises longjmps back to it)
         let _ = crate::core::call_native_c(init as *const c_void, 0, QNIL, &[]);
@@ -119,7 +119,7 @@ globals!(
     rb_eArgError, rb_eTypeError, rb_eNameError, rb_eNoMethodError, rb_eIndexError, rb_eKeyError, rb_eRangeError,
     rb_eZeroDivError, rb_eNotImpError, rb_eIOError, rb_eStopIteration, rb_eFrozenError, rb_eNoMemError,
     rb_eScriptError, rb_eFloatDomainError, rb_eEncodingError, rb_eLocalJumpError, rb_eSecurityError,
-    rb_cBinding, rb_cComplex, rb_cData, rb_cDir, rb_cEncoding, rb_cEnumerator, rb_cFile, rb_cMatch, rb_cMethod, rb_cRandom, rb_cRational, rb_cRegexp, rb_cSet, rb_cThread, rb_cUnboundMethod, rb_eEncCompatError, rb_eEOFError, rb_eFatal, rb_eInterrupt, rb_eLoadError, rb_eMathDomainError, rb_eNoMatchingPatternError, rb_eNoMatchingPatternKeyError, rb_eRegexpError, rb_eSignal, rb_eSyntaxError, rb_eSystemCallError, rb_eSystemExit, rb_eThreadError, rb_mErrno, rb_mGC, rb_mMath, rb_mProcess,
+    rb_cBinding, rb_cComplex, rb_cData, rb_cDir, rb_cEncoding, rb_cEnumerator, rb_cFile, rb_cMatch, rb_cMethod, rb_cRandom, rb_cRational, rb_cRegexp, rb_cSet, rb_cThread, rb_cUnboundMethod, rb_eEncCompatError, rb_eEOFError, rb_eFatal, rb_eInterrupt, rb_eLoadError, rb_eMathDomainError, rb_eNoMatchingPatternError, rb_eNoMatchingPatternKeyError, rb_eRegexpError, rb_eSignal, rb_eSyntaxError, rb_eSystemCallError, rb_eSystemExit, rb_eThreadError, rb_mErrno, rb_mGC, rb_mMath, rb_mProcess, rb_eSysStackError,
 );
 
 pub fn init() {
@@ -207,6 +207,7 @@ pub fn init() {
         rb_eRegexpError = path("RegexpError");
         rb_eSignal = path("SignalException");
         rb_eSyntaxError = path("SyntaxError");
+        rb_eSysStackError = path("SystemStackError");
         rb_eSystemCallError = path("SystemCallError");
         rb_eSystemExit = path("SystemExit");
         rb_eThreadError = path("ThreadError");
@@ -705,6 +706,8 @@ pub unsafe extern "C" fn rb_str_new_with_class(obj: V, p: *const c_char, len: c_
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_capacity(s: V) -> usize {
+    // (C code that asks may write up to it: see `filling`)
+    filling(s, true);
     rstr(s).b.capacity()
 }
 /// (CRuby: a byte range of the String, sharing its buffer; here a copy)
@@ -735,9 +738,39 @@ pub extern "C" fn rb_str_hash(s: V) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_capi_str_reserve(s: V, extra: c_long) {
     rstr(s).b.reserve(extra.max(0) as usize);
+    filling(s, true);
+}
+
+/// Strings C code is filling past their length (after rb_str_modify_expand or
+/// rb_str_buf_new, until rb_str_set_len): RSTRING_PTR then leaves the bytes after the length
+/// alone instead of writing the terminator there. (The string, and its buffer: an entry whose
+/// buffer moved is stale.)
+static FILLING: std::sync::Mutex<Option<rustc_hash::FxHashMap<V, usize>>> = std::sync::Mutex::new(None);
+static FILLING_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn filling(s: V, on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !on && FILLING_N.load(Relaxed) == 0 {
+        return;
+    }
+    let mut g = FILLING.lock().unwrap();
+    let m = g.get_or_insert_with(Default::default);
+    if on {
+        m.insert(s, rstr(s).b.as_ptr() as usize);
+    } else {
+        m.remove(&s);
+    }
+    FILLING_N.store(m.len(), Relaxed);
+}
+fn is_filling(s: V) -> bool {
+    if FILLING_N.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let g = FILLING.lock().unwrap();
+    g.as_ref().and_then(|m| m.get(&s)).is_some_and(|&p| p == rstr(s).b.as_ptr() as usize)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_resize(s: V, len: c_long) -> V {
+    filling(s, false);
     rstr(s).b.resize(len.max(0) as usize, 0);
     s
 }
@@ -745,6 +778,7 @@ pub extern "C" fn rb_str_resize(s: V, len: c_long) -> V {
 /// its capacity; growing past it zero-fills).
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_set_len(s: V, len: c_long) {
+    filling(s, false);
     let b = &mut rstr(s).b;
     let len = len.max(0) as usize;
     if len <= b.capacity() {
@@ -752,17 +786,24 @@ pub extern "C" fn rb_str_set_len(s: V, len: c_long) {
     } else {
         b.resize(len, 0);
     }
+    // (the terminator, as CRuby's)
+    b.reserve(1);
+    unsafe { *b.as_mut_ptr().add(b.len()) = 0 };
 }
 /// An empty ASCII-8BIT String with room for `cap` bytes.
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_buf_new(cap: c_long) -> V {
     let s = str_new(Vec::with_capacity(cap.max(0) as usize + 1));
     set_enc_index(s, ENC_BINARY);
+    filling(s, true);
     s
 }
 /// RSTRING_PTR: a NUL-terminated view of the bytes (capacity reserved for the terminator).
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_kn_rstring_ptr(s: V) -> *mut c_char {
+    if is_filling(s) && rstr(s).b.len() < rstr(s).b.capacity() {
+        return rstr(s).b.as_mut_ptr() as *mut c_char;
+    }
     let b = &mut rstr(s).b;
     b.reserve(1);
     unsafe { *b.as_mut_ptr().add(b.len()) = 0 };
@@ -1202,11 +1243,12 @@ pub extern "C" fn rb_attr_get(obj: V, id: V) -> V {
 // ---------- the running C method (rb_frame_this_func, rb_current_receiver) ----------
 
 thread_local! {
-    static FRAMES: std::cell::RefCell<Vec<(u32, V)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FRAMES: std::cell::RefCell<Vec<(u32, V, *mut Class)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-/// A C method is called (its name and receiver; the receiver is also on the caller's stack).
-pub fn enter_frame(name: u32, recv: V) {
-    FRAMES.with(|f| f.borrow_mut().push((name, recv)));
+/// A C method is called (its name, receiver and owner; the receiver is also on the caller's
+/// stack, the owner is a class).
+pub fn enter_frame(name: u32, recv: V, owner: *mut Class) {
+    FRAMES.with(|f| f.borrow_mut().push((name, recv, owner)));
 }
 pub fn leave_frame() {
     FRAMES.with(|f| f.borrow_mut().pop());
@@ -1218,6 +1260,21 @@ pub extern "C" fn rb_frame_this_func() -> V {
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_frame_callee() -> V {
     rb_frame_this_func()
+}
+/// `super` from the running C method (with its arguments and block).
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_call_super(argc: c_int, argv: *const V) -> V {
+    let Some((mid, recv, owner)) = FRAMES.with(|f| f.borrow().last().copied()) else {
+        return raise(rt().c.runtime_error, "super called outside of method");
+    };
+    let args: &[V] = if argc <= 0 || argv.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(argv, argc as usize) } };
+    let m = crate::core::find_super_method(recv, owner, mid);
+    if m.is_null() || owner.is_null() {
+        let d = crate::core::describe_recv(recv);
+        return raise(rt().c.no_method_error, &format!("super: no superclass method '{}' for {d}", sym_str(mid)));
+    }
+    let blk = pst().current_block.last().copied().unwrap_or(QNIL);
+    crate::core::invoke(m, recv, args, blk)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_current_receiver() -> V {

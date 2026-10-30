@@ -183,7 +183,7 @@ pub fn class_new_instance(c: V, args: &[V], blk: V) -> V {
     let k = c as *mut Class;
     unsafe {
         if (*k).is_module {
-            return raise(rt().c.no_method_error, &format!("undefined method 'new' for module {}", (*k).name));
+            return raise(rt().c.no_method_error, &format!("undefined method 'new' for module {}", class_name(k)));
         }
     }
     let o = tri!(alloc_instance(k));
@@ -1117,6 +1117,37 @@ pub fn init() {
         let c = rclass(s);
         if c.name.is_empty() || c.is_singleton { QNIL } else { str_from(&c.name.clone()) }
     });
+    // Module#set_temporary_name(name or nil) (Ruby 3.3+)
+    defn(md, "set_temporary_name", 1, 1, |s, a, _| {
+        let c = rclass(s);
+        let k = s as *mut Class;
+        if c.is_singleton || (!c.name.is_empty() && !crate::core::temp_named(k)) {
+            return raise(rt().c.runtime_error, "can't change permanent name");
+        }
+        if a[0] == QNIL {
+            c.name.clear();
+            crate::core::set_temp_named(k, false);
+            return s;
+        }
+        let name = match crate::string::want_str(a[0]) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => return e,
+        };
+        if name.is_empty() {
+            return arg_error("empty class/module name");
+        }
+        let const_seg = |seg: &str| {
+            let mut cs = seg.chars();
+            cs.next().is_some_and(|f| f.is_uppercase()) && cs.all(|ch| ch.is_alphanumeric() || ch == '_' || !ch.is_ascii())
+        };
+        let path = name.strip_prefix("::").unwrap_or(&name);
+        if path.split("::").all(const_seg) {
+            return arg_error("the temporary name must not be a constant path to avoid confusion");
+        }
+        c.name = name;
+        crate::core::set_temp_named(k, true);
+        s
+    });
     defn(md, "to_s", 0, 0, |s, _, _| new_str_v(class_name(s as *mut Class)));
     defn(md, "inspect", 0, 0, |s, _, _| new_str_v(class_name(s as *mut Class)));
     defn(md, "hash", 0, 0, |s, _, _| mkfix((s >> 3) as i64));
@@ -1722,8 +1753,35 @@ pub fn init() {
     });
     defs(ex, "exception", 0, -1, |s, a, b| class_new_instance(s, a, b));
     defn(c.stop_iteration, "result", 0, 0, |s, _, _| ivar_get(s, sym("@__result")));
-    defn(c.key_error, "key", 0, 0, |s, _, _| ivar_get(s, sym("@key")));
-    defn(c.key_error, "receiver", 0, 0, |s, _, _| ivar_get(s, sym("@receiver")));
+    // KeyError.new(msg = nil, receiver: obj, key: k); #key / #receiver raise when not given
+    defn(c.key_error, "initialize", 0, -1, |s, a, _| {
+        let mut a = a.to_vec();
+        if a.last().is_some_and(|x| is_hash(*x) && hdr(*x).flags & FL_KWHASH != 0) {
+            let h = a.pop().unwrap();
+            for (k, v) in crate::hash::pairs(h).iter().copied() {
+                match if is_sym(k) { sym_name(sym_id(k)) } else { b"" } {
+                    b"receiver" => {
+                        ivar_set(s, sym("@receiver"), v);
+                    }
+                    b"key" => {
+                        ivar_set(s, sym("@key"), v);
+                    }
+                    _ => return arg_error(&format!("unknown keyword: {}", crate::fmt::inspect_lossy(k))),
+                }
+            }
+        }
+        if a.len() > 1 {
+            return arg_error(&format!("wrong number of arguments (given {}, expected 0..1)", a.len()));
+        }
+        ivar_set(s, sym("@__message"), a.first().copied().unwrap_or(QNIL));
+        QNIL
+    });
+    defn(c.key_error, "key", 0, 0, |s, _, _| {
+        if ivar_defined(s, sym("@key")) { ivar_get(s, sym("@key")) } else { arg_error("no key is available") }
+    });
+    defn(c.key_error, "receiver", 0, 0, |s, _, _| {
+        if ivar_defined(s, sym("@receiver")) { ivar_get(s, sym("@receiver")) } else { arg_error("no receiver is available") }
+    });
     let le = const_lookup(rt().c.object, sym("LoadError")).unwrap() as *mut Class;
     defn(le, "path", 0, 0, |s, _, _| ivar_get(s, sym("@path")));
     defn(c.name_error, "name", 0, 0, |s, _, _| ivar_get(s, sym("@name")));

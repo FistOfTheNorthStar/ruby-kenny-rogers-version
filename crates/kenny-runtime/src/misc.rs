@@ -224,24 +224,13 @@ fn range_items(r: V) -> Option<Vec<V>> {
         return Some((fix(rg.lo)..=hi).map(mkfix).collect());
     }
     if is_str(rg.lo) && is_str(rg.hi) {
-        let mut out = RVec::new();
-        let end = rstr(rg.hi).b.clone();
-        let mut cur = rg.lo;
-        loop {
-            let cb = rstr(cur).b.clone();
-            if cb.len() > end.len() {
-                break;
-            }
-            if cb == end {
-                if !rg.excl {
-                    out.push(cur);
-                }
-                break;
-            }
-            out.push(cur);
-            cur = send0(cur, "succ");
+        // (String#upto's elements: CRuby's String ranges iterate with it)
+        let en = send(rg.lo, sym("enum_for"), &[mksym(sym("upto")), rg.hi, bool_v(rg.excl)], QNIL);
+        let a = if en == UNDEF { UNDEF } else { send0(en, "to_a") };
+        if a == UNDEF || !is_ary(a) {
+            return Some(Vec::new());
         }
-        return Some(out.take());
+        return Some(rary(a).v.to_vec());
     }
     None
 }
@@ -762,7 +751,35 @@ pub fn init() {
             Err(e) => e,
         }
     });
-    for name in ["include?", "member?", "===", "cover?"] {
+    // include?/member? of a String range: whether succ from the beginning reaches the value
+    // (CRuby's rb_str_include_range_p), not cover?
+    for name in ["include?", "member?"] {
+        defn(rg, name, 1, 1, |s, a, _| {
+            let r = rrange(s);
+            if is_str(r.lo) && is_str(r.hi) {
+                let v = if is_str(a[0]) {
+                    a[0]
+                } else if is_heap(a[0]) && respond_to(a[0], sym("to_str")) {
+                    tri!(send0(a[0], "to_str"))
+                } else {
+                    return QFALSE;
+                };
+                let en = tri!(send(r.lo, sym("enum_for"), &[mksym(sym("upto")), r.hi, bool_v(r.excl)], QNIL));
+                return send(en, sym("include?"), &[v], QNIL);
+            }
+            if (is_str(r.lo) && r.hi == QNIL) || (r.lo == QNIL && (is_str(r.hi) || r.hi == QNIL)) {
+                return type_error("cannot determine inclusion in beginless/endless ranges");
+            }
+            if is_range(a[0]) {
+                let o = rrange(a[0]);
+                let lo = tri!(range_cover(s, o.lo));
+                let hi = tri!(range_cover(s, o.hi));
+                return bool_v(truthy(lo) && truthy(hi));
+            }
+            range_cover(s, a[0])
+        });
+    }
+    for name in ["===", "cover?"] {
         defn(rg, name, 1, 1, |s, a, _| {
             if is_range(a[0]) {
                 let o = rrange(a[0]);

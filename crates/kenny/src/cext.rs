@@ -37,7 +37,8 @@ impl Ext {
     }
 }
 
-const C_EXTS: &[&str] = &["c", "m"];
+// (".S": assembler sources run through the C preprocessor, e.g. bcrypt's x86.S)
+const C_EXTS: &[&str] = &["c", "m", "S"];
 const CXX_EXTS: &[&str] = &["cc", "cpp", "cxx", "C", "mm"];
 
 fn is_cxx(p: &Path) -> bool {
@@ -204,6 +205,25 @@ pub fn from_gem(gem: &str, dir: &Path, work: &Path) -> Result<Ext, String> {
         e.libs.push(cxx_runtime().into());
     }
     Ok(e)
+}
+
+/// The features the extensions' C code requires by name: `rb_require("date")`.
+pub fn required_features(exts: &[Ext]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for src in exts.iter().flat_map(|e| &e.sources) {
+        let Ok(text) = std::fs::read(src) else { continue };
+        let text = String::from_utf8_lossy(&text);
+        for (i, _) in text.match_indices("rb_require(\"") {
+            let rest = &text[i + "rb_require(\"".len()..];
+            if let Some(end) = rest.find('"') {
+                let f = &rest[..end];
+                if !f.is_empty() && !f.contains('\\') && !out.iter().any(|x| x == f) {
+                    out.push(f.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 fn cxx_runtime() -> &'static str {

@@ -2638,6 +2638,10 @@ pub fn init() {
     const_set(io, sym("SEEK_SET"), mkfix(libc::SEEK_SET as i64));
     const_set(io, sym("SEEK_CUR"), mkfix(libc::SEEK_CUR as i64));
     const_set(io, sym("SEEK_END"), mkfix(libc::SEEK_END as i64));
+    // IO#wait's events
+    const_set(io, sym("READABLE"), mkfix(1));
+    const_set(io, sym("PRIORITY"), mkfix(2));
+    const_set(io, sym("WRITABLE"), mkfix(4));
     for name in ["WaitReadable", "WaitWritable"] {
         let m = new_module(&format!("IO::{name}"));
         const_set(io, sym(name), m as V);
@@ -3082,6 +3086,106 @@ pub fn init() {
             Err(e) => e,
         }
     }
+    // the events (IO::READABLE | IO::PRIORITY | IO::WRITABLE) of `events` the IO is ready for
+    // within the timeout (nil: no limit); 0 when none
+    fn wait_events(s: V, events: i64, timeout: V) -> Result<i64, V> {
+        let stt = st(s)?;
+        stt.check_open()?;
+        // (buffered input is readable now)
+        if events & 1 != 0 && (stt.avail() > 0 || stt.mem.is_some()) {
+            return Ok(1);
+        }
+        let timeout = match Some(timeout).filter(|t| *t != QNIL) {
+            Some(t) => match num_to_f(t) {
+                Some(f) => Some(time_interval(f)?),
+                None => return Err(type_error(&format!("can't convert {} into time interval", class_desc(t)))),
+            },
+            None => None,
+        };
+        let (rfd, wfd) = if stt.std != 0 { (stt.std as i32, stt.std as i32) } else { (stt.fd, stt.wfd) };
+        let rev = (if events & 1 != 0 { libc::POLLIN } else { 0 }) | (if events & 2 != 0 { libc::POLLPRI } else { 0 });
+        let wev = if events & 4 != 0 { libc::POLLOUT } else { 0 };
+        let mut p = Vec::new();
+        if rfd == wfd || wfd < 0 {
+            p.push(libc::pollfd { fd: rfd, events: rev | wev, revents: 0 });
+        } else {
+            if rev != 0 {
+                p.push(libc::pollfd { fd: rfd, events: rev, revents: 0 });
+            }
+            if wev != 0 {
+                p.push(libc::pollfd { fd: wfd, events: wev, revents: 0 });
+            }
+        }
+        let n = poll_wait(&mut p, timeout)?;
+        if n <= 0 {
+            return Ok(0);
+        }
+        let mut ready = 0;
+        for x in &p {
+            let err = x.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+            if events & 1 != 0 && (x.revents & libc::POLLIN != 0 || (err && x.events & libc::POLLIN != 0)) {
+                ready |= 1;
+            }
+            if events & 2 != 0 && x.revents & libc::POLLPRI != 0 && priority_data(x.fd) {
+                ready |= 2;
+            }
+            if events & 4 != 0 && (x.revents & libc::POLLOUT != 0 || (err && x.events & libc::POLLOUT != 0)) {
+                ready |= 4;
+            }
+        }
+        Ok(ready)
+    }
+    // whether fd has exceptional (out-of-band) data: macOS's poll gives POLLPRI with plain
+    // data too, so it's asked of select, as CRuby (which waits with select there) does
+    fn priority_data(fd: i32) -> bool {
+        if !cfg!(target_os = "macos") || !(0..libc::FD_SETSIZE as i32).contains(&fd) {
+            return true;
+        }
+        unsafe {
+            let mut ex: libc::fd_set = std::mem::zeroed();
+            libc::FD_ZERO(&mut ex);
+            libc::FD_SET(fd, &mut ex);
+            let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+            libc::select(fd + 1, std::ptr::null_mut(), std::ptr::null_mut(), &mut ex, &mut tv) > 0
+        }
+    }
+    // IO#wait(events, timeout): the ready events, or nil on timeout; IO#wait(timeout = nil,
+    // mode = :read) (the older form, mode :read, :write or :read_write): self or nil
+    defn(io, "wait", 0, -1, |s, a, _| {
+        let legacy = a.len() != 2 || a.iter().any(|v| is_sym(*v));
+        if !legacy {
+            let ev = ok!(int_arg(a[0]));
+            return match wait_events(s, ev, a[1]) {
+                Ok(0) => QNIL,
+                Ok(r) => mkfix(r),
+                Err(e) => e,
+            };
+        }
+        let mut events = 0;
+        let mut timeout = QNIL;
+        for &v in a {
+            if is_sym(v) {
+                events |= match sym_str(sym_id(v)).as_str() {
+                    "r" | "read" | "readable" => 1,
+                    "w" | "write" | "writable" => 4,
+                    "rw" | "read_write" | "readable_writable" => 5,
+                    m => return arg_error(&format!("unsupported mode: {m}")),
+                };
+            } else {
+                timeout = v;
+            }
+        }
+        match wait_events(s, if events == 0 { 1 } else { events }, timeout) {
+            Ok(0) => QNIL,
+            Ok(_) => s,
+            Err(e) => e,
+        }
+    });
+    defn(io, "wait_priority", 0, 1, |s, a, _| match wait_events(s, 2, a.first().copied().unwrap_or(QNIL)) {
+        Ok(0) => QNIL,
+        Ok(_) => s,
+        Err(e) => e,
+    });
     defn(io, "wait_readable", 0, 1, |s, a, _| wait_ready(s, a, false));
     defn(io, "wait_writable", 0, 1, |s, a, _| wait_ready(s, a, true));
     defn(io, "stat", 0, 0, |s, _, _| {

@@ -13,7 +13,7 @@ fn s_of(v: V) -> String {
     String::from_utf8_lossy(&rstr(v).b).into_owned()
 }
 /// A String argument's bytes, converted with `to_str` (Err: the exception raised).
-fn want_str(v: V) -> Result<Vec<u8>, V> {
+pub(crate) fn want_str(v: V) -> Result<Vec<u8>, V> {
     if is_str(v) {
         return Ok(rstr(v).b.clone());
     }
@@ -1529,18 +1529,67 @@ pub fn init() {
     });
     defn(c, "succ", 0, 0, |s, _, _| str_new(succ(&rstr(s).b)));
     defn(c, "next", 0, 0, |s, _, _| str_new(succ(&rstr(s).b)));
+    // String#upto(end, exclusive = false), as CRuby's rb_str_upto_each: single ASCII
+    // characters by code, digit strings as numbers (zero-padded to the start's width), the
+    // rest by succ until end (or a longer string)
     defn(c, "upto", 1, 2, |s, a, blk| {
-        let end = rstr(a[0]).b.clone();
-        let mut cur = rstr(s).b.clone();
-        loop {
-            if cur.len() > end.len() {
+        if !is_proc(blk) {
+            return crate::misc::enum_for(s, "upto", a);
+        }
+        let end_v = match want_str(a[0]) {
+            Ok(_) if is_str(a[0]) => a[0],
+            Ok(b) => str_new(b),
+            Err(e) => return e,
+        };
+        let excl = a.get(1).is_some_and(|v| truthy(*v));
+        let enc = crate::transcode::enc_of(s);
+        let beg = rstr(s).b.clone();
+        let end = rstr(end_v).b.clone();
+        let out = |b: Vec<u8>| {
+            let v = str_new(b);
+            crate::transcode::set_enc(v, enc);
+            v
+        };
+        if beg.len() == 1 && end.len() == 1 && beg[0].is_ascii() && end[0].is_ascii() {
+            let (b, e) = (beg[0], end[0]);
+            if b > e || (excl && b == e) {
+                return s;
+            }
+            let last = if excl { e - 1 } else { e };
+            for ch in b..=last {
+                tri!(call_block(blk, &[out(vec![ch])]));
+            }
+            return s;
+        }
+        let digits = |x: &[u8]| !x.is_empty() && x.iter().all(|c| c.is_ascii_digit());
+        if digits(&beg) && digits(&end) {
+            let (Ok(b), Ok(e)) = (String::from_utf8_lossy(&beg).parse::<i128>(), String::from_utf8_lossy(&end).parse::<i128>()) else {
+                return s;
+            };
+            let width = beg.len();
+            let mut i = b;
+            while if excl { i < e } else { i <= e } {
+                tri!(call_block(blk, &[out(format!("{i:0width$}").into_bytes())]));
+                i += 1;
+            }
+            return s;
+        }
+        if beg > end || (excl && beg == end) {
+            return s;
+        }
+        let after_end = succ(&end);
+        let mut cur = beg;
+        while cur != after_end {
+            let next = if excl || cur != end { Some(succ(&cur)) } else { None };
+            tri!(call_block(blk, &[out(cur.clone())]));
+            let Some(n) = next else { break };
+            cur = n;
+            if excl && cur == end {
                 break;
             }
-            tri!(call_block(blk, &[str_new(cur.clone())]));
-            if cur == end {
+            if cur.len() > end.len() || cur.is_empty() {
                 break;
             }
-            cur = succ(&cur);
         }
         s
     });

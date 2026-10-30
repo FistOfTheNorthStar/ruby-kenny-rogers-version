@@ -1164,6 +1164,11 @@ pub fn init() {
     let _ = to_re;
 }
 
+/// String#match / match?'s pattern: a String is compiled as a regexp source, not quoted
+/// (CRuby's get_pat; sub, scan, index and the rest take a String literally)
 pub fn pattern_arg(v: V) -> Result<V, V> {
+    if is_str(v) {
+        return tri_r(regexp_new(&rstr(v).b, 0));
+    }
     to_re(v)
 }
