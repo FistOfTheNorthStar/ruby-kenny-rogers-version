@@ -3,8 +3,12 @@
 # Kenny's OpenSSL: the crypto (digests, HMAC, PBKDF2/HKDF, AES-ECB/CBC/CTR/GCM,
 # RSA keys, random bytes) is native Rust (crates/kenny-runtime/src/openssl.rs and
 # openssl_pkey.rs); this file adds the Ruby-level conveniences of the openssl gem
-# on top. TLS sockets, X509 certificates, EC/DSA/DH keys and ASN1 are not provided:
-# their classes and constants exist (gems refer to them when loading), and using
+# on top. OpenSSL::ASN1 and OpenSSL::X509 (certificates, names, extensions, CSRs, CRLs,
+# and a Store that verifies chains as OpenSSL 3.6 does) are Ruby, in kenny/openssl_asn1.rb
+# and kenny/openssl_x509*.rb, with signatures checked natively (openssl_x509.rs); EC keys
+# are public only (kenny/openssl_ec.rb). TLS (SSLContext, SSLSocket) runs on rustls
+# (kenny/openssl_ssl.rb, openssl_tls.rs) under the gem's own openssl/ssl.rb. DSA and DH
+# keys are not provided: their classes exist (gems refer to them when loading), and using
 # them raises NotImplementedError.
 __kenny_openssl_init
 
@@ -214,9 +218,14 @@ module OpenSSL
   end
 
   module PKey
-    class ECError < PKeyError; end
-    class DSAError < PKeyError; end
-    class DHError < PKeyError; end
+    if RUBY_VERSION >= "4"
+      # (the openssl gem 4.0: other names of PKeyError)
+      ECError = DSAError = DHError = PKeyError
+    else
+      class ECError < PKeyError; end
+      class DSAError < PKeyError; end
+      class DHError < PKeyError; end
+    end
 
     # PEM or DER text: a String, an IO (a File), or anything with #to_der
     def self.__kenny_input(data)
@@ -358,8 +367,9 @@ module OpenSSL
       end
     end
 
-    # EC, DSA and DH keys aren't implemented; the classes exist for the gems that name them.
-    { EC: ECError, DSA: DSAError, DH: DHError }.each do |name, _err|
+    # DSA and DH keys aren't implemented; the classes exist for the gems that name them. (EC
+    # public keys, what certificates carry, are in kenny/openssl_ec.rb.)
+    { DSA: DSAError, DH: DHError }.each do |name, _err|
       const_set(name, Class.new(PKey) {
         define_method(:initialize) do |*|
           raise NotImplementedError, "OpenSSL::PKey::#{name} keys are not supported by Kenny (RSA keys are)"
@@ -369,20 +379,6 @@ module OpenSSL
         end
       })
     end
-
-    class EC
-      class Group
-        def initialize(*)
-          raise NotImplementedError, "OpenSSL::PKey::EC::Group is not supported by Kenny"
-        end
-      end
-
-      class Point
-        def initialize(*)
-          raise NotImplementedError, "OpenSSL::PKey::EC::Point is not supported by Kenny"
-        end
-      end
-    end
   end
 end
 
@@ -390,115 +386,12 @@ class Integer
   def to_bn = OpenSSL::BN.new(self)
 end
 
-module OpenSSL
-  # No TLS sockets in Kenny; the classes exist so `io.is_a?(OpenSSL::SSL::SSLSocket)` checks
-  # (nio4r's selector, Net::HTTP) work and gems that name them load.
-  module SSL
-    class SSLError < OpenSSL::OpenSSLError; end unless const_defined?(:SSLError, false)
+# OpenSSL::ASN1 and OpenSSL::X509 (in Ruby, signatures checked natively), then the stdlib's
+# openssl/x509.rb on top, as the gem does
+require "kenny/openssl_asn1"
+require "kenny/openssl_x509"
+require "openssl/x509"
 
-    class SSLErrorWaitReadable < SSLError
-      include IO::WaitReadable
-    end
-
-    class SSLErrorWaitWritable < SSLError
-      include IO::WaitWritable
-    end
-
-    {
-      OP_ALL: 0x80000850, OP_LEGACY_SERVER_CONNECT: 4, OP_TLSEXT_PADDING: 16, OP_SAFARI_ECDHE_ECDSA_BUG: 64,
-      OP_IGNORE_UNEXPECTED_EOF: 128, OP_ALLOW_CLIENT_RENEGOTIATION: 256, OP_DISABLE_TLSEXT_CA_NAMES: 512,
-      OP_ALLOW_NO_DHE_KEX: 1024, OP_DONT_INSERT_EMPTY_FRAGMENTS: 2048, OP_NO_TICKET: 16384,
-      OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION: 65536, OP_NO_COMPRESSION: 131072,
-      OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION: 262144, OP_NO_ENCRYPT_THEN_MAC: 524288,
-      OP_ENABLE_MIDDLEBOX_COMPAT: 1048576, OP_PRIORITIZE_CHACHA: 2097152, OP_CIPHER_SERVER_PREFERENCE: 4194304,
-      OP_TLS_ROLLBACK_BUG: 8388608, OP_NO_ANTI_REPLAY: 16777216, OP_NO_SSLv3: 33554432, OP_NO_TLSv1: 67108864,
-      OP_NO_TLSv1_2: 134217728, OP_NO_TLSv1_1: 268435456, OP_NO_TLSv1_3: 536870912, OP_NO_RENEGOTIATION: 1073741824,
-      OP_NO_SSLv2: 0, OP_SINGLE_DH_USE: 0, OP_SINGLE_ECDH_USE: 0, OP_EPHEMERAL_RSA: 0,
-      SSL3_VERSION: 768, TLS1_VERSION: 769, TLS1_1_VERSION: 770, TLS1_2_VERSION: 771, TLS1_3_VERSION: 772
-    }.each { |k, v| const_set(k, v) unless const_defined?(k, false) }
-
-    class SSLSocket
-      def initialize(*)
-        raise NotImplementedError, "TLS sockets (OpenSSL::SSL::SSLSocket) are not supported by Kenny"
-      end
-    end
-
-    class SSLContext
-      def initialize(*)
-        raise NotImplementedError, "TLS (OpenSSL::SSL::SSLContext) is not supported by Kenny"
-      end
-    end unless const_defined?(:SSLContext, false)
-  end
-
-  # No certificate handling in Kenny. A Store records what it's given (httpclient and
-  # aws-sdk build one up front); parsing or verifying certificates raises NotImplementedError.
-  module X509
-    class CertificateError < OpenSSLError; end
-    class CRLError < OpenSSLError; end
-    class StoreError < OpenSSLError; end
-    class NameError < OpenSSLError; end
-    class ExtensionError < OpenSSLError; end
-    class RequestError < OpenSSLError; end
-
-    DEFAULT_CERT_AREA = "/etc/ssl"
-    DEFAULT_CERT_FILE = "/etc/ssl/cert.pem"
-    DEFAULT_CERT_DIR = "/etc/ssl/certs"
-    DEFAULT_CERT_FILE_ENV = "SSL_CERT_FILE"
-    DEFAULT_CERT_DIR_ENV = "SSL_CERT_DIR"
-    V_OK = 0
-    V_ERR_CERT_HAS_EXPIRED = 10
-    V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT = 18
-    V_ERR_SELF_SIGNED_CERT_IN_CHAIN = 19
-    V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY = 20
-    V_ERR_HOSTNAME_MISMATCH = 62
-    V_FLAG_CRL_CHECK = 4
-    V_FLAG_CRL_CHECK_ALL = 8
-    V_FLAG_PARTIAL_CHAIN = 0x80000
-    PURPOSE_SSL_CLIENT = 1
-    PURPOSE_SSL_SERVER = 2
-    PURPOSE_ANY = 7
-
-    def self.__kenny_unsupported(what)
-      raise NotImplementedError, "#{what} is not supported by Kenny"
-    end
-
-    class Store
-      attr_accessor :verify_callback
-      attr_reader :error, :error_string, :chain
-      attr_writer :flags, :purpose, :trust, :time
-
-      def initialize
-        @error = V_OK
-        @error_string = "ok"
-        @chain = nil
-      end
-
-      def set_default_paths = self
-      def add_file(_path) = self
-      def add_path(_path) = self
-      def add_cert(_cert) = self
-      def add_crl(_crl) = self
-      def verify(*) = X509.__kenny_unsupported("Certificate verification (OpenSSL::X509::Store#verify)")
-    end
-
-    class Certificate
-      def initialize(*args)
-        X509.__kenny_unsupported("OpenSSL::X509::Certificate") unless args.empty?
-      end
-    end
-
-    class CRL
-      def initialize(*args)
-        X509.__kenny_unsupported("OpenSSL::X509::CRL") unless args.empty?
-      end
-    end
-
-    class StoreContext
-      def initialize(*) = X509.__kenny_unsupported("OpenSSL::X509::StoreContext")
-    end
-
-    %i[Name Extension ExtensionFactory Request Attribute Revoked].each do |n|
-      const_set(n, Class.new { define_method(:initialize) { |*| X509.__kenny_unsupported("OpenSSL::X509::#{n}") } })
-    end
-  end
-end
+# TLS: openssl.so's half (lib/kenny/kenny/openssl_ssl.rb), then the openssl gem's own Ruby half
+require "kenny/openssl_ssl"
+require "openssl/ssl"

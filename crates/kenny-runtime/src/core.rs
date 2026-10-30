@@ -154,6 +154,10 @@ pub const FL_PROC_KW: u32 = 256;
 /// String flag: frozen and ASCII-only, known (string.rs `ascii_only`; a frozen String's
 /// bytes never change, so this stays true).
 pub const FL_STR_ASCII: u32 = 1 << 12;
+/// String flag: a chilled literal (a literal in a file without a `frozen_string_literal`
+/// comment, as in CRuby 3.4 and 4.0): not frozen, but its first change clears the flag and,
+/// with `Warning[:deprecated]` on, warns that literals will be frozen (`unchill`).
+pub const FL_CHILLED: u32 = 1 << 13;
 
 #[repr(C)]
 pub struct Header {
@@ -409,6 +413,30 @@ fn header(klass: *mut Class, kind: Kind) -> Header {
 pub fn str_new(b: Vec<u8>) -> V {
     alloc(RString { h: header(rt().c.string, Kind::String), b: SVec::from(b), iv: GenIv::new() })
 }
+/// A chilled String literal (FL_CHILLED) of the `n` bytes at `p`, which it shares until its
+/// first change (svec.rs `shared`).
+///
+/// # Safety
+/// The bytes must stay valid and unchanged for the rest of the run.
+pub unsafe fn str_chilled(p: *const u8, n: usize) -> V {
+    let v = unsafe { str_shared(p, n) };
+    hdr(v).flags |= FL_CHILLED;
+    v
+}
+/// A String of the `n` bytes at `p`, shared until it is changed (svec.rs `shared`).
+///
+/// # Safety
+/// The bytes must stay valid and unchanged for the rest of the run.
+pub unsafe fn str_shared(p: *const u8, n: usize) -> V {
+    alloc(RString { h: header(rt().c.string, Kind::String), b: unsafe { SVec::shared(p, n) }, iv: GenIv::new() })
+}
+/// A plain String of `v`'s bytes: shares them when `v`'s are a literal's (svec.rs `share`).
+pub fn str_copy(v: V) -> V {
+    match rstr(v).b.share() {
+        Some(b) => alloc(RString { h: header(rt().c.string, Kind::String), b, iv: GenIv::new() }),
+        None => str_new(rstr(v).b.clone()),
+    }
+}
 pub fn str_from(s: &str) -> V {
     str_new(s.as_bytes().to_vec())
 }
@@ -535,7 +563,7 @@ fn not_a_tail_call() {
 }
 /// C extension functions running on any thread (see call_native).
 pub static C_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-fn call_native_c(f: *const std::ffi::c_void, arity: i32, recv: V, args: &[V]) -> V {
+pub fn call_native_c(f: *const std::ffi::c_void, arity: i32, recv: V, args: &[V]) -> V {
     C_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let r = crate::capi::call_cfunc(f, arity, recv, args);
     C_CALLS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -598,6 +626,8 @@ pub unsafe fn args_slice<'a>(argc: u64, argv: *const V) -> &'a [V] {
 pub fn is_frozen(v: V) -> bool {
     !is_heap(v) || hdr(v).flags & FL_FROZEN != 0
 }
+/// Before changing `v`: FrozenError if it is frozen, else nil (and a chilled String stops
+/// being one: `unchill`).
 pub fn check_frozen(v: V) -> V {
     if is_frozen(v) {
         let msg = format!("can't modify frozen {}: {}", class_name(class_of(v)), crate::fmt::inspect_lossy(v));
@@ -605,7 +635,31 @@ pub fn check_frozen(v: V) -> V {
         ivar_set(e, sym("@__receiver"), v);
         return raise_exc(e);
     }
+    unchill(v);
     QNIL
+}
+/// `v` is a chilled String literal (FL_CHILLED).
+#[inline(always)]
+pub fn is_chilled(v: V) -> bool {
+    is_heap(v) && hdr(v).flags & FL_CHILLED != 0
+}
+/// `v` (not frozen) is about to change: a chilled String becomes a plain one, warning first
+/// when `Warning[:deprecated]` is on, as CRuby does.
+#[inline(always)]
+pub fn unchill(v: V) {
+    if is_chilled(v) {
+        unchill_slow(v);
+    }
+}
+#[cold]
+#[inline(never)]
+fn unchill_slow(v: V) {
+    hdr(v).flags &= !FL_CHILLED;
+    if crate::io::warn_deprecated() {
+        let loc = current_loc().map(|l| format!("{l}: ")).unwrap_or_default();
+        let msg = str_from(&format!("{loc}warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)\n"));
+        crate::io::warn_category(msg, "deprecated");
+    }
 }
 
 // ---------- symbols ----------
@@ -649,6 +703,17 @@ fn sym_probe(t: &SymTable, h: u64, name: &[u8]) -> Result<u32, usize> {
     }
 }
 pub fn intern(name: &[u8]) -> u32 {
+    // The one-character names come first, so a symbol's id is its character, as CRuby's IDs
+    // are: C extensions call operators by char (`rb_funcall(x, '+', 1, y)`).
+    static ONE_CHAR: std::sync::Once = std::sync::Once::new();
+    ONE_CHAR.call_once(|| {
+        for c in 0..128u8 {
+            intern_name(&[c]);
+        }
+    });
+    intern_name(name)
+}
+fn intern_name(name: &[u8]) -> u32 {
     use std::sync::atomic::Ordering;
     let h = sym_hash(name);
     let t = SYM_TABLE.load(Ordering::Acquire);
@@ -1925,7 +1990,9 @@ pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
         }
         Body::CFunc(f, arity) => {
             pst().current_block.push(blk);
+            crate::capi::enter_frame((*m).name, recv);
             let r = call_native_c(*f, *arity, recv, args);
+            crate::capi::leave_frame();
             pst().current_block.pop();
             r
         }
@@ -2091,7 +2158,7 @@ pub fn ivar_index_for(shape: *mut Class, id: u32) -> u32 {
     i
 }
 pub fn ivar_set(v: V, id: u32, val: V) -> V {
-    if is_frozen(v) {
+    if !is_heap(v) || hdr(v).flags & (FL_FROZEN | FL_CHILLED) != 0 {
         let r = check_frozen(v);
         if r == UNDEF {
             return UNDEF;
@@ -2470,7 +2537,11 @@ pub fn eql(a: V, b: V) -> bool {
         return true;
     }
     match (kind(a), kind(b)) {
-        (Some(Kind::String), Some(Kind::String)) => rstr(a).b == rstr(b).b,
+        (Some(Kind::String), Some(Kind::String)) => {
+            // (a Hash's copy of a literal key shares the literal's bytes: no compare)
+            let (x, y) = (rstr(a).b.as_slice(), rstr(b).b.as_slice());
+            x.len() == y.len() && (x.as_ptr() == y.as_ptr() || x == y)
+        }
         (Some(Kind::Float), Some(Kind::Float)) => float_val(a) == float_val(b),
         (Some(Kind::Bignum), Some(Kind::Bignum)) => rbig(a).n == rbig(b).n,
         (Some(Kind::Array), Some(Kind::Array)) => {

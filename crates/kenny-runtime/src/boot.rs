@@ -145,6 +145,7 @@ pub fn boot() {
     crate::strscan::init();
     crate::digest::init();
     crate::zlib::init();
+    crate::coverage::init();
     crate::date::init();
     crate::yaml::init();
     crate::bigdecimal::init();

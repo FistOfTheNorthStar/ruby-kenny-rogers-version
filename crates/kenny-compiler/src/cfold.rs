@@ -97,7 +97,7 @@ fn fold_value(n: &Node, known: &HashMap<Vec<u8>, i64>) -> Option<i64> {
 impl<M: Module> Compiler<M> {
     /// Find the foldable constants of a file's top level (`slot`: its cref slot).
     pub(crate) fn cfold_scan(&mut self, slot: usize, prog: &ProgramNode) {
-        if self.eval_unit || std::env::var_os("KENNY_NO_CFOLD").is_some() {
+        if self.eval_unit || self.cov.is_some() || std::env::var_os("KENNY_NO_CFOLD").is_some() {
             return;
         }
         let mut w = Writes(HashMap::new());

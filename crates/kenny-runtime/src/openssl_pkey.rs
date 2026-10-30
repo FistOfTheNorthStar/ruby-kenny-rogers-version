@@ -220,7 +220,13 @@ pub(super) fn init_pkey(ossl: *mut Class) {
     *PKEY_ERROR.get() = class_under(pk, "PKeyError", *OSSL_ERROR.get());
     let base = class_under(pk, "PKey", rt().c.object);
     let rsa = class_under(pk, "RSA", base);
-    *RSA_ERROR.get() = class_under(pk, "RSAError", *PKEY_ERROR.get());
+    // (the openssl gem 4.0 of Ruby 4.0: RSAError, DSAError, ... are other names of PKeyError)
+    *RSA_ERROR.get() = if crate::misc::ruby4() {
+        const_set(pk, sym("RSAError"), *PKEY_ERROR.get() as V);
+        *PKEY_ERROR.get()
+    } else {
+        class_under(pk, "RSAError", *PKEY_ERROR.get())
+    };
 
     defn(rsa, "__generate", 2, 2, |s, a, _| {
         let bits = get!(int(a[0]));

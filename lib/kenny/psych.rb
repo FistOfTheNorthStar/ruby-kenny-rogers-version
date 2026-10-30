@@ -51,31 +51,22 @@ module Psych
     end
   end
 
-  module Nodes
-    class Node
-    end
-
-    class Scalar < Node
-      ANY = 0
-      PLAIN = 1
-      SINGLE_QUOTED = 2
-      DOUBLE_QUOTED = 3
-      LITERAL = 4
-      FOLDED = 5
-    end
-
-    class Sequence < Node
-      ANY = 0
-      BLOCK = 1
-      FLOW = 2
-    end
-
-    class Mapping < Node
-      ANY = 0
-      BLOCK = 1
-      FLOW = 2
-    end
-  end
+  # The tree API (psych's own Ruby code on Kenny's native parser events and emitter:
+  # lib/kenny/kenny/psych_tree.rb), loaded on first use
+  autoload :Nodes, "kenny/psych_tree"
+  autoload :Visitors, "kenny/psych_tree"
+  autoload :Handler, "kenny/psych_tree"
+  autoload :TreeBuilder, "kenny/psych_tree"
+  autoload :Parser, "kenny/psych_tree"
+  autoload :Emitter, "kenny/psych_tree"
+  autoload :ScalarScanner, "kenny/psych_tree"
+  autoload :ClassLoader, "kenny/psych_tree"
+  autoload :Omap, "kenny/psych_tree"
+  autoload :Set, "kenny/psych_tree"
+  autoload :Stream, "kenny/psych_tree"
+  autoload :Streaming, "kenny/psych_tree"
+  autoload :Handlers, "kenny/psych_tree"
+  autoload :JSON, "kenny/psych_tree"
 
   class Coder
     attr_accessor :tag, :style, :implicit, :object
@@ -87,7 +78,7 @@ module Psych
       @implicit = false
       @type = :map
       @tag = tag
-      @style = Psych::Nodes::Mapping::BLOCK
+      @style = 1 # Psych::Nodes::Mapping::BLOCK
       @scalar = nil
       @object = nil
     end
@@ -236,8 +227,42 @@ module Psych
     end
 
     def to_json(object)
-      require "json"
-      JSON.generate(object)
+      visitor = Psych::Visitors::JSONTree.create
+      visitor << object
+      visitor.tree.yaml
+    end
+
+    def parse(yaml, filename: nil)
+      parse_stream(yaml, filename: filename) do |node|
+        return node
+      end
+      false
+    end
+
+    def parse_file(filename, fallback: false)
+      result = File.open(filename, "r:bom|utf-8") do |f|
+        parse(f, filename: filename)
+      end
+      result || fallback
+    end
+
+    def parser
+      Psych::Parser.new(TreeBuilder.new)
+    end
+
+    def parse_stream(yaml, filename: nil, &block)
+      if block_given?
+        parser = Psych::Parser.new(Handlers::DocumentStream.new(&block))
+        parser.parse(yaml, filename)
+      else
+        parser = self.parser
+        parser.parse(yaml, filename)
+        parser.handler.root
+      end
+    end
+
+    def libyaml_version
+      LIBYAML_VERSION.split(".").map(&:to_i)
     end
 
     if VERSION.to_i < 4

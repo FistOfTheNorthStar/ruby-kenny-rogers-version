@@ -150,3 +150,11 @@ big = (0...5000).map { |n| (n * 7919 % 256).chr }.join
 p Zlib.inflate(Zlib.deflate(big)) == big, Zlib.gunzip(Zlib.gzip(big, level: 9)) == big
 p Zlib::Inflate.new(Zlib::MAX_WBITS + 32).inflate(Zlib.gzip("auto"))
 p Zlib::BEST_COMPRESSION, Zlib::DEFAULT_COMPRESSION
+# Zlib streams with a block: the output is yielded and nil returned (Net::HTTP's inflater)
+zi = Zlib::Inflate.new(32 + Zlib::MAX_WBITS)
+got = +""
+p zi.inflate(Zlib.gzip("abc" * 100)) { |c| got << c }, got.bytesize
+zd = Zlib::Deflate.new
+parts = []
+zd.deflate("x" * 1000) { |c| parts << c }
+p zd.finish { |c| parts << c }, Zlib::Inflate.inflate(parts.join).bytesize

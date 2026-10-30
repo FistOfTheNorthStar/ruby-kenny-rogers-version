@@ -193,6 +193,20 @@ pub fn raise_errno(e: i32, func: Option<&str>, detail: &[u8]) -> V {
     ivar_set(ex, sym("@__errno"), mkfix(e as i64));
     raise_exc(ex)
 }
+/// Raise what a `*_nonblock` call raises when it would block: IO::EAGAINWaitReadable
+/// ("Resource temporarily unavailable - read would block"), IO::EINPROGRESSWaitWritable, ...
+pub(crate) fn raise_would_block(e: i32, write: bool, what: &str) -> V {
+    let name = match (e, write) {
+        (libc::EAGAIN, false) => "EAGAINWaitReadable",
+        (libc::EAGAIN, true) => "EAGAINWaitWritable",
+        (libc::EINPROGRESS, false) => "EINPROGRESSWaitReadable",
+        _ => "EINPROGRESSWaitWritable",
+    };
+    let cls = const_get_under(rt().c.io, sym(name)).map(|k| k as *mut Class).unwrap_or_else(|| errno_class(e));
+    let ex = exc_new(cls, &format!("{} - {what} would block", strerror(e)));
+    ivar_set(ex, sym("@__errno"), mkfix(e as i64));
+    raise_exc(ex)
+}
 fn io_fail(e: &std::io::Error, func: Option<&str>, detail: &[u8]) -> V {
     raise_errno(e.raw_os_error().unwrap_or(libc::EIO), func, detail)
 }
@@ -2628,6 +2642,24 @@ pub fn init() {
         let m = new_module(&format!("IO::{name}"));
         const_set(io, sym(name), m as V);
     }
+    // IO::EAGAINWaitReadable < Errno::EAGAIN (including IO::WaitReadable) and friends: what
+    // the *_nonblock methods raise. EWOULDBLOCK is EAGAIN here, so its names are aliases.
+    for (name, e, wait) in [
+        ("EAGAINWaitReadable", libc::EAGAIN, "WaitReadable"),
+        ("EAGAINWaitWritable", libc::EAGAIN, "WaitWritable"),
+        ("EINPROGRESSWaitReadable", libc::EINPROGRESS, "WaitReadable"),
+        ("EINPROGRESSWaitWritable", libc::EINPROGRESS, "WaitWritable"),
+    ] {
+        let k = new_class(&format!("IO::{name}"), errno_class(e));
+        let m = const_get_under(io, sym(wait)).unwrap() as *mut Class;
+        unsafe { (*k).includes.push(m) };
+        const_set(k, sym("Errno"), mkfix(e as i64));
+        const_set(io, sym(name), k as V);
+        if e == libc::EAGAIN {
+            const_set(io, sym(&name.replace("EAGAIN", "EWOULDBLOCK")), k as V);
+        }
+    }
+    bump_serial();
 
     let mk_std = |fd: i32, std: u8, r: bool, w: bool| {
         let mut s = IoState::new(fd, r, w);
@@ -2713,8 +2745,20 @@ pub fn init() {
         mkfix(b.len() as i64)
     });
     defn(io, "write_nonblock", 1, 2, |s, a, _| {
-        let b = ok!(to_s_bytes(a[0]));
+        let (a, kw) = split_kw(a);
+        let Some(&data) = a.first() else { return arity_error(0, 1, 2) };
+        let b = ok!(to_s_bytes(data));
         let stt = ok!(st(s));
+        ok!(stt.check_writable());
+        if stt.std == 0 && stt.wbuf.is_empty() && !b.is_empty() && !is_regular_file(stt.wfd) {
+            let mut p = libc::pollfd { fd: stt.wfd, events: libc::POLLOUT, revents: 0 };
+            if unsafe { libc::poll(&mut p, 1, 0) } == 0 {
+                if kw_get(kw, "exception") == Some(QFALSE) {
+                    return mksym(sym("wait_writable"));
+                }
+                return raise_would_block(libc::EAGAIN, true, "write");
+            }
+        }
         ok!(stt.write(&b));
         ok!(stt.flush());
         mkfix(b.len() as i64)
@@ -2834,7 +2878,7 @@ pub fn init() {
                 if !exc {
                     return mksym(sym("wait_readable"));
                 }
-                return raise_errno(libc::EAGAIN, None, b"read would block");
+                return raise_would_block(libc::EAGAIN, false, "read");
             }
         }
         let b = ok!(stt.read_partial(n.max(0) as usize));
@@ -3015,8 +3059,31 @@ pub fn init() {
     defn(io, "internal_encoding", 0, 0, |_, _, _| QNIL);
     defn(io, "fcntl", 1, 2, |_, _, _| mkfix(0));
     defn(io, "advise", 1, 3, |_, _, _| QNIL);
-    defn(io, "wait_readable", 0, 1, |s, _, _| s);
-    defn(io, "wait_writable", 0, 1, |s, _, _| s);
+    // io/wait: self once the IO is ready, nil when the timeout passes first (the thread
+    // parks meanwhile, as in IO.select)
+    fn wait_ready(s: V, a: &[V], write: bool) -> V {
+        let stt = ok!(st(s));
+        ok!(stt.check_open());
+        if !write && (stt.avail() > 0 || stt.mem.is_some()) {
+            return s;
+        }
+        let timeout = match a.first().copied().filter(|t| *t != QNIL) {
+            Some(t) => match num_to_f(t) {
+                Some(f) => Some(ok!(time_interval(f))),
+                None => return type_error(&format!("can't convert {} into time interval", class_desc(t))),
+            },
+            None => None,
+        };
+        let fd = if stt.std != 0 { stt.std as i32 } else if write { stt.wfd } else { stt.fd };
+        let mut p = [libc::pollfd { fd, events: if write { libc::POLLOUT } else { libc::POLLIN }, revents: 0 }];
+        match poll_wait(&mut p, timeout) {
+            Ok(n) if n > 0 => s,
+            Ok(_) => QNIL,
+            Err(e) => e,
+        }
+    }
+    defn(io, "wait_readable", 0, 1, |s, a, _| wait_ready(s, a, false));
+    defn(io, "wait_writable", 0, 1, |s, a, _| wait_ready(s, a, true));
     defn(io, "stat", 0, 0, |s, _, _| {
         let stt = ok!(st(s));
         ok!(stt.check_open());
@@ -3303,8 +3370,20 @@ pub fn init() {
         let mut ready_r = Vec::new();
         let mut ready_w = Vec::new();
         let mut pfds = Vec::new();
+        // (an object that isn't an IO is waited on through its #to_io, like an SSLSocket, and
+        // reported as itself)
+        let st_of = |x: V| {
+            if try_st(x).is_none() && respond_to(x, sym("to_io")) {
+                let io = send0(x, "to_io");
+                if io == UNDEF {
+                    return Err(UNDEF);
+                }
+                return st(io);
+            }
+            st(x)
+        };
         for &x in &rs {
-            let s = ok!(st(x));
+            let s = ok!(st_of(x));
             if s.avail() > 0 || s.mem.is_some() {
                 ready_r.push(x);
             }
@@ -3312,7 +3391,7 @@ pub fn init() {
             pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.fd }, events: libc::POLLIN, revents: 0 });
         }
         for &x in &ws {
-            let s = ok!(st(x));
+            let s = ok!(st_of(x));
             pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.wfd }, events: libc::POLLOUT, revents: 0 });
         }
         let n = if ready_r.is_empty() {
@@ -4739,6 +4818,24 @@ static WARNING: G<V> = G::new(QNIL);
 static WARNING_CATEGORIES: std::sync::Mutex<[(&str, bool); 4]> =
     std::sync::Mutex::new([("deprecated", false), ("experimental", true), ("performance", false), ("strict_unused_block", false)]);
 
+/// `Warning[:deprecated]`, readable without the lock (core.rs `unchill` asks on every first
+/// change of a String literal).
+static WARN_DEPRECATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn warn_deprecated() -> bool {
+    WARN_DEPRECATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// `Warning.warn(msg, category: cat)`, as CRuby's own warnings of a category are issued.
+pub fn warn_category(msg: V, cat: &str) {
+    let w = *WARNING.get();
+    if w == QNIL {
+        return;
+    }
+    let kw = hash_new();
+    crate::hash::hset(kw, mksym(sym("category")), mksym(sym(cat)));
+    hdr(kw).flags |= FL_KWHASH;
+    let _ = send(w, sym("warn"), &[msg, kw], QNIL);
+}
+
 fn warning_category_enabled(cat: V) -> Result<bool, V> {
     let name = if is_sym(cat) { String::from_utf8_lossy(sym_name(sym_id(cat))).into_owned() } else { String::new() };
     let cats = WARNING_CATEGORIES.lock().unwrap_or_else(|e| e.into_inner());
@@ -4768,6 +4865,9 @@ fn init_warning() {
         let mut cats = WARNING_CATEGORIES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cats.iter_mut().find(|(n, _)| *n == name) {
             c.1 = truthy(a[1]);
+            if name == "deprecated" {
+                WARN_DEPRECATED.store(c.1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         a[1]
     });

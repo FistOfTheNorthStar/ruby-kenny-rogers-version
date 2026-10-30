@@ -23,6 +23,9 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_yield", kenny_runtime::abi::kn_yield as *const u8),
         ("kn_yield_splat", kenny_runtime::abi::kn_yield_splat as *const u8),
         ("kn_str_lit", kenny_runtime::abi::kn_str_lit as *const u8),
+        ("kn_str_chilled", kenny_runtime::abi::kn_str_chilled as *const u8),
+        ("kn_str_lit_eval", kenny_runtime::abi::kn_str_lit_eval as *const u8),
+        ("kn_str_chilled_eval", kenny_runtime::abi::kn_str_chilled_eval as *const u8),
         ("kn_str_new", kenny_runtime::abi::kn_str_new as *const u8),
         ("kn_str_append_raw", kenny_runtime::abi::kn_str_append_raw as *const u8),
         ("kn_str_append", kenny_runtime::abi::kn_str_append as *const u8),
@@ -110,6 +113,7 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_catch_return", kenny_runtime::abi::kn_catch_return as *const u8),
         ("kn_raise_msg", kenny_runtime::abi::kn_raise_msg as *const u8),
         ("kn_respond_to", kenny_runtime::abi::kn_respond_to as *const u8),
+        ("kn_respond_to_pub", kenny_runtime::abi::kn_respond_to_pub as *const u8),
         ("kn_ivar_defined", kenny_runtime::abi::kn_ivar_defined as *const u8),
         ("kn_gvar_defined", kenny_runtime::abi::kn_gvar_defined as *const u8),
         ("kn_gvar_alias", kenny_runtime::abi::kn_gvar_alias as *const u8),
@@ -131,8 +135,6 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_require_file", kenny_runtime::compat::kn_require_file as *const u8),
         ("kn_wb_env", kenny_runtime::abi::kn_wb_env as *const u8),
         ("kn_using", kenny_runtime::abi::kn_using as *const u8),
-        ("kn_binding_new_l", kenny_runtime::compat::kn_binding_new_l as *const u8),
-        ("kn_eval_locals", kenny_runtime::compat::kn_eval_locals as *const u8),
         ("kn_refine_scope", kenny_runtime::abi::kn_refine_scope as *const u8),
         ("kn_super_dyn", kenny_runtime::abi::kn_super_dyn as *const u8),
         ("kn_super_blk", kenny_runtime::abi::kn_super_blk as *const u8),
@@ -140,6 +142,8 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_set_lexical_parent", kenny_runtime::compat::kn_set_lexical_parent as *const u8),
         ("kn_rational_lit", kenny_runtime::rational::kn_rational_lit as *const u8),
         ("kn_binding_new", kenny_runtime::compat::kn_binding_new as *const u8),
+        ("kn_binding_new_l", kenny_runtime::compat::kn_binding_new_l as *const u8),
+        ("kn_eval_locals", kenny_runtime::compat::kn_eval_locals as *const u8),
         ("kn_register_file", kenny_runtime::compat::kn_register_file as *const u8),
         ("kn_register_debug", kenny_runtime::backtrace::kn_register_debug as *const u8),
         ("kn_register_ruby", kenny_runtime::misc::kn_register_ruby as *const u8),
@@ -166,6 +170,10 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_float_unbox", kenny_runtime::opt::kn_float_unbox as *const u8),
         ("kn_is_float", kenny_runtime::opt::kn_is_float as *const u8),
         ("kn_vobj_fill", kenny_runtime::abi::kn_vobj_fill as *const u8),
+        ("kn_cov_register", kenny_runtime::coverage::kn_cov_register as *const u8),
+        ("kn_cov_methods", kenny_runtime::coverage::kn_cov_methods as *const u8),
+        ("kn_cov_file_start", kenny_runtime::coverage::kn_cov_file_start as *const u8),
+        ("kn_cov_first", kenny_runtime::coverage::kn_cov_first as *const u8),
         ("KN_GC_PENDING", &kenny_runtime::gc::KN_GC_PENDING as *const _ as *const u8),
         ("KN_DIRECT", &kenny_runtime::core::KN_DIRECT as *const _ as *const u8),
     ]
@@ -288,6 +296,21 @@ fn compiled(key: (u8, Vec<u8>), src: &[u8], mode: EvalMode, file: &str) -> Resul
     }
 }
 
+/// The length of the blank and comment lines `src` starts with.
+fn leading_comments(src: &[u8]) -> usize {
+    let mut i = 0;
+    while i < src.len() {
+        let end = src[i..].iter().position(|&b| b == b'\n').map_or(src.len(), |e| i + e + 1);
+        let line = &src[i..end];
+        let t = line.iter().position(|b| !b.is_ascii_whitespace()).map(|p| &line[p..]);
+        if t.is_some_and(|t| t[0] != b'#') {
+            break;
+        }
+        i = end;
+    }
+    i
+}
+
 fn eval_hook(src: &[u8], mode: u8, self_: V, locals: V, file: Option<&str>, line: i64) -> V {
     let m = if mode == 1 { EvalMode::ClassEval } else { EvalMode::Eval };
     // the caller's locals: the source starts with `a, b, = __kenny_evl;` (on its first line,
@@ -311,15 +334,29 @@ fn eval_hook(src: &[u8], mode: u8, self_: V, locals: V, file: Option<&str>, line
         };
     }
     let mut full = Vec::with_capacity(src.len() + names.len() * 8 + shift + 16);
+    let mut prefix = Vec::new();
     if !names.is_empty() {
         for n in &names {
-            full.extend_from_slice(&sym_name(sym_id(*n)));
-            full.extend_from_slice(b", ");
+            prefix.extend_from_slice(&sym_name(sym_id(*n)));
+            prefix.extend_from_slice(b", ");
         }
-        full.extend_from_slice(b"= __kenny_evl; ");
+        prefix.extend_from_slice(b"= __kenny_evl; ");
+    }
+    // (after the leading comments, on the first line of code: magic comments such as
+    // `# frozen_string_literal: true` only count before any code)
+    let lead = leading_comments(src);
+    let at_code = lead > 0 && !src[lead..].starts_with(b"=begin") && !src[lead..].starts_with(b"__END__");
+    if !at_code {
+        full.extend_from_slice(&prefix);
     }
     full.extend(std::iter::repeat_n(b'\n', shift));
-    full.extend_from_slice(src);
+    if at_code {
+        full.extend_from_slice(&src[..lead]);
+        full.extend_from_slice(&prefix);
+        full.extend_from_slice(&src[lead..]);
+    } else {
+        full.extend_from_slice(src);
+    }
     let mut key = full.clone();
     key.extend_from_slice(b"\0");
     key.extend_from_slice(file.as_bytes());

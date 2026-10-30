@@ -4,8 +4,10 @@
 //!   kenny run app.rb [args...]
 
 mod bundle;
+mod cext;
 mod ruby;
 mod embed;
+mod prism;
 
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
@@ -33,6 +35,7 @@ const CAPI_SHIM: &str = include_str!("../../../include/kenny_capi.c");
 const OVERLAY: &[(&str, &str)] = &[
     ("forwardable.rb", include_str!("../../../lib/kenny/forwardable.rb")),
     ("openssl.rb", include_str!("../../../lib/kenny/openssl.rb")),
+    ("kenny/openssl_ssl.rb", include_str!("../../../lib/kenny/kenny/openssl_ssl.rb")),
     ("securerandom.rb", include_str!("../../../lib/kenny/securerandom.rb")),
     ("random/formatter.rb", include_str!("../../../lib/kenny/random/formatter.rb")),
     ("json.rb", include_str!("../../../lib/kenny/json.rb")),
@@ -43,6 +46,10 @@ const OVERLAY: &[(&str, &str)] = &[
     ("stringio.rb", include_str!("../../../lib/kenny/stringio.rb")),
     ("pathname.so", include_str!("../../../lib/kenny/pathname_ext.rb")),
     ("ripper.so", include_str!("../../../lib/kenny/ripper_ext.rb")),
+    // Prism's native part and Ripper's parser on the runtime's libprism (see prism.rs; both are
+    // replaced by stand-ins that raise when there is no prism Ruby library to pair with it)
+    ("prism/prism.rb", include_str!("../../../lib/kenny/prism/prism.rb")),
+    ("kenny/ripper_prism.rb", include_str!("../../../lib/kenny/kenny/ripper_prism.rb")),
     ("kenny/gem.rb", include_str!("../../../lib/kenny/kenny/gem.rb")),
     ("kenny/gem_specification.rb", include_str!("../../../lib/kenny/kenny/gem_specification.rb")),
     ("kenny/data.rb", include_str!("../../../lib/kenny/kenny/data.rb")),
@@ -58,10 +65,20 @@ const OVERLAY: &[(&str, &str)] = &[
     ("execjs.rb", include_str!("../../../lib/kenny/execjs.rb")),
     ("kenny/assets_precompile.rb", include_str!("../../../lib/kenny/kenny/assets_precompile.rb")),
     ("socket.rb", include_str!("../../../lib/kenny/socket.rb")),
+    ("coverage.rb", include_str!("../../../lib/kenny/coverage.rb")),
     ("nio.rb", include_str!("../../../lib/kenny/nio.rb")),
     ("pp.rb", include_str!("../../../lib/kenny/pp.rb")),
     ("yaml.rb", include_str!("../../../lib/kenny/yaml.rb")),
     ("psych.rb", include_str!("../../../lib/kenny/psych.rb")),
+    ("kenny/psych_tree.rb", include_str!("../../../lib/kenny/kenny/psych_tree.rb")),
+    // OpenSSL::ASN1 and OpenSSL::X509 (openssl.rb requires them, then the stdlib's openssl/x509.rb)
+    ("kenny/openssl_asn1.rb", include_str!("../../../lib/kenny/kenny/openssl_asn1.rb")),
+    ("kenny/openssl_x509.rb", include_str!("../../../lib/kenny/kenny/openssl_x509.rb")),
+    ("kenny/openssl_x509_name.rb", include_str!("../../../lib/kenny/kenny/openssl_x509_name.rb")),
+    ("kenny/openssl_x509_ext.rb", include_str!("../../../lib/kenny/kenny/openssl_x509_ext.rb")),
+    ("kenny/openssl_x509_cert.rb", include_str!("../../../lib/kenny/kenny/openssl_x509_cert.rb")),
+    ("kenny/openssl_x509_store.rb", include_str!("../../../lib/kenny/kenny/openssl_x509_store.rb")),
+    ("kenny/openssl_ec.rb", include_str!("../../../lib/kenny/kenny/openssl_ec.rb")),
     ("bigdecimal.rb", include_str!("../../../lib/kenny/bigdecimal.rb")),
     ("bigdecimal/util.rb", include_str!("../../../lib/kenny/bigdecimal/util.rb")),
     ("racc/parser.rb", include_str!("../../../lib/kenny/racc/parser.rb")),
@@ -233,79 +250,30 @@ fn cc() -> Command {
     Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
 }
 
-/// Compile C extensions + the C-API shim; returns object files.
-fn build_exts(exts: &[PathBuf], work: &Path) -> Result<Vec<PathBuf>, String> {
-    if exts.is_empty() {
-        return Ok(vec![]);
+/// The C extensions to build: `--ext` dirs, then the locked gems' (a gem's that can't be set
+/// up is left out with a warning).
+fn ext_list(o: &Opts, gem_exts: &[bundle::GemExt], work: &Path) -> Result<Vec<cext::Ext>, String> {
+    let mut exts = Vec::new();
+    for e in &o.exts {
+        exts.push(cext::from_dir(e)?);
     }
-    let inc = work.join("include");
-    std::fs::create_dir_all(inc.join("ruby")).map_err(|e| e.to_string())?;
-    std::fs::write(inc.join("ruby.h"), RUBY_H).map_err(|e| e.to_string())?;
-    std::fs::write(inc.join("ruby/ruby.h"), "#include \"../ruby.h\"\n").map_err(|e| e.to_string())?;
-    std::fs::write(inc.join("ruby/encoding.h"), "#include \"../ruby.h\"\ntypedef struct rb_encoding rb_encoding;\n").map_err(|e| e.to_string())?;
-    std::fs::write(inc.join("ruby/thread.h"), "#include \"../ruby.h\"\n").map_err(|e| e.to_string())?;
-    std::fs::write(inc.join("ruby/io.h"), "#include \"../ruby.h\"\n").map_err(|e| e.to_string())?;
-    std::fs::write(work.join("kenny_capi.c"), CAPI_SHIM).map_err(|e| e.to_string())?;
-    let mut sources = vec![work.join("kenny_capi.c")];
-    let mut inits = Vec::new();
-    let mut ext_dirs = Vec::new();
-    for e in exts {
-        let files: Vec<PathBuf> = if e.is_dir() {
-            std::fs::read_dir(e)
-                .map_err(|x| format!("{}: {x}", e.display()))?
-                .flatten()
-                .map(|d| d.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "c"))
-                .collect()
-        } else {
-            vec![e.clone()]
-        };
-        ext_dirs.push(if e.is_dir() { e.clone() } else { e.parent().unwrap_or(Path::new(".")).to_path_buf() });
-        for f in files {
-            let text = std::fs::read_to_string(&f).unwrap_or_default();
-            for line in text.lines() {
-                if let Some(rest) = line.trim_start().strip_prefix("void Init_").or_else(|| line.trim_start().strip_prefix("RUBY_FUNC_EXPORTED void Init_")) {
-                    let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                    if !name.is_empty() && rest[name.len()..].trim_start().starts_with('(') && !inits.contains(&name) {
-                        inits.push(name);
-                    }
+    if std::env::var_os("KENNY_NO_GEM_EXTS").is_none() {
+        for g in gem_exts {
+            match cext::from_gem(&g.gem, &g.dir, work) {
+                Ok(e) => exts.push(e),
+                Err(why) if std::env::var_os("KENNY_QUIET").is_none() => {
+                    eprintln!("kenny: warning: the C extension of {} is left out (`require` of it raises LoadError): {why}", g.gem)
                 }
+                Err(_) => {}
             }
-            sources.push(f);
         }
     }
-    let mut reg = String::from("extern void kn_register_ext(const char *, void (*)(void));\n");
-    for n in &inits {
-        reg.push_str(&format!("void Init_{n}(void);\n"));
-    }
-    reg.push_str("__attribute__((constructor)) static void kn_register_all_exts(void) {\n");
-    for n in &inits {
-        reg.push_str(&format!("  kn_register_ext(\"{n}\", Init_{n});\n"));
-    }
-    reg.push_str("}\n");
-    std::fs::write(work.join("kenny_exts.c"), reg).map_err(|e| e.to_string())?;
-    sources.push(work.join("kenny_exts.c"));
-    let mut objs = Vec::new();
-    for (i, s) in sources.iter().enumerate() {
-        let o = work.join(format!("ext{i}.o"));
-        let mut c = cc();
-        c.args(["-std=gnu17", "-O2", "-fPIC", "-w", "-c"]).arg("-I").arg(&inc);
-        for d in &ext_dirs {
-            c.arg("-I").arg(d);
-        }
-        c.arg(s).arg("-o").arg(&o);
-        let out = c.output().map_err(|e| format!("failed to run the C compiler: {e}"))?;
-        if !out.status.success() {
-            return Err(format!("compiling {} failed:\n{}", s.display(), String::from_utf8_lossy(&out.stderr)));
-        }
-        objs.push(o);
-    }
-    Ok(objs)
+    Ok(exts)
 }
 
 /// Write the overlay files into `overlay` and work out the compiler options: the overlay,
 /// the -I dirs, the locked gems of a Bundler project, then the standard library.
-fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, String> {
+fn compile_options(o: &Opts, overlay: &Path) -> Result<(kenny_compiler::Options, prism::Pairing, Vec<bundle::GemExt>), String> {
     ruby::select(&o.src);
     std::fs::create_dir_all(overlay).map_err(|e| e.to_string())?;
     for (name, src) in OVERLAY {
@@ -319,6 +287,7 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, 
     let mut embed_dirs = o.load_paths.clone();
     let mut dep_dirs = Vec::new();
     let mut psych_version = None;
+    let mut gem_exts = Vec::new();
     let mut bundle_rb = String::from("module Bundler\n  module Kenny\n    ROOT = nil\n    GEMFILE = nil\n    LOCKFILE = nil\n    WITHOUT = [].freeze\n    REPLACED = [].freeze\n    DEPENDENCIES = [].freeze\n    SPECS = [].freeze\n  end\nend\n");
     if let Some(lock) = bundle::find_lockfile(&o.src) {
         let b = bundle::resolve(&lock)?;
@@ -342,6 +311,7 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, 
         dep_dirs.extend(b.engine_dirs.iter().cloned());
         bundle_rb = b.ruby;
         psych_version = b.psych_version;
+        gem_exts = b.exts;
     }
     std::fs::write(overlay.join("kenny/bundle.rb"), bundle_rb).map_err(|e| e.to_string())?;
     // YAML follows the psych of the Ruby the program is built against (psych 3 and 4+ differ
@@ -377,7 +347,7 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, 
     }
     let mut load_paths = vec![overlay.to_path_buf()];
     load_paths.extend(gem_paths);
-    load_paths.extend(stdlib);
+    load_paths.extend(stdlib.clone());
     // then the gems that left the standard library (csv, bigdecimal ... in Ruby 3.4), which
     // Ruby lets you require without a Gemfile (with one, as with Bundler, they must be in it)
     let bundled = bundle::find_lockfile(&o.src).is_none();
@@ -385,14 +355,17 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<kenny_compiler::Options, 
         load_paths.extend(ruby::get().map(|r| r.bundled_gem_libs()).unwrap_or_default());
     }
     // every file of the -I dirs goes in (runtime-computed requires/autoloads, e.g. Rails)
+    let pairing = prism::pair(&mut load_paths, stdlib.as_deref(), overlay)?;
     let ruby = ruby::get().map(|r| r.release_line()).unwrap_or_default();
-    Ok(kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs, ruby })
+    // Ripper's Prism backend: compiled in only when the program's code names Ripper's parser
+    let ripper_backend = Some(overlay.join("kenny/ripper_prism.rb"));
+    Ok((kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs, ruby, coverage: false, ripper_backend }, pairing, gem_exts))
 }
 
 /// Returns whether the asset compilers were linked in (see `needs_assets`).
 fn build(o: &Opts, out: &Path) -> Result<bool, String> {
     let work = std::env::temp_dir().join(format!("kenny-build-{}", std::process::id()));
-    let mut opts = match compile_options(o, &work.join("overlay")) {
+    let (mut opts, pairing, gem_exts) = match compile_options(o, &work.join("overlay")) {
         Ok(x) => x,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&work);
@@ -411,30 +384,38 @@ fn build(o: &Opts, out: &Path) -> Result<bool, String> {
             return Err(errs.join("\n"));
         }
     };
+    let (libprism, prism_warning) = prism::needs_libprism(&pairing, &work.join("overlay"), &compiled.files);
     if std::env::var_os("KENNY_QUIET").is_none() {
         for w in &compiled.warnings {
             eprintln!("warning: {w}");
+        }
+        if let Some(w) = prism_warning {
+            eprintln!("kenny: warning: {w}");
         }
     }
     let obj = work.join("program.o");
     std::fs::write(&obj, &compiled.object).map_err(|e| format!("{}: {e}", obj.display()))?;
     let result = (|| {
         let mut objs = vec![obj.clone()];
-        objs.extend(build_exts(&o.exts, &work)?);
+        let exts = ext_list(o, &gem_exts, &work)?;
+        let mut exts = if exts.is_empty() { None } else { Some(cext::compile(exts, &work, RUBY_H, CAPI_SHIM)?) };
         if assets {
-            objs.push(assets_stub(&work)?);
+            objs.push(ext_stub(&work, "kenny_assets")?);
+        }
+        if libprism {
+            objs.push(ext_stub(&work, "kenny_prism")?);
         }
         let rt = runtime_lib(compiled.needs_jit)?;
         // A Rails app precompiles its own assets (the program with the asset compilers linked
         // in) before its files are embedded, so the binary carries the fresh ones.
         if assets && !o.running {
             if let Some(reason) = precompile_reason(o)? {
-                link(&objs, &rt, out)?;
+                link_exts(&objs, &mut exts, &rt, out)?;
                 precompile_assets(o, out, reason)?;
             }
         }
         objs.extend(embed_files(o, &opts, out, &work)?);
-        link(&objs, &rt, out)
+        link_exts(&objs, &mut exts, &rt, out)
     })();
     let _ = std::fs::remove_dir_all(&work);
     result.map(|_| assets)
@@ -537,16 +518,19 @@ fn precompile_assets(o: &Opts, bin: &Path, reason: &str) -> Result<(), String> {
     }
 }
 
-/// A constructor registering `Init_kenny_assets` as the extension "kenny_assets"; referencing
-/// it is what keeps grass and QuickJS in the binary.
-fn assets_stub(work: &Path) -> Result<PathBuf, String> {
-    let src = work.join("kenny_assets.c");
-    let obj = work.join("kenny_assets.o");
+/// A constructor registering `Init_<name>` as the extension `name`, for the runtime's optional
+/// native parts: referencing it is what keeps them in the binary (kenny_assets: grass and
+/// QuickJS; kenny_prism: libprism).
+fn ext_stub(work: &Path, name: &str) -> Result<PathBuf, String> {
+    let src = work.join(format!("{name}.c"));
+    let obj = work.join(format!("{name}.o"));
     std::fs::create_dir_all(work).map_err(|e| e.to_string())?;
     std::fs::write(
         &src,
-        "extern void kn_register_ext(const char *, void (*)(void));\nextern void Init_kenny_assets(void);\n\
-         __attribute__((constructor)) static void kn_register_assets(void) { kn_register_ext(\"kenny_assets\", Init_kenny_assets); }\n",
+        format!(
+            "extern void kn_register_ext(const char *, void (*)(void));\nextern void Init_{name}(void);\n\
+             __attribute__((constructor)) static void kn_register_{name}(void) {{ kn_register_ext(\"{name}\", Init_{name}); }}\n"
+        ),
     )
     .map_err(|e| e.to_string())?;
     let out = cc().args(["-O2", "-c"]).arg(&src).arg("-o").arg(&obj).output().map_err(|e| format!("failed to run the C compiler: {e}"))?;
@@ -591,22 +575,47 @@ fn embed_files(o: &Opts, opts: &kenny_compiler::Options, out: &Path, work: &Path
     Ok(vec![obj])
 }
 
-fn link(objs: &[PathBuf], rt: &Path, out: &Path) -> Result<(), String> {
+/// Link the program with the C extensions; an extension of a gem that uses a C API function
+/// Kenny lacks is left out (see cext.rs), and the rest linked again.
+fn link_exts(objs: &[PathBuf], exts: &mut Option<cext::Built>, rt: &Path, out: &Path) -> Result<(), String> {
+    loop {
+        let mut all = objs.to_vec();
+        let mut extra = Vec::new();
+        if let Some(b) = exts.as_ref() {
+            all.extend(b.objects());
+            extra = b.link_args();
+        }
+        match link(&all, rt, out, &extra) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let retry = match exts.as_mut() {
+                    Some(b) => b.drop_unresolved(&e)?,
+                    None => false,
+                };
+                if !retry {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+fn link(objs: &[PathBuf], rt: &Path, out: &Path, extra: &[String]) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     if std::env::var_os("KENNY_LINK_UMBRELLA").is_none() {
         if let Some(stubs) = macos::system_lib_stubs() {
-            if link_with(objs, rt, out, &stubs).is_ok() && macos::direct_binds_ok(out) {
+            if link_with(objs, rt, out, &stubs, extra).is_ok() && macos::direct_binds_ok(out) {
                 return Ok(());
             }
         }
     }
-    link_with(objs, rt, out, &[])
+    link_with(objs, rt, out, &[], extra)
 }
 
 /// Link, binding libSystem's symbols to these sub-library stubs (macOS, `macos`).
-fn link_with(objs: &[PathBuf], rt: &Path, out: &Path, stubs: &[PathBuf]) -> Result<(), String> {
+fn link_with(objs: &[PathBuf], rt: &Path, out: &Path, stubs: &[PathBuf], extra: &[String]) -> Result<(), String> {
     let mut c = cc();
-    c.arg("-o").arg(out).args(objs).arg(rt);
+    c.arg("-o").arg(out).args(objs).arg(rt).args(extra);
     if cfg!(target_os = "macos") {
         c.args(["-Wl,-dead_strip", "-lm"]);
         for s in stubs {
@@ -711,6 +720,19 @@ fn main() {
     };
     match args.get(1).map(|s| s.as_str()) {
         Some("--version") | Some("-v") => println!("kenny {} (Ruby 3.4 syntax via Prism, Cranelift backend)", env!("CARGO_PKG_VERSION")),
+        // (a debugging aid: the coverage structure of files, as CRuby's Coverage.peek_result
+        // reports it for a file compiled with lines and branches, or lines only)
+        Some("--coverage-dump") => {
+            let lines_only = std::env::var_os("KENNY_COV_LINES_ONLY").is_some();
+            for f in &args[2..] {
+                let p = Path::new(f);
+                let p = p.canonicalize().unwrap_or(p.to_path_buf());
+                match std::fs::read(&p) {
+                    Ok(src) => print!("{}", kenny_compiler::coverage::dump(&src, &p, !lines_only)),
+                    Err(e) => eprintln!("{f}: {e}"),
+                }
+            }
+        }
         Some("build") => {
             let o = parse(&args[2..]).unwrap_or_else(|e| fail(e));
             let out = o.out.clone().unwrap_or_else(|| PathBuf::from(o.src.file_stem().unwrap_or_default()));
@@ -720,7 +742,7 @@ fn main() {
             // compile only (no linking): report compile errors/warnings for one file
             let o = parse(&args[2..]).unwrap_or_else(|e| fail(e));
             let work = std::env::temp_dir().join(format!("kenny-check-{}", std::process::id()));
-            let mut opts = compile_options(&o, &work.join("overlay")).unwrap_or_else(|e| fail(e));
+            let (mut opts, _, _) = compile_options(&o, &work.join("overlay")).unwrap_or_else(|e| fail(e));
             // only the file itself (and what it requires), not every file of the gems
             opts.embed_dirs.clear();
             let r = kenny_compiler::compile_file_with(&o.src, &opts);

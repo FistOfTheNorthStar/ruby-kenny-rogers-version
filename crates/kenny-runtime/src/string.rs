@@ -92,6 +92,7 @@ fn mutate(s: V) -> Result<&'static mut SVec<u8>, V> {
         let e = check_frozen(s);
         return Err(e);
     }
+    unchill(s);
     Ok(b(s))
 }
 
@@ -126,6 +127,8 @@ pub extern "C" fn kn_str_append_own(s: V, e: V, own: u64) -> V {
         return UNDEF;
     }
     if own != 0 && s != e && hdr(s).klass == rt().c.string && !is_frozen(s) {
+        // (`s + e` would have made a String that is no literal)
+        hdr(s).flags &= !FL_CHILLED;
         let add: &[u8] = &rstr(e).b;
         if !crate::transcode::same_native(s, e) {
             match crate::transcode::concat_enc(s, add, crate::transcode::enc_of(e)) {
@@ -721,7 +724,8 @@ pub fn init() {
     defn(c, "size", 0, 0, |s, _, _| mkfix(char_len(s) as i64));
     defn(c, "bytesize", 0, 0, |s, _, _| mkfix(rstr(s).b.len() as i64));
     defn(c, "empty?", 0, 0, |s, _, _| bool_v(rstr(s).b.is_empty()));
-    defn(c, "+@", 0, 0, |s, _, _| if is_frozen(s) { str_new(rstr(s).b.clone()) } else { s });
+    // (a chilled literal too: CRuby 3.4 copies it)
+    defn(c, "+@", 0, 0, |s, _, _| if hdr(s).flags & (FL_FROZEN | FL_CHILLED) != 0 { str_copy(s) } else { s });
     defn(c, "-@", 0, 0, |s, _, _| {
         if is_frozen(s) {
             return s;
@@ -953,8 +957,10 @@ pub fn init() {
             Err(e) => return e,
         };
         let b = &rstr(s).b;
-        match find(b, &o, char_byte(b, from as usize)) {
-            Some(i) => mkfix(char_count(&b[..i]) as i64),
+        // (a binary String's characters are its bytes)
+        let bin = is_binary(s);
+        match find(b, &o, if bin { (from as usize).min(b.len()) } else { char_byte(b, from as usize) }) {
+            Some(i) => mkfix(if bin { i } else { char_count(&b[..i]) } as i64),
             None => QNIL,
         }
     });
@@ -986,9 +992,10 @@ pub fn init() {
         };
         let b = &rstr(s).b;
         // the last occurrence starting at character `pos` or before
-        let end = (char_byte(b, pos) + o.len()).min(b.len());
+        let bin = is_binary(s);
+        let end = (if bin { pos.min(b.len()) } else { char_byte(b, pos) } + o.len()).min(b.len());
         match rfind(&b[..end], &o) {
-            Some(i) => mkfix(char_count(&b[..i]) as i64),
+            Some(i) => mkfix(if bin { i } else { char_count(&b[..i]) } as i64),
             None => QNIL,
         }
     });
@@ -1053,9 +1060,7 @@ pub fn init() {
     });
     // bytesplice(index, length, str [, str_index, str_length]) / (range, str [, str_range])
     defn(c, "bytesplice", 2, 5, |s, a, _| {
-        if is_frozen(s) {
-            return check_frozen(s);
-        }
+        crate::tri!(check_frozen(s));
         let n = rstr(s).b.len() as i64;
         let span = |r: V, n: i64| -> Option<(usize, usize)> {
             let (st, len) = range_bounds(r, n)?;
@@ -1372,7 +1377,16 @@ pub fn init() {
         Some(ch) => mkfix(ch as i64),
         None => arg_error("empty string"),
     });
-    defn(c, "sum", 0, 0, |s, _, _| mkfix(rstr(s).b.iter().map(|x| *x as i64).sum()));
+    // String#sum(bits = 16): the bytes' sum modulo 2**bits (bits <= 0: the whole sum)
+    defn(c, "sum", 0, 1, |s, a, _| {
+        let bits = match a.first() {
+            Some(v) if is_fix(*v) => fix(*v),
+            Some(v) => return type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(*v)))),
+            None => 16,
+        };
+        let total: i64 = rstr(s).b.iter().map(|x| *x as i64).sum();
+        mkfix(if bits > 0 && bits < 63 { total & ((1i64 << bits) - 1) } else { total })
+    });
     fn pad(s: V, a: &[V], mode: u8) -> V {
         let w = fix(a[0]).max(0) as usize;
         let padc: Vec<char> = match a.get(1) {

@@ -1,6 +1,12 @@
-# Ripper's native part (ripper.so), as far as Kenny provides it: the event tables of Ruby 3.3
-# and the lexer state constants, so that code subclassing Ripper (ActionView's render parser)
-# loads. Parsing raises NotImplementedError: Kenny has no Ripper parser.
+# Ripper's native part (ripper.so), as Kenny provides it: Ruby 3.4's event tables and lexer
+# state constants, and a parser built on Prism. `Ripper#parse` has Prism::Translation::Ripper
+# (the prism gem's drop-in Ripper) walk Prism's tree and send Ripper's events to this Ripper
+# object, so the stdlib's subclasses (Ripper::SexpBuilder for `Ripper.sexp`, ActionView's render
+# parser ...) work; `Ripper.lex` and Ripper::Lexer use Prism.lex_compat, Prism's Ripper-compatible
+# token stream (the tree walk doesn't produce every scanner event). The backend is
+# kenny/ripper_prism.rb, compiled in only when the program can parse with Ripper (see
+# `__kenny_backend`); Prism's Ruby library must be the version of the libprism Kenny links
+# (see crates/kenny/src/prism.rs), else parsing raises NotImplementedError.
 class Ripper
   Version = "0.1.0"
   PARSER_EVENT_TABLE = {
@@ -62,51 +68,132 @@ class Ripper
     @__src = src
     @__filename = filename
     @__lineno = lineno
+    @__kenny_parser = nil
+    @__kenny_error = false
+    @__kenny_end_seen = false
   end
-  
+
   def filename
     @__filename
   end
-  
+
   def parse
-    raise NotImplementedError, "Ripper parsing is not supported by Kenny"
+    __kenny_backend
+    parser = KennyParser.new(self, __kenny_source, @__filename, @__lineno)
+    @__kenny_parser = parser
+    begin
+      parser.parse
+    ensure
+      @__kenny_error = parser.error?
+      @__kenny_end_seen = parser.kenny_end_seen?
+      @__kenny_parser = nil
+    end
   end
-  
+
   def error?
-    false
+    @__kenny_error
   end
-  
+
   def end_seen?
-    false
+    @__kenny_end_seen
   end
-  
+
   def encoding
-    Encoding::UTF_8
+    @__src.is_a?(String) ? @__src.encoding : Encoding::UTF_8
   end
-  
+
+  # (the position of the event being dispatched, while parsing)
   def lineno
-    nil
+    @__kenny_parser&.lineno
   end
-  
+
   def column
-    nil
+    @__kenny_parser&.column
   end
-  
+
   def state
     nil
   end
-  
+
   def token
     nil
   end
-  
+
   attr_accessor :yydebug, :debug_output
-  
-  def self.lex_state_name(state)
-    constants.grep(/\AEXPR_/).select { |c| const_get(c) == state }.first.to_s
+
+  # The parser's backend, kenny/ripper_prism.rb (it loads Prism). `kenny build` compiles it in
+  # only when the program's code names Ripper's parser (Ripper.sexp, Ripper.lex, a subclass ...,
+  # see crates/kenny-compiler/src/ripper.rs), so it isn't required by a literal path here.
+  BACKEND = "kenny/ripper_prism"
+  private_constant :BACKEND
+
+  private def __kenny_backend
+    require BACKEND
+  rescue LoadError => e
+    raise NotImplementedError, "Ripper's parser isn't compiled into this program: `kenny build` adds it " \
+      "(with Prism) when the program's code names Ripper's parsing API (Ripper.sexp, Ripper.lex, " \
+      "Ripper.new, a Ripper subclass ...), and here it is only reached dynamically (const_get, eval ...); " \
+      "name it in the code, e.g. `Ripper.sexp` (#{e.message})"
   end
-  
+
+  # The source as a String (Ripper also takes an IO, anything with `gets`, or with `to_str`).
+  def __kenny_source
+    src = @__src
+    return src if src.is_a?(String)
+    if src.respond_to?(:gets)
+      out = +""
+      while (line = src.gets)
+        out << line
+      end
+      @__src = out
+    elsif src.respond_to?(:to_str)
+      @__src = src.to_str
+    else
+      raise TypeError, "no implicit conversion of #{src.class} into String"
+    end
+  end
+  private :__kenny_source
+
+  LEX_STATE_NAMES = %w[BEG END ENDARG ENDFN ARG CMDARG MID FNAME DOT CLASS LABEL LABELED FITEM].freeze
+  private_constant :LEX_STATE_NAMES
+
+  def self.lex_state_name(state)
+    names = []
+    LEX_STATE_NAMES.each_with_index { |n, i| names << n if state & (1 << i) != 0 }
+    names.empty? ? "NONE" : names.join("|")
+  end
+
+  # Removes up to `width` columns of leading whitespace from `input` (in place, tabs to the next
+  # multiple of 8), returning the number of characters removed: the dedent of a `<<~` heredoc.
   def self.dedent_string(input, width)
-    raise NotImplementedError, "Ripper parsing is not supported by Kenny"
+    whitespace = 0
+    cursor = 0
+    while cursor < input.length && input[cursor].match?(/\s/) && whitespace < width
+      if input[cursor] == "\t"
+        whitespace = ((whitespace / 8 + 1) * 8)
+        break if whitespace > width
+      else
+        whitespace += 1
+      end
+      cursor += 1
+    end
+    input.replace(input[cursor..])
+    cursor
+  end
+
+  private def dedent_string(input, width)
+    Ripper.dedent_string(input, width)
+  end
+
+  # Ripper::Lexer (defined by the stdlib's ripper/lexer.rb) collects scanner events as the C
+  # parser emits them; under Kenny it takes Prism.lex_compat's tokens instead.
+  class Lexer < ::Ripper
+    module KennyLex
+      def parse(raise_errors: false)
+        __kenny_backend
+        __kenny_lex(raise_errors)
+      end
+    end
+    prepend KennyLex
   end
 end

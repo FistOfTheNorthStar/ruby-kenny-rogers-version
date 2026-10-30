@@ -18,6 +18,11 @@
 //!   the object's own GC slot). It is never freed; growing past it moves to a heap buffer,
 //!   and the GC moves the pointer along when it moves the owner (`rebase`).
 //!
+//! * A byte buffer may be *shared* (`shared`: a String literal's bytes, which live for the
+//!   whole run and are never written; abi.rs `kn_str_lit`, `kn_str_chilled`). Readers see it as any other buffer; the first
+//!   write copies it into a buffer of its own (`unshare`), and it is never freed. Compiled
+//!   code that writes bytes in place checks for it (kenny-compiler fastpath.rs `SVEC_SHARED`).
+//!
 //! Layout is `repr(C)` {ptr, len, cap} (compiled code may read ptr/len directly).
 
 use crate::mt;
@@ -35,6 +40,8 @@ const FLAGS: usize = OLD | REM;
 const SHIFT: usize = 1 << 60;
 /// The buffer is inside the owner (see the module docs): not freed with it.
 const EMBED: usize = 1 << 59;
+/// The bytes are borrowed (see the module docs): copied before any write, never freed.
+const SHARED: usize = 1 << 58;
 const CAP_MASK: usize = (1 << 56) - 1;
 
 #[repr(C)]
@@ -85,6 +92,45 @@ impl<T: Copy> SVec<T> {
     pub fn with_capacity(n: usize) -> Self {
         Self::from(Vec::with_capacity(n))
     }
+    /// A view of `n` elements at `p` that is never written or freed (see the module docs).
+    ///
+    /// # Safety
+    /// `p` must stay valid and unchanged for `n` elements for the rest of the run.
+    pub unsafe fn shared(p: *const T, n: usize) -> Self {
+        if n == 0 {
+            return SVec::new();
+        }
+        SVec { ptr: AtomicPtr::new(p as *mut T), len: AtomicUsize::new(n), cap: AtomicUsize::new(n | SHARED), _t: PhantomData }
+    }
+    /// The buffer is a shared view (`shared`) not yet copied.
+    #[inline(always)]
+    pub fn is_shared(&self) -> bool {
+        self.cap.load(Relaxed) & SHARED != 0
+    }
+    /// Another view of a shared buffer's bytes (none if it isn't shared).
+    pub fn share(&self) -> Option<Self> {
+        let (p, n) = self.snap();
+        (self.is_shared() && n > 0).then(|| unsafe { Self::shared(p, n) })
+    }
+    /// Before a write: copy a shared buffer into one of this vector's own.
+    #[inline(always)]
+    fn own(&self) {
+        if std::mem::size_of::<T>() == 1 && self.cap.load(Relaxed) & SHARED != 0 {
+            self.unshare();
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn unshare(&self) {
+        let cap = self.lock_raw();
+        if self.cap.load(Relaxed) & SHARED == 0 {
+            self.unlock(cap);
+            return;
+        }
+        let n = self.len.load(Relaxed).min(cap);
+        // (room to grow: a literal that is written to is usually appended to)
+        self.grow_with(cap, n, (n * 2).max(16), &[], false);
+    }
 
     // ----- reading -----
 
@@ -110,6 +156,7 @@ impl<T: Copy> SVec<T> {
     }
     #[inline(always)]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self.own();
         self.wb();
         let (p, n) = self.snap();
         unsafe { std::slice::from_raw_parts_mut(p, n) }
@@ -153,9 +200,15 @@ impl<T: Copy> SVec<T> {
 
     // ----- writer lock -----
 
-    /// Lock for writing (only when several OS threads run Ruby code). Returns the capacity.
+    /// Lock for writing (only when several OS threads run Ruby code), first copying a
+    /// shared buffer (`own`). Returns the capacity.
     #[inline(always)]
     fn lock(&self) -> usize {
+        self.own();
+        self.lock_raw()
+    }
+    #[inline(always)]
+    fn lock_raw(&self) -> usize {
         if !mt::multi() {
             return self.cap.load(Relaxed) & CAP_MASK;
         }
@@ -181,7 +234,7 @@ impl<T: Copy> SVec<T> {
     /// are kept.
     #[inline(always)]
     fn unlock(&self, c: usize) {
-        let flags = self.cap.load(Relaxed) & (FLAGS | SHIFT | EMBED);
+        let flags = self.cap.load(Relaxed) & (FLAGS | SHIFT | EMBED | SHARED);
         self.cap.store(c | flags, Release);
     }
     /// The allocation behind `p` (this buffer's pointer) and its capacity, given capacity
@@ -218,7 +271,7 @@ impl<T: Copy> SVec<T> {
         // (a fresh buffer: not shifted, not embedded)
         let flags = self.cap.load(Relaxed) & FLAGS;
         self.cap.store(ncap | flags, Release);
-        if w0 & EMBED == 0 {
+        if w0 & (EMBED | SHARED) == 0 {
             if private {
                 free_buf(old_start, old_alloc);
             } else {
@@ -379,6 +432,14 @@ impl<T: Copy> SVec<T> {
         self.extend_from_slice(other);
         other.clear();
     }
+    /// Set the length within the capacity, keeping the buffer's bytes: a C extension writes
+    /// into a String's buffer (`RSTRING_PTR`), then sets its length (`rb_str_set_len`).
+    pub fn set_len_in_capacity(&mut self, k: usize) {
+        self.wb();
+        let cap = self.lock();
+        self.len.store(k.min(cap), Release);
+        self.unlock(cap);
+    }
     pub fn reserve(&mut self, extra: usize) {
         let cap = self.lock();
         let n = self.len.load(Relaxed).min(cap);
@@ -419,7 +480,7 @@ impl<T: Copy> SVec<T> {
             // (a fresh buffer: not shifted, not embedded; this store also unlocks)
             let w0 = self.cap.load(Relaxed);
             self.cap.store(ncap | (w0 & FLAGS), Release);
-            if w0 & EMBED == 0 {
+            if w0 & (EMBED | SHARED) == 0 {
                 let (start, alloc) = Self::alloc_start(old, cap | (w0 & SHIFT));
                 retire_buf(start, alloc);
             }
@@ -533,7 +594,7 @@ impl<T: Copy> Default for SVec<T> {
 impl<T: Copy> Drop for SVec<T> {
     fn drop(&mut self) {
         let w = self.cap.load(Relaxed);
-        if w & EMBED != 0 {
+        if w & (EMBED | SHARED) != 0 {
             return;
         }
         let p = self.ptr.load(Relaxed);

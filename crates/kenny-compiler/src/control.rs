@@ -8,6 +8,17 @@ impl<M: Module> Compiler<M> {
     /// Branch to `t` when `node` is truthy, else to `e`. Comparisons, `!`, `&&`, `||` and
     /// parentheses branch directly (no Ruby true/false made and tested again).
     pub(crate) fn cond_br(&mut self, fx: &mut Fx, node: &Node, t: Block, e: Block) {
+        if self.cov.is_none() {
+            return self.cond_br_node(fx, node, t, e);
+        }
+        // (a statement's line event; the branches leave the block, so it's counted first)
+        let c = self.cov_enter(fx, node);
+        let pushed = self.cov_leave_now(fx, c);
+        self.cond_br_node(fx, node, t, e);
+        self.cov_pop(pushed);
+    }
+
+    fn cond_br_node(&mut self, fx: &mut Fx, node: &Node, t: Block, e: Block) {
         if let Some(p) = node.as_parentheses_node() {
             if let Some(b) = p.body() {
                 let single = match b.as_statements_node() {
@@ -68,9 +79,11 @@ impl<M: Module> Compiler<M> {
         fx.b.append_block_param(done, I64);
         self.cond_br(fx, &n.predicate(), then_b, else_b);
         fx.b.switch_to_block(then_b);
+        self.cov_branch(fx, &n.as_node(), 0);
         let v = self.stmts(fx, n.statements());
         fx.b.ins().jump(done, &[v.into()]);
         fx.b.switch_to_block(else_b);
+        self.cov_branch(fx, &n.as_node(), 1);
         let v = match n.subsequent() {
             Some(s) => self.expr(fx, &s),
             None => self.nil(fx),
@@ -87,9 +100,11 @@ impl<M: Module> Compiler<M> {
         let done = fx.b.create_block();
         self.cond_br(fx, &n.predicate(), then_b, else_b);
         fx.b.switch_to_block(then_b);
+        self.cov_branch(fx, &n.as_node(), 0);
         self.stmts_void(fx, n.statements());
         fx.b.ins().jump(done, &[]);
         fx.b.switch_to_block(else_b);
+        self.cov_branch(fx, &n.as_node(), 1);
         if let Some(s) = n.subsequent() {
             match s.as_else_node() {
                 Some(e) => self.stmts_void(fx, e.statements()),
@@ -108,9 +123,11 @@ impl<M: Module> Compiler<M> {
         let done = fx.b.create_block();
         self.cond_br(fx, &n.predicate(), else_b, then_b);
         fx.b.switch_to_block(then_b);
+        self.cov_branch(fx, &n.as_node(), 1);
         self.stmts_void(fx, n.statements());
         fx.b.ins().jump(done, &[]);
         fx.b.switch_to_block(else_b);
+        self.cov_branch(fx, &n.as_node(), 0);
         if let Some(e) = n.else_clause() {
             self.stmts_void(fx, e.statements());
         }
@@ -126,9 +143,11 @@ impl<M: Module> Compiler<M> {
         fx.b.append_block_param(done, I64);
         self.cond_br(fx, &n.predicate(), else_b, then_b);
         fx.b.switch_to_block(then_b);
+        self.cov_branch(fx, &n.as_node(), 1);
         let v = self.stmts(fx, n.statements());
         fx.b.ins().jump(done, &[v.into()]);
         fx.b.switch_to_block(else_b);
+        self.cov_branch(fx, &n.as_node(), 0);
         let v = match n.else_clause() {
             Some(e) => self.stmts(fx, e.statements()),
             None => self.nil(fx),
@@ -140,7 +159,7 @@ impl<M: Module> Compiler<M> {
 
     /// `lp`: the WhileNode / UntilNode, when the loop may be speculated on (spec.rs).
     pub(crate) fn while_loop(&mut self, fx: &mut Fx, lp: Option<&Node>, pred: &Node, body: Option<StatementsNode>, until: bool, do_while: bool) -> Value {
-        if let (Some(lp), false) = (lp, do_while) {
+        if let (Some(lp), false, true) = (lp, do_while, self.cov.is_none()) {
             let mut core = |c: &mut Self, fx: &mut Fx, exit: Block| {
                 let (p, b) = match lp.as_while_node() {
                     Some(w) => (w.predicate(), w.statements()),
@@ -158,6 +177,7 @@ impl<M: Module> Compiler<M> {
         let exit = fx.b.create_block();
         fx.b.append_block_param(exit, I64);
         let saved = self.hoist_enter(fx, lp);
+        fx.cov_loop = lp.map(crate::coverage::key);
         self.while_core(fx, pred, body, until, do_while, exit);
         self.hoist_leave(fx, saved);
         fx.b.switch_to_block(exit);
@@ -169,6 +189,7 @@ impl<M: Module> Compiler<M> {
         let header = fx.b.create_block();
         let body_b = fx.b.create_block();
         let remembered = self.licm_enter(fx, pred, body.as_ref());
+        let cov_loop = fx.cov_loop.take();
         fx.b.ins().jump(if do_while { body_b } else { header }, &[]);
         fx.b.switch_to_block(header);
         let out = fx.b.create_block();
@@ -182,6 +203,9 @@ impl<M: Module> Compiler<M> {
         fx.b.ins().jump(exit, &[nil.into()]);
         fx.b.switch_to_block(body_b);
         fx.loops.push(LoopCtx { next: header, exit, redo: body_b, next_val: false, rescue_depth: fx.rescue_prev.len() });
+        if let Some(k) = cov_loop {
+            self.cov_branch_key(fx, k, 0);
+        }
         self.stmts_void(fx, body);
         fx.loops.pop();
         self.safepoint(fx);
@@ -231,6 +255,7 @@ impl<M: Module> Compiler<M> {
         let subj = n.predicate().map(|p| self.expr(fx, &p));
         let done = fx.b.create_block();
         fx.b.append_block_param(done, I64);
+        let mut when_i = 0u8;
         for w in n.conditions().iter() {
             let Some(w) = w.as_when_node() else { continue };
             let body_b = fx.b.create_block();
@@ -288,10 +313,13 @@ impl<M: Module> Compiler<M> {
             }
             let fallthrough = fx.b.current_block().unwrap();
             fx.b.switch_to_block(body_b);
+            self.cov_branch(fx, &n.as_node(), when_i);
+            when_i += 1;
             let v = self.stmts(fx, w.statements());
             fx.b.ins().jump(done, &[v.into()]);
             fx.b.switch_to_block(fallthrough);
         }
+        self.cov_branch(fx, &n.as_node(), when_i);
         let v = match n.else_clause() {
             Some(e) => self.stmts(fx, e.statements()),
             None => self.nil(fx),

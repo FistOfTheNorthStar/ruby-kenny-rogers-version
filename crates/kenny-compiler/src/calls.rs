@@ -352,6 +352,10 @@ impl<M: Module> Compiler<M> {
                 }
                 b"require" if arg_nodes.len() == 1 && arg_nodes[0].as_string_node().is_some() => {
                     let name = String::from_utf8_lossy(arg_nodes[0].as_string_node().unwrap().unescaped()).into_owned();
+                    // the coverage library: the program is instrumented (lib.rs `compile_with`)
+                    if name == "coverage" {
+                        self.uses_coverage = true;
+                    }
                     // only Ruby sources are compiled in (.so/.bundle/.jar stay runtime requires)
                     let found = if name.ends_with(".so") || name.ends_with(".bundle") || name.ends_with(".jar") || name.ends_with(".dll") {
                         // a Ruby file standing in for a C extension (Kenny's overlay), never a real binary
@@ -442,6 +446,8 @@ impl<M: Module> Compiler<M> {
         }
 
         let recv = match &recv_node {
+            // (`Ripper.lex_state_name(..)`: not Ripper's parser)
+            Some(r) if crate::ripper::is_data_method(&name) && crate::ripper::is_ripper(r) => self.ripper_quietly(|c| c.expr(fx, r)),
             Some(r) => self.expr(fx, r),
             None => self.self_val(fx),
         };
@@ -454,8 +460,18 @@ impl<M: Module> Compiler<M> {
             let cont = fx.b.create_block();
             let is_nil = fx.b.ins().icmp_imm_s(IntCC::Equal, recv, QNIL);
             let nil = self.nil(fx);
-            fx.b.ins().brif(is_nil, done, &[nil.into()], cont, &[]);
+            if self.cov_has_branch(&c.as_node()) {
+                // (branch coverage: the nil case counted on its way out)
+                let nil_b = fx.b.create_block();
+                fx.b.ins().brif(is_nil, nil_b, &[], cont, &[]);
+                fx.b.switch_to_block(nil_b);
+                self.cov_branch(fx, &c.as_node(), 1);
+                fx.b.ins().jump(done, &[nil.into()]);
+            } else {
+                fx.b.ins().brif(is_nil, done, &[nil.into()], cont, &[]);
+            }
             fx.b.switch_to_block(cont);
+            self.cov_branch(fx, &c.as_node(), 0);
             (Some(done), Some(cont))
         } else {
             (None, None)
@@ -519,7 +535,14 @@ impl<M: Module> Compiler<M> {
         } else if let Some(r) = self.yield_inline_site(fx, c, recv, &name, &arg_nodes, at_loc) {
             r
         } else {
+            // `s << "lit"` (chilled.rs, `append_lit`)
+            if name == b"<<" && arg_nodes.len() == 1 && recv_node.is_some() {
+                if let Some(sn) = arg_nodes[0].as_string_node().filter(|s| !s.is_frozen() && !s.is_mutable()) {
+                    self.append_recv = Some((crate::chilled::key(&sn), recv));
+                }
+            }
             let args = self.eval_args(fx, c.arguments());
+            self.append_recv = None;
             // an eval'd string sees the caller's locals: a snapshot, handed to the runtime with
             // the source string it is for
             if crate::analysis::sees_locals(c) && args.splat.is_none() && !args.vals.is_empty() {
@@ -591,7 +614,7 @@ impl<M: Module> Compiler<M> {
     /// `inline_target`): its body inline, the block's body at each `yield` (`inline_yield`).
     /// None (nothing compiled): not such a call.
     fn yield_inline_site(&mut self, fx: &mut Fx, c: &CallNode, recv: Value, name: &[u8], arg_nodes: &[Node], at_loc: usize) -> Option<Value> {
-        if fx.spec.is_some() || c.is_safe_navigation() || c.is_attribute_write() || std::env::var_os("KENNY_NO_INLINE").is_some() {
+        if fx.spec.is_some() || c.is_safe_navigation() || c.is_attribute_write() || self.cov.is_some() || std::env::var_os("KENNY_NO_INLINE").is_some() {
             return None;
         }
         let bn = c.block()?.as_block_node()?;

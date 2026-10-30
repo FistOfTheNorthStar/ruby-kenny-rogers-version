@@ -36,7 +36,7 @@ hello you
 1
 Counter
 true
-true
+false
 false
 "singleton!"
 [:special]

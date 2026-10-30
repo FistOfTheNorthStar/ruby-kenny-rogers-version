@@ -14,13 +14,18 @@ tests/gems/run.sh rack json       # some
 Outputs land in `target/gems/<gem>.{ruby,build,kenny}` (stderr in `.ruby.err`, `.kenny.err`).
 The gems must be installed for the Ruby the tests run against (`bundle install` in a gem's directory).
 
-## Results (Ruby 3.4.12, 2026-10-29): 84 of 100 pass
+## Results (Ruby 3.4.12, 2026-10-29): 97 of 100 pass
 
 40 passed when the suite was added; the fixes on the `gem-fixes-1` branch brought it to
-76, RSA keys, the SSL/X509 names and an empty `RubyVM` (`openssl-pkey`) to 81, and Nokogiri's
-SAX parsers (`nokogiri-sax`) to 84.
+76, RSA keys, the SSL/X509 names and an empty `RubyVM` (`openssl-pkey`) to 81, Nokogiri's
+SAX parsers (`nokogiri-sax`) to 84, and `gem-fixes-2` (sockets, json 3.x, Psych's tree API,
+Prism and Ripper, C extensions from the lock, chilled string literals, `Coverage`) to 97.
 
-Pass: actioncable, actionmailer, actionpack, actionview, activejob, activemodel, activerecord, activestorage, activesupport, addressable, ast, aws-eventstream, aws-partitions, aws-sdk-core, aws-sdk-kms, aws-sdk-s3, aws-sigv4, base64, bigdecimal, builder, bundler, coderay, concurrent-ruby, connection_pool, crass, diff-lcs, docile, domain_name, dotenv, faraday, faraday-net_http, globalid, googleauth, http-cookie, httpclient, i18n, jmespath, jwt, loofah, mail, method_source, mime-types, mime-types-data, mini_mime, mini_portile2, minitest, multi_json, multi_xml, multipart-post, netrc, nokogiri, parallel, parser, public_suffix, racc, rack, rack-protection, rack-test, rails, rails-dom-testing, rails-html-sanitizer, railties, rainbow, rake, rb-fsevent, regexp_parser, rexml, rspec-core, rspec-expectations, rspec-mocks, rspec-support, ruby-progressbar, rubyzip, signet, sprockets, sprockets-rails, thor, thread_safe, tilt, tzinfo, unf, unicode-display_width, websocket-extensions, zeitwerk.
+Built against Ruby 4.0.9 (`KENNY_RUBY=/path/to/ruby-4.0/bin/ruby tests/gems/run.sh`, with each gem
+directory's `bundle install` run for that Ruby) the result is the same: 97 of 100, the same three
+failing.
+
+Pass: actioncable, actionmailer, actionpack, actionview, activejob, activemodel, activerecord, activestorage, activesupport, addressable, ast, aws-eventstream, aws-partitions, aws-sdk-core, aws-sdk-kms, aws-sdk-s3, aws-sigv4, base64, bigdecimal, builder, bundler, coderay, concurrent-ruby, connection_pool, crass, diff-lcs, docile, domain_name, dotenv, erubi, excon, faraday, faraday-net_http, globalid, googleauth, http-cookie, httpclient, i18n, jmespath, json, jwt, loofah, mail, method_source, mime-types, mime-types-data, mini_mime, mini_portile2, minitest, msgpack, multi_json, multi_xml, multipart-post, netrc, nio4r, nokogiri, parallel, parser, public_suffix, racc, rack, rack-protection, rack-test, rails, rails-dom-testing, rails-html-sanitizer, railties, rainbow, rake, rb-fsevent, redis, regexp_parser, rexml, rspec, rspec-core, rspec-expectations, rspec-mocks, rspec-support, rubocop, rubocop-ast, ruby-progressbar, rubygems-update, rubyzip, signet, simplecov, sprockets, sprockets-rails, thor, thread_safe, tilt, tzinfo, unf, unf_ext, unicode-display_width, websocket-driver, websocket-extensions, zeitwerk.
 
 ### Still failing
 
@@ -28,13 +33,6 @@ Pass: actioncable, actionmailer, actionpack, actionview, activejob, activemodel,
 |---|---|
 | puma | Left out by design: the binary is the server |
 | ffi | Calling C functions through FFI is dropped (docs/LANGUAGE.md); also `FFI.type_size` |
-| simplecov | No `Coverage` |
-| erubi, websocket-driver | String literals are frozen by design (docs/LANGUAGE.md). erubi sees `eval("''").frozen?` and leaves `.freeze` out of its generated code; `WebSocket::Mask.mask` writes into the caller's literal, which CRuby 3.4 still allows |
-| rspec | Its failure report uses Ripper (not supported) |
-| excon, redis, nio4r | Sockets: no `Socket.sockaddr_in`, raw `Socket.new`, `UNIXSocket.pair` |
-| msgpack, unf_ext, rubocop-ast, rubocop | Gems' C extensions aren't built from the lock (rubocop and rubocop-ast need prism's) |
-| json | The native JSON follows json 2.9 whatever the lock says: no `JSON::Coder`, `allow_trailing_comma`, `allow_comments`, `load_file` options |
-| rubygems-update | Building a `.gem` writes the spec with Psych's tree API (`Psych::Visitors::YAMLTree`), which the native Psych lacks |
 | pry | Eval'd code is labelled `<eval>` in backtraces (CRuby: the calling frame's label) |
 
 ## Fixed
@@ -78,5 +76,39 @@ The bugs found when the suite was added, all fixed on `gem-fixes-1` except where
   AWS SDK parses its XML responses with; HTML4 documents that start with text get libxml2's
   implied `<p>`.
 
-Not yet: OpenSSL TLS/X509 certificates/EC keys/ASN1, sockets, C extensions from the lock, json
-3.x, Psych's tree API, `Module.nesting` (always `[]`).
+On `gem-fixes-2`:
+
+- Sockets: `Socket.new` and the `sockaddr_*` helpers, connect/bind/listen/accept and their
+  `_nonblock` forms, `Addrinfo`, `Socket::Option`, `UNIXSocket`/`UNIXServer`, `Socket.pair`,
+  `IO::EAGAINWaitReadable` and friends, `IO#wait_readable`/`wait_writable` (excon, redis,
+  nio4r).
+- JSON follows the json version the program gets (the lock's, else the Ruby's): json 3.x's
+  parser and generator, `JSON::Coder`, `JSON::Fragment`, the new options and error messages.
+- Psych's tree API (`Psych.parse`, `Psych::Nodes`, `YAMLTree`, `Emitter`) is psych's own Ruby
+  code on native parse events and libyaml's emitter (rubygems-update builds a `.gem`);
+  `pack` of nil, `String#sum`'s bits.
+- Prism at runtime on the compiler's libprism (rubocop, rubocop-ast); Ripper on
+  `Prism::Translation::Ripper` (rspec's failure snippets), linked in only when the code uses
+  Ripper's parser.
+- C extensions of locked gems (C and C++) are compiled into the binary (msgpack, unf_ext,
+  websocket-driver's mask), with a much larger C API.
+- String literals are chilled as in Ruby 3.4 in files without a `frozen_string_literal`
+  comment (erubi, websocket-driver); `Hash#[]=` copies only new String keys; `clone(freeze:)`.
+- `Coverage` (lines, branches, methods, oneshot_lines), compiled in only for programs that
+  require it (simplecov); `Range#minmax` on endless ranges, `Array#sum` with NaN/Infinity.
+
+On `openssl-tls`:
+- OpenSSL TLS (`SSLContext`, `SSLSocket`, `SSLServer`, `Session`) on rustls, with CRuby's own
+  `openssl/ssl.rb` and `openssl/buffering.rb` on top: verification with OpenSSL's errors and
+  alerts, `verify_callback`, hostname checks, client certificates, ALPN, session resumption
+  (Net::HTTP's), non-blocking IO. TLS 1.2/1.3 with rustls' AES-GCM/ChaCha20 suites.
+- `OpenSSL::ASN1`, `OpenSSL::X509` (certificates, names, extensions, CSRs, CRLs, a `Store`
+  that verifies as OpenSSL 3.6), `PKey::EC` public keys; CRuby's `openssl/x509.rb` on top.
+- Fixes found on the way: `Zlib::Inflate#inflate`/`Deflate#deflate` with a block (Net::HTTP's
+  gzip bodies), `String#index`/`rindex` offsets in binary Strings (chunked responses),
+  `IO.select` on objects with `#to_io`, `defined?(obj.private_method)`.
+
+Not yet: OpenSSL EC private keys/DSA/DH, TLS session serialization (`Session#to_der`),
+UDP `sendto`/`recvfrom`,
+`JSON::ResumableParser`, C extensions that use CRuby's internal headers (rbs), `Module.nesting`
+(always `[]`).

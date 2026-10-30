@@ -689,6 +689,19 @@ pub fn init() {
             Err(e) => e,
         }
     });
+    // (as CRuby's range_minmax: min and max without iterating, so `(0..Float::INFINITY).minmax`
+    // is [0, Infinity]; with a block, Enumerable's)
+    defn(rg, "minmax", 0, 0, |s, _, b| {
+        if is_proc(b) {
+            return match each_to_vec(s) {
+                Ok(v) => send(ary_new(v), sym("minmax"), &[], b),
+                Err(e) => e,
+            };
+        }
+        let lo = tri!(send(s, sym("min"), &[], QNIL));
+        let hi = tri!(send(s, sym("max"), &[], QNIL));
+        ary_new(vec![lo, hi])
+    });
     if ruby4() {
         defn(rg, "to_set", 0, -1, |s, a, b| {
             if rrange(s).hi == QNIL {

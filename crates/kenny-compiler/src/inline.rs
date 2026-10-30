@@ -265,7 +265,7 @@ impl<M: Module> Compiler<M> {
     /// Try to compile `recv.name(args) { block }` as an inline loop with a guarded fallback.
     /// Returns None (having emitted nothing) when the call doesn't qualify.
     pub(crate) fn inline_block_call(&mut self, fx: &mut Fx, c: &CallNode, recv: Value) -> Option<Value> {
-        if self.refine_scope.is_some() || c.is_safe_navigation() || std::env::var_os("KENNY_NO_INLINE").is_some() {
+        if self.refine_scope.is_some() || c.is_safe_navigation() || self.cov.is_some() || std::env::var_os("KENNY_NO_INLINE").is_some() {
             return None;
         }
         let bn = c.block()?.as_block_node()?;

@@ -72,7 +72,7 @@ anywhere, `=0` off. The gems' files always come from the binary.
 | HTTP | Built into the runtime: a Rack `config.ru` is the entry point, no Puma needed |
 
 Notable choices:
-- **Tagged values** use the same layout as CRuby (Fixnum, Symbol, nil/true/false), so a C-extension API shim stays possible later.
+- **Tagged values** use the same layout as CRuby (Fixnum, Symbol, nil/true/false), so C extensions run on a thin API shim.
 - **Floats are immediates ("flonums")** when their exponent is in range, with CRuby's encoding (low bits `10`, the
   double rotated by 3); +0.0 has its own flonum, and -0.0, NaN, Infinity and very large or small values stay heap
   objects. `ruby.h` mirrors the encoding (`FLONUM_P`, `RFLOAT_VALUE`, `rb_float_new`).
@@ -136,14 +136,24 @@ Working:
   freed once nothing can run them (no method, block, frame or Method object refers to them), so
   code that evals a new string per request doesn't grow memory. `binding` captures `self` (not
   locals), so `ERB#result(binding)` works.
-- **C extensions:** a CRuby-compatible `ruby.h` and C API, built with `kenny build --ext dir`.
+- **C extensions:** a CRuby-compatible `ruby.h` and C API. The C (and C++) extensions of the
+  gems in Gemfile.lock are compiled into the binary, with the flags and `HAVE_*` defines of the
+  Makefile their `extconf.rb` made (msgpack and unf_ext, for example), so `require` of the
+  extension runs its `Init_` function; `kenny build --ext dir` adds one of your own. Gems the
+  runtime has a native replacement for (nokogiri, json, date, sqlite3, ...) keep using it. An
+  extension that doesn't compile or link against Kenny's API is left out with a warning
+  (`require` of it then raises `LoadError`); `KENNY_NO_GEM_EXTS=1` leaves them all out.
 - **Libraries:** `require` / `require_relative` / `autoload` / `load` compile gems and the stdlib
   into the binary (`-I dir`; the stdlib of the Ruby built against is found automatically, and
   without a Gemfile so are the gems that Ruby bundles in place of former stdlib parts, such as
   `csv` and `bigdecimal` in 3.4).
-- **Native stdlib extensions** (Rust instead of C): date, json, yaml (Psych API), bigdecimal,
-  strscan, digest, zlib, openssl (digests, HMAC, ciphers, RSA keys and signatures; no TLS, X509
-  certificates or EC keys), Marshal (byte-compatible format 4.8),
+- **Native stdlib extensions** (Rust instead of C): date, json (2.x or 3.x, as the lock file
+  says), yaml (Psych API; its tree API, `Psych.parse`, `Psych::Nodes`, `YAMLTree` ..., is psych's
+  Ruby code on native parse events and a port of libyaml's emitter), bigdecimal,
+  strscan, digest, zlib, openssl (digests, HMAC, ciphers, RSA keys and signatures, ASN1, X509
+  certificates verified as OpenSSL does, EC public keys, and TLS 1.2/1.3 on rustls under the
+  gem's own `openssl/ssl.rb`, so Net::HTTP does https; no EC private keys, DSA or DH),
+  Marshal (byte-compatible format 4.8),
   cgi/escape, erb/escape (Rails' `html_escape`), plus `Gem::Version`/`Gem::Requirement`.
   Nokogiri is native too (html5ever and quick-xml underneath, its own XPath 1.0 engine, a SAX
   scanner that reports what libxml2's does, and nokogiri's Ruby layer on top), so loofah, the
@@ -175,12 +185,24 @@ Working:
   running code: compiled code keeps frame pointers and the binary carries a table of each
   call's source line, so a backtrace is a walk of the native stack, taken only when needed.
 - **Bundler, socket, FFI:** Bundler's runtime API on gems resolved at build time;
-  `TCPSocket`/`TCPServer`/`Socket` name resolution (blocking); FFI bindings load (their
+  the socket library: `TCPSocket`/`TCPServer`, `UNIXSocket`/`UNIXServer` (and `.pair`),
+  `Socket` on sockaddr strings (`connect`/`connect_nonblock`/`bind`/`listen`/`accept`),
+  `Addrinfo`, `Socket::Option` (UDP's `sendto`/`recvfrom` and `send_io`: not yet;
+  name resolution blocks); FFI bindings load (their
   declarations work) but calling a C function through FFI raises NotImplementedError. As with
   the ffi gem, `ffi_lib` raises LoadError when the library isn't installed, so optional native
-  dependencies (Active Storage's libvips) are skipped. `require "ripper"` gives Ripper's
-  constants and event tables (enough for gems that load it), but parsing with it raises
-  NotImplementedError.
+  dependencies (Active Storage's libvips) are skipped.
+- **Prism and Ripper at runtime:** the prism gem's C extension is replaced by the libprism
+  Kenny's compiler parses with (linked only into programs that load Prism or name Ripper's
+  parser: `require "ripper"` alone costs nothing), so `Prism.parse`/`lex`/`dump`, rubocop-ast
+  and RuboCop work. Its parse is serialized for the
+  gem's Ruby library, whose version must be libprism's (1.9.0): `kenny build` uses the
+  Gemfile.lock's prism, else an installed prism 1.9.0 gem in place of the standard library's
+  (Ruby 3.4 ships 1.5), and otherwise `require "prism"` raises LoadError (with a build
+  warning). Ripper runs on Prism (`Prism::Translation::Ripper` sends Ripper's parser events,
+  `Prism.lex_compat` gives `Ripper.lex` its tokens), so `Ripper.sexp`, `Ripper.lex` and
+  Ripper subclasses work; lexer states of some tokens (spaces, heredoc ends) can differ from
+  CRuby's, and `Ripper#state`/`#token` are nil.
 - **Built-in HTTP server** for Rack apps: one process serves requests on every core
   (`rack.multithread` is true); `WEB_CONCURRENCY=n` forks n processes instead. `rack.hijack`
   (full and partial) hands the connection's socket to the app.

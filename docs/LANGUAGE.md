@@ -27,7 +27,7 @@ Kenny compiles Ruby ahead of time to a single native binary, like Go.
 | `TracePoint`, `set_trace_func` | No hooks on every call/line (a debug build flag replaces them) |
 | String encodings other than UTF-8, ASCII-8BIT (binary), US-ASCII | Strings skip per-operation encoding checks. CRuby's other encodings exist as `Encoding` objects (every constant, `Encoding.find`, `list`, `aliases`, `dummy?`) so code that compares against them or looks them up runs. `String#encode` converts between UTF-8, UTF-16/32 (LE, BE, with a BOM), US-ASCII, binary, ISO-8859-1 and Windows-1252 (ASCII-only text to and from any ASCII-compatible encoding; other text raises `NotImplementedError`). A String in one of those other encodings (from `encode` or `force_encoding`) reports it from `encoding`, `encode` and `valid_encoding?`, but its other methods see bytes, as a binary String's do (`length` of a UTF-16 String is its byte count) |
 | `require` / `autoload` of a library by name (searched on `$LOAD_PATH`) that wasn't compiled in | Whole program is compiled together. `load` of a file, and `require` of an absolute path, that is new or changed since the build are compiled at runtime by the embedded JIT (Rails' code reloading in development) |
-| Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in with `--ext`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError`. As with the ffi gem, `ffi_lib` raises `LoadError` when the library isn't installed. The `sassc` gem (libsass through FFI) is replaced by a native Sass compiler |
+| Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in: those of the gems in Gemfile.lock, and `--ext dir`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError`. As with the ffi gem, `ffi_lib` raises `LoadError` when the library isn't installed. The `sassc` gem (libsass through FFI) is replaced by a native Sass compiler |
 | `Thread#raise` / `Thread#kill` landing at arbitrary instructions | Delivered only at safe points (calls, loop back-edges, IO) |
 | `RubyVM::*`, `Ractor`, `$;`, `$,`, `callcc`, flip-flop, `END` | CRuby internals, superseded, or deprecated (`BEGIN` works; use `at_exit` for `END`). `RubyVM` itself is an empty module, for gems that ask it about YJIT |
 
@@ -41,9 +41,40 @@ Refinements were on this list at first, but real gems (Rack among them) use them
 supported in a way that costs nothing elsewhere: `using` is lexical, so the compiler knows exactly
 which call sites come after it, and only those sites use a refinement-aware lookup.
 
+`Coverage` (the `coverage` library, which SimpleCov uses) works the same way despite the
+`TracePoint` row: a program that requires `coverage` is compiled with counters (a load, add and
+store into its file's table at each line event, branch target and method entry); any other
+program's code is unchanged. `setup` / `start` (`lines:`, `oneshot_lines:`, `branches:`,
+`methods:`, `eval:`, `:all`, or none for the plain lines array), `resume`, `suspend`,
+`result(stop:, clear:)`, `peek_result`, `running?`, `state`, `supported?` and `line_stub` act as
+in CRuby 3.4, with the same errors. Which lines count (`nil` or a number), the branch keys and
+ids, and the method keys are those of CRuby's compiler: a file starts being measured when it is
+loaded after `setup`, as in CRuby. The differences:
+
+- Code compiled at runtime (`eval`, and files the JIT compiles) isn't measured, `eval: true`
+  notwithstanding; native code (`--ext`, and Kenny's built-in replacements for stdlib files) has
+  no Ruby lines to measure.
+- Methods are found in the class tables, not the heap: a method removed or redefined after it
+  ran is missing. A `module_function` method's two copies share a counter, so the module's copy
+  counts calls through either (CRuby counts only calls through that copy).
+- `line_stub` of a file that wasn't compiled in gives `nil` for every line.
+- Counts follow what Kenny runs: where Kenny's library runs other code than CRuby's (Bundler
+  is resolved at build time, for one) those files' counts differ.
+
 ## Rule 3: defaults that differ from CRuby
 
-- **Frozen string literals by default** (Ruby is heading here already).
+- **String literals are chilled, as in Ruby 3.4 and 4.0, except where nothing can tell.** With
+  `# frozen_string_literal: true` a literal is one frozen String for the whole run (no
+  allocation); with `false`, a new String each time. Without the comment it is *chilled*: a new
+  String each time, not frozen (`"a".equal?("a")` and `"a".frozen?` are false), and its first
+  change warns under `Warning[:deprecated] = true` (as CRuby does). A chilled String shares the
+  literal's bytes until it is changed, so it costs one small object. Where the compiler sees that
+  the String is only read by the call it is passed to (an operand of `==` or `+`,
+  `h["key"]`, `h["key"] = v`, `s.start_with?("x")`, `s.split(",")`, `"%d" % n`, `puts "..."`,
+  `"abc".size`, `"x".freeze`, `s << "x"` onto a String, ...), it is the frozen literal instead,
+  costing nothing. Those calls are recognised by method name, so a method of the program with
+  one of those names that keeps or changes such an argument gets a frozen String where CRuby
+  would pass a chilled one.
 - **Metaprogramming is free during boot, slower after.** `define_method`, `class_eval`, `include`,
   `extend` work any time; after boot they invalidate caches and take a slow path.
 - **`$~` / `$1`** are tracked only in methods that reference them.
@@ -58,6 +89,20 @@ which call sites come after it, and only those sites use a refinement-aware look
 - **`YAML.load` follows the psych of the Ruby the program is built against** (or of a psych
   gem in the lock file): with psych 3 (Ruby ≤ 3.0) it is a full load that accepts aliases and
   any class, as older gems expect; with psych 4+ it is a safe load.
+- **Prism at runtime is the compiler's libprism, Ripper runs on it.** `require "prism"` loads the
+  prism gem's Ruby library on libprism 1.9.0 (linked into the binary only when Prism or Ripper's
+  parser is used), so it needs that library at 1.9.0: the Gemfile.lock's prism, else an installed prism
+  1.9.0 gem replaces the standard library's (Ruby 3.4 ships 1.5.x, so `Prism::VERSION` is newer
+  than under CRuby); otherwise `kenny build` warns and `require "prism"` raises LoadError.
+  Ripper is `Prism::Translation::Ripper` sending Ripper's parser events (and `Prism.lex_compat`
+  giving `Ripper.lex` its tokens): `Ripper.sexp`, `Ripper.lex` and subclasses work, but the lexer
+  state of some tokens (spaces, heredoc ends) differs from CRuby's, and `Ripper#state` and
+  `#token` are nil. Ripper's Prism backend is compiled in only when code outside Ripper's own
+  files evaluates the constant `Ripper` other than for its data (`Ripper::EVENTS`, `EXPR_*`,
+  `Ripper.lex_state_name` ...): `Ripper.sexp`, `Ripper.lex`, `Ripper.new`, a subclass,
+  `Ripper::Lexer` and so on. So `require "ripper"` alone costs nothing, and parsing reached only
+  dynamically (`Object.const_get(:Ripper).sexp(src)`, an eval'd string) raises
+  NotImplementedError saying so.
 - **Trailing-Hash keyword arguments in dependencies.** Methods and blocks defined in files found
   via load paths (gems, the stdlib) and in `eval`'d strings take a trailing positional Hash with
   Symbol keys as their keywords — older gems still pass options that way. The app's own code

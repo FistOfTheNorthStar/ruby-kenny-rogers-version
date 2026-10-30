@@ -152,6 +152,11 @@ fn int_bits(v: V) -> Result<u64, V> {
     Err(no_implicit(v, "Integer"))
 }
 
+/// The string of an `a A Z B b H h` item: as in CRuby, nil packs as an empty string.
+fn str_item_nil(v: V) -> Result<Vec<u8>, V> {
+    if v == QNIL { Ok(Vec::new()) } else { str_item(v) }
+}
+
 fn str_item(v: V) -> Result<Vec<u8>, V> {
     if is_str(v) {
         return Ok(rstr(v).b.clone());
@@ -280,7 +285,7 @@ pub fn pack(items: &[V], fmt: &[u8]) -> Result<Vec<u8>, V> {
         let t = d.t;
         match t {
             b'a' | b'A' | b'Z' => {
-                let s = str_item(next_item!())?;
+                let s = str_item_nil(next_item!())?;
                 let pad = if t == b'A' { b' ' } else { 0 };
                 match d.count {
                     Count::Star => {
@@ -301,7 +306,7 @@ pub fn pack(items: &[V], fmt: &[u8]) -> Result<Vec<u8>, V> {
                 }
             }
             b'B' | b'b' => {
-                let s = str_item(next_item!())?;
+                let s = str_item_nil(next_item!())?;
                 let n = match d.count {
                     Count::Star => s.len(),
                     Count::None => 1,
@@ -333,7 +338,7 @@ pub fn pack(items: &[V], fmt: &[u8]) -> Result<Vec<u8>, V> {
                 }
             }
             b'H' | b'h' => {
-                let s = str_item(next_item!())?;
+                let s = str_item_nil(next_item!())?;
                 let n = match d.count {
                     Count::Star => s.len(),
                     Count::None => 1,
@@ -1053,9 +1058,7 @@ pub fn init() {
         };
         match kw_get(&a[1..], "buffer") {
             Some(buf) if is_str(buf) => {
-                if is_frozen(buf) {
-                    return check_frozen(buf);
-                }
+                crate::tri!(check_frozen(buf));
                 rstr(buf).b.extend_from_slice(&bytes);
                 buf
             }

@@ -21,8 +21,11 @@ mod licm;
 mod owned;
 mod ispec;
 mod cfold;
+pub mod coverage;
 mod felem;
 mod hoist;
+mod chilled;
+mod ripper;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -103,6 +106,10 @@ pub(crate) struct MethodCtx {
 
 pub(crate) struct Fx<'a> {
     pub b: FunctionBuilder<'a>,
+    /// coverage.rs: this function's reference to its file's counters word
+    pub cov_gv: Option<ir::GlobalValue>,
+    /// coverage.rs: the loop `while_core` compiles next (its body is a branch target)
+    pub cov_loop: Option<coverage::Key>,
     pub kind: ScopeKind,
     pub lambda: bool,
     /// a method's own fast entry (statics.rs: the `def`'s static target), in its body
@@ -226,6 +233,13 @@ pub struct Compiler<M: Module> {
     /// Cache slots whose first word points to a heap entry the runtime allocates (word
     /// offset, OWNED_CALL / OWNED_CONST): freed with an eval unit.
     pub(crate) owned_caches: Vec<(u32, u8)>,
+    /// chilled.rs: the chilled String literals of the unit being compiled that may be frozen,
+    /// and those of the (never freed) copies of files that inlined methods come from
+    pub(crate) shared_lits: HashSet<usize>,
+    pub(crate) shared_lits_kept: HashSet<usize>,
+    /// (literal, receiver) of the `recv << "lit"` whose argument is being compiled
+    /// (fastpath.rs `append_lit`)
+    pub(crate) append_recv: Option<(usize, Value)>,
     /// statics.rs: the program's `def`s with predeclared fast entries, by name
     pub(crate) static_defs: HashMap<Vec<u8>, Vec<statics::StaticDef>>,
     /// keyword `def`s of the program by name (statics.rs `KwDef`)
@@ -281,6 +295,10 @@ pub struct Compiler<M: Module> {
     pub(crate) load_paths: Vec<PathBuf>,
     /// see `Options::ruby`
     pub(crate) ruby: String,
+    /// see `Options::ripper_backend`; set once a compiled file names Ripper's parser
+    pub(crate) ripper_backend: Option<PathBuf>,
+    pub(crate) ripper_used: bool,
+    pub(crate) ripper_quiet: bool,
     /// Canonical load paths and dependency directories (code compiled with gem semantics).
     pub(crate) dep_roots: Vec<PathBuf>,
     pub warnings: Vec<String>,
@@ -311,6 +329,10 @@ pub struct Compiler<M: Module> {
     pub(crate) block_params: Vec<(FuncId, String)>,
     /// Start offset of every line of the current source (for `line_of`), keyed by the source.
     line_index: (PathBuf, usize, usize, Vec<usize>),
+    /// coverage.rs: the program is instrumented for the coverage library
+    pub(crate) cov: Option<Box<coverage::Build>>,
+    /// a `require "coverage"` was compiled (see `compile_with`)
+    pub(crate) uses_coverage: bool,
 }
 
 /// Backtrace information of one compiled function: its file and label (offsets into the
@@ -348,6 +370,9 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_yield", &[I64, I64, I64], &[I64]),
     ("kn_yield_splat", &[I64, I64], &[I64]),
     ("kn_str_lit", &[I64, I64, I64], &[I64]),
+    ("kn_str_chilled", &[I64, I64, I64], &[I64]),
+    ("kn_str_lit_eval", &[I64, I64, I64], &[I64]),
+    ("kn_str_chilled_eval", &[I64, I64], &[I64]),
     ("kn_str_new", &[I64, I64], &[I64]),
     ("kn_str_append_raw", &[I64, I64, I64], &[I64]),
     ("kn_str_append", &[I64, I64], &[I64]),
@@ -435,6 +460,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_catch_return", &[I64], &[I64]),
     ("kn_raise_msg", &[I64, I64, I64], &[I64]),
     ("kn_respond_to", &[I64, I64], &[I64]),
+    ("kn_respond_to_pub", &[I64, I64], &[I64]),
     ("kn_ivar_defined", &[I64, I64], &[I64]),
     ("kn_gvar_defined", &[I64], &[I64]),
     ("kn_gvar_alias", &[I64, I64], &[I64]),
@@ -491,12 +517,18 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_float_unbox", &[I64], &[ir::types::F64]),
     ("kn_is_float", &[I64], &[I64]),
     ("kn_vobj_fill", &[I64, I64, I64, I64, I64], &[I64]),
+    ("kn_cov_register", &[I64, I64, I64, I64, I64], &[]),
+    ("kn_cov_methods", &[I64, I64], &[]),
+    ("kn_cov_file_start", &[I64], &[]),
+    ("kn_cov_first", &[I64, I64], &[]),
 ];
 
 pub struct Output {
     pub object: Vec<u8>,
     pub needs_jit: bool,
     pub warnings: Vec<String>,
+    /// every file compiled in (canonical paths)
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Default, Clone)]
@@ -515,6 +547,12 @@ pub struct Options {
     /// runtime's default, Ruby 3.4). The program reports it (RUBY_VERSION ...) and gets that
     /// version's behavior where 3.4 and 4.0 differ.
     pub ruby: String,
+    /// Instrument the program for the coverage library (coverage.rs). Set by `compile_with`
+    /// itself when the program requires "coverage".
+    pub coverage: bool,
+    /// Ripper's parsing backend (Kenny's kenny/ripper_prism.rb, which loads Prism): compiled in
+    /// only when the program's code names Ripper's parser (see ripper.rs).
+    pub ripper_backend: Option<PathBuf>,
 }
 
 pub fn compile_file(path: &Path) -> Result<Output, Vec<String>> {
@@ -532,16 +570,32 @@ pub fn compile(src: &[u8], path: &Path) -> Result<Output, Vec<String>> {
 
 pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, Vec<String>> {
     let mut c = Compiler::new_object(path, src).map_err(|e| vec![e])?;
+    if opts.coverage {
+        c.cov = Some(Box::default());
+    }
     c.load_paths = opts.load_paths.clone();
     c.ruby = opts.ruby.clone();
+    c.ripper_backend = opts.ripper_backend.clone();
     c.dep_roots = opts.load_paths.iter().chain(opts.dep_dirs.iter()).map(|p| p.canonicalize().unwrap_or(p.clone())).collect();
     let top = c.compile_program(src, path);
     c.embed(&opts.embed_dirs);
     for f in &opts.embed_files {
         c.require_file(f.clone(), 0);
     }
+    if c.ripper_used {
+        if let Some(b) = &opts.ripper_backend {
+            c.require_file(b.clone(), 0);
+        }
+    }
     if !c.errors.is_empty() {
         return Err(c.errors);
+    }
+    // the program uses the coverage library: compiled again, measuring itself (programs
+    // that don't are compiled exactly as without it)
+    if c.uses_coverage && !opts.coverage {
+        let mut o = opts.clone();
+        o.coverage = true;
+        return compile_with(src, path, &o);
     }
     let top = top.map_err(|e| vec![e])?;
     c.finish(top).map_err(|e| vec![e])
@@ -585,6 +639,9 @@ impl<M: Module> Compiler<M> {
             str_offsets: HashMap::new(),
             cache_words: 0,
             owned_caches: Vec::new(),
+            shared_lits: HashSet::new(),
+            shared_lits_kept: HashSet::new(),
+            append_recv: None,
             static_defs: HashMap::new(),
             kw_defs: HashMap::new(),
             static_defined: HashSet::new(),
@@ -619,6 +676,9 @@ impl<M: Module> Compiler<M> {
             src_hashes: HashMap::new(),
             load_paths: Vec::new(),
             ruby: String::new(),
+            ripper_backend: None,
+            ripper_used: false,
+            ripper_quiet: false,
             dep_roots: Vec::new(),
             warnings: Vec::new(),
             refine_scope: None,
@@ -633,6 +693,8 @@ impl<M: Module> Compiler<M> {
             def_line_next: 0,
             block_params: Vec::new(),
             line_index: (PathBuf::new(), 0, 0, Vec::new()),
+            cov: None,
+            uses_coverage: false,
         })
     }
 }
@@ -641,6 +703,7 @@ impl Compiler<ObjectModule> {
     fn finish(mut self, toplevel: FuncId) -> Result<Output, String> {
         let needs_jit = self.needs_jit;
         let warnings = std::mem::take(&mut self.warnings);
+        let files: Vec<PathBuf> = self.loaded.keys().cloned().collect();
         let e = |x: cranelift_module::ModuleError| x.to_string();
         // main(argc, argv) -> kn_start(...)
         let mut sig = self.module.make_signature();
@@ -755,6 +818,43 @@ impl Compiler<ObjectModule> {
                 let cp = gv(&mut self.module, &mut b, calls_id);
                 b.ins().call(reg_dbg, &[fp, n, cp, strs_base]);
             }
+            // coverage: each file's counters and description, the methods' counters
+            if let Some(cov) = self.cov.take() {
+                let reg = self.rt_id("kn_cov_register");
+                let reg = self.module.declare_func_in_func(reg, b.func);
+                for (id, path, meta) in &cov.files {
+                    let w = gv(&mut self.module, &mut b, *id);
+                    let mo = self.str_offset(meta.as_bytes());
+                    let mp = b.ins().iadd_imm_s(strs_base, mo as i64);
+                    let ml = b.ins().iconst(I64, meta.len() as i64);
+                    let po = self.str_offset(path.as_bytes());
+                    let pp = b.ins().iadd_imm_s(strs_base, po as i64);
+                    let pl = b.ins().iconst(I64, path.len() as i64);
+                    b.ins().call(reg, &[w, mp, ml, pp, pl]);
+                }
+                let id = self.module.declare_data("__kn_cov_methods", Linkage::Local, false, false).map_err(e)?;
+                let mut d = DataDescription::new();
+                let mut bytes = Vec::with_capacity(cov.methods.len() * 24);
+                for (i, (fid, word, ctr)) in cov.methods.iter().enumerate() {
+                    let fr = self.module.declare_func_in_data(*fid, &mut d);
+                    d.write_function_addr((i * 24) as u32, fr);
+                    let wr = self.module.declare_data_in_data(*word, &mut d);
+                    d.write_data_addr((i * 24 + 8) as u32, wr, 0);
+                    bytes.extend_from_slice(&0u64.to_le_bytes());
+                    bytes.extend_from_slice(&0u64.to_le_bytes());
+                    bytes.extend_from_slice(&(*ctr as u64).to_le_bytes());
+                }
+                bytes.resize(bytes.len().max(24), 0);
+                d.define(bytes.into_boxed_slice());
+                d.set_align(8);
+                self.module.define_data(id, &d).map_err(e)?;
+                let f = self.rt_id("kn_cov_methods");
+                let f = self.module.declare_func_in_func(f, b.func);
+                let tp = gv(&mut self.module, &mut b, id);
+                let n = b.ins().iconst(I64, cov.methods.len() as i64);
+                b.ins().call(f, &[tp, n]);
+                cov.report_unemitted();
+            }
             let top_ref = self.module.declare_func_in_func(toplevel, b.func);
             let top = b.ins().func_addr(I64, top_ref);
             let start_name = if needs_jit { "kn_start_jit" } else { "kn_start" };
@@ -800,7 +900,7 @@ impl Compiler<ObjectModule> {
         self.module.define_data(script_id, &d).map_err(e)?;
         let product = self.module.finish();
         let object = product.emit().map_err(|x| x.to_string())?;
-        Ok(Output { object, needs_jit, warnings })
+        Ok(Output { object, needs_jit, warnings, files })
     }
 }
 
@@ -992,11 +1092,27 @@ impl<M: Module> Compiler<M> {
         let l = fx.b.ins().iconst(I64, b.len() as i64);
         (p, l)
     }
-    /// Frozen, cached string literal.
+    /// Frozen, cached string literal. (Eval'd code may be freed: its literals' bytes are
+    /// their own, not kept for the whole run.)
     pub(crate) fn str_lit(&mut self, fx: &mut Fx, b: &[u8]) -> Value {
         let slot = self.cache_ptr(fx, 1);
         let (p, l) = self.str_ptr(fx, b);
-        self.call(fx, "kn_str_lit", &[slot, p, l])
+        self.call(fx, if self.eval_unit { "kn_str_lit_eval" } else { "kn_str_lit" }, &[slot, p, l])
+    }
+    /// A chilled string literal (chilled.rs): a new String each time.
+    pub(crate) fn str_chilled(&mut self, fx: &mut Fx, b: &[u8]) -> Value {
+        let (p, l) = self.str_ptr(fx, b);
+        if self.eval_unit {
+            return self.call(fx, "kn_str_chilled_eval", &[p, l]);
+        }
+        let slot = self.cache_ptr(fx, 1);
+        self.call(fx, "kn_str_chilled", &[slot, p, l])
+    }
+    /// A literal with neither `frozen_string_literal` comment is chilled, unless the program
+    /// can't tell it from the frozen literal (chilled.rs `shared_lits`).
+    pub(crate) fn stays_chilled(&self, s: &ruby_prism::StringNode) -> bool {
+        let k = crate::chilled::key(s);
+        !self.shared_lits.contains(&k) && !self.shared_lits_kept.contains(&k)
     }
     pub(crate) fn args_buf(&mut self, fx: &mut Fx, vals: &[Value]) -> Value {
         if vals.is_empty() {

@@ -284,6 +284,14 @@ pub extern "C" fn kn_binding_new(self_: V) -> V {
 /// `binding` with the locals visible where it is called ([name Symbol, value, ...]).
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_binding_new_l(self_: V, locals: V) -> V {
+    // (the compiler makes every receiverless `binding` this call: when self has a `binding`
+    // method of its own, such as an attr_reader, that is what it calls)
+    let mid = sym("binding");
+    let m = find_method(class_of(self_), mid);
+    let kernel = unsafe { (*rt().c.kernel).methods.get(&mid).copied() };
+    if !m.is_null() && kernel.is_some_and(|k| k as *const Method != m) {
+        return send(self_, mid, &[], QNIL);
+    }
     let b = kn_binding_new(self_);
     let h = hash_new();
     if is_ary(locals) {
@@ -458,7 +466,11 @@ fn init_objectspace() {
             QNIL
         });
         defn(wm, "[]", 1, 1, |s, a, _| crate::hash::hget(ivar_get(s, sym("@__h")), a[0]));
-        defn(wm, "[]=", 2, 2, |s, a, _| crate::hash::hset(ivar_get(s, sym("@__h")), a[0], a[1]));
+        // (the key itself, as CRuby keeps it: a Hash would keep a frozen copy of a String)
+        defn(wm, "[]=", 2, 2, |s, a, _| {
+            rhash(ivar_get(s, sym("@__h"))).m.insert(HKey(a[0]), a[1]);
+            a[1]
+        });
         defn(wm, "key?", 1, 1, |s, a, _| bool_v(rhash(ivar_get(s, sym("@__h"))).m.contains_key(&HKey(a[0]))));
         defn(wm, "delete", 1, 1, |s, a, _| rhash(ivar_get(s, sym("@__h"))).m.shift_remove(&HKey(a[0])).unwrap_or(QNIL));
         defn(wm, "getkey", 1, 1, |s, a, _| rhash(ivar_get(s, sym("@__h"))).m.get_key_value(&HKey(a[0])).map(|(k, _)| k.0).unwrap_or(QNIL));
@@ -586,9 +598,7 @@ pub fn init() {
         let plain_id = sym(plain);
         let p = proc_new_native(
             Box::new(move |s, a, b| {
-                if is_frozen(s) {
-                    return check_frozen(s);
-                }
+                crate::tri!(check_frozen(s));
                 let r = crate::tri!(send(s, plain_id, a, b));
                 if is_str(r) && rstr(r).b != rstr(s).b {
                     rstr(s).b.set(rstr(r).b.clone());

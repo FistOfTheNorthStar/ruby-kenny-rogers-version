@@ -398,6 +398,19 @@ fn is_zlib_mode(s: V) -> bool {
     truthy(ivar_get(s, sym("@__zlibhdr")))
 }
 
+
+/// A stream method's output: returned, or with a block (CRuby's zstream_run) yielded to it
+/// (when there is any) and nil returned.
+fn out_or_yield(out: Vec<u8>, blk: V) -> V {
+    if blk == QNIL {
+        return bin(out);
+    }
+    if !out.is_empty() && call_block(blk, &[bin(out)]) == UNDEF {
+        return UNDEF;
+    }
+    QNIL
+}
+
 fn init_streams(z: *mut Class) {
     let zstream = new_class("Zlib::ZStream", rt().c.object);
     const_set(z, sym("ZStream"), zstream as V);
@@ -450,7 +463,7 @@ fn init_streams(z: *mut Class) {
         new_state(s, Engine::Deflate(Compress::new(level, wbits > 0 && wbits <= 15)), wbits > 15);
         QNIL
     });
-    defn(deflate, "deflate", 1, 2, |s, a, _| {
+    defn(deflate, "deflate", 1, 2, |s, a, blk| {
         let b = match bytes_arg(a[0]) {
             Ok(b) => b,
             Err(e) => return e,
@@ -463,7 +476,7 @@ fn init_streams(z: *mut Class) {
                     p.append(&mut out);
                     out = p;
                 }
-                bin(out)
+                out_or_yield(out, blk)
             }
             Err(e) => e,
         }
@@ -483,7 +496,7 @@ fn init_streams(z: *mut Class) {
             Err(e) => e,
         }
     });
-    defn(deflate, "flush", 0, 1, |s, a, _| {
+    defn(deflate, "flush", 0, 1, |s, a, blk| {
         let flush = match a.first() {
             Some(&x) => flush_of(Some(x)),
             None => FlushCompress::Sync,
@@ -496,12 +509,12 @@ fn init_streams(z: *mut Class) {
                 };
                 let mut p = std::mem::take(&mut st.pending_out);
                 p.extend(out);
-                bin(p)
+                out_or_yield(p, blk)
             }
             Err(e) => e,
         }
     });
-    defn(deflate, "finish", 0, 0, |s, _, _| match deflate_chunk(s, &[], FlushCompress::Finish) {
+    defn(deflate, "finish", 0, 0, |s, _, blk| match deflate_chunk(s, &[], FlushCompress::Finish) {
         Ok(out) => {
             let st = match state(s) {
                 Ok(st) => st,
@@ -509,7 +522,7 @@ fn init_streams(z: *mut Class) {
             };
             let mut p = std::mem::take(&mut st.pending_out);
             p.extend(out);
-            bin(p)
+            out_or_yield(p, blk)
         }
         Err(e) => e,
     });
@@ -532,7 +545,7 @@ fn init_streams(z: *mut Class) {
         new_state(s, Engine::Inflate(Decompress::new(zlib)), wbits > 15);
         QNIL
     });
-    defn(inflate, "inflate", 1, 2, |s, a, _| {
+    defn(inflate, "inflate", 1, 2, |s, a, blk| {
         let b = match bytes_arg(a[0]) {
             Ok(b) => b,
             Err(e) => return e,
@@ -544,7 +557,7 @@ fn init_streams(z: *mut Class) {
                     p.append(&mut out);
                     out = p;
                 }
-                bin(out)
+                out_or_yield(out, blk)
             }
             Err(e) => e,
         }
@@ -564,7 +577,7 @@ fn init_streams(z: *mut Class) {
             Err(e) => e,
         }
     });
-    defn(inflate, "finish", 0, 0, |s, _, _| {
+    defn(inflate, "finish", 0, 0, |s, _, blk| {
         let st = match state(s) {
             Ok(st) => st,
             Err(e) => return e,
@@ -572,7 +585,7 @@ fn init_streams(z: *mut Class) {
         if !st.ended {
             return raise(errs().buf, "buffer error");
         }
-        bin(std::mem::take(&mut st.pending_out))
+        out_or_yield(std::mem::take(&mut st.pending_out), blk)
     });
     defn(inflate, "unused", 0, 0, |s, _, _| match state(s) {
         Ok(st) if !st.unused.is_empty() => bin(st.unused.clone()),

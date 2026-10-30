@@ -31,6 +31,10 @@ libsqlite3-sys = { version = "=0.38.2", features = ["bundled"] }
 grass_compiler = { version = "=0.13.4", default-features = false, features = ["custom-builtin-fns"] }
 rquickjs = "=0.14.0"
 unicode-normalization = "0.1.26"
+# `prism/prism` (src/prism.rs): the libprism the compiler parses with
+ruby-prism-sys = "1.9.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ring = "0.17"
 
 [lib]
 crate-type = ["staticlib", "rlib"]

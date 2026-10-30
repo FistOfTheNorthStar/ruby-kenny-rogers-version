@@ -1,5 +1,11 @@
-//! JSON (the `json` gem's C extension, json 2.9 behaviour): parser, generator,
-//! JSON::Ext::Generator::State and `#to_json` on the core classes.
+//! JSON (the `json` gem's C extension): parser, generator, JSON::Ext::Generator::State and
+//! `#to_json` on the core classes.
+//!
+//! The behaviour follows the json version the program gets: the one in its Gemfile.lock, else
+//! the one bundled with the Ruby it is built against (2.9.1 in Ruby 3.4). json 2.10 and later
+//! ("modern") have a new parser (json_parser3.rs: other error messages, `allow_trailing_comma`,
+//! `JSON::Coder`, `JSON::Fragment` ...); json 3.0 rejects comments, duplicate keys and unknown
+//! options by default and drops the old API. lib/kenny/json.rb adds the Ruby-level parts.
 //!
 //! The generator handles core values natively. Any value whose `to_json` is not one of the
 //! built-in methods (a user/ActiveSupport override) gets `to_json(state)` called, with the
@@ -9,6 +15,55 @@ use crate::core::*;
 use crate::tri;
 use num_bigint::BigInt;
 
+#[path = "json_parser3.rs"]
+mod parser3;
+
+/// The json version, as major * 10000 + minor * 100 + patch.
+static VER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(20901);
+pub(crate) fn ver() -> u32 {
+    VER.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub(crate) const V2_10: u32 = 21000;
+pub(crate) const V2_12: u32 = 21200;
+pub(crate) const V2_14: u32 = 21400;
+pub(crate) const V3_0: u32 = 30000;
+pub(crate) const V3_1: u32 = 30100;
+fn modern() -> bool {
+    ver() >= V2_10
+}
+fn parse_ver(s: &str) -> Option<u32> {
+    let mut it = s.split('.').map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u32>().unwrap_or(0));
+    let (a, b, c) = (it.next()?, it.next().unwrap_or(0), it.next().unwrap_or(0));
+    Some(a * 10000 + b.min(99) * 100 + c.min(99))
+}
+/// The json gem's version: `Gem.loaded_specs["json"]` (from the lock), else the Ruby's own.
+fn detect_version() -> String {
+    let default = if crate::misc::ruby4() { "2.18.0" } else { "2.9.1" };
+    let saved = pst().pending;
+    let r = (|| {
+        let gem = const_lookup(rt().c.object, sym("Gem"))?;
+        if !respond_to(gem, sym("loaded_specs")) {
+            return None;
+        }
+        let specs = send0(gem, "loaded_specs");
+        if !is_hash(specs) {
+            return None;
+        }
+        let spec = crate::hash::hget(specs, str_from("json"));
+        if spec == QNIL || spec == UNDEF {
+            return None;
+        }
+        let v = send0(spec, "version");
+        if v == UNDEF {
+            return None;
+        }
+        let s = crate::fmt::to_s(v).ok()?;
+        Some(String::from_utf8_lossy(&s).into_owned())
+    })();
+    pst().pending = saved;
+    r.filter(|v| parse_ver(v).is_some()).unwrap_or_else(|| default.to_string())
+}
+
 struct JC {
     parser_error: *mut Class,
     nesting_error: *mut Class,
@@ -16,6 +71,7 @@ struct JC {
     state: *mut Class,
     parser: *mut Class,
     generator: *mut Class,
+    json: *mut Class,
 }
 static JCS: G<Option<JC>> = G::new(None);
 fn jc() -> &'static JC {
@@ -39,6 +95,14 @@ struct Opts {
     strict: bool,
     max_nesting: i64,
     depth: i64,
+    // json 2.10+
+    /// strict mode's converter for other objects (a Proc), or QFALSE
+    as_json: V,
+    /// a Proc that orders a Hash's pairs, or QFALSE
+    sort_keys: V,
+    rfc8785: bool,
+    allow_duplicate_key: bool,
+    buffer_initial_length: i64,
 }
 impl Default for Opts {
     fn default() -> Self {
@@ -54,6 +118,11 @@ impl Default for Opts {
             strict: false,
             max_nesting: 100,
             depth: 0,
+            as_json: QFALSE,
+            sort_keys: QFALSE,
+            rfc8785: false,
+            allow_duplicate_key: false,
+            buffer_initial_length: 1024,
         }
     }
 }
@@ -125,6 +194,11 @@ impl Opts {
             strict: truthy(g("strict")),
             max_nesting: nesting_of(g("max_nesting")),
             depth: nesting_of(g("depth")),
+            as_json: if modern() && truthy(g("as_json")) { g("as_json") } else { QFALSE },
+            sort_keys: if modern() && truthy(g("sort_keys")) { g("sort_keys") } else { QFALSE },
+            rfc8785: modern() && truthy(g("rfc8785")),
+            allow_duplicate_key: modern() && truthy(g("allow_duplicate_key")),
+            buffer_initial_length: { let b = g("buffer_initial_length"); if is_fix(b) { fix(b) } else { 1024 } },
         }
     }
     fn store(&self, st: V) {
@@ -142,6 +216,13 @@ impl Opts {
         set("strict", bool_v(self.strict));
         set("max_nesting", mkfix(self.max_nesting));
         set("depth", mkfix(self.depth));
+        if modern() {
+            set("as_json", self.as_json);
+            set("sort_keys", self.sort_keys);
+            set("rfc8785", bool_v(self.rfc8785));
+            set("allow_duplicate_key", bool_v(self.allow_duplicate_key));
+            set("buffer_initial_length", mkfix(self.buffer_initial_length));
+        }
     }
 }
 fn state_new(o: &Opts) -> V {
@@ -391,6 +472,975 @@ fn to_json_native(s: V, a: &[V], _: V) -> V {
     match r {
         Ok(()) => str_new(out),
         Err(e) => e,
+    }
+}
+
+// ---------- generator of json 2.10+ ----------
+
+const FL_ASCII: u32 = crate::compat::FL_BINARY << 1;
+
+fn gen_error_obj(msg: &[u8], invalid: V) -> V {
+    let e = object_new(jc().generator_error);
+    ivar_set(e, sym("@__message"), str_new(msg.to_vec()));
+    ivar_set(e, sym("@invalid_object"), invalid);
+    raise_exc(e)
+}
+fn gen_error3(msg: &str, invalid: V) -> V {
+    gen_error_obj(msg.as_bytes(), invalid)
+}
+/// `CLASS_OF(v)` as an error message shows it (a singleton class if `v` has one).
+fn class_label(v: V) -> String {
+    String::from_utf8_lossy(&crate::fmt::to_s(class_of(v) as V).unwrap_or_default()).into_owned()
+}
+fn wrong_type(v: V, expected: &str) -> V {
+    type_error(&format!("wrong argument type {} (expected {expected})", class_name(real_class(v))))
+}
+fn call_proc(p: V, args: &[V]) -> V {
+    send(p, sym("call"), args, QNIL)
+}
+/// The JSON::Fragment class, once lib/kenny/json.rb has defined it.
+static FRAGMENT: G<V> = G::new(QNIL);
+fn fragment_class() -> V {
+    let f = *FRAGMENT.get();
+    if f != QNIL {
+        return f;
+    }
+    match const_get_under(jc().json, sym("Fragment")) {
+        Some(c) if is_class(c) => {
+            *FRAGMENT.get() = c;
+            c
+        }
+        _ => QNIL,
+    }
+}
+/// Valid as it is: ASCII, or valid UTF-8 in a UTF-8 String.
+fn valid_json_str(s: V) -> bool {
+    let b = &rstr(s).b;
+    if b.is_ascii() {
+        return true;
+    }
+    let f = hdr(s).flags;
+    if f & FL_ASCII != 0 {
+        return false;
+    }
+    if f & crate::compat::FL_BINARY != 0 {
+        // json < 3.1 still took BINARY Strings holding UTF-8 (with a deprecation warning)
+        if ver() >= V3_1 || crate::transcode::enc_of(s).codec != crate::transcode::Codec::Binary {
+            return false;
+        }
+    }
+    std::str::from_utf8(b).is_ok()
+}
+
+/// fpconv_dtoa's format (json 2.12+): shortest digits, scientific notation only for very
+/// large or small numbers, without Float#to_s's ".0" before an exponent.
+fn fmt_float3(f: f64) -> String {
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
+    }
+    let neg = f < 0.0;
+    let e = format!("{:e}", f.abs());
+    let (mant, exp) = e.split_once('e').unwrap();
+    let exp: i32 = exp.parse().unwrap();
+    let digits: Vec<u8> = mant.bytes().filter(|c| *c != b'.').collect();
+    let nd = digits.len() as i32;
+    let k = exp - (nd - 1);
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    let ds = |a: usize, b: usize| String::from_utf8_lossy(&digits[a..b]).into_owned();
+    let aexp = (k + nd - 1).abs();
+    if k >= 0 && aexp < 15 {
+        out += &ds(0, nd as usize);
+        out += &"0".repeat(k as usize);
+        out += ".0";
+        return out;
+    }
+    if k < 0 && (k > -7 || aexp < 10) {
+        let offset = nd + k;
+        if offset <= 0 {
+            out += "0.";
+            out += &"0".repeat((-offset) as usize);
+            out += &ds(0, nd as usize);
+        } else {
+            out += &ds(0, offset as usize);
+            out.push('.');
+            out += &ds(offset as usize, nd as usize);
+        }
+        return out;
+    }
+    let nd = nd.min(18 - neg as i32) as usize;
+    out += &ds(0, 1);
+    if nd > 1 {
+        out.push('.');
+        out += &ds(1, nd);
+    }
+    out.push('e');
+    out.push(if k + nd as i32 - 1 < 0 { '-' } else { '+' });
+    out += &aexp.to_string();
+    out
+}
+
+struct G3<'a> {
+    o: &'a Opts,
+    /// the State passed to `to_json` calls (made when first needed)
+    vstate: V,
+    depth: i64,
+    out: Vec<u8>,
+}
+
+impl G3<'_> {
+    fn new(o: &Opts) -> G3<'_> {
+        G3 { o, vstate: QNIL, depth: o.depth, out: Vec::new() }
+    }
+    fn indent(&mut self, n: i64) {
+        if !self.o.indent.is_empty() {
+            for _ in 0..n {
+                self.out.extend_from_slice(&self.o.indent);
+            }
+        }
+    }
+    fn depth_up(&mut self) -> Result<i64, V> {
+        if self.o.max_nesting != 0 && self.depth >= self.o.max_nesting {
+            return Err(raise(
+                jc().nesting_error,
+                &format!(
+                    "nesting of {} is too deep. Did you try to serialize objects with circular references?",
+                    if ver() >= V3_0 { self.depth + 1 } else { self.depth }
+                ),
+            ));
+        }
+        self.depth += 1;
+        Ok(self.depth)
+    }
+    fn as_json(&self, v: V, is_key: bool) -> Result<V, V> {
+        let r = call_proc(self.o.as_json, &[v, bool_v(is_key)]);
+        if r == UNDEF { Err(UNDEF) } else { Ok(r) }
+    }
+    /// A String already checked to be ASCII or valid UTF-8.
+    fn raw_str(&mut self, s: V) -> Result<(), V> {
+        escape_str(&rstr(s).b, self.o, &mut self.out)
+    }
+    /// A String to generate in place of `s`, whose encoding isn't valid for JSON.
+    fn convert_encoding(&mut self, s: V, as_json_called: bool, is_key: bool) -> Result<V, V> {
+        if !as_json_called && self.o.strict && truthy(self.o.as_json) {
+            let c = self.as_json(s, false)?;
+            if c != s {
+                if is_str(c) {
+                    if !valid_json_str(c) {
+                        return Err(gen_error3("source sequence is illegal/malformed utf-8", s));
+                    }
+                } else if is_key {
+                    return Err(gen_error3(&format!("{} not allowed as object key in JSON", class_label(c)), c));
+                }
+                return Ok(c);
+            }
+        }
+        let r = send(s, sym("encode"), &[str_from("UTF-8")], QNIL);
+        if r == UNDEF {
+            if let Throw::Raise(e) = pst().pending {
+                if is_a(e, rt().c.standard_error) {
+                    pst().pending = Throw::None;
+                    let m = send0(e, "message");
+                    let m = if is_str(m) { rstr(m).b.to_vec() } else { Vec::new() };
+                    return Err(gen_error_obj(&m, s));
+                }
+            }
+            return Err(UNDEF);
+        }
+        if !is_str(r) {
+            return Err(wrong_type(r, "String"));
+        }
+        if !valid_json_str(r) {
+            return Err(gen_error3("source sequence is illegal/malformed utf-8", r));
+        }
+        Ok(r)
+    }
+    fn ensure_valid(&mut self, s: V, as_json_called: bool, is_key: bool) -> Result<V, V> {
+        if valid_json_str(s) { Ok(s) } else { self.convert_encoding(s, as_json_called, is_key) }
+    }
+    fn rfc_number(&mut self, v: V) -> Result<(), V> {
+        let p = ivar_get(jc().state as V, sym("@__rfc8785_number_formatter_proc"));
+        let r = call_proc(p, &[v]);
+        if r == UNDEF {
+            return Err(UNDEF);
+        }
+        if !is_str(r) {
+            return Err(wrong_type(r, "String"));
+        }
+        self.out.extend_from_slice(&rstr(r).b);
+        Ok(())
+    }
+    fn float(&mut self, v: V) -> Result<(), V> {
+        let f = float_val(v);
+        if f.is_nan() || f.is_infinite() {
+            if !self.o.allow_nan {
+                if self.o.strict && truthy(self.o.as_json) {
+                    let c = self.as_json(v, false)?;
+                    if c != v {
+                        self.depth_up()?;
+                        self.value(c, true)?;
+                        self.depth -= 1;
+                        return Ok(());
+                    }
+                }
+                return Err(gen_error3(&format!("{} not allowed in JSON", crate::fmt::float_to_s(f)), v));
+            }
+            self.out.extend_from_slice(crate::fmt::float_to_s(f).as_bytes());
+            return Ok(());
+        }
+        if self.o.rfc8785 {
+            return self.rfc_number(v);
+        }
+        if ver() >= V2_12 {
+            self.out.extend_from_slice(fmt_float3(f).as_bytes());
+        } else {
+            self.out.extend_from_slice(crate::fmt::float_to_s(f).as_bytes());
+        }
+        Ok(())
+    }
+    /// `obj.to_json(state)` (the C generator's fallback for other objects).
+    fn fallback(&mut self, v: V) -> Result<(), V> {
+        let m = find_method(class_of(v), sym("to_json"));
+        if !m.is_null() && BUILTIN_TO_JSON.get().contains(&m) {
+            // JSON::GeneratorMethods#to_json, without the call
+            return self.value(to_json_target(v)?, false);
+        }
+        if !m.is_null() {
+            if self.vstate == QNIL {
+                self.vstate = state_new(self.o);
+            }
+            ivar_set(self.vstate, sym("@__depth"), mkfix(self.depth));
+            let r = send(v, sym("to_json"), &[self.vstate], QNIL);
+            if r == UNDEF {
+                return Err(UNDEF);
+            }
+            if !is_str(r) {
+                return Err(wrong_type(r, "String"));
+            }
+            self.out.extend_from_slice(&rstr(r).b);
+            return Ok(());
+        }
+        let s = str_new(crate::fmt::to_s(v).map_err(|_| UNDEF)?);
+        let s = self.ensure_valid(s, false, false)?;
+        self.raw_str(s)
+    }
+    /// generate_json_general: `fallback` calls `to_json` on subclasses of the core classes.
+    fn value(&mut self, v: V, fallback: bool) -> Result<(), V> {
+        let core = &rt().c;
+        let mut obj = v;
+        let mut as_json_called = false;
+        loop {
+            let mut string = false;
+            if obj == QNIL {
+                self.out.extend_from_slice(b"null");
+                return Ok(());
+            } else if obj == QFALSE {
+                self.out.extend_from_slice(b"false");
+                return Ok(());
+            } else if obj == QTRUE {
+                self.out.extend_from_slice(b"true");
+                return Ok(());
+            } else if is_fix(obj) {
+                if self.o.rfc8785 {
+                    return self.rfc_number(obj);
+                }
+                self.out.extend_from_slice(fix(obj).to_string().as_bytes());
+                return Ok(());
+            } else if is_sym(obj) {
+                if !self.o.strict {
+                    return self.fallback(obj);
+                }
+                obj = str_new(sym_name(sym_id(obj)).to_vec());
+                string = true;
+            } else if is_float(obj) {
+                return self.float(obj);
+            } else {
+                let general = match kind(obj) {
+                    Some(Kind::Bignum) => {
+                        if self.o.rfc8785 {
+                            return self.rfc_number(obj);
+                        }
+                        self.out.extend_from_slice(rbig(obj).n.to_string().as_bytes());
+                        return Ok(());
+                    }
+                    Some(Kind::Hash) => {
+                        if fallback && real_class(obj) != core.hash {
+                            true
+                        } else {
+                            return self.object(obj);
+                        }
+                    }
+                    Some(Kind::Array) => {
+                        if fallback && real_class(obj) != core.array {
+                            true
+                        } else {
+                            return self.array(obj);
+                        }
+                    }
+                    Some(Kind::String) => {
+                        if fallback && real_class(obj) != core.string {
+                            true
+                        } else {
+                            string = true;
+                            false
+                        }
+                    }
+                    _ => {
+                        let fc = fragment_class();
+                        if fc != QNIL && real_class(obj) as V == fc {
+                            let j = send0(obj, "json");
+                            if j == UNDEF {
+                                return Err(UNDEF);
+                            }
+                            if !is_str(j) {
+                                return Err(wrong_type(j, "String"));
+                            }
+                            self.out.extend_from_slice(&rstr(j).b);
+                            return Ok(());
+                        }
+                        true
+                    }
+                };
+                if general {
+                    if self.o.strict {
+                        if truthy(self.o.as_json) && !as_json_called {
+                            obj = self.as_json(obj, false)?;
+                            as_json_called = true;
+                            continue;
+                        }
+                        return Err(gen_error3(&format!("{} not allowed in JSON", class_label(obj)), obj));
+                    }
+                    return self.fallback(obj);
+                }
+            }
+            if string {
+                if valid_json_str(obj) {
+                    return self.raw_str(obj);
+                }
+                if as_json_called {
+                    return Err(gen_error3("source sequence is illegal/malformed utf-8", obj));
+                }
+                obj = self.ensure_valid(obj, false, false)?;
+                as_json_called = true;
+            }
+        }
+    }
+    /// JSON.on_mixed_keys_hash: a Hash with both String and Symbol keys may repeat one.
+    fn mixed_keys(&mut self, h: V) -> Result<(), V> {
+        if self.o.allow_duplicate_key || ver() < V3_0 {
+            return Ok(());
+        }
+        let seen = hash_new();
+        let mut i = 0;
+        while let Some(k) = rhash(h).m.get_index(i).map(|(k, _)| k.0) {
+            i += 1;
+            let ks = str_new(crate::fmt::to_s(k).map_err(|_| UNDEF)?);
+            if crate::hash::hget(seen, ks) != QNIL {
+                let mut msg = b"detected duplicate key ".to_vec();
+                msg.extend(crate::fmt::inspect(ks).map_err(|_| UNDEF)?);
+                msg.extend_from_slice(b" in ");
+                msg.extend(crate::fmt::inspect(h).map_err(|_| UNDEF)?);
+                return Err(gen_error_obj(&msg, QNIL));
+            }
+            crate::hash::hset(seen, ks, QTRUE);
+        }
+        Ok(())
+    }
+    fn object(&mut self, h0: V) -> Result<(), V> {
+        let mut h = h0;
+        if self.o.rfc8785 {
+            let p = ivar_get(jc().state as V, sym("@__rfc8785_sort_keys_proc"));
+            h = call_proc(p, &[h, if self.o.strict { self.o.as_json } else { QNIL }]);
+        } else if truthy(self.o.sort_keys) {
+            h = call_proc(self.o.sort_keys, &[h]);
+        }
+        if h == UNDEF {
+            return Err(UNDEF);
+        }
+        if !is_hash(h) {
+            return Err(wrong_type(h, "Hash"));
+        }
+        let depth = self.depth_up()?;
+        if rhash(h).m.is_empty() {
+            self.out.extend_from_slice(b"{}");
+            self.depth -= 1;
+            return Ok(());
+        }
+        self.out.push(b'{');
+        // 0: String, 1: Symbol, 2: other
+        let tag = |k: V| if kind(k) == Some(Kind::String) { 0 } else if is_sym(k) { 1 } else { 2 };
+        let mut first_tag = 0;
+        let mut mixed = false;
+        let mut i = 0;
+        while let Some((k, val)) = rhash(h).m.get_index(i).map(|(k, v)| (k.0, *v)) {
+            if i == 0 {
+                first_tag = tag(k);
+            } else {
+                self.out.push(b',');
+            }
+            i += 1;
+            self.out.extend_from_slice(&self.o.object_nl);
+            self.indent(depth);
+            let mut key = k;
+            let mut as_json_called = false;
+            let ks = loop {
+                let t = tag(key);
+                if t != 2 && t != first_tag && !mixed {
+                    mixed = true;
+                    self.mixed_keys(h)?;
+                }
+                if t == 0 {
+                    if real_class(key) == rt().c.string {
+                        break key;
+                    }
+                    let r = send0(key, "to_s");
+                    if r == UNDEF {
+                        return Err(UNDEF);
+                    }
+                    if !is_str(r) {
+                        let c = class_name(real_class(key));
+                        return Err(type_error(&format!("can't convert {c} to String ({c}#to_s gives {})", class_name(real_class(r)))));
+                    }
+                    break r;
+                } else if t == 1 {
+                    break str_new(sym_name(sym_id(key)).to_vec());
+                }
+                if self.o.strict && ver() >= V2_14 {
+                    if truthy(self.o.as_json) && !as_json_called {
+                        key = self.as_json(key, true)?;
+                        as_json_called = true;
+                        continue;
+                    }
+                    return Err(gen_error3(&format!("{} not allowed as object key in JSON", class_label(key)), key));
+                }
+                let r = send0(key, "to_s");
+                if r == UNDEF {
+                    return Err(UNDEF);
+                }
+                if !is_str(r) {
+                    let c = class_name(real_class(key));
+                    return Err(type_error(&format!("can't convert {c} to String ({c}#to_s gives {})", class_name(real_class(r)))));
+                }
+                break r;
+            };
+            let ks = self.ensure_valid(ks, as_json_called, true)?;
+            if is_str(ks) && real_class(ks) == rt().c.string {
+                self.raw_str(ks)?;
+            } else {
+                self.value(ks, true)?;
+            }
+            self.out.extend_from_slice(&self.o.space_before);
+            self.out.push(b':');
+            self.out.extend_from_slice(&self.o.space);
+            self.value(val, true)?;
+        }
+        self.depth -= 1;
+        if !self.o.object_nl.is_empty() {
+            self.out.extend_from_slice(&self.o.object_nl);
+            self.indent(self.depth);
+        }
+        self.out.push(b'}');
+        Ok(())
+    }
+    fn array(&mut self, a: V) -> Result<(), V> {
+        let depth = self.depth_up()?;
+        if rary(a).v.is_empty() {
+            self.out.extend_from_slice(b"[]");
+            self.depth -= 1;
+            return Ok(());
+        }
+        self.out.push(b'[');
+        self.out.extend_from_slice(&self.o.array_nl);
+        let mut i = 0;
+        while let Some(&x) = rary(a).v.get(i) {
+            if i > 0 {
+                self.out.push(b',');
+                self.out.extend_from_slice(&self.o.array_nl);
+            }
+            self.indent(depth);
+            self.value(x, true)?;
+            i += 1;
+        }
+        self.depth -= 1;
+        if !self.o.array_nl.is_empty() {
+            self.out.extend_from_slice(&self.o.array_nl);
+            self.indent(self.depth);
+        }
+        self.out.push(b']');
+        Ok(())
+    }
+}
+
+/// What JSON::GeneratorMethods#to_json generates for `v`: itself for the JSON types,
+/// else `"#{v}"`.
+fn to_json_target(v: V) -> Result<V, V> {
+    if v == QNIL || v == QTRUE || v == QFALSE || is_fix(v) || is_float(v) || matches!(kind(v), Some(Kind::Bignum | Kind::Array | Kind::Hash)) {
+        return Ok(v);
+    }
+    Ok(str_new(crate::fmt::to_s(v).map_err(|_| UNDEF)?))
+}
+
+fn validate_rfc8785(o: &Opts) -> Result<(), V> {
+    if !o.rfc8785 {
+        return Ok(());
+    }
+    let opt = if !o.indent.is_empty() {
+        "indent"
+    } else if !o.space.is_empty() {
+        "space"
+    } else if !o.space_before.is_empty() {
+        "space_before"
+    } else if !o.object_nl.is_empty() {
+        "object_nl"
+    } else if !o.array_nl.is_empty() {
+        "array_nl"
+    } else if o.ascii_only {
+        "ascii_only"
+    } else if o.script_safe {
+        "script_safe"
+    } else if o.allow_nan {
+        "allow_nan"
+    } else {
+        return Ok(());
+    };
+    Err(arg_error(&format!("{opt} cannot be used with rfc8785")))
+}
+
+/// Generate `v` (json 2.10+), into `io` if one is given.
+fn generate3(v: V, o: &Opts, io: V, fallback: bool) -> V {
+    if let Err(e) = validate_rfc8785(o) {
+        return e;
+    }
+    let mut g = G3::new(o);
+    if let Err(e) = g.value(v, fallback) {
+        return e;
+    }
+    let s = str_new(std::mem::take(&mut g.out));
+    if truthy(io) {
+        tri!(send1(io, "write", s));
+        if respond_to(io, sym("flush")) {
+            tri!(send0(io, "flush"));
+        }
+        return io;
+    }
+    s
+}
+
+/// The generator options of a Hash (State#configure); unknown keys raise ArgumentError.
+fn configure3(o: &mut Opts, h: V) -> Result<(), V> {
+    if !truthy(h) {
+        return Ok(());
+    }
+    if !is_hash(h) {
+        return Err(wrong_type(h, "Hash"));
+    }
+    let mut unknown: Vec<V> = Vec::new();
+    let mut i = 0;
+    while let Some((k, v)) = rhash(h).m.get_index(i).map(|(k, v)| (k.0, *v)) {
+        i += 1;
+        let name = if is_sym(k) {
+            String::from_utf8_lossy(sym_name(sym_id(k))).into_owned()
+        } else if is_str(k) && ver() < V3_0 {
+            String::from_utf8_lossy(&rstr(k).b).into_owned()
+        } else {
+            String::new()
+        };
+        let string_config = |v: V| -> Result<Vec<u8>, V> {
+            if !truthy(v) {
+                return Ok(vec![]);
+            }
+            if !is_str(v) {
+                return Err(wrong_type(v, "String"));
+            }
+            Ok(rstr(v).b.to_vec())
+        };
+        let long_config = |v: V| -> Result<i64, V> {
+            if !truthy(v) {
+                return Ok(0);
+            }
+            if is_fix(v) {
+                Ok(fix(v))
+            } else if is_float(v) {
+                Ok(float_val(v) as i64)
+            } else {
+                Err(type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(v)))))
+            }
+        };
+        match name.as_str() {
+            "indent" => o.indent = string_config(v)?,
+            "space" => o.space = string_config(v)?,
+            "space_before" => o.space_before = string_config(v)?,
+            "object_nl" => o.object_nl = string_config(v)?,
+            "array_nl" => o.array_nl = string_config(v)?,
+            "max_nesting" => o.max_nesting = long_config(v)?,
+            "allow_nan" => o.allow_nan = truthy(v),
+            "ascii_only" => o.ascii_only = truthy(v),
+            "depth" => o.depth = depth_config(v)?,
+            "buffer_initial_length" => {
+                if !is_fix(v) {
+                    return Err(wrong_type(v, "Integer"));
+                }
+                if fix(v) > 0 {
+                    o.buffer_initial_length = fix(v);
+                }
+            }
+            "script_safe" => o.script_safe = truthy(v),
+            "escape_slash" if ver() < V3_0 => o.script_safe = truthy(v),
+            "strict" => o.strict = truthy(v),
+            "allow_duplicate_key" => o.allow_duplicate_key = truthy(v),
+            "rfc8785" if ver() >= V3_1 => o.rfc8785 = truthy(v),
+            "as_json" => o.as_json = as_json_config(v)?,
+            "sort_keys" if ver() >= 22100 => o.sort_keys = sort_keys_config(v)?,
+            _ => {
+                if ver() >= V3_0 {
+                    unknown.push(k)
+                }
+            }
+        }
+    }
+    if !unknown.is_empty() {
+        let names: Vec<String> = unknown.iter().map(|k| String::from_utf8_lossy(&crate::fmt::to_s(*k).unwrap_or_default()).into_owned()).collect();
+        return Err(if names.len() == 1 {
+            arg_error(&format!("unknown keyword: {}", names[0]))
+        } else {
+            arg_error(&format!("unknown keywords: {}", names.join(", ")))
+        });
+    }
+    validate_rfc8785(o)
+}
+fn depth_config(v: V) -> Result<i64, V> {
+    if !truthy(v) {
+        return Ok(0);
+    }
+    let d = if is_fix(v) {
+        fix(v)
+    } else if is_float(v) {
+        float_val(v) as i64
+    } else {
+        return Err(type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(v)))));
+    };
+    if d < 0 {
+        return Err(arg_error(&format!("depth must be >= 0 (got {d})")));
+    }
+    if d > i32::MAX as i64 {
+        return Err(arg_error(&format!("depth is too large (got {d})")));
+    }
+    Ok(d)
+}
+fn as_json_config(v: V) -> Result<V, V> {
+    if !truthy(v) {
+        return Ok(QFALSE);
+    }
+    if is_proc(v) {
+        return Ok(v);
+    }
+    if respond_to(v, sym("to_proc")) {
+        let p = send0(v, "to_proc");
+        if p == UNDEF {
+            return Err(UNDEF);
+        }
+        if is_proc(p) {
+            return Ok(p);
+        }
+    }
+    Err(type_error("as_json must be a Proc"))
+}
+fn sort_keys_config(v: V) -> Result<V, V> {
+    if is_proc(v) {
+        Ok(v)
+    } else if v == QTRUE {
+        Ok(ivar_get(jc().state as V, sym("@__default_sort_keys_proc")))
+    } else if truthy(v) {
+        Err(type_error("The `sort_keys` argument must be a boolean or a Proc"))
+    } else {
+        Ok(QFALSE)
+    }
+}
+/// A Hash from `opts` (State#configure's to_hash / to_h conversion).
+fn opts_hash(v: V) -> Result<V, V> {
+    if is_hash(v) {
+        return Ok(v);
+    }
+    for m in ["to_hash", "to_h"] {
+        if respond_to(v, sym(m)) {
+            let h = send0(v, m);
+            if h == UNDEF {
+                return Err(UNDEF);
+            }
+            return Ok(h);
+        }
+    }
+    Err(type_error(&format!("can't convert {} into Hash", class_name(real_class(v)))))
+}
+/// JSON::State.from_state: a State as it is, a Hash as `State.new(hash)`, else a new State.
+fn from_state3(a: Option<V>) -> Result<Opts, V> {
+    match a {
+        Some(v) if is_heap(v) && is_a(v, jc().state) => Ok(Opts::from_state(v)),
+        Some(v) if kind(v) == Some(Kind::Hash) => {
+            let mut o = Opts::default();
+            configure3(&mut o, v)?;
+            Ok(o)
+        }
+        _ => Ok(Opts::default()),
+    }
+}
+/// JSON::GeneratorMethods#to_json (json 2.10+).
+fn to_json3(s: V, a: &[V], _: V) -> V {
+    let t = tri!(to_json_target(s).unwrap_or_else(|e| e));
+    let o = match from_state3(a.first().copied()) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    generate3(t, &o, QNIL, false)
+}
+
+fn init_state3(state: *mut Class) {
+    defn(state, "initialize", 0, 1, |s, a, _| {
+        let mut o = Opts::default();
+        if let Some(&h) = a.first().filter(|h| truthy(**h)) {
+            let h = tri!(opts_hash(h).unwrap_or_else(|e| e));
+            if !rhash(h).m.is_empty() {
+                if let Err(e) = configure3(&mut o, h) {
+                    return e;
+                }
+            }
+        }
+        o.store(s);
+        s
+    });
+    defn(state, "initialize_copy", 1, 1, |s, a, _| {
+        Opts::from_state(a[0]).store(s);
+        s
+    });
+    defs(state, "from_state", 1, 1, |c, a, _| {
+        let v = a[0];
+        if is_heap(v) && is_a(v, c as *mut Class) {
+            return v;
+        }
+        if kind(v) == Some(Kind::Hash) {
+            return send(c, sym("new"), &[v], QNIL);
+        }
+        send(jc().state as V, sym("new"), &[], QNIL)
+    });
+    for name in ["default_sort_keys_proc", "rfc8785_number_formatter_proc", "rfc8785_sort_keys_proc"] {
+        let iv = sym(&format!("@__{name}"));
+        let label: &'static str = if name == "default_sort_keys_proc" { "sort_key_proc" } else { name };
+        let f = proc_new_native(
+            Box::new(move |c, a, _| {
+                if !is_proc(a[0]) {
+                    return type_error(&format!("{label} must be a Proc"));
+                }
+                ivar_set(c, iv, a[0]);
+                a[0]
+            }),
+            1,
+            1,
+        );
+        add_method(singleton_class(state as V), sym(&format!("{name}=")), Body::Proc(f));
+    }
+    fn gen_class(a: &[V], fallback: bool) -> V {
+        let mut o = Opts::default();
+        if let Err(e) = configure3(&mut o, a[1]) {
+            return e;
+        }
+        generate3(a[0], &o, a[2], fallback)
+    }
+    defs(state, "generate", 3, 3, |_, a, _| gen_class(a, true));
+    defs(state, "_generate_no_fallback", 3, 3, |_, a, _| gen_class(a, false));
+    defn(state, "generate", 1, 2, |s, a, _| generate3(a[0], &Opts::from_state(s), a.get(1).copied().unwrap_or(QNIL), true));
+    defn(state, "_generate_no_fallback", 1, 2, |s, a, _| generate3(a[0], &Opts::from_state(s), a.get(1).copied().unwrap_or(QNIL), false));
+    fn configure(s: V, a: &[V]) -> V {
+        tri!(check_frozen(s));
+        let h = tri!(opts_hash(a[0]).unwrap_or_else(|e| e));
+        let mut o = Opts::from_state(s);
+        if let Err(e) = configure3(&mut o, h) {
+            return e;
+        }
+        o.store(s);
+        s
+    }
+    defn(state, "configure", 1, 1, |s, a, _| configure(s, a));
+    defn(state, "merge", 1, 1, |s, a, _| configure(s, a));
+    defn(state, "_configure", 1, 1, |s, a, _| configure(s, a));
+    fn to_h(s: V) -> V {
+        let o = Opts::from_state(s);
+        let h = hash_new();
+        let set = |k: &str, v: V| {
+            crate::hash::hset(h, mksym(sym(k)), v);
+        };
+        let st = |b: &Vec<u8>| str_new(b.clone());
+        set("indent", st(&o.indent));
+        set("space", st(&o.space));
+        set("space_before", st(&o.space_before));
+        set("object_nl", st(&o.object_nl));
+        set("array_nl", st(&o.array_nl));
+        set("as_json", o.as_json);
+        set("allow_nan", bool_v(o.allow_nan));
+        set("ascii_only", bool_v(o.ascii_only));
+        set("max_nesting", mkfix(o.max_nesting));
+        set("script_safe", bool_v(o.script_safe));
+        set("strict", bool_v(o.strict));
+        set("depth", mkfix(o.depth));
+        set("buffer_initial_length", mkfix(o.buffer_initial_length));
+        set("sort_keys", o.sort_keys);
+        if ver() >= V3_1 {
+            set("rfc8785", bool_v(o.rfc8785));
+        }
+        if ver() >= V3_0 {
+            set("allow_duplicate_key", bool_v(o.allow_duplicate_key));
+        }
+        h
+    }
+    defn(state, "to_h", 0, 0, |s, _, _| to_h(s));
+    defn(state, "to_hash", 0, 0, |s, _, _| to_h(s));
+    // the string options: "" when unset
+    for k in STR_KEYS {
+        let iv = sym(&format!("@__{k}"));
+        let rd = proc_new_native(
+            Box::new(move |s, _, _| {
+                let v = ivar_get(s, iv);
+                let r = if is_str(v) { str_new(rstr(v).b.to_vec()) } else { str_new(vec![]) };
+                hdr(r).flags |= FL_FROZEN;
+                r
+            }),
+            0,
+            0,
+        );
+        add_method(state, sym(k), Body::Proc(rd));
+        let wr = proc_new_native(
+            Box::new(move |s, a, _| {
+                tri!(check_frozen(s));
+                let v = a[0];
+                let b = if !truthy(v) {
+                    vec![]
+                } else if is_str(v) {
+                    rstr(v).b.to_vec()
+                } else {
+                    return wrong_type(v, "String");
+                };
+                ivar_set(s, iv, str_new(b));
+                a[0]
+            }),
+            1,
+            1,
+        );
+        add_method(state, sym(&format!("{k}=")), Body::Proc(wr));
+    }
+    // boolean options: `name?` (strict and script_safe also without the ?) and `name=`
+    for (k, plain) in [("allow_nan", false), ("ascii_only", false), ("script_safe", true), ("strict", true), ("rfc8785", false)] {
+        let iv = sym(&format!("@__{k}"));
+        let q = proc_new_native(Box::new(move |s, _, _| bool_v(truthy(ivar_get(s, iv)))), 0, 0);
+        add_method(state, sym(&format!("{k}?")), Body::Proc(q));
+        if plain {
+            let q = proc_new_native(Box::new(move |s, _, _| bool_v(truthy(ivar_get(s, iv)))), 0, 0);
+            add_method(state, sym(k), Body::Proc(q));
+        }
+        let wr = proc_new_native(
+            Box::new(move |s, a, _| {
+                tri!(check_frozen(s));
+                ivar_set(s, iv, bool_v(truthy(a[0])));
+                a[0]
+            }),
+            1,
+            1,
+        );
+        add_method(state, sym(&format!("{k}=")), Body::Proc(wr));
+    }
+    let m = add_method(
+        state,
+        sym("allow_duplicate_key?"),
+        Body::Proc(proc_new_native(Box::new(|s, _, _| bool_v(truthy(ivar_get(s, sym("@__allow_duplicate_key"))))), 0, 0)),
+    );
+    unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
+    defn(state, "max_nesting", 0, 0, |s, _, _| mkfix(nesting_of(ivar_get(s, sym("@__max_nesting")))));
+    defn(state, "max_nesting=", 1, 1, |s, a, _| {
+        tri!(check_frozen(s));
+        let n = if !truthy(a[0]) {
+            0
+        } else if is_fix(a[0]) {
+            fix(a[0])
+        } else {
+            return type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(a[0]))));
+        };
+        ivar_set(s, sym("@__max_nesting"), mkfix(n));
+        a[0]
+    });
+    defn(state, "depth", 0, 0, |s, _, _| mkfix(nesting_of(ivar_get(s, sym("@__depth")))));
+    defn(state, "depth=", 1, 1, |s, a, _| {
+        tri!(check_frozen(s));
+        let d = match depth_config(a[0]) {
+            Ok(d) => d,
+            Err(e) => return e,
+        };
+        ivar_set(s, sym("@__depth"), mkfix(d));
+        a[0]
+    });
+    defn(state, "check_circular?", 0, 0, |s, _, _| bool_v(nesting_of(ivar_get(s, sym("@__max_nesting"))) != 0));
+    defn(state, "as_json", 0, 0, |s, _, _| {
+        let v = ivar_get(s, sym("@__as_json"));
+        if truthy(v) { v } else { QFALSE }
+    });
+    defn(state, "as_json=", 1, 1, |s, a, _| {
+        tri!(check_frozen(s));
+        let p = match as_json_config(a[0]) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        ivar_set(s, sym("@__as_json"), p);
+        QNIL
+    });
+    defn(state, "sort_keys", 0, 0, |s, _, _| {
+        let v = ivar_get(s, sym("@__sort_keys"));
+        if truthy(v) { v } else { QFALSE }
+    });
+    defn(state, "sort_keys=", 1, 1, |s, a, _| {
+        tri!(check_frozen(s));
+        let p = match sort_keys_config(a[0]) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        ivar_set(s, sym("@__sort_keys"), p);
+        p
+    });
+    defn(state, "buffer_initial_length", 0, 0, |s, _, _| {
+        let b = ivar_get(s, sym("@__buffer_initial_length"));
+        if is_fix(b) { b } else { mkfix(1024) }
+    });
+    defn(state, "buffer_initial_length=", 1, 1, |s, a, _| {
+        tri!(check_frozen(s));
+        if !is_fix(a[0]) {
+            return wrong_type(a[0], "Integer");
+        }
+        if fix(a[0]) > 0 {
+            ivar_set(s, sym("@__buffer_initial_length"), a[0]);
+        }
+        QNIL
+    });
+    if ver() < V3_0 {
+        // (deprecated in 2.16, removed in 3.0)
+        defn(state, "escape_slash?", 0, 0, |s, _, _| bool_v(truthy(ivar_get(s, sym("@__script_safe")))));
+        defn(state, "escape_slash", 0, 0, |s, _, _| bool_v(truthy(ivar_get(s, sym("@__script_safe")))));
+        defn(state, "escape_slash=", 1, 1, |s, a, _| {
+            ivar_set(s, sym("@__script_safe"), bool_v(truthy(a[0])));
+            a[0]
+        });
+        defn(state, "[]", 1, 1, |s, a, _| {
+            let name = String::from_utf8_lossy(&crate::fmt::to_s(a[0]).unwrap_or_default()).into_owned();
+            if respond_to(s, sym(&name)) {
+                return send(s, sym(&name), &[], QNIL);
+            }
+            ivar_get(s, sym(&format!("@{name}")))
+        });
+        defn(state, "[]=", 2, 2, |s, a, _| {
+            let name = String::from_utf8_lossy(&crate::fmt::to_s(a[0]).unwrap_or_default()).into_owned();
+            if respond_to(s, sym(&format!("{name}="))) {
+                return send(s, sym(&format!("{name}=")), &[a[1]], QNIL);
+            }
+            ivar_set(s, sym(&format!("@{name}")), a[1]);
+            a[1]
+        });
     }
 }
 
@@ -935,6 +1985,8 @@ fn init_state(state: *mut Class) {
 
 fn init_json() {
     let r = rt();
+    let version = detect_version();
+    VER.store(parse_ver(&version).unwrap_or(20901), std::sync::atomic::Ordering::Relaxed);
     let json = new_module("JSON");
     set_global_const("JSON", json as V);
     let json_error = new_class("JSON::JSONError", r.c.standard_error);
@@ -945,11 +1997,16 @@ fn init_json() {
     const_set(json, sym("NestingError"), nesting_error as V);
     let generator_error = new_class("JSON::GeneratorError", json_error);
     const_set(json, sym("GeneratorError"), generator_error as V);
-    const_set(json, sym("UnparserError"), generator_error as V);
-    const_set(json, sym("PARSE_ERROR"), parser_error as V);
-    const_set(json, sym("VERSION"), str_from("2.9.1"));
-    for (n, v) in [("VERSION_MAJOR", 2), ("VERSION_MINOR", 9), ("VERSION_BUILD", 1)] {
-        const_set(json, sym(n), mkfix(v));
+    let v = str_from(&version);
+    hdr(v).flags |= FL_FROZEN;
+    const_set(json, sym("VERSION"), v);
+    if !modern() {
+        const_set(json, sym("UnparserError"), generator_error as V);
+        const_set(json, sym("PARSE_ERROR"), parser_error as V);
+        let n = ver();
+        for (name, v) in [("VERSION_MAJOR", n / 10000), ("VERSION_MINOR", n / 100 % 100), ("VERSION_BUILD", n % 100)] {
+            const_set(json, sym(name), mkfix(v as i64));
+        }
     }
     const_set(json, sym("NaN"), float_new(f64::NAN));
     const_set(json, sym("Infinity"), float_new(f64::INFINITY));
@@ -965,9 +2022,180 @@ fn init_json() {
     let parser = new_class("JSON::Ext::Parser", r.c.object);
     const_set(ext, sym("Parser"), parser as V);
     const_set(json, sym("Parser"), parser as V);
-    *JCS.get() = Some(JC { parser_error, nesting_error, generator_error, state, parser, generator: genm });
-    init_state(state);
+    *JCS.get() = Some(JC { parser_error, nesting_error, generator_error, state, parser, generator: genm, json });
+    if modern() {
+        init_modern(json, ext, state, parser);
+    } else {
+        init_state(state);
+        init_classic(json, parser);
+    }
+    defs(json, "state", 0, 0, |_, _, _| jc().state as V);
+    defs(json, "generator", 0, 0, |_, _, _| jc().generator as V);
+    defs(json, "parser", 0, 0, |_, _, _| jc().parser as V);
 
+    // Kernel#JSON (private)
+    fn kernel_json(_: V, a: &[V], _: V) -> V {
+        if modern() {
+            return json_brackets3(a);
+        }
+        if is_str(a[0]) {
+            parse_impl(a[0], a.get(1).copied(), default_po())
+        } else {
+            let (o, st) = opts_arg(a.get(1).copied(), Opts::default());
+            generate(a[0], &o, st)
+        }
+    }
+    let m = add_method(r.c.kernel, sym("JSON"), Body::Native(kernel_json, 1, 2));
+    unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
+
+    let to_json = sym("to_json");
+    let mut builtin = Vec::new();
+    if modern() {
+        // json 2.10+: one JSON::GeneratorMethods#to_json, in Object
+        let gm = new_module("JSON::GeneratorMethods");
+        const_set(json, sym("GeneratorMethods"), gm as V);
+        builtin.push(add_method(gm, to_json, Body::Native(to_json3, 0, -1)));
+        crate::kernel::do_include(r.c.object, gm as V);
+    } else {
+        // as in the json gem, the core classes' to_json comes from included modules, so a module
+        // included later (ActiveSupport's ToJsonWithActiveSupportEncoder in Rails 8) overrides it
+        // and reaches it through `super`
+        let gm = new_module("JSON::Ext::Generator::GeneratorMethods");
+        const_set(genm, sym("GeneratorMethods"), gm as V);
+        for (name, c) in [
+            ("Object", r.c.object),
+            ("Hash", r.c.hash),
+            ("Array", r.c.array),
+            ("String", r.c.string),
+            ("Integer", r.c.integer),
+            ("Float", r.c.float),
+            ("NilClass", r.c.nil),
+            ("TrueClass", r.c.true_),
+            ("FalseClass", r.c.false_),
+        ] {
+            let m = new_module(&format!("JSON::Ext::Generator::GeneratorMethods::{name}"));
+            const_set(gm, sym(name), m as V);
+            builtin.push(add_method(m, to_json, Body::Native(to_json_native, 0, -1)));
+            crate::kernel::do_include(c, m as V);
+        }
+    }
+    *BUILTIN_TO_JSON.get() = builtin;
+}
+
+/// JSON[object, opts] (json 2.10+): parse a String, generate anything else.
+fn json_brackets3(a: &[V]) -> V {
+    let opts = a.get(1).copied().filter(|o| *o != QNIL);
+    let mut src = a[0];
+    if !is_str(src) && respond_to(src, sym("to_str")) {
+        let s = tri!(send0(src, "to_str"));
+        if is_str(s) {
+            src = s;
+        }
+    }
+    if is_str(src) {
+        return parser3::parse_with(src, opts, parser3::Config::new());
+    }
+    generate_with3(a[0], opts, Opts::default())
+}
+/// JSON.generate(obj, opts) (json 2.10+): a State's options, or a Hash of options.
+fn generate_with3(v: V, opts: Option<V>, base: Opts) -> V {
+    match opts {
+        Some(st) if is_heap(st) && is_a(st, jc().state) => generate3(v, &Opts::from_state(st), QNIL, true),
+        _ => {
+            let mut o = base;
+            if let Some(h) = opts {
+                if let Err(e) = configure3(&mut o, h) {
+                    return e;
+                }
+            }
+            generate3(v, &o, QNIL, true)
+        }
+    }
+}
+
+/// The parser, generator and module functions of json 2.10 and later.
+fn init_modern(json: *mut Class, ext: *mut Class, state: *mut Class, parser: *mut Class) {
+    init_state3(state);
+    let pc = new_class("JSON::Ext::ParserConfig", rt().c.object);
+    const_set(ext, sym("ParserConfig"), pc as V);
+    const_set(parser, sym("Config"), pc as V);
+    let m = add_method(
+        pc,
+        sym("initialize"),
+        Body::Native(
+            |s, a, _| {
+                tri!(check_frozen(s));
+                let mut c = parser3::Config::new();
+                if let Err(e) = c.apply(a[0], false) {
+                    return e;
+                }
+                c.store(s);
+                s
+            },
+            1,
+            1,
+        ),
+    );
+    unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
+    defn(pc, "parse", 1, 1, |s, a, _| parser3::parse(a[0], &parser3::Config::load(s)));
+
+    defn(parser, "initialize", 1, 2, |s, a, _| {
+        let mut c = parser3::Config::new();
+        if let Err(e) = c.apply(a.get(1).copied().unwrap_or(QNIL), false) {
+            return e;
+        }
+        c.store(s);
+        ivar_set(s, sym("@source"), a[0]);
+        s
+    });
+    defn(parser, "source", 0, 0, |s, _, _| {
+        let src = ivar_get(s, sym("@source"));
+        if is_str(src) { str_new(rstr(src).b.to_vec()) } else { send0(src, "dup") }
+    });
+    defn(parser, "parse", 0, 0, |s, _, _| parser3::parse(ivar_get(s, sym("@source")), &parser3::Config::load(s)));
+    defs(parser, "parse", 1, 2, |_, a, _| parser3::parse_with(a[0], a.get(1).copied(), parser3::Config::new()));
+
+    defs(json, "parse", 1, 2, |_, a, _| parser3::parse_with(a[0], a.get(1).copied(), parser3::Config::new()));
+    defs(json, "parse!", 1, 2, |_, a, _| {
+        let base = parser3::Config { max_nesting: 0, allow_nan: true, ..parser3::Config::new() };
+        parser3::parse_with(a[0], a.get(1).copied(), base)
+    });
+    defs(json, "generate", 1, 2, |_, a, _| generate_with3(a[0], a.get(1).copied().filter(|o| *o != QNIL), Opts::default()));
+    defs(json, "pretty_generate", 1, 2, |_, a, _| {
+        let opts = a.get(1).copied().filter(|o| truthy(*o));
+        if let Some(st) = opts.filter(|st| is_heap(*st) && is_a(*st, jc().state)) {
+            return generate3(a[0], &Opts::from_state(st), QNIL, true);
+        }
+        let mut o = pretty();
+        if let Some(h) = opts {
+            let h = tri!(opts_hash(h).unwrap_or_else(|e| e));
+            if let Err(e) = configure3(&mut o, h) {
+                return e;
+            }
+        }
+        generate3(a[0], &o, QNIL, true)
+    });
+    defs(json, "[]", 1, 2, |_, a, _| json_brackets3(a));
+    if ver() < V3_0 {
+        // removed in json 3.0 (lib/kenny/json.rb defines 3.0's load and dump)
+        init_classic_extras(json);
+        defs(json, "unparse", 1, 2, |_, a, _| generate_with3(a[0], a.get(1).copied().filter(|o| *o != QNIL), Opts::default()));
+        defs(json, "fast_generate", 1, 2, |_, a, _| generate_with3(a[0], a.get(1).copied().filter(|o| *o != QNIL), Opts::default()));
+        defs(json, "pretty_unparse", 1, 2, |_, a, _| {
+            let opts = a.get(1).copied().filter(|o| truthy(*o));
+            let mut o = pretty();
+            if let Some(h) = opts {
+                if let Err(e) = configure3(&mut o, h) {
+                    return e;
+                }
+            }
+            generate3(a[0], &o, QNIL, true)
+        });
+    }
+}
+
+/// JSON.load / dump / load_file of json < 3.0 (and the parser and generator of json < 2.10).
+fn init_classic(json: *mut Class, parser: *mut Class) {
     defn(parser, "initialize", 1, 2, |s, a, _| {
         let b = match source_bytes(a[0]) {
             Ok(b) => b,
@@ -988,6 +2216,28 @@ fn init_json() {
     defs(json, "parse!", 1, 2, |_, a, _| {
         parse_impl(a[0], a.get(1).copied(), PO { allow_nan: true, max_nesting: 0, ..default_po() })
     });
+    fn gen_with(a: &[V], base: Opts) -> V {
+        let (o, st) = opts_arg(a.get(1).copied().filter(|x| *x != QNIL), base);
+        generate(a[0], &o, st)
+    }
+    defs(json, "generate", 1, 2, |_, a, _| gen_with(a, Opts::default()));
+    defs(json, "unparse", 1, 2, |_, a, _| gen_with(a, Opts::default()));
+    defs(json, "fast_generate", 1, 2, |_, a, _| gen_with(a, Opts::default()));
+    defs(json, "pretty_generate", 1, 2, |_, a, _| gen_with(a, pretty()));
+    defs(json, "pretty_unparse", 1, 2, |_, a, _| gen_with(a, pretty()));
+    defs(json, "[]", 1, 2, |_, a, _| {
+        if is_str(a[0]) {
+            parse_impl(a[0], a.get(1).copied(), default_po())
+        } else {
+            gen_with(a, Opts::default())
+        }
+    });
+    init_classic_extras(json);
+}
+
+/// The parts of the json < 3.0 API that json 2.10 - 2.21 still have.
+fn init_classic_extras(json: *mut Class) {
+    /// The document and options of JSON.parse for `load`.
     fn load(a: &[V]) -> V {
         let mut src = a[0];
         if src == QNIL {
@@ -1001,6 +2251,28 @@ fn init_json() {
                 src = tri!(send0(src, "read"));
             }
         }
+        let pr = a.get(1).copied().filter(|p| *p != QNIL && !is_hash(*p));
+        if modern() {
+            // json 2.10 - 2.21: allow_blank (default true) loads "" as nil; the proc is
+            // on_load, whose results replace the values
+            let opts = last_hash(&a[1..]);
+            let blank = opts.and_then(|h| opt_get(h, "allow_blank")).map_or(true, truthy);
+            if src == QNIL || (is_str(src) && rstr(src).b.is_empty()) {
+                if blank {
+                    return QNIL;
+                }
+            }
+            let mut c = parser3::Config { max_nesting: 0, allow_nan: true, ..parser3::Config::new() };
+            if let Some(h) = opts {
+                if let Err(e) = c.apply(h, true) {
+                    return e;
+                }
+            }
+            if let Some(pr) = pr {
+                c.on_load = if is_proc(pr) { pr } else { tri!(send0(pr, "to_proc")) };
+            }
+            return parser3::parse(src, &c);
+        }
         let b = match source_bytes(src) {
             Ok(b) => b,
             Err(e) => return e,
@@ -1008,8 +2280,9 @@ fn init_json() {
         if b.iter().all(|c| c.is_ascii_whitespace()) {
             return QNIL;
         }
-        let pr = a.get(1).copied().filter(|p| *p != QNIL && !is_hash(*p));
-        let v = tri!(parse_bytes(&b, parse_opts(last_hash(&a[1..]), PO { allow_nan: true, max_nesting: 0, ..default_po() })));
+        let v = {
+            tri!(parse_bytes(&b, parse_opts(last_hash(&a[1..]), PO { allow_nan: true, max_nesting: 0, ..default_po() })))
+        };
         if let Some(pr) = pr {
             tri!(recurse_proc(v, pr));
         }
@@ -1021,7 +2294,13 @@ fn init_json() {
     defs(json, "load_file", 1, 2, |_, a, _| {
         let path = String::from_utf8_lossy(&crate::fmt::to_s(a[0]).unwrap_or_default()).into_owned();
         match crate::vfs::read_file(path.as_bytes()) {
-            Ok(b) => parse_bytes(&b, parse_opts(a.get(1).copied(), default_po())),
+            Ok(b) => {
+                if modern() {
+                    parser3::parse_with(str_new(b.to_vec()), a.get(1).copied(), parser3::Config::new())
+                } else {
+                    parse_bytes(&b, parse_opts(a.get(1).copied(), default_po()))
+                }
+            }
             Err(_) => {
                 let errno = const_lookup(rt().c.object, sym("Errno")).unwrap() as *mut Class;
                 let enoent = const_get_under(errno, sym("ENOENT")).unwrap() as *mut Class;
@@ -1029,30 +2308,42 @@ fn init_json() {
             }
         }
     });
-    fn gen_with(a: &[V], base: Opts) -> V {
-        let (o, st) = opts_arg(a.get(1).copied().filter(|x| *x != QNIL), base);
-        generate(a[0], &o, st)
-    }
-    defs(json, "generate", 1, 2, |_, a, _| gen_with(a, Opts::default()));
-    defs(json, "unparse", 1, 2, |_, a, _| gen_with(a, Opts::default()));
-    defs(json, "fast_generate", 1, 2, |_, a, _| gen_with(a, Opts::default()));
-    defs(json, "pretty_generate", 1, 2, |_, a, _| gen_with(a, pretty()));
-    defs(json, "pretty_unparse", 1, 2, |_, a, _| gen_with(a, pretty()));
     defs(json, "dump", 1, 4, |_, a, _| {
         // JSON.dump(obj, io = nil, limit = nil, kwargs = nil)
         let mut pos: Vec<V> = vec![a[0]];
         pos.extend(a[1..].iter().copied().filter(|x| !is_hash(*x)));
         let mut o = Opts { allow_nan: true, max_nesting: 0, ..Opts::default() };
         if let Some(h) = last_hash(&a[1..]) {
-            o.merge_hash(h);
+            if modern() {
+                if let Err(e) = configure3(&mut o, h) {
+                    return e;
+                }
+            } else {
+                o.merge_hash(h);
+            }
         }
         if let Some(&lim) = pos.get(2).or(pos.get(1).filter(|x| is_fix(**x))) {
             if is_fix(lim) {
                 o.max_nesting = fix(lim);
             }
         }
-        let st = state_new(&o);
-        let s = tri!(generate(pos[0], &o, st));
+        let s = if modern() {
+            let r = generate3(pos[0], &o, QNIL, true);
+            if r == UNDEF {
+                // json < 3.0: a NestingError is reported as an ArgumentError
+                if let Throw::Raise(e) = pst().pending {
+                    if is_a(e, jc().nesting_error) {
+                        pst().pending = Throw::None;
+                        return arg_error("exceed depth limit");
+                    }
+                }
+                return UNDEF;
+            }
+            r
+        } else {
+            let st = state_new(&o);
+            tri!(generate(pos[0], &o, st))
+        };
         match pos.get(1) {
             Some(&io) if !is_fix(io) && io != QNIL && respond_to(io, sym("write")) => {
                 tri!(send1(io, "write", s));
@@ -1061,16 +2352,6 @@ fn init_json() {
             _ => s,
         }
     });
-    defs(json, "[]", 1, 2, |_, a, _| {
-        if is_str(a[0]) {
-            parse_impl(a[0], a.get(1).copied(), default_po())
-        } else {
-            gen_with(a, Opts::default())
-        }
-    });
-    defs(json, "state", 0, 0, |_, _, _| jc().state as V);
-    defs(json, "generator", 0, 0, |_, _, _| jc().generator as V);
-    defs(json, "parser", 0, 0, |_, _, _| jc().parser as V);
     defs(json, "create_id", 0, 0, |_, _, _| str_from("json_class"));
     defs(json, "dump_default_options", 0, 0, |_, _, _| {
         let h = hash_new();
@@ -1084,41 +2365,6 @@ fn init_json() {
         crate::hash::hset(h, mksym(sym("allow_nan")), QTRUE);
         h
     });
-
-    // Kernel#JSON
-    defn(r.c.kernel, "JSON", 1, 2, |_, a, _| {
-        if is_str(a[0]) {
-            parse_impl(a[0], a.get(1).copied(), default_po())
-        } else {
-            let (o, st) = opts_arg(a.get(1).copied(), Opts::default());
-            generate(a[0], &o, st)
-        }
-    });
-
-    // as in the json gem, the core classes' to_json comes from included modules, so a module
-    // included later (ActiveSupport's ToJsonWithActiveSupportEncoder in Rails 8) overrides it
-    // and reaches it through `super`
-    let to_json = sym("to_json");
-    let mut builtin = Vec::new();
-    let gm = new_module("JSON::Ext::Generator::GeneratorMethods");
-    const_set(genm, sym("GeneratorMethods"), gm as V);
-    for (name, c) in [
-        ("Object", r.c.object),
-        ("Hash", r.c.hash),
-        ("Array", r.c.array),
-        ("String", r.c.string),
-        ("Integer", r.c.integer),
-        ("Float", r.c.float),
-        ("NilClass", r.c.nil),
-        ("TrueClass", r.c.true_),
-        ("FalseClass", r.c.false_),
-    ] {
-        let m = new_module(&format!("JSON::Ext::Generator::GeneratorMethods::{name}"));
-        const_set(gm, sym(name), m as V);
-        builtin.push(add_method(m, to_json, Body::Native(to_json_native, 0, -1)));
-        crate::kernel::do_include(c, m as V);
-    }
-    *BUILTIN_TO_JSON.get() = builtin;
 }
 
 pub fn init() {

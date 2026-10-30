@@ -619,7 +619,7 @@ impl<M: Module> Compiler<M> {
     /// locals to speculate on. `generic` compiles the loop normally (with `exit` as its
     /// exit block); returns false when the loop isn't speculated.
     pub(crate) fn spec_loop(&mut self, fx: &mut Fx, lp: &Node, compile: &mut dyn FnMut(&mut Self, &mut Fx, Block)) -> Option<Value> {
-        if fx.spec_depth > 0 || !self.inline_ctx.is_empty() || !fx.inline_levels.is_empty() || self.refine_scope.is_some() || self.in_dependency() || std::env::var_os("KENNY_NO_SPEC").is_some() {
+        if fx.spec_depth > 0 || !self.inline_ctx.is_empty() || !fx.inline_levels.is_empty() || self.refine_scope.is_some() || self.in_dependency() || self.cov.is_some() || std::env::var_os("KENNY_NO_SPEC").is_some() {
             return None;
         }
         let register = |n: &[u8]| matches!(fx.locals.get(n), Some(Local::Var(_))) && !fx.flocals.contains_key(n);

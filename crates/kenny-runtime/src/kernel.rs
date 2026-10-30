@@ -84,8 +84,12 @@ pub fn dup(v: V, keep_frozen: bool) -> V {
     let r = match kind(v) {
         None => return v,
         Some(Kind::String) => {
-            let n = str_new(rstr(v).b.clone());
+            let n = str_copy(v);
             crate::transcode::set_enc(n, crate::transcode::enc_of(v));
+            // (a clone of a chilled literal is chilled too, as in CRuby)
+            if keep_frozen {
+                hdr(n).flags |= hdr(v).flags & FL_CHILLED;
+            }
             n
         }
         Some(Kind::Array) => ary_new(rary(v).v.clone()),
@@ -812,9 +816,15 @@ pub fn init() {
         }
         r
     });
-    defn(k, "String", 1, 1, |_, a, _| match to_s(a[0]) {
-        Ok(b) => str_new(b),
-        Err(()) => UNDEF,
+    // (a String is returned as it is, as in CRuby)
+    defn(k, "String", 1, 1, |_, a, _| {
+        if is_str(a[0]) {
+            return a[0];
+        }
+        match to_s(a[0]) {
+            Ok(b) => str_new(b),
+            Err(()) => UNDEF,
+        }
     });
     defn(k, "Array", 1, 1, |_, a, _| {
         let v = a[0];
@@ -904,7 +914,7 @@ pub fn init() {
     defn(k, "frozen?", 0, 0, |s, _, _| bool_v(is_frozen(s)));
     defn(k, "freeze", 0, 0, |s, _, _| {
         if is_heap(s) {
-            hdr(s).flags |= FL_FROZEN;
+            hdr(s).flags = (hdr(s).flags | FL_FROZEN) & !FL_CHILLED;
         }
         s
     });
@@ -986,8 +996,20 @@ pub fn init() {
     });
     defn(k, "dup", 0, 0, |s, _, _| dup(s, false));
     defn(k, "clone", 0, 1, |s, a, _| {
-        let keep = !a.first().is_some_and(|h| is_hash(*h));
-        dup(s, keep)
+        // `freeze:` nil (the default) keeps the frozen (or chilled) state, true freezes the
+        // copy, false doesn't
+        let fr = match a.first() {
+            Some(&h) if is_hash(h) => crate::hash::hget(h, mksym(sym("freeze"))),
+            _ => QNIL,
+        };
+        if fr == QFALSE {
+            return dup(s, false);
+        }
+        let r = dup(s, true);
+        if fr == QTRUE && is_heap(r) {
+            hdr(r).flags = (hdr(r).flags | FL_FROZEN) & !FL_CHILLED;
+        }
+        r
     });
     defn(k, "itself", 0, 0, |s, _, _| s);
     defn(k, "tap", 0, 0, |s, _, b| {

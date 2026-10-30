@@ -431,11 +431,46 @@ pub unsafe extern "C" fn kn_str_lit(slot: *mut V, ptr: *const u8, len: u64) -> V
     if *s != 0 {
         return *s;
     }
+    // (its bytes live as long as it does, the whole run: `dup` and `+@` share them)
+    let b: &'static [u8] = Box::leak(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec().into_boxed_slice());
+    let v = unsafe { str_shared(b.as_ptr(), b.len()) };
+    hdr(v).flags |= FL_FROZEN;
+    crate::gc::pin(v);
+    *s = v;
+    v
+}
+/// `kn_str_lit` in eval'd code, which may be freed (and its literals collected): the String
+/// has bytes of its own.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_str_lit_eval(slot: *mut V, ptr: *const u8, len: u64) -> V {
+    let s = unsafe { &mut *slot };
+    if *s != 0 {
+        return *s;
+    }
     let v = str_new(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec());
     hdr(v).flags |= FL_FROZEN;
     crate::gc::pin(v);
     *s = v;
     v
+}
+/// `kn_str_chilled` in eval'd code (see `kn_str_lit_eval`): a copy of the bytes each time.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_str_chilled_eval(ptr: *const u8, len: u64) -> V {
+    let v = str_new(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec());
+    hdr(v).flags |= FL_CHILLED;
+    v
+}
+/// A chilled String literal (core.rs `FL_CHILLED`): a new String each time it runs, sharing
+/// the literal's bytes until it is changed. The bytes are copied once, to memory that lives
+/// as long as the program, and `*slot` keeps their address.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_str_chilled(slot: *mut V, ptr: *const u8, len: u64) -> V {
+    let s = unsafe { &mut *slot };
+    if *s == 0 && len > 0 {
+        let b: &'static [u8] = Box::leak(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec().into_boxed_slice());
+        *s = b.as_ptr() as V;
+    }
+    unsafe { str_chilled(*s as *const u8, len as usize) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_str_new(ptr: *const u8, len: u64) -> V {
@@ -2053,6 +2088,12 @@ pub extern "C" fn kn_raise_msg(cls_name: u64, ptr: *const u8, len: u64) -> V {
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_respond_to(self_: V, id: V) -> u64 {
     respond_to(self_, sym_id(id)) as u64
+}
+/// `defined?(recv.m)` with an explicit receiver (not `self`): a private method doesn't count
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_respond_to_pub(recv: V, id: V) -> u64 {
+    let m = find_method(class_of(recv), sym_id(id));
+    (!m.is_null() && unsafe { (*m).vis } != VIS_PRIVATE) as u64
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_ivar_defined(self_: V, id: V) -> u64 {

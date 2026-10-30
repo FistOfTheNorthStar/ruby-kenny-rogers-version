@@ -264,6 +264,16 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn expr_void(&mut self, fx: &mut Fx, node: &Node) -> Value {
+        if self.cov.is_none() {
+            return self.expr_void_node(fx, node);
+        }
+        let c = self.cov_enter(fx, node);
+        let v = self.expr_void_node(fx, node);
+        self.cov_leave(fx, c);
+        v
+    }
+
+    fn expr_void_node(&mut self, fx: &mut Fx, node: &Node) -> Value {
         if !fx.owned.is_empty() && fx.inline_levels.is_empty() {
             if let Some(name) = crate::owned::append_target(node) {
                 if let Some(&ov) = fx.owned.get(&name) {
@@ -330,10 +340,20 @@ impl<M: Module> Compiler<M> {
                 }
             }
         }
-        self.expr(fx, node)
+        self.expr_node(fx, node)
     }
 
     pub(crate) fn expr(&mut self, fx: &mut Fx, node: &Node) -> Value {
+        if self.cov.is_none() {
+            return self.expr_node(fx, node);
+        }
+        let c = self.cov_enter(fx, node);
+        let v = self.expr_node(fx, node);
+        self.cov_leave(fx, c);
+        v
+    }
+
+    fn expr_node(&mut self, fx: &mut Fx, node: &Node) -> Value {
         let at = node.location().start_offset();
         self.cur_offset = at;
         self.set_srcloc(fx);
@@ -397,6 +417,11 @@ impl<M: Module> Compiler<M> {
                 if s.is_mutable() {
                     let (p, l) = self.str_ptr(fx, &bytes);
                     self.call(fx, "kn_str_new", &[p, l])
+                } else if !s.is_frozen() && self.stays_chilled(&s) {
+                    match self.append_recv.take() {
+                        Some((k, recv)) if k == crate::chilled::key(&s) => self.append_lit(fx, recv, &bytes),
+                        _ => self.str_chilled(fx, &bytes),
+                    }
                 } else {
                     self.str_lit(fx, &bytes)
                 }
@@ -508,8 +533,17 @@ impl<M: Module> Compiler<M> {
                 self.call(fx, "kn_range_new", &[lo, hi, ex])
             }
             Node::SourceFileNode { .. } => {
+                // (frozen, chilled or new as a String literal is)
+                let sf = node.as_source_file_node().unwrap();
                 let f = self.file.display().to_string();
-                self.str_lit(fx, f.as_bytes())
+                if sf.is_mutable() {
+                    let (p, l) = self.str_ptr(fx, f.as_bytes());
+                    self.call(fx, "kn_str_new", &[p, l])
+                } else if sf.is_frozen() {
+                    self.str_lit(fx, f.as_bytes())
+                } else {
+                    self.str_chilled(fx, f.as_bytes())
+                }
             }
             Node::SourceLineNode { .. } => {
                 let l = self.line_of(at) as i64;
@@ -660,6 +694,9 @@ impl<M: Module> Compiler<M> {
             }
             Node::ConstantReadNode { .. } => {
                 let n = node.as_constant_read_node().unwrap();
+                if n.name().as_slice() == b"Ripper" {
+                    self.note_ripper();
+                }
                 if let Some(v) = self.cfold_read(fx, n.name().as_slice(), |c, fx| {
                     let crefp = c.slot_ptr(fx, fx.cref_slot);
                     let s = c.sym_val(fx, n.name().as_slice());
@@ -681,11 +718,18 @@ impl<M: Module> Compiler<M> {
             }
             Node::ConstantPathNode { .. } => {
                 let n = node.as_constant_path_node().unwrap();
-                let parent = match n.parent() {
-                    Some(p) => self.expr(fx, &p),
-                    None => self.call(fx, "kn_object_class", &[]),
-                };
                 let name = n.name().map(|x| x.as_slice().to_vec()).unwrap_or_default();
+                let parent = match n.parent() {
+                    // (`Ripper::EVENTS` ...: Ripper's data, not its parser)
+                    Some(p) if crate::ripper::is_data_const(&name) && crate::ripper::is_ripper(&p) => self.ripper_quietly(|c| c.expr(fx, &p)),
+                    Some(p) => self.expr(fx, &p),
+                    None => {
+                        if name == b"Ripper" {
+                            self.note_ripper();
+                        }
+                        self.call(fx, "kn_object_class", &[])
+                    }
+                };
                 let s = self.sym_val(fx, &name);
                 self.callc(fx, "kn_const_get_under", &[parent, s])
             }
@@ -1238,7 +1282,8 @@ impl<M: Module> Compiler<M> {
                     let ok = fx.b.block_params(done)[1];
                     let rv = fx.b.block_params(done)[0];
                     let id = self.sym_val(fx, call.name().as_slice());
-                    let r = self.call(fx, "kn_respond_to", &[rv, id]);
+                    // (an explicit receiver, `self` too: a private method is not defined)
+                    let r = self.call(fx, "kn_respond_to_pub", &[rv, id]);
                     let r = fx.b.ins().band(r, ok);
                     return cond_str(self, fx, r, "method");
                 }

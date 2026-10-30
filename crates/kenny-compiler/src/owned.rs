@@ -82,9 +82,10 @@ fn is_number(n: &Node) -> bool {
     n.as_integer_node().is_some() || n.as_float_node().is_some() || n.as_rational_node().is_some() || n.as_imaginary_node().is_some()
 }
 
-/// A literal that makes a new String each time it runs.
+/// A literal that makes a new String each time it runs (one with `frozen_string_literal:
+/// false`, or a chilled one: an assigned literal is never compiled frozen, chilled.rs).
 pub fn fresh_str(n: &Node) -> bool {
-    n.as_string_node().is_some_and(|s| s.is_mutable())
+    n.as_string_node().is_some_and(|s| !s.is_frozen())
 }
 
 fn mentions(n: &Node, name: &[u8]) -> bool {

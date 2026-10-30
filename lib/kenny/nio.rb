@@ -18,3 +18,10 @@ require "nio/monitor"
 require "nio/selector"
 require "nio/bytebuffer"
 NIO::ENGINE = "ruby"
+
+module NIO
+  class ByteBuffer
+    # (the C extension's ByteBuffer has #size too)
+    alias_method :size, :capacity unless method_defined?(:size)
+  end
+end
