@@ -79,6 +79,7 @@ const OVERLAY: &[(&str, &str)] = &[
     ("kenny/openssl_x509_cert.rb", include_str!("../../../lib/kenny/kenny/openssl_x509_cert.rb")),
     ("kenny/openssl_x509_store.rb", include_str!("../../../lib/kenny/kenny/openssl_x509_store.rb")),
     ("kenny/openssl_ec.rb", include_str!("../../../lib/kenny/kenny/openssl_ec.rb")),
+    ("kenny/openssl_ed25519.rb", include_str!("../../../lib/kenny/kenny/openssl_ed25519.rb")),
     ("bigdecimal.rb", include_str!("../../../lib/kenny/bigdecimal.rb")),
     ("bigdecimal/util.rb", include_str!("../../../lib/kenny/bigdecimal/util.rb")),
     ("racc/parser.rb", include_str!("../../../lib/kenny/racc/parser.rb")),

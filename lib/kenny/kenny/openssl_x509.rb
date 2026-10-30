@@ -162,7 +162,8 @@ module Kenny
       case oid
       when "1.2.840.113549.1.1.1" then OpenSSL::PKey::RSA.new(spki)
       when "1.2.840.10045.2.1" then OpenSSL::PKey::EC.new(spki)
-      else raise NotImplementedError, "#{Kenny::OID.ln(oid.to_s) || oid} public keys are not supported by Kenny (RSA and EC keys are)"
+      when "1.3.101.112" then OpenSSL::PKey.read(spki)
+      else raise NotImplementedError, "#{Kenny::OID.ln(oid.to_s) || oid} public keys are not supported by Kenny (RSA, EC and Ed25519 keys are)"
       end
     rescue OpenSSL::PKey::PKeyError, OpenSSL::ASN1::ASN1Error, NoMethodError, TypeError
       raise err, "decode error"
@@ -176,8 +177,20 @@ module Kenny
     # signs tbs with key; [signature algorithm TLV, signature]
     def sign(key, digest, tbs_builder)
       raise TypeError, "wrong argument type #{Kenny::DER.class_name(key)} (expected OpenSSL/EVP_PKEY)" unless key.is_a?(OpenSSL::PKey::PKey)
+      if key.is_a?(OpenSSL::PKey::EC)
+        raise ArgumentError, "private key is needed" unless key.private?
+        d = digest_name(digest)
+        alg = alg_tlv(EC_SIG.fetch(d) { raise NotImplementedError, "ECDSA with #{d} is not supported by Kenny" }, false)
+        tbs = tbs_builder.call(alg)
+        return [alg, tbs, key.sign(d, tbs)]
+      end
+      if key.instance_of?(OpenSSL::PKey::PKey) && key.oid == "ED25519"
+        alg = alg_tlv("1.3.101.112", false)
+        tbs = tbs_builder.call(alg)
+        return [alg, tbs, key.sign(nil, tbs)]
+      end
       unless key.is_a?(OpenSSL::PKey::RSA)
-        raise NotImplementedError, "signing with #{key.class} keys is not supported by Kenny (RSA keys are)"
+        raise NotImplementedError, "signing with #{key.class} keys is not supported by Kenny (RSA, EC and Ed25519 keys are)"
       end
       raise ArgumentError, "private key is needed" unless key.private?
       d = digest_name(digest)
@@ -185,6 +198,9 @@ module Kenny
       tbs = tbs_builder.call(alg)
       [alg, tbs, key.sign(d, tbs)]
     end
+
+    EC_SIG = { "SHA1" => "1.2.840.10045.4.1", "SHA224" => "1.2.840.10045.4.3.1", "SHA256" => "1.2.840.10045.4.3.2",
+               "SHA384" => "1.2.840.10045.4.3.3", "SHA512" => "1.2.840.10045.4.3.4" }.freeze
 
     EC_CURVES = { "1.2.840.10045.3.1.7" => "P256", "1.3.132.0.34" => "P384" }.freeze
 
@@ -207,7 +223,15 @@ module Kenny
       when "1.2.840.10045.2.1"
         curve = key_params && EC_CURVES[Kenny::DER.oid_dotted(Kenny::DER.unwrap(key_params)[1])]
         r = curve && OpenSSL::X509.__kenny_verify("ECDSA_#{curve}_#{digest}", bits, data, sig)
-        raise NotImplementedError, "ECDSA with this curve or digest (#{Kenny::OID.ln(oid) || oid}) is not supported by Kenny" if r.nil?
+        if r.nil?
+          # (P-521, secp256k1, or a digest ring doesn't pair with the curve)
+          key = OpenSSL::PKey::EC.new(spki)
+          r = begin
+            key.verify(digest, sig, data)
+          rescue OpenSSL::PKey::PKeyError
+            false
+          end
+        end
         r
       when "1.3.101.112"
         OpenSSL::X509.__kenny_verify("ED25519", bits, data, sig)
@@ -361,3 +385,4 @@ require "kenny/openssl_x509_ext"
 require "kenny/openssl_x509_cert"
 require "kenny/openssl_x509_store"
 require "kenny/openssl_ec"
+require "kenny/openssl_ed25519"

@@ -28,7 +28,7 @@ impl Rsa {
 }
 
 /// The OS random source as a `rand_core` CSPRNG (key generation, blinding, PSS salts).
-struct OsRng;
+pub(super) struct OsRng;
 impl rsa::rand_core::TryRng for OsRng {
     type Error = std::convert::Infallible;
     fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
@@ -215,7 +215,8 @@ fn salt_arg(v: V, k: &RsaPublicKey, alg: Alg, signing: bool) -> Result<Option<us
     }
 }
 
-pub(super) fn init_pkey(ossl: *mut Class) {
+/// (returns OpenSSL::PKey and OpenSSL::PKey::PKey, for openssl_ec.rs)
+pub(super) fn init_pkey(ossl: *mut Class) -> (*mut Class, *mut Class) {
     let pk = module_under(ossl, "PKey");
     *PKEY_ERROR.get() = class_under(pk, "PKeyError", *OSSL_ERROR.get());
     let base = class_under(pk, "PKey", rt().c.object);
@@ -363,4 +364,5 @@ pub(super) fn init_pkey(ossl: *mut Class) {
         });
         bool_v(ok.is_ok())
     });
+    (pk, base)
 }

@@ -108,7 +108,17 @@ On `openssl-tls`:
   gzip bodies), `String#index`/`rindex` offsets in binary Strings (chunked responses),
   `IO.select` on objects with `#to_io`, `defined?(obj.private_method)`.
 
-Not yet: OpenSSL EC private keys/DSA/DH, TLS session serialization (`Session#to_der`),
+On `ec-keys`:
+- `OpenSSL::PKey::EC` on P-256, P-384, P-521 and secp256k1: `generate`, SEC1/PKCS#8/SPKI keys,
+  ECDSA (`sign`/`verify`, `dsa_sign_asn1`), ECDH (`derive`, `dh_compute_key`), `Group` and
+  `Point` arithmetic; Ed25519 keys (`PKey.generate_key("ED25519")`, raw keys); certificates,
+  CSRs and TLS servers with EC and Ed25519 keys. jwt's ES256/ES384/ES512/ES256K and JWKs.
+- Fixes found on the way: `String#ljust`/`rjust`/`center` on binary Strings (jwt pads ECDSA
+  signatures with them), `OpenSSL::Digest` is a `Digest::Class` and `require "openssl"`
+  loads `digest` (jwt's JWK thumbprints use `::Digest`).
+
+Not yet: OpenSSL DSA/DH and X25519/Ed448 keys, encrypted private keys, TLS session
+serialization (`Session#to_der`),
 UDP `sendto`/`recvfrom`,
 `JSON::ResumableParser`, C extensions that use CRuby's internal headers (rbs), `Module.nesting`
 (always `[]`).
