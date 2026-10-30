@@ -1124,6 +1124,7 @@ fn init_bigdecimal() {
     const_set(c, sym("NAN"), new_bd(D::nan()));
 
     defn(rt().c.kernel, "BigDecimal", 1, -1, |_, a, _| kernel_bigdecimal(a));
+    crate::visibility::global_function("BigDecimal");
 
     defs(c, "_load", 1, 1, |_, a, _| {
         if !is_str(a[0]) {

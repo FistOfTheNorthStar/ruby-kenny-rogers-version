@@ -1042,6 +1042,13 @@ fn rng_number(r: V, a: &[V], strict: bool) -> V {
 
 static THREAD_REPORT: G<V> = G::new(QTRUE);
 static THREAD_ABORT: G<V> = G::new(QFALSE);
+/// Thread.report_on_exception / Thread.abort_on_exception (what a new thread starts with)
+pub fn thread_report_default() -> V {
+    *THREAD_REPORT.get()
+}
+pub fn thread_abort_default() -> V {
+    *THREAD_ABORT.get()
+}
 
 /// String encodings: UTF-8 unless flagged binary (ASCII-8BIT), plus the Encoding class API.
 fn init_encoding(st: *mut Class, enc: *mut Class) {

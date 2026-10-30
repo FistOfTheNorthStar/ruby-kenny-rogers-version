@@ -441,7 +441,25 @@ fn md_named_index(m: V, name: &str) -> Option<usize> {
 }
 
 /// Match `re` against string `s` from char position `pos`; sets `$~`.
+/// A match against a UTF-8 (or US-ASCII) String with invalid bytes raises, as CRuby's
+/// rb_reg_prepare_enc does: Some(the raised UNDEF).
+pub fn broken_subject(s: V) -> Option<V> {
+    if !is_str(s) || hdr(s).flags & crate::compat::FL_BINARY != 0 {
+        return None;
+    }
+    let b = &rstr(s).b;
+    if b.is_ascii() || std::str::from_utf8(b).is_ok() {
+        return None;
+    }
+    let enc = crate::transcode::enc_of(s);
+    Some(arg_error(&format!("invalid byte sequence in {}", enc.name)))
+}
+
+/// MatchData of `re` on `s` from character `pos`, or nil (UNDEF: raised, see broken_subject).
 pub fn do_match(re: V, s: V, pos: usize, set: bool) -> V {
+    if let Some(e) = broken_subject(s) {
+        return e;
+    }
     let t = text(s);
     let start = t.byte_index(pos);
     match search(re, &t, start) {
@@ -588,6 +606,9 @@ pub fn expand(rep: &[u8], src: &[u8], pos: &[i64], re: V) -> Vec<u8> {
 
 /// String#sub/gsub with a Regexp pattern. Ok(None) = no change.
 pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<(Vec<u8>, crate::transcode::Enc)>, V> {
+    if let Some(e) = broken_subject(s).filter(|_| is_regexp(re)) {
+        return Err(e);
+    }
     let t = text(s);
     let r = re_of(re);
     let src_ascii = t.b.is_ascii();
@@ -691,6 +712,9 @@ pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<(
 }
 
 pub fn scan(s: V, re: V, blk: V) -> V {
+    if let Some(e) = broken_subject(s).filter(|_| is_regexp(re)) {
+        return e;
+    }
     let t = text(s);
     let src = t.as_bytes().to_vec();
     let mut out = RVec::new();
@@ -719,6 +743,9 @@ pub fn scan(s: V, re: V, blk: V) -> V {
 }
 
 pub fn split(s: V, re: V, limit: i64) -> V {
+    if let Some(e) = broken_subject(s).filter(|_| is_regexp(re)) {
+        return e;
+    }
     let t = text(s);
     let src = t.as_bytes();
     let mut parts: Vec<V> = Vec::new();
@@ -773,8 +800,8 @@ pub fn match_index(re: V, s: V) -> V {
         return QNIL;
     }
     let m = do_match(re, s, 0, true);
-    if m == QNIL {
-        return QNIL;
+    if m == QNIL || m == UNDEF {
+        return m;
     }
     let pos = md_pos(m);
     mkfix(md_char_index(m, pos[0] as usize) as i64)
@@ -782,8 +809,8 @@ pub fn match_index(re: V, s: V) -> V {
 
 pub fn str_index(s: V, re: V, from: usize) -> V {
     let m = do_match(re, s, from, true);
-    if m == QNIL {
-        return QNIL;
+    if m == QNIL || m == UNDEF {
+        return m;
     }
     mkfix(md_char_index(m, md_pos(m)[0] as usize) as i64)
 }
@@ -827,8 +854,8 @@ pub fn str_byte_search(s: V, re: V, from: usize, back: bool) -> V {
 
 pub fn str_aref(s: V, re: V, cap: Option<V>) -> V {
     let m = do_match(re, s, 0, true);
-    if m == QNIL {
-        return QNIL;
+    if m == QNIL || m == UNDEF {
+        return m;
     }
     match cap {
         None => md_group(m, 0),
@@ -1122,7 +1149,7 @@ pub fn init() {
         let pos = a.get(1).map(|x| fix(*x).max(0) as usize).unwrap_or(0);
         let target = if is_sym(a[0]) { str_from(&sym_str(sym_id(a[0]))) } else { a[0] };
         let m = do_match(s, target, pos, true);
-        if m != QNIL && is_proc(b) { call_block(b, &[m]) } else { m }
+        if m != QNIL && m != UNDEF && is_proc(b) { call_block(b, &[m]) } else { m }
     });
     defn(rc, "match?", 1, 2, |s, a, _| {
         if a[0] == QNIL {
@@ -1136,6 +1163,9 @@ pub fn init() {
             Some(&p) if is_fix(p) => fix(p),
             _ => 0,
         };
+        if let Some(e) = broken_subject(target) {
+            return e;
+        }
         bool_v(matches(s, target, pos))
     });
     defn(rc, "===", 1, 1, |s, a, _| {
@@ -1143,7 +1173,7 @@ pub fn init() {
         if !is_str(target) {
             return QFALSE;
         }
-        bool_v(do_match(s, target, 0, true) != QNIL)
+        bool_v(tri!(do_match(s, target, 0, true)) != QNIL)
     });
     defn(rc, "==", 1, 1, |s, a, _| bool_v(is_regexp(a[0]) && re_of(s).source == re_of(a[0]).source && re_of(s).opts == re_of(a[0]).opts));
     defn(rc, "eql?", 1, 1, |s, a, _| bool_v(is_regexp(a[0]) && re_of(s).source == re_of(a[0]).source && re_of(s).opts == re_of(a[0]).opts));

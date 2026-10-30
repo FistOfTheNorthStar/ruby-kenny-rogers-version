@@ -919,7 +919,7 @@ pub fn init() {
     defn(c, "start_with?", 0, -1, |s, a, _| {
         for &p in a {
             if crate::regex::is_regexp(p) {
-                let m = crate::regex::do_match(p, s, 0, true);
+                let m = tri!(crate::regex::do_match(p, s, 0, true));
                 if m != QNIL && fix(tri!(send1(m, "begin", mkfix(0)))) == 0 {
                     return QTRUE;
                 }

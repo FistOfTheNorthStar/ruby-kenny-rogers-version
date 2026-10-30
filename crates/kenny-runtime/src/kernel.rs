@@ -951,7 +951,6 @@ pub fn init() {
     });
     defn(k, "nil?", 0, 0, |s, _, _| bool_v(s == QNIL));
     defn(k, "===", 1, 1, |s, a, _| equal(s, a[0]));
-    defn(k, "=~", 1, 1, |_, _, _| QNIL);
     // Object#eql? is identity (plus value equality of the core value types); unlike the
     // hash-key `eql`, it must not dispatch to a user eql? (`super` from Mime::Type#eql?)
     defn(k, "eql?", 1, 1, |s, a, _| {
@@ -1378,6 +1377,8 @@ pub fn init() {
                 }
             }
         }
+        // (the instance methods become private: `module_function :URI` in uri/common.rb)
+        tri!(send(s, sym("private"), a, QNIL));
         visibility(s, a)
     });
     defn(md, "method_defined?", 1, 2, |s, a, _| match sym_arg(a[0]) {

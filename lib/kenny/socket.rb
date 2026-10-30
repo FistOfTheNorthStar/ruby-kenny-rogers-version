@@ -304,6 +304,38 @@ class Socket < BasicSocket
 
   def self.ip_address_list = []
 
+  # Listening sockets on every address of host (nil: all of them), as CRuby's socket.rb
+  # (WEBrick's create_listeners). Port 0: the rest take the port the first one got.
+  def self.tcp_server_sockets(host = nil, port)
+    sockets = []
+    begin
+      Addrinfo.getaddrinfo(host, port, nil, :STREAM, nil, AI_PASSIVE).each do |ai|
+        ai = Addrinfo.tcp(ai.ip_address, sockets.first.local_address.ip_port) if port.to_i == 0 && !sockets.empty?
+        s = Socket.new(ai.pfamily, ai.socktype, ai.protocol)
+        begin
+          s.setsockopt(SOL_SOCKET, SO_REUSEADDR, true)
+          s.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, true) if ai.ipv6?
+          s.bind(ai)
+          s.listen(128)
+        rescue SystemCallError
+          s.close
+          next
+        end
+        sockets << s
+      end
+      raise SocketError, "no appropriate local address" if sockets.empty?
+    rescue Exception
+      sockets.each(&:close)
+      raise
+    end
+    return sockets unless block_given?
+    begin
+      yield sockets
+    ensure
+      sockets.each { |s| s.close unless s.closed? }
+    end
+  end
+
   def initialize(domain, socktype, protocol = nil)
     fd = Kenny::SocketNative.socket(Socket.__kenny_family(domain), Socket.__kenny_socktype(socktype), protocol || 0)
     super(fd, "r+")

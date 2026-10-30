@@ -4,6 +4,12 @@ module Forwardable
   VERSION = "1.3.3"
   FORWARDABLE_VERSION = VERSION
 
+  @debug = nil
+  class << self
+    # (the stdlib's switch for its backtrace trimming; kept for the gems that set it)
+    attr_accessor :debug
+  end
+
   # The accessor as the stdlib accepts it (it evals it): "@ivar", "@@cvar", "method",
   # "Const::Path", "self", and chains of those with "." ("self.class", "@a.b"). Parsed
   # once, when the delegator is defined.

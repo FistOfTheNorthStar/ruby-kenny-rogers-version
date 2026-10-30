@@ -672,6 +672,23 @@ fn resume_thread(i: usize) {
                 let obj = t.obj;
                 s.ps[pi].nthreads -= 1;
                 P_NTHREADS[pi].fetch_sub(1, Ordering::Relaxed);
+                // abort_on_exception (the thread's, or Thread.abort_on_exception): the exception
+                // is raised in the main thread, in the same step (a main thread blocked in a
+                // wait would otherwise be found deadlocked)
+                if let Some((_, e)) = report {
+                    let abort = truthy(ivar_get(obj, sym("@__abort"))) || truthy(crate::extra::thread_abort_default());
+                    if abort && class_name(real_class(e)) != "SystemExit" && s.threads[0].state != St::Done {
+                        let m = &mut s.threads[0];
+                        m.interrupt = Some(Throw::Raise(e));
+                        m.has_interrupt.store(true, Ordering::Release);
+                        let mp = m.p;
+                        match s.threads[0].state {
+                            St::Blocked => wake.extend(make_runnable(s, 0)),
+                            _ => wake.push(s.ps[mp].parker.clone()),
+                        }
+                        crate::gc::KN_GC_PENDING.fetch_or(PREEMPT_BIT, Ordering::Relaxed);
+                    }
+                }
                 // wake the joiners in the same step: between "done" and "joiners woken", P 0's
                 // deadlock check would see every thread finished or blocked
                 loop {
@@ -1379,7 +1396,8 @@ pub fn init() {
         let obj = locked!(s => s.threads[tid].obj);
         ivar_set(obj, sym("@__blk"), b);
         ivar_set(obj, sym("@__args"), ary_new(a.to_vec()));
-        ivar_set(obj, sym("@__report"), QTRUE);
+        // (Thread.report_on_exception at its start)
+        ivar_set(obj, sym("@__report"), crate::extra::thread_report_default());
         ivar_set(obj, sym("@__inherited_storage"), storage);
         obj
     });

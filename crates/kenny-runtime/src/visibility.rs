@@ -322,18 +322,26 @@ pub fn init() {
         "catch", "throw", "binding", "block_given?", "caller", "caller_locations", "Integer", "Float", "String",
         "Array", "Hash", "Rational", "Complex", "system", "`", "exec", "fork", "spawn", "open", "eval", "warn",
         "trap", "autoload", "readline", "readlines", "select", "local_variables", "global_variables", "gem",
-        "set_trace_func", "iterator?", "__method__", "__dir__",
+        "set_trace_func", "iterator?", "__method__", "__dir__", "BigDecimal", "__kenny_require_relative",
     ] {
-        let id = sym(name);
-        if let Some(&m) = unsafe { (*k).methods.get(&id) } {
-            unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
-            // `Kernel.format(...)`, `Kernel.raise` etc. stay callable (module_function style)
-            let ks = singleton_class(k as V);
-            if unsafe { !(*ks).methods.contains_key(&id) } {
-                let nm = add_method(ks, id, crate::kernel::clone_body(unsafe { &(*m).body }));
-                unsafe { (*(nm as *mut Method)).vis = VIS_PUBLIC };
-            }
-        }
+        global_function(name);
     }
     bump_serial();
+}
+
+/// Kernel#`name` made a private "global function", callable as `Kernel.name` too (CRuby's
+/// rb_define_global_function). For the ones a library defines when it loads (BigDecimal).
+pub fn global_function(name: &str) {
+    let k = rt().c.kernel;
+    let id = sym(name);
+    if let Some(&m) = unsafe { (*k).methods.get(&id) } {
+        unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
+        // `Kernel.format(...)`, `Kernel.raise` etc. stay callable (module_function style)
+        let ks = singleton_class(k as V);
+        if unsafe { !(*ks).methods.contains_key(&id) } {
+            let nm = add_method(ks, id, crate::kernel::clone_body(unsafe { &(*m).body }));
+            unsafe { (*(nm as *mut Method)).vis = VIS_PUBLIC };
+        }
+        bump_serial();
+    }
 }
