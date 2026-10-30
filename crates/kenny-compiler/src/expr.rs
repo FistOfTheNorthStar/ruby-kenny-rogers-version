@@ -1282,7 +1282,8 @@ impl<M: Module> Compiler<M> {
                     let ok = fx.b.block_params(done)[1];
                     let rv = fx.b.block_params(done)[0];
                     let id = self.sym_val(fx, call.name().as_slice());
-                    let r = self.call(fx, "kn_respond_to", &[rv, id]);
+                    // (an explicit receiver, `self` too: a private method is not defined)
+                    let r = self.call(fx, "kn_respond_to_pub", &[rv, id]);
                     let r = fx.b.ins().band(r, ok);
                     return cond_str(self, fx, r, "method");
                 }

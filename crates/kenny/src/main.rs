@@ -35,6 +35,7 @@ const CAPI_SHIM: &str = include_str!("../../../include/kenny_capi.c");
 const OVERLAY: &[(&str, &str)] = &[
     ("forwardable.rb", include_str!("../../../lib/kenny/forwardable.rb")),
     ("openssl.rb", include_str!("../../../lib/kenny/openssl.rb")),
+    ("kenny/openssl_ssl.rb", include_str!("../../../lib/kenny/kenny/openssl_ssl.rb")),
     ("securerandom.rb", include_str!("../../../lib/kenny/securerandom.rb")),
     ("random/formatter.rb", include_str!("../../../lib/kenny/random/formatter.rb")),
     ("json.rb", include_str!("../../../lib/kenny/json.rb")),
@@ -70,6 +71,14 @@ const OVERLAY: &[(&str, &str)] = &[
     ("yaml.rb", include_str!("../../../lib/kenny/yaml.rb")),
     ("psych.rb", include_str!("../../../lib/kenny/psych.rb")),
     ("kenny/psych_tree.rb", include_str!("../../../lib/kenny/kenny/psych_tree.rb")),
+    // OpenSSL::ASN1 and OpenSSL::X509 (openssl.rb requires them, then the stdlib's openssl/x509.rb)
+    ("kenny/openssl_asn1.rb", include_str!("../../../lib/kenny/kenny/openssl_asn1.rb")),
+    ("kenny/openssl_x509.rb", include_str!("../../../lib/kenny/kenny/openssl_x509.rb")),
+    ("kenny/openssl_x509_name.rb", include_str!("../../../lib/kenny/kenny/openssl_x509_name.rb")),
+    ("kenny/openssl_x509_ext.rb", include_str!("../../../lib/kenny/kenny/openssl_x509_ext.rb")),
+    ("kenny/openssl_x509_cert.rb", include_str!("../../../lib/kenny/kenny/openssl_x509_cert.rb")),
+    ("kenny/openssl_x509_store.rb", include_str!("../../../lib/kenny/kenny/openssl_x509_store.rb")),
+    ("kenny/openssl_ec.rb", include_str!("../../../lib/kenny/kenny/openssl_ec.rb")),
     ("bigdecimal.rb", include_str!("../../../lib/kenny/bigdecimal.rb")),
     ("bigdecimal/util.rb", include_str!("../../../lib/kenny/bigdecimal/util.rb")),
     ("racc/parser.rb", include_str!("../../../lib/kenny/racc/parser.rb")),

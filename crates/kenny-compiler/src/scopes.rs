@@ -1416,7 +1416,8 @@ impl<M: Module> Compiler<M> {
         BlockArity {
             min: (nreq + npost) as i64,
             max: if has_rest && !implicit_rest { -1 } else { positional as i64 },
-            autosplat: positional > 1 || has_rest,
+            // (CRuby: a lone `*rest`, or optionals with a rest, take a yielded Array as one value)
+            autosplat: positional > 1 || (has_rest && nreq + npost > 0),
         }
     }
 

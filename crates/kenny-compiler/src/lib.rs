@@ -460,6 +460,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_catch_return", &[I64], &[I64]),
     ("kn_raise_msg", &[I64, I64, I64], &[I64]),
     ("kn_respond_to", &[I64, I64], &[I64]),
+    ("kn_respond_to_pub", &[I64, I64], &[I64]),
     ("kn_ivar_defined", &[I64, I64], &[I64]),
     ("kn_gvar_defined", &[I64], &[I64]),
     ("kn_gvar_alias", &[I64, I64], &[I64]),

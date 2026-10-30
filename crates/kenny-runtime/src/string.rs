@@ -957,8 +957,10 @@ pub fn init() {
             Err(e) => return e,
         };
         let b = &rstr(s).b;
-        match find(b, &o, char_byte(b, from as usize)) {
-            Some(i) => mkfix(char_count(&b[..i]) as i64),
+        // (a binary String's characters are its bytes)
+        let bin = is_binary(s);
+        match find(b, &o, if bin { (from as usize).min(b.len()) } else { char_byte(b, from as usize) }) {
+            Some(i) => mkfix(if bin { i } else { char_count(&b[..i]) } as i64),
             None => QNIL,
         }
     });
@@ -990,9 +992,10 @@ pub fn init() {
         };
         let b = &rstr(s).b;
         // the last occurrence starting at character `pos` or before
-        let end = (char_byte(b, pos) + o.len()).min(b.len());
+        let bin = is_binary(s);
+        let end = (if bin { pos.min(b.len()) } else { char_byte(b, pos) } + o.len()).min(b.len());
         match rfind(&b[..end], &o) {
-            Some(i) => mkfix(char_count(&b[..i]) as i64),
+            Some(i) => mkfix(if bin { i } else { char_count(&b[..i]) } as i64),
             None => QNIL,
         }
     });

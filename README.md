@@ -150,8 +150,10 @@ Working:
 - **Native stdlib extensions** (Rust instead of C): date, json (2.x or 3.x, as the lock file
   says), yaml (Psych API; its tree API, `Psych.parse`, `Psych::Nodes`, `YAMLTree` ..., is psych's
   Ruby code on native parse events and a port of libyaml's emitter), bigdecimal,
-  strscan, digest, zlib, openssl (digests, HMAC, ciphers, RSA keys and signatures; no TLS, X509
-  certificates or EC keys), Marshal (byte-compatible format 4.8),
+  strscan, digest, zlib, openssl (digests, HMAC, ciphers, RSA keys and signatures, ASN1, X509
+  certificates verified as OpenSSL does, EC public keys, and TLS 1.2/1.3 on rustls under the
+  gem's own `openssl/ssl.rb`, so Net::HTTP does https; no EC private keys, DSA or DH),
+  Marshal (byte-compatible format 4.8),
   cgi/escape, erb/escape (Rails' `html_escape`), plus `Gem::Version`/`Gem::Requirement`.
   Nokogiri is native too (html5ever and quick-xml underneath, its own XPath 1.0 engine, a SAX
   scanner that reports what libxml2's does, and nokogiri's Ruby layer on top), so loofah, the

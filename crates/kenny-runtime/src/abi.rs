@@ -2089,6 +2089,12 @@ pub extern "C" fn kn_raise_msg(cls_name: u64, ptr: *const u8, len: u64) -> V {
 pub extern "C" fn kn_respond_to(self_: V, id: V) -> u64 {
     respond_to(self_, sym_id(id)) as u64
 }
+/// `defined?(recv.m)` with an explicit receiver (not `self`): a private method doesn't count
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_respond_to_pub(recv: V, id: V) -> u64 {
+    let m = find_method(class_of(recv), sym_id(id));
+    (!m.is_null() && unsafe { (*m).vis } != VIS_PRIVATE) as u64
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_ivar_defined(self_: V, id: V) -> u64 {
     ivar_defined(self_, sym_id(id)) as u64
