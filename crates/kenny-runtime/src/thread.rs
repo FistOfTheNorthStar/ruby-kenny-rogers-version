@@ -34,6 +34,10 @@ use std::time::{Duration, Instant};
 
 const THREAD_STACK: usize = 16 << 20;
 const MAIN_STACK: usize = 1 << 30;
+/// How much of it Ruby code may use before SystemStackError: several hundred thousand frames
+/// (CRuby stops near ten thousand), but not so deep that runaway recursion takes minutes to
+/// fail (every GC scans the whole stack).
+const MAIN_USABLE: usize = 64 << 20;
 const FIBER_STACK: usize = 8 << 20;
 const STACK_MARGIN: usize = 1 << 20;
 const P_STACK: usize = 8 << 20;
@@ -80,6 +84,7 @@ struct GThread {
     last_match: V,
     definee: Vec<*mut Class>,
     dm_stack: Vec<*const Method>,
+    super_at: Vec<(V, u32, usize)>,
     current_block: Vec<V>,
     saved_throws: crate::gc::SavedThrows,
     fiber_stack: Vec<usize>,
@@ -292,6 +297,7 @@ fn save_state(t: &mut GThread) {
     t.last_match = p.last_match;
     t.definee = std::mem::take(&mut p.definee);
     t.dm_stack = std::mem::take(&mut p.dm_stack);
+    t.super_at = std::mem::take(&mut p.super_at);
     t.current_block = std::mem::take(&mut p.current_block);
     t.saved_throws = std::mem::take(&mut p.heap.saved_throws);
     t.fiber_stack = std::mem::take(&mut p.thr.fiber_stack);
@@ -303,6 +309,7 @@ fn restore_state(t: &mut GThread) {
     p.last_match = t.last_match;
     p.definee = std::mem::take(&mut t.definee);
     p.dm_stack = std::mem::take(&mut t.dm_stack);
+    p.super_at = std::mem::take(&mut t.super_at);
     p.current_block = std::mem::take(&mut t.current_block);
     p.heap.saved_throws = std::mem::take(&mut t.saved_throws);
     p.thr.fiber_stack = std::mem::take(&mut t.fiber_stack);
@@ -395,6 +402,7 @@ fn thread_obj(tid: usize) -> V {
 fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize>) -> usize {
     let stack = DefaultStack::new(stack_size).expect("thread stack");
     let (base, limit) = (stack.base().get(), stack.limit().get());
+    let limit = if stack_size == MAIN_STACK { limit.max(base.saturating_sub(MAIN_USABLE)) } else { limit };
     // pick the P; starting a second P switches the runtime into multi-threaded mode first
     let p = on.unwrap_or_else(|| locked!(s => {
         let p = s.next_p % s.max_ps;
@@ -431,6 +439,7 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
             last_match: QNIL,
             definee: Vec::new(),
             dm_stack: Vec::new(),
+            super_at: Vec::new(),
             current_block: Vec::new(),
             interrupt: None,
             has_interrupt: AtomicBool::new(false),

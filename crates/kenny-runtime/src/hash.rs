@@ -131,7 +131,7 @@ pub fn init() {
         if is_proc(b) {
             h.default_proc = b;
         }
-        QNIL
+        s
     });
     defs(c, "[]", 0, -1, |s, a, _| {
         let h = hash_new();

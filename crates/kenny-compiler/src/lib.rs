@@ -1221,21 +1221,25 @@ impl<M: Module> Compiler<M> {
 
     /// (require key, function, loaded-flag slot) for every compiled file, keyed by path relative
     /// to each load path (without .rb) and by absolute path.
+    /// The runtime keeps the first entry for a key (`kn_register_file`), so the order is
+    /// CRuby's precedence: absolute paths, then each key under the earliest load path (the
+    /// overlay, -I dirs, gems, stdlib), whatever order the files were compiled in.
     pub(crate) fn file_table(&self) -> Vec<(String, FuncId, usize, u64)> {
-        let mut out = Vec::new();
+        let mut keyed: Vec<(usize, String, String, FuncId, usize, u64)> = Vec::new();
         let lps: Vec<PathBuf> = self.load_paths.iter().map(|p| p.canonicalize().unwrap_or(p.clone())).collect();
         for (path, (fid, flag)) in &self.loaded {
             let hash = self.src_hashes.get(path).copied().unwrap_or(0);
             let abs = path.display().to_string();
-            out.push((abs.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
-            for lp in &lps {
+            keyed.push((0, abs.clone(), abs.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
+            for (i, lp) in lps.iter().enumerate() {
                 if let Ok(rel) = path.strip_prefix(lp) {
                     let r = rel.display().to_string();
-                    out.push((r.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
+                    keyed.push((1 + i, abs.clone(), r.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
                 }
             }
         }
-        out
+        keyed.sort_by(|a, b| (a.0, &a.1, &a.2).cmp(&(b.0, &b.1, &b.2)));
+        keyed.into_iter().map(|(_, _, k, f, fl, h)| (k, f, fl, h)).collect()
     }
 
     /// GC safepoint for loop back-edges: a load and a rarely taken branch.

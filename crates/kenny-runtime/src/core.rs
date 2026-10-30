@@ -1007,6 +1007,10 @@ pub struct PState {
     pub definee: Vec<*mut Class>,
     /// Methods defined with define_method that are running (for `super` inside them).
     pub dm_stack: Vec<*const Method>,
+    /// Methods running through `super` from a module that appears more than once in the
+    /// receiver's ancestors: (receiver, name, ancestor index it was found at), so a further
+    /// `super` goes on from that copy (`find_super_method_at`)
+    pub super_at: Vec<(V, u32, usize)>,
     /// Blocks passed to running C-extension functions (rb_block_given_p / rb_yield).
     pub current_block: Vec<V>,
     pub mcache: HashMap<(usize, u32), *const Method, FxBuild>,
@@ -1108,6 +1112,7 @@ pub fn new_pstate() -> *mut PState {
         stack_limit: 0,
         definee: Vec::new(),
         dm_stack: Vec::new(),
+        super_at: Vec::new(),
         current_block: Vec::new(),
         mcache: HashMap::default(),
         mcache_serial: 0,
@@ -1881,14 +1886,50 @@ fn find_method_uncached(c: *mut Class, mid: u32) -> *const Method {
     std::ptr::null()
 }
 pub fn find_super_method(self_: V, owner: *mut Class, mid: u32) -> *const Method {
+    find_super_method_at(self_, owner, mid).0
+}
+/// The method `super` reaches, and (when `owner` is a module the receiver's ancestors list
+/// more than once) the ancestor index it was found at — the caller records it in
+/// `PState::super_at` while that method runs (see `invoke_super`); usize::MAX otherwise.
+pub fn find_super_method_at(self_: V, owner: *mut Class, mid: u32) -> (*const Method, usize) {
     let k = class_of(self_);
     let key = (k as usize, owner as usize, mid);
     if let Some(&m) = ancestor_cache().supers.get(&key) {
-        return m;
+        return (m, usize::MAX);
     }
-    let m = find_super_method_uncached(k, owner, mid);
-    ancestor_cache().supers.insert(key, m);
-    m
+    let anc = ancestors_rc(k);
+    let first = anc.iter().position(|&c| c == owner);
+    let dup = first.is_some_and(|f| anc[f + 1..].contains(&owner));
+    if !dup {
+        let m = find_super_method_uncached(k, owner, mid);
+        ancestor_cache().supers.insert(key, m);
+        return (m, usize::MAX);
+    }
+    // the copy the running method was found at (a `super` chain through this module), else
+    // the first
+    let start = pst()
+        .super_at
+        .last()
+        .filter(|&&(s, m, i)| s == self_ && m == mid && anc.get(i) == Some(&owner))
+        .map(|x| x.2)
+        .unwrap_or(first.unwrap());
+    for (i, &c) in anc.iter().enumerate().skip(start + 1) {
+        if let Some(&m) = unsafe { (*c).methods.get(&mid) } {
+            return (m, i);
+        }
+    }
+    (std::ptr::null(), usize::MAX)
+}
+/// Runs the method `super` found (see `find_super_method_at`).
+pub fn invoke_super(m: *const Method, at: usize, recv: V, args: &[V], blk: V) -> V {
+    if at == usize::MAX {
+        return invoke(m, recv, args, blk);
+    }
+    let mid = unsafe { (*m).name };
+    pst().super_at.push((recv, mid, at));
+    let r = invoke(m, recv, args, blk);
+    pst().super_at.pop();
+    r
 }
 fn find_super_method_uncached(klass: *mut Class, owner: *mut Class, mid: u32) -> *const Method {
     let anc = ancestors_rc(klass);
@@ -2200,7 +2241,7 @@ pub fn ivar_list(v: V) -> Vec<(u32, V)> {
                 .collect()
         }
         Some(Kind::Class) => rclass(v).civars.iter().map(|(&k, &v)| (k, v)).filter(|(n, _)| !sym_name(*n).starts_with(b"@__")).collect(),
-        _ => gen_ivar_list(v),
+        _ => gen_ivar_list(v).into_iter().filter(|(n, _)| !sym_name(*n).starts_with(b"@__")).collect(),
     }
 }
 

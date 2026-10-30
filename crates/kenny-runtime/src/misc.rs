@@ -175,11 +175,19 @@ fn enum_size(recv: V, m: &str, args: &[V]) -> V {
         | "each_with_index" | "each_entry" | "sort_by" | "min_by" | "max_by" | "minmax_by" | "group_by" | "partition"
         | "each_with_object" | "with_index" | "with_object" | "each_index" | "reverse_each" | "each_key" | "each_value"
         | "each_pair" | "delete_if" | "keep_if" | "select!" | "filter!" | "reject!" | "map!" | "collect!" | "each_char"
-        | "chars" | "each_codepoint" | "codepoints" | "each_grapheme_cluster" | "transform_values" | "transform_keys"
+        | "chars" | "each_codepoint" | "codepoints" | "transform_values" | "transform_keys"
         | "transform_values!" | "transform_keys!" | "filter_map!" | "sum" | "uniq" | "to_h" | "each_child" => {
             size()
         }
         "each_byte" | "bytes" => send(recv, sym("bytesize"), &[], QNIL),
+        "each_grapheme_cluster" => {
+            let g = send(recv, sym("grapheme_clusters"), &[], QNIL);
+            if g == UNDEF || !is_ary(g) {
+                pst().pending = Throw::None;
+                return QNIL;
+            }
+            mkfix(rary(g).v.len() as i64)
+        }
         "times" if is_fix(recv) => mkfix(fix(recv).max(0)),
         "upto" if is_fix(recv) => n_arg(0).map(|t| mkfix((t - fix(recv) + 1).max(0))).unwrap_or(QNIL),
         "downto" if is_fix(recv) => n_arg(0).map(|t| mkfix((fix(recv) - t + 1).max(0))).unwrap_or(QNIL),
@@ -507,7 +515,52 @@ pub fn init() {
 
     // ---- Range ----
     let rg = c.range;
-    defs(rg, "new", 2, 3, |_, a, _| range_new(a[0], a[1], a.get(2).is_some_and(|x| truthy(*x))));
+    // Range.new(begin, end, exclusive = false); a subclass's instance is allocated and given
+    // to its initialize (`super(a, b)` reaches Range#initialize)
+    fn range_check(lo: V, hi: V) -> Result<(), V> {
+        if lo == QNIL || hi == QNIL || (is_fix(lo) && is_fix(hi)) {
+            return Ok(());
+        }
+        let c = send(lo, sym("<=>"), &[hi], QNIL);
+        if c == UNDEF {
+            // (CRuby rescues the error <=> raises)
+            if !matches!(pst().pending, Throw::Raise(_)) {
+                return Err(UNDEF);
+            }
+            pst().pending = Throw::None;
+            return Err(arg_error("bad value for range"));
+        }
+        if c == QNIL {
+            return Err(arg_error("bad value for range"));
+        }
+        Ok(())
+    }
+    defs(rg, "new", 0, -1, |s, a, b| {
+        if s as *mut Class == rt().c.range {
+            if !(2..=3).contains(&a.len()) {
+                return crate::core::arity_error(a.len() as i32, 2, 3);
+            }
+            if let Err(e) = range_check(a[0], a[1]) {
+                return e;
+            }
+            return range_new(a[0], a[1], a.get(2).is_some_and(|x| truthy(*x)));
+        }
+        let r = range_new(QNIL, QNIL, false);
+        hdr(r).klass = s as *mut Class;
+        hdr(r).flags &= !FL_FROZEN;
+        tri!(send(r, sym("initialize"), a, b));
+        r
+    });
+    defn(rg, "initialize", 2, 3, |s, a, _| {
+        if let Err(e) = range_check(a[0], a[1]) {
+            return e;
+        }
+        let r = rrange(s);
+        r.lo = a[0];
+        r.hi = a[1];
+        r.excl = a.get(2).is_some_and(|x| truthy(*x));
+        QNIL
+    });
     defn(rg, "each", 0, 0, |s, _, b| if is_proc(b) { range_each(s, b) } else { enum_for(s, "each", &[]) });
     defn(rg, "reverse_each", 0, 0, |s, _, b| match range_items(s) {
         Some(items) => {

@@ -320,6 +320,10 @@ pub extern "C" fn rb_define_alloc_func(klass: V, f: unsafe extern "C" fn(V) -> V
     });
 }
 #[unsafe(no_mangle)]
+pub extern "C" fn rb_get_alloc_func(klass: V) -> Option<unsafe extern "C" fn(V) -> V> {
+    alloc_func(cls(klass))
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn rb_undef_alloc_func(klass: V) {
     alloc_funcs_change(|m| {
         m.remove(&(klass as usize));
@@ -1799,4 +1803,116 @@ pub extern "C" fn kn_capi_restore_throw(h: V) {
             pst().pending = t;
         }
     }
+}
+
+// ---------- Integer <-> words (rb_integer_pack / rb_integer_unpack) ----------
+
+fn int_of(v: V) -> Option<num_bigint::BigInt> {
+    if is_fix(v) {
+        Some(num_bigint::BigInt::from(fix(v)))
+    } else if is_big(v) {
+        Some(rbig(v).n.clone())
+    } else {
+        None
+    }
+}
+const IP_MSWORD_FIRST: c_int = 0x01;
+const IP_MSBYTE_FIRST: c_int = 0x10;
+const IP_NATIVE: c_int = 0x40;
+const IP_2COMP: c_int = 0x80;
+const IP_NEGATIVE: c_int = 0x200;
+/// Index in the buffer of little-endian byte `i` of the whole number.
+fn ip_pos(i: usize, wordsize: usize, numwords: usize, flags: c_int) -> usize {
+    let (w, b) = (i / wordsize, i % wordsize);
+    let w = if flags & IP_MSWORD_FIRST != 0 { numwords - 1 - w } else { w };
+    let msbyte = flags & IP_MSBYTE_FIRST != 0 || (flags & IP_NATIVE != 0 && cfg!(target_endian = "big"));
+    let b = if msbyte { wordsize - 1 - b } else { b };
+    w * wordsize + b
+}
+/// CRuby's validate_integer_pack_format: an ArgumentError (pending) when the flags don't say
+/// the word and byte order the sizes need.
+fn ip_check(numwords: usize, wordsize: usize, flags: c_int) -> bool {
+    let wo = flags & (IP_MSWORD_FIRST | 0x02);
+    let bo = flags & (IP_MSBYTE_FIRST | 0x20 | IP_NATIVE);
+    let msg = if wo == (IP_MSWORD_FIRST | 0x02) {
+        "unexpected word order"
+    } else if wo == 0 && numwords > 1 {
+        "word order not specified"
+    } else if bo.count_ones() > 1 {
+        "unexpected byte order"
+    } else if bo == 0 && wordsize > 1 {
+        "byte order not specified"
+    } else if wordsize == 0 {
+        "too small wordsize"
+    } else {
+        return true;
+    };
+    arg_error(msg);
+    false
+}
+/// rb_integer_pack (kenny_capi.c): *ok = 0 with an exception pending.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_integer_pack(val: V, words: *mut u8, numwords: usize, wordsize: usize, _nails: usize, flags: c_int, ok: *mut c_int) -> c_int {
+    use num_bigint::Sign;
+    unsafe { *ok = 0 };
+    if !ip_check(numwords, wordsize, flags) {
+        return 0;
+    }
+    // (the C side has converted it with rb_to_int)
+    let Some(n) = int_of(val) else { return 0 };
+    unsafe { *ok = 1 };
+    let total = numwords * wordsize;
+    let sign: c_int = match n.sign() {
+        Sign::Minus => -1,
+        Sign::NoSign => 0,
+        Sign::Plus => 1,
+    };
+    let mag = n.magnitude().to_bytes_le();
+    let mut bytes = vec![0u8; total];
+    let mut overflow = mag.len() > total && !(mag.len() == 1 && mag[0] == 0);
+    for (i, &b) in mag.iter().enumerate().take(total) {
+        bytes[i] = b;
+    }
+    if flags & IP_2COMP != 0 && sign < 0 {
+        // two's complement: invert and add one
+        let mut carry = 1u16;
+        for b in bytes.iter_mut() {
+            let x = (!*b) as u16 + carry;
+            *b = x as u8;
+            carry = x >> 8;
+        }
+        // fits when -2**(8*total-1) <= n
+        if !overflow && total > 0 && bytes[total - 1] & 0x80 == 0 && mag.iter().any(|&b| b != 0) {
+            overflow = true;
+        }
+    }
+    let out = unsafe { std::slice::from_raw_parts_mut(words, total) };
+    for (i, &b) in bytes.iter().enumerate() {
+        out[ip_pos(i, wordsize, numwords, flags)] = b;
+    }
+    if overflow { sign * 2 } else { sign }
+}
+/// rb_integer_unpack (kenny_capi.c): UNDEF with an exception pending.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_integer_unpack(words: *const u8, numwords: usize, wordsize: usize, _nails: usize, flags: c_int) -> V {
+    if !ip_check(numwords, wordsize, flags) {
+        return UNDEF;
+    }
+    let total = numwords * wordsize;
+    let src = unsafe { std::slice::from_raw_parts(words, total) };
+    let mut bytes = vec![0u8; total];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = src[ip_pos(i, wordsize, numwords, flags)];
+    }
+    let mut n = num_bigint::BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes);
+    if flags & IP_2COMP != 0 {
+        if total > 0 && bytes[total - 1] & 0x80 != 0 {
+            n -= num_bigint::BigInt::from(1) << (8 * total);
+        } else if flags & IP_NEGATIVE != 0 && n == num_bigint::BigInt::from(0) {
+            n = -(num_bigint::BigInt::from(1) << (8 * total));
+        }
+    } else if flags & IP_NEGATIVE != 0 {
+        n = -n;
+    }
+    int_from_big(n)
 }

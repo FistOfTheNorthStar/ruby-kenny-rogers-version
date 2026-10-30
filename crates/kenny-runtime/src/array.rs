@@ -417,9 +417,13 @@ pub fn init() {
         av(target).set(v.take());
         target
     }
-    defs(c, "new", 0, 2, |s, a, b| {
+    defs(c, "new", 0, -1, |s, a, b| {
+        // (a subclass's initialize takes what it takes)
         if s as *mut Class != rt().c.array {
             return crate::kernel::class_new_instance(s, a, b);
+        }
+        if a.len() > 2 {
+            return crate::core::arity_error(a.len() as i32, 0, 2);
         }
         let r = ary_new(vec![]);
         tri!(fill_init(r, a, b));
@@ -435,7 +439,7 @@ pub fn init() {
     });
     defn(c, "initialize", 0, 2, |s, a, b| {
         tri!(fill_init(s, a, b));
-        QNIL
+        s
     });
     defn(c, "[]", 1, 2, |s, a, _| aref(s, a));
     defn(c, "slice", 1, 2, |s, a, _| aref(s, a));

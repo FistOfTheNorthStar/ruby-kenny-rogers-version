@@ -185,6 +185,50 @@ pub fn capture() -> Vec<usize> {
     out
 }
 
+/// The label of the innermost compiled-code frame on the stack ("A#foo", "block in A#foo",
+/// "<main>" ...), cached by return address.
+#[inline(never)]
+pub fn caller_label() -> Option<String> {
+    static CACHE: std::sync::Mutex<Option<rustc_hash::FxHashMap<usize, Option<String>>>> = std::sync::Mutex::new(None);
+    let (lo, hi) = crate::thread::current_stack()?;
+    let mut fp = frame_pointer();
+    let mut n = 0;
+    let mut ret_found = None;
+    {
+        let t = TABLE.read().unwrap();
+        if !t.sorted {
+            drop(t);
+            let mut w = TABLE.write().unwrap();
+            if !w.sorted {
+                w.funcs.sort_by_key(|f| f.start);
+                w.sorted = true;
+            }
+        }
+    }
+    let t = TABLE.read().unwrap();
+    while fp >= lo && fp + 16 <= hi && fp % 8 == 0 && n < 64 {
+        let next = unsafe { *(fp as *const usize) };
+        let ret = unsafe { *((fp + 8) as *const usize) } & 0x0000_ffff_ffff_ffff;
+        if find(&t.funcs, ret).is_some() {
+            ret_found = Some(ret);
+            break;
+        }
+        if next <= fp {
+            break;
+        }
+        fp = next;
+        n += 1;
+    }
+    drop(t);
+    let ret = ret_found?;
+    if let Some(l) = CACHE.lock().unwrap().as_ref().and_then(|c| c.get(&ret)) {
+        return l.clone();
+    }
+    let l = symbolize(ret).map(|x| x.2);
+    CACHE.lock().unwrap().get_or_insert_with(Default::default).insert(ret, l.clone());
+    l
+}
+
 fn find(funcs: &[Func], addr: usize) -> Option<&Func> {
     let i = funcs.partition_point(|f| f.start < addr);
     let f = funcs.get(i.checked_sub(1)?)?;

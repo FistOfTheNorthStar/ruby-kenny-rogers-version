@@ -197,6 +197,24 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn call_node(&mut self, fx: &mut Fx, c: &CallNode) -> Value {
+        // `Module.nesting`: the lexical scopes, innermost first (the cref slots of the
+        // enclosing class bodies, without the top level's)
+        if c.name().as_slice() == b"nesting"
+            && c.arguments().is_none()
+            && c.block().is_none()
+            && c.receiver().is_some_and(|r| r.as_constant_read_node().is_some_and(|k| k.name().as_slice() == b"Module"))
+        {
+            let mut vals = Vec::new();
+            let mut slot = fx.cref_slot;
+            while let Some(&parent) = self.cref_parents.get(&slot) {
+                let p = self.slot_ptr(fx, slot);
+                vals.push(fx.b.ins().load(I64, mem(), p, 0));
+                slot = parent;
+            }
+            let n = self.iconst(fx, vals.len() as i64);
+            let buf = self.args_buf(fx, &vals);
+            return self.call(fx, "kn_ary_new", &[n, buf]);
+        }
         // `refine X do ... end`: inside the block the module's refinements are active (CRuby
         // activates them in refine blocks), so its calls are refined call sites
         if c.receiver().is_none()

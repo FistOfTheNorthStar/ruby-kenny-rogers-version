@@ -573,6 +573,31 @@ pub fn init() {
         let a: Vec<V> = a.iter().copied().filter(|x| !is_hash(*x)).collect();
         puts_to(&a, &mut |b| err_out(b))
     });
+    fn feature_listed(base: &str) -> bool {
+        let strs = |g: &str| -> Vec<String> {
+            match rt().gvars.get(&sym(g)).copied().filter(|v| is_ary(*v)) {
+                Some(a) => rary(a).v.iter().filter(|x| is_str(**x)).map(|x| String::from_utf8_lossy(&rstr(*x).b).into_owned()).collect(),
+                None => vec![],
+            }
+        };
+        let lf = strs("$LOADED_FEATURES");
+        if lf.is_empty() {
+            return false;
+        }
+        let lp = strs("$LOAD_PATH");
+        lf.iter().any(|f| {
+            [".rb", ".so", ".bundle", ""].iter().any(|ext| {
+                let want = format!("{base}{ext}");
+                if *f == want {
+                    return !ext.is_empty() || !base.starts_with('/') && base.contains('.');
+                }
+                if base.starts_with('/') || ext.is_empty() {
+                    return false;
+                }
+                f.strip_suffix(&want).and_then(|d| d.strip_suffix('/')).is_some_and(|d| lp.iter().any(|l| l.trim_end_matches('/') == d))
+            })
+        })
+    }
     defn(k, "require", 1, 1, |_, a, _| {
         let name = match crate::fmt::to_s(a[0]) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -592,11 +617,17 @@ pub fn init() {
         const BUILTIN: &[&str] = &[
             "stringio", "thread", "enumerator", "fiber", "monitor", "rbconfig", "rational", "complex", "etc",
             "io/console", "io/wait", "io/nonblock", "continuation", "rubygems", "bundler/setup", "bundler",
+            "ruby2_keywords",
         ];
         if let Some(r) = crate::compat::require_feature(base) {
             return r;
         }
         if BUILTIN.contains(&base) {
+            return QFALSE;
+        }
+        // a feature added to $LOADED_FEATURES by hand counts as loaded (as in CRuby: the name
+        // with an extension, or under a $LOAD_PATH directory)
+        if feature_listed(base) {
             return QFALSE;
         }
         let le = const_lookup(rt().c.object, sym("LoadError")).unwrap() as *mut Class;
@@ -1107,7 +1138,14 @@ pub fn init() {
         bool_v(!truthy(r))
     });
     defn(bo, "__id__", 0, 0, |s, _, _| mkfix(object_id_of(s)));
-    defn(bo, "method_missing", 1, -1, |s, a, _| no_method_error(s, sym_id(a[0]), false));
+    defn(bo, "method_missing", 1, -1, |s, a, _| {
+        // (after a private/protected call was refused: that's what it reports)
+        let why = crate::visibility::MM_REASON.with(|r| r.replace(""));
+        if !why.is_empty() {
+            return crate::visibility::vis_error(s, sym_id(a[0]), why);
+        }
+        no_method_error(s, sym_id(a[0]), false)
+    });
     defn(bo, "respond_to_missing?", 2, 2, |_, _, _| QFALSE);
     defn(bo, "singleton_method_added", 1, 1, |_, _, _| QNIL);
 
@@ -1704,11 +1742,18 @@ pub fn init() {
     });
     defn(ex, "backtrace", 0, 0, |s, _, _| crate::backtrace::exc_backtrace(s));
     defn(ex, "backtrace_locations", 0, 0, |s, _, _| {
+        // (the same Array each call, as CRuby's: callers trim it in place)
+        let memo = ivar_get(s, sym("@__bt_locs"));
+        if memo != QNIL {
+            return memo;
+        }
         let raw = ivar_get(s, sym("@__bt_raw"));
         if raw == QNIL {
             return QNIL;
         }
-        crate::backtrace::locations(&crate::backtrace::unpack(raw))
+        let l = crate::backtrace::locations(&crate::backtrace::unpack(raw));
+        ivar_set(s, sym("@__bt_locs"), l);
+        l
     });
     // nil, a String, or an Array of Strings or of Thread::Backtrace::Locations
     defn(ex, "set_backtrace", 1, 1, |s, a, _| {

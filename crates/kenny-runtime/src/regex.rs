@@ -969,11 +969,67 @@ pub fn init() {
     let re_err = new_class("RegexpError", rt().c.standard_error);
     set_global_const("RegexpError", re_err as V);
     *REGEXP_ERROR.get() = re_err;
+    let te = new_class("Regexp::TimeoutError", re_err);
+    const_set(rc, sym("TimeoutError"), te as V);
     let md = new_class("MatchData", o);
     set_global_const("MatchData", md as V);
     *MATCHDATA.get() = md;
 
     fn new_re(a: &[V]) -> V {
+        // `timeout:` (kept for Regexp#timeout; matches aren't interrupted)
+        let mut timeout = QNIL;
+        let mut av = a.to_vec();
+        if let Some(&h) = av.last().filter(|&&h| av.len() > 1 && is_hash(h) && hdr(h).flags & FL_KWHASH != 0) {
+            if let Some(&t) = rhash(h).m.get(&HKey(mksym(sym("timeout")))) {
+                timeout = match timeout_arg(t) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+            }
+            av.pop();
+        }
+        let a = &av[..];
+        let r = new_re_plain(a);
+        if timeout != QNIL && r != UNDEF && is_regexp(r) {
+            gen_ivar_set(r, sym("@__timeout"), timeout);
+        }
+        r
+    }
+    /// A timeout in seconds: nil, or a positive Float.
+    fn timeout_arg(t: V) -> Result<V, V> {
+        if t == QNIL {
+            return Ok(QNIL);
+        }
+        let f = if is_fix(t) || is_float(t) || is_big(t) {
+            crate::fmt::num_to_f(t).unwrap_or(0.0)
+        } else if is_str(t) || t == QTRUE || t == QFALSE {
+            return Err(type_error("no implicit conversion to float from string"));
+        } else {
+            let x = send(t, sym("to_f"), &[], QNIL);
+            if x == UNDEF {
+                return Err(UNDEF);
+            }
+            crate::fmt::num_to_f(x).unwrap_or(0.0)
+        };
+        if !(f > 0.0) || !f.is_finite() {
+            return Err(arg_error(&format!("invalid timeout: {}", crate::fmt::inspect_lossy(t))));
+        }
+        Ok(float_new(f))
+    }
+    // (kept in a hidden global, so the GC sees it)
+    defs(rc, "timeout", 0, 0, |_, _, _| rt().gvars.get(&sym("$__kenny_regexp_timeout")).copied().unwrap_or(QNIL));
+    defs(rc, "timeout=", 1, 1, |_, a, _| match timeout_arg(a[0]) {
+        Ok(t) => {
+            rt().gvars.insert(sym("$__kenny_regexp_timeout"), t);
+            a[0]
+        }
+        Err(e) => e,
+    });
+    defn(rc, "timeout", 0, 0, |s, _, _| {
+        let t = ivar_get(s, sym("@__timeout"));
+        if t == UNDEF { QNIL } else { t }
+    });
+    fn new_re_plain(a: &[V]) -> V {
         let src = a[0];
         if is_regexp(src) {
             return src;

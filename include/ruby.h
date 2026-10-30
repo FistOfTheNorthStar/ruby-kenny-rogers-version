@@ -148,6 +148,8 @@ typedef st_data_t st_index_t;
 #define FIX2ULONG(v) ((unsigned long)FIX2LONG(v))
 #define RB_FIX2LONG(v) FIX2LONG(v)
 #define FIXNUM_MAX (LONG_MAX >> 1)
+#define RUBY_FIXNUM_MAX FIXNUM_MAX
+#define RUBY_FIXNUM_MIN FIXNUM_MIN
 #define FIXNUM_MIN (LONG_MIN >> 1)
 #define POSFIXABLE(n) ((n) <= FIXNUM_MAX)
 #define NEGFIXABLE(n) ((n) >= FIXNUM_MIN)
@@ -241,6 +243,12 @@ void rb_define_const(VALUE klass, const char *name, VALUE val);
 void rb_define_global_const(const char *name, VALUE val);
 void rb_const_set(VALUE klass, ID id, VALUE val);
 void rb_define_alloc_func(VALUE klass, VALUE (*func)(VALUE));
+typedef VALUE (*rb_alloc_func_t)(VALUE klass);
+/* the class's allocator, NULL when it has none of its own */
+rb_alloc_func_t rb_get_alloc_func(VALUE klass);
+/* anonymous ones (CRuby: named by `name` once assigned to a constant) */
+VALUE rb_define_class_id(ID name, VALUE super);
+VALUE rb_define_module_id(ID name);
 void rb_undef_alloc_func(VALUE klass);
 void rb_include_module(VALUE klass, VALUE module);
 void rb_extend_object(VALUE obj, VALUE module);
@@ -335,6 +343,32 @@ VALUE rb_check_to_int(VALUE v);
 VALUE rb_cstr2inum(const char *s, int base);
 VALUE rb_str2inum(VALUE s, int base);
 VALUE rb_cstr_to_inum(const char *s, int base, int badcheck);
+VALUE rb_str_to_inum(VALUE str, int base, int badcheck);
+/* Integer <-> words (CRuby's bignum.c) */
+#define INTEGER_PACK_MSWORD_FIRST 0x01
+#define INTEGER_PACK_LSWORD_FIRST 0x02
+#define INTEGER_PACK_MSBYTE_FIRST 0x10
+#define INTEGER_PACK_LSBYTE_FIRST 0x20
+#define INTEGER_PACK_NATIVE 0x40
+#define INTEGER_PACK_2COMP 0x80
+#define INTEGER_PACK_FORCE_BIGNUM 0x100
+#define INTEGER_PACK_NEGATIVE 0x200
+#define INTEGER_PACK_FORCE_GENERIC_IMPLEMENTATION 0x400
+#define INTEGER_PACK_LITTLE_ENDIAN (INTEGER_PACK_LSWORD_FIRST | INTEGER_PACK_LSBYTE_FIRST)
+#define INTEGER_PACK_BIG_ENDIAN (INTEGER_PACK_MSWORD_FIRST | INTEGER_PACK_MSBYTE_FIRST)
+int rb_integer_pack(VALUE val, void *words, size_t numwords, size_t wordsize, size_t nails, int flags);
+VALUE rb_integer_unpack(const void *words, size_t numwords, size_t wordsize, size_t nails, int flags);
+VALUE rb_str_encode_ospath(VALUE path);
+int rb_reserved_fd_p(int fd);
+#define RB_RESERVED_FD_P(fd) rb_reserved_fd_p(fd)
+#define rb_isspace(c) ISSPACE(c)
+#define rb_isdigit(c) ISDIGIT(c)
+#define rb_isalpha(c) ISALPHA(c)
+#define rb_isalnum(c) ISALNUM(c)
+#define rb_isupper(c) ISUPPER(c)
+#define rb_islower(c) ISLOWER(c)
+#define rb_isxdigit(c) ISXDIGIT(c)
+#define rb_isprint(c) ISPRINT(c)
 double rb_cstr_to_dbl(const char *s, int badcheck);
 double rb_str_to_dbl(VALUE s, int badcheck);
 VALUE rb_dbl2big(double d);
@@ -704,6 +738,7 @@ VALUE rb_struct_define(const char *name, ...);
 VALUE rb_struct_define_under(VALUE outer, const char *name, ...);
 VALUE rb_struct_new(VALUE klass, ...);
 VALUE rb_struct_alloc(VALUE klass, VALUE values);
+VALUE rb_struct_alloc_noinit(VALUE klass);
 VALUE rb_struct_aref(VALUE st, VALUE idx);
 VALUE rb_struct_aset(VALUE st, VALUE idx, VALUE v);
 VALUE rb_struct_getmember(VALUE st, ID id);
@@ -717,6 +752,12 @@ VALUE rb_struct_size(VALUE st);
 /* ranges */
 VALUE rb_range_new(VALUE beg, VALUE end, int excl);
 int rb_range_values(VALUE range, VALUE *begp, VALUE *endp, int *exclp);
+/* a Range's begin and length within a sequence of `len`: Qtrue, Qfalse for a non-Range,
+   Qnil out of range (err 1: RangeError instead) */
+VALUE rb_range_beg_len(VALUE range, long *begp, long *lenp, long len, int err);
+VALUE rb_reg_new_str(VALUE src, int opts);
+VALUE rb_reg_new(const char *src, long len, int opts);
+VALUE rb_obj_encoding(VALUE obj);
 
 /* objects & calls */
 VALUE rb_obj_class(VALUE v);

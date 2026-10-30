@@ -171,6 +171,10 @@ pub fn from_gem(gem: &str, dir: &Path, work: &Path) -> Result<Ext, String> {
     };
     let mut cflags = pick(&["INCFLAGS", "CPPFLAGS", "CFLAGS"]);
     let mut cxxflags = pick(&["INCFLAGS", "CPPFLAGS", "CXXFLAGS"]);
+    // (a `-std=` for the other language, from the shared CPPFLAGS: charlock_holmes puts its
+    // -std=c++20 there; clang refuses it for C)
+    cflags.retain(|w| !(w.starts_with("-std=") && w.contains("++")));
+    cxxflags.retain(|w| !(w.starts_with("-std=") && !w.contains("++")));
     // (mkmf's own `-I. -I$(srcdir)` come first anyway; an extconf.h is in the build directory)
     for f in [&mut cflags, &mut cxxflags] {
         f.insert(0, format!("-I{}", build_dir.display()));
@@ -398,7 +402,8 @@ const HEADERS: &[&str] = &[
     "ruby/ruby.h", "ruby/encoding.h", "ruby/thread.h", "ruby/io.h", "ruby/st.h", "ruby/intern.h", "ruby/version.h",
     "ruby/re.h", "ruby/util.h", "ruby/defines.h", "ruby/config.h", "ruby/missing.h", "ruby/vm.h", "ruby/assert.h",
     "ruby/atomic.h", "ruby/memory_view.h", "ruby/oniguruma.h", "ruby/onigmo.h", "ruby/regex.h", "ruby/thread_native.h",
-    "ruby/debug.h", "ruby/backward.h",
+    "ruby/debug.h", "ruby/backward.h", "ruby/internal/symbol.h", "ruby/internal/encoding/encoding.h",
+    "ruby/internal/intern/string.h",
 ];
 
 pub fn compile(exts: Vec<Ext>, work: &Path, ruby_h: &str, shim: &str) -> Result<Built, String> {
@@ -406,7 +411,12 @@ pub fn compile(exts: Vec<Ext>, work: &Path, ruby_h: &str, shim: &str) -> Result<
     std::fs::create_dir_all(inc.join("ruby")).map_err(|e| e.to_string())?;
     std::fs::write(inc.join("ruby.h"), ruby_h).map_err(|e| e.to_string())?;
     for h in HEADERS {
-        std::fs::write(inc.join(h), "#include \"../ruby.h\"\n").map_err(|e| e.to_string())?;
+        let p = inc.join(h);
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+        }
+        let up = "../".repeat(h.matches('/').count());
+        std::fs::write(&p, format!("#include \"{up}ruby.h\"\n")).map_err(|e| e.to_string())?;
     }
     std::fs::write(work.join("kenny_capi.c"), shim).map_err(|e| e.to_string())?;
     // one job per source file, compiled in parallel

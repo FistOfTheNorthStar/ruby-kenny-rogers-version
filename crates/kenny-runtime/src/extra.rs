@@ -1774,6 +1774,11 @@ pub fn init() {
                 bump_serial();
                 v
             }
+            // (a pending autoload: dropped, its file not loaded)
+            None if crate::abi::remove_autoload(s as *mut Class, id) => {
+                bump_serial();
+                QNIL
+            }
             None => {
                 let prefix = if s as *mut Class == rt().c.object { String::new() } else { format!("{}::", class_name(s as *mut Class)) };
                 raise(rt().c.name_error, &format!("constant {}{} not defined", prefix, sym_str(id)))

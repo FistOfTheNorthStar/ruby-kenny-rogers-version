@@ -187,6 +187,9 @@ pub(crate) unsafe fn call_found(m: *const Method, recv: V, mid: V, args: &[V], e
     if explicit != 0 && mm.vis == VIS_PRIVATE {
         return crate::visibility::private_call_error(recv, sym_id(mid), args, QNIL);
     }
+    if explicit != 0 && mm.vis == VIS_PROTECTED && !crate::visibility::protected_ok(m) {
+        return crate::visibility::protected_call_error(recv, sym_id(mid), args, QNIL);
+    }
     match &mm.body {
         Body::Compiled(f) => {
             if crate::gc::safepoint() {
@@ -323,7 +326,7 @@ unsafe fn send1_found(m: *const Method, recv: V, mid: V, a: V, explicit: u64) ->
         }
         OPT_HASH_AREF => return crate::hash::hget(recv, a),
         OPT_HASH_KEY => return bool_v(rhash(recv).m.contains_key(&HKey(a))),
-        OPT_STR_EQ => return bool_v(is_str(a) && rstr(recv).b == rstr(a).b),
+        OPT_STR_EQ => return crate::string::str_equal(recv, a),
         OPT_STR_AREF if is_fix(a) => return crate::string::aref_idx(recv, fix(a)),
         // `!(recv == a)`: answered here when that `==` is a builtin one
         OPT_NEQ => {

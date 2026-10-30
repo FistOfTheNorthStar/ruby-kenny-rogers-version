@@ -532,7 +532,7 @@ pub fn init() {
             b(s).set(rstr(x).b.clone());
             copy_enc(s, x);
         }
-        QNIL
+        s
     });
     /// `String.new(str)` keeps str's encoding
     fn copy_enc(dst: V, src: V) {
@@ -554,8 +554,8 @@ pub fn init() {
     defn(c, "inspect", 0, 0, |s, _, _| new_str_v(str_inspect_v(s)));
     defn(c, "dump", 0, 0, |s, _, _| new_str_v(str_inspect(&rstr(s).b)));
     defn(c, "hash", 0, 0, |s, _, _| mkfix((hash_self(s) >> 2) as i64));
-    defn(c, "==", 1, 1, |s, a, _| bool_v(is_str(a[0]) && rstr(s).b == rstr(a[0]).b));
-    defn(c, "===", 1, 1, |s, a, _| bool_v(is_str(a[0]) && rstr(s).b == rstr(a[0]).b));
+    defn(c, "==", 1, 1, |s, a, _| str_equal(s, a[0]));
+    defn(c, "===", 1, 1, |s, a, _| str_equal(s, a[0]));
     defn(c, "eql?", 1, 1, |s, a, _| bool_v(is_str(a[0]) && rstr(s).b == rstr(a[0]).b));
     defn(c, "<=>", 1, 1, |s, a, _| str_cmp(s, a[0]));
     defn(c, "=~", 1, 1, |s, a, _| {
@@ -1677,4 +1677,16 @@ pub fn init() {
     defn(y, "match?", 1, 2, |s, a, _| send(str_from(&sym_str(sym_id(s))), sym("match?"), a, QNIL));
     defn(y, "empty?", 0, 0, |s, _, _| bool_v(sym_name(sym_id(s)).is_empty()));
     let _ = sym_arg;
+}
+
+/// String#== (and ===): a non-String with to_str is asked `other == self`, as in CRuby.
+pub fn str_equal(s: V, o: V) -> V {
+    if is_str(o) {
+        return bool_v(rstr(s).b == rstr(o).b);
+    }
+    if is_heap(o) && !is_sym(o) && respond_to(o, sym("to_str")) {
+        let r = send(o, sym("=="), &[s], QNIL);
+        return if r == UNDEF { UNDEF } else { bool_v(truthy(r)) };
+    }
+    QFALSE
 }
