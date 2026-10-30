@@ -287,6 +287,90 @@ fn range_each(s: V, b: V) -> V {
     }
 }
 
+/// a <=> b as -1/0/1, or None when they don't compare (CRuby's r_less: INT_MAX)
+fn r_less(a: V, b: V) -> Result<Option<i64>, V> {
+    let c = send1(a, "<=>", b);
+    if c == UNDEF {
+        return Err(c);
+    }
+    if c == QNIL {
+        return Ok(None);
+    }
+    if is_fix(c) {
+        return Ok(Some(fix(c).signum()));
+    }
+    let gt = send1(c, ">", mkfix(0));
+    if gt == UNDEF {
+        return Err(gt);
+    }
+    if truthy(gt) {
+        return Ok(Some(1));
+    }
+    let lt = send1(c, "<", mkfix(0));
+    if lt == UNDEF {
+        return Err(lt);
+    }
+    Ok(Some(if truthy(lt) { -1 } else { 0 }))
+}
+
+/// Range#cover?(range): CRuby's r_cover_range_p
+fn range_cover_range(s: V, v: V) -> V {
+    macro_rules! tri_r {
+        ($e:expr) => {
+            match $e {
+                Ok(x) => x,
+                Err(e) => return e,
+            }
+        };
+    }
+    let (r, o) = (rrange(s), rrange(v));
+    if (r.hi != QNIL && o.hi == QNIL) || (r.lo != QNIL && o.lo == QNIL) {
+        return QFALSE;
+    }
+    // an empty (or backwards) range is covered by none
+    if o.lo != QNIL && o.hi != QNIL {
+        match tri_r!(r_less(o.lo, o.hi)) {
+            None => return QFALSE,
+            Some(c) if c > if o.excl { -1 } else { 0 } => return QFALSE,
+            _ => {}
+        }
+    }
+    if o.lo != QNIL && !truthy(tri!(range_cover(s, o.lo))) {
+        return QFALSE;
+    }
+    let cmp_end = match tri_r!(r_less(r.hi, o.hi)) {
+        Some(c) => c,
+        None => return QFALSE,
+    };
+    if r.excl == o.excl {
+        return bool_v(cmp_end >= 0);
+    }
+    if r.excl {
+        return bool_v(cmp_end > 0);
+    }
+    if cmp_end >= 0 {
+        return QTRUE;
+    }
+    // (1..5).cover?(1...6): the other's last element
+    let max = send0(v, "max");
+    if max == UNDEF {
+        if let Throw::Raise(e) = pst().pending {
+            if is_a(e, rt().c.type_error) {
+                pst().pending = Throw::None;
+                return QFALSE;
+            }
+        }
+        return UNDEF;
+    }
+    if max == QNIL {
+        return QFALSE;
+    }
+    match tri_r!(r_less(r.hi, max)) {
+        Some(c) => bool_v(c >= 0),
+        None => QFALSE,
+    }
+}
+
 fn range_cover(s: V, x: V) -> V {
     let rg = rrange(s);
     if rg.lo != QNIL {
@@ -770,26 +854,17 @@ pub fn init() {
             if (is_str(r.lo) && r.hi == QNIL) || (r.lo == QNIL && (is_str(r.hi) || r.hi == QNIL)) {
                 return type_error("cannot determine inclusion in beginless/endless ranges");
             }
-            if is_range(a[0]) {
-                let o = rrange(a[0]);
-                let lo = tri!(range_cover(s, o.lo));
-                let hi = tri!(range_cover(s, o.hi));
-                return bool_v(truthy(lo) && truthy(hi));
-            }
             range_cover(s, a[0])
         });
     }
-    for name in ["===", "cover?"] {
-        defn(rg, name, 1, 1, |s, a, _| {
-            if is_range(a[0]) {
-                let o = rrange(a[0]);
-                let lo = tri!(range_cover(s, o.lo));
-                let hi = if o.excl { tri!(range_cover(s, o.hi)) } else { tri!(range_cover(s, o.hi)) };
-                return bool_v(truthy(lo) && truthy(hi));
-            }
-            range_cover(s, a[0])
-        });
-    }
+    // (=== with a Range compares it as one value, as CRuby's does)
+    defn(rg, "===", 1, 1, |s, a, _| range_cover(s, a[0]));
+    defn(rg, "cover?", 1, 1, |s, a, _| {
+        if is_range(a[0]) {
+            return range_cover_range(s, a[0]);
+        }
+        range_cover(s, a[0])
+    });
     defn(rg, "exclude_end?", 0, 0, |s, _, _| bool_v(rrange(s).excl));
     defn(rg, "to_s", 0, 0, |s, _, _| range_to_s(s, false));
     defn(rg, "inspect", 0, 0, |s, _, _| range_to_s(s, true));

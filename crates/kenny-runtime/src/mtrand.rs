@@ -466,14 +466,22 @@ pub fn init() {
     });
     fn srand(a: &[V]) -> V {
         let seed = match a.first() {
-            Some(&x) if x != QNIL => match int_big(x) {
+            Some(&x) => match int_big(x) {
                 Some(n) => n,
-                None => {
+                None if x != QNIL && respond_to(x, sym("to_int")) => {
                     let i = tri!(send(x, sym("to_int"), &[], QNIL));
+                    if int_big(i).is_none() {
+                        return type_error(&format!("can't convert {0} to Integer ({0}#to_int gives {1})", class_name(real_class(x)), class_name(real_class(i))));
+                    }
                     return srand(&[i]);
                 }
+                // (rb_to_int: nil, Strings ... are no seed)
+                None => {
+                    let what = if x == QNIL { "nil".to_string() } else if x == QTRUE { "true".into() } else if x == QFALSE { "false".into() } else { class_name(real_class(x)) };
+                    return type_error(&format!("no implicit conversion of {what} into Integer"));
+                }
             },
-            _ => new_seed(),
+            None => new_seed(),
         };
         let mut d = DEFAULT.lock().unwrap();
         let old = d.take().map(|(_, s)| s).unwrap_or_else(BigInt::zero);

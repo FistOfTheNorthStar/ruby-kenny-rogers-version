@@ -293,6 +293,14 @@ pub extern "C" fn kn_binding_new_l(self_: V, locals: V) -> V {
         return send(self_, mid, &[], QNIL);
     }
     let b = kn_binding_new(self_);
+    set_binding_locals(b, locals);
+    // (where: for Binding#source_location, symbolized when asked)
+    if let Some(&pc) = crate::backtrace::capture().first() {
+        ivar_set(b, sym("@__pc"), mkfix(pc as i64));
+    }
+    b
+}
+fn set_binding_locals(b: V, locals: V) {
     let h = hash_new();
     if is_ary(locals) {
         let items = rary(locals).v.clone();
@@ -303,7 +311,14 @@ pub extern "C" fn kn_binding_new_l(self_: V, locals: V) -> V {
         }
     }
     ivar_set(b, sym("@__locals"), h);
-    b
+}
+/// A block literal's proc, with the locals visible where it was written (a snapshot, for
+/// Proc#binding: the compiler passes them for blocks in the program's own code and in code
+/// compiled at runtime, such as templates).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_proc_set_locals(p: V, locals: V) -> V {
+    ivar_set(p, sym("@__blocals"), locals);
+    p
 }
 /// A call site's locals for the string `src` it is about to eval.
 #[unsafe(no_mangle)]
@@ -417,7 +432,29 @@ fn init_binding() {
             Err(e) => e,
         });
     }
-    defn(rt().c.proc_, "binding", 0, 0, |s, _, _| kn_binding_new(rproc(s).self_));
+    defn(rt().c.proc_, "binding", 0, 0, |s, _, _| {
+        let b = kn_binding_new(rproc(s).self_);
+        let l = ivar_get(s, sym("@__blocals"));
+        if l != QNIL {
+            set_binding_locals(b, l);
+        }
+        ivar_set(b, sym("@__proc"), s);
+        b
+    });
+    // [file, line] where the binding was made (a block's: where the block is)
+    defn(b, "source_location", 0, 0, |s, _, _| {
+        let p = ivar_get(s, sym("@__proc"));
+        if p != QNIL {
+            return send0(p, "source_location");
+        }
+        let pc = ivar_get(s, sym("@__pc"));
+        if is_fix(pc) {
+            if let Some((file, line, _)) = crate::backtrace::symbolize(fix(pc) as usize) {
+                return ary_new(vec![crate::kernel::new_str_v(file), mkfix(line)]);
+            }
+        }
+        QNIL
+    });
     defn(rt().c.kernel, "binding", 0, 0, |s, _, _| kn_binding_new(s));
 }
 

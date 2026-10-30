@@ -2320,6 +2320,7 @@ pub unsafe extern "C" fn kn_send_pub(cache: *mut CallCache, recv: V, mid: V, arg
 pub extern "C" fn kn_class_enter(c: V) -> V {
     if is_class(c) {
         rclass(c).default_vis = VIS_PUBLIC;
+        rclass(c).module_function = false;
         pst().definee.push(c as *mut Class);
     }
     c
@@ -2329,6 +2330,7 @@ pub extern "C" fn kn_class_enter(c: V) -> V {
 pub extern "C" fn kn_class_leave(c: V) -> V {
     if is_class(c) {
         rclass(c).default_vis = VIS_PUBLIC;
+        rclass(c).module_function = false;
         pst().definee.pop();
     }
     c

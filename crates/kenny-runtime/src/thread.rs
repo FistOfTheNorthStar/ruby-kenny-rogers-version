@@ -86,6 +86,8 @@ struct GThread {
     // set by other threads (under the lock)
     interrupt: Option<Throw>,
     has_interrupt: AtomicBool,
+    /// killed: running its ensure blocks on the way out (Thread#status "aborting")
+    aborting: bool,
     waiting_on: usize,
 }
 
@@ -434,6 +436,7 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
             current_block: Vec::new(),
             interrupt: None,
             has_interrupt: AtomicBool::new(false),
+            aborting: false,
             waiting_on: 0,
             pinned: on.is_some(),
             saved_throws: Default::default(),
@@ -715,6 +718,9 @@ fn prepare_block(s: &mut Sched, on: V, timeout: Option<Duration>) -> Option<Thro
     let t = &mut s.threads[cur];
     if let Some(i) = t.interrupt.take() {
         t.has_interrupt.store(false, Ordering::Release);
+        if matches!(i, Throw::Kill) {
+            t.aborting = true;
+        }
         return Some(i);
     }
     t.state = St::Blocked;
@@ -746,6 +752,9 @@ fn finish_block(on: V) -> Wake {
         t.waiting_on = 0;
         let i = t.interrupt.take();
         t.has_interrupt.store(false, Ordering::Release);
+        if matches!(i, Some(Throw::Kill)) {
+            t.aborting = true;
+        }
         (i, std::mem::replace(&mut t.timed_out, false))
     });
     if let Some(i) = intr {
@@ -1038,10 +1047,20 @@ fn deliver_interrupt() {
     let i = locked!(s => {
         let t = &mut s.threads[cur];
         t.has_interrupt.store(false, Ordering::Release);
-        t.interrupt.take()
+        let i = t.interrupt.take();
+        if matches!(i, Some(Throw::Kill)) {
+            t.aborting = true;
+        }
+        i
     });
     if let Some(i) = i {
         pst().pending = i;
+    }
+}
+/// The current thread is being killed (Thread#kill of itself, Thread.exit).
+fn mark_aborting() {
+    if let Some(cur) = pt().current {
+        locked!(s => s.threads[cur].aborting = true);
     }
 }
 
@@ -1451,10 +1470,13 @@ pub fn init() {
     });
     defn(th, "alive?", 0, 0, |s, _, _| bool_v(locked!(st => st.threads[tid_of(s)].state != St::Done)));
     defn(th, "status", 0, 0, |s, _, _| {
-        let (state, exc) = locked!(st => {
+        let (state, exc, aborting) = locked!(st => {
             let t = &st.threads[tid_of(s)];
-            (t.state, t.exc)
+            (t.state, t.exc, t.aborting)
         });
+        if aborting && state != St::Done {
+            return str_from("aborting");
+        }
         match state {
             St::Done => {
                 if exc != QNIL {
@@ -1494,6 +1516,9 @@ pub fn init() {
     fn interrupt(s: V, what: Throw) -> V {
         let tid = tid_of(s);
         if Some(tid) == pt().current {
+            if matches!(what, Throw::Kill) {
+                mark_aborting();
+            }
             pst().pending = what;
             return UNDEF;
         }
@@ -1575,6 +1600,7 @@ pub fn init() {
         s
     });
     defs(th, "exit", 0, 0, |_, _, _| {
+        mark_aborting();
         pst().pending = Throw::Kill;
         UNDEF
     });
