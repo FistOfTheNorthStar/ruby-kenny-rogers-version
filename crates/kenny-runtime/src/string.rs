@@ -1389,29 +1389,59 @@ pub fn init() {
     });
     fn pad(s: V, a: &[V], mode: u8) -> V {
         let w = fix(a[0]).max(0) as usize;
-        let padc: Vec<char> = match a.get(1) {
-            Some(p) if is_str(*p) => s_of(*p).chars().collect(),
-            _ => vec![' '],
+        let (pb, pe) = match a.get(1) {
+            Some(p) if is_str(*p) => (rstr(*p).b.clone(), crate::transcode::enc_of(*p)),
+            _ => (b" ".to_vec(), crate::transcode::ASCII),
         };
-        if padc.is_empty() {
+        if pb.is_empty() {
             return arg_error("zero width padding");
         }
-        let cur = s_of(s);
-        let n = cur.chars().count();
-        if w <= n {
-            return str_new(cur.into_bytes());
-        }
-        let total = w - n;
-        let mk = |k: usize| -> String { (0..k).map(|i| padc[i % padc.len()]).collect() };
-        let out = match mode {
-            b'l' => cur + &mk(total),
-            b'r' => mk(total) + &cur,
-            _ => {
-                let left = total / 2;
-                mk(left) + &cur + &mk(total - left)
+        // (the result's encoding as for s + pad: a binary String pads by bytes, and a pad
+        // that can't mix with it raises Encoding::CompatibilityError)
+        let enc = match crate::transcode::concat_enc(s, &pb, pe) {
+            Ok(e) => e.unwrap_or_else(|| crate::transcode::enc_of(s)),
+            Err(e) => return e,
+        };
+        let out: Vec<u8> = if enc.name == "UTF-8" {
+            let padc: Vec<char> = String::from_utf8_lossy(&pb).chars().collect();
+            let cur = s_of(s);
+            let n = cur.chars().count();
+            if w <= n {
+                cur.into_bytes()
+            } else {
+                let total = w - n;
+                let mk = |k: usize| -> String { (0..k).map(|i| padc[i % padc.len()]).collect() };
+                match mode {
+                    b'l' => cur + &mk(total),
+                    b'r' => mk(total) + &cur,
+                    _ => {
+                        let left = total / 2;
+                        mk(left) + &cur + &mk(total - left)
+                    }
+                }
+                .into_bytes()
+            }
+        } else {
+            let cur = rstr(s).b.to_vec();
+            let n = cur.len();
+            if w <= n {
+                cur
+            } else {
+                let total = w - n;
+                let mk = |k: usize| -> Vec<u8> { (0..k).map(|i| pb[i % pb.len()]).collect() };
+                match mode {
+                    b'l' => [cur, mk(total)].concat(),
+                    b'r' => [mk(total), cur].concat(),
+                    _ => {
+                        let left = total / 2;
+                        [mk(left), cur, mk(total - left)].concat()
+                    }
+                }
             }
         };
-        new_str_v(out)
+        let r = str_new(out);
+        crate::transcode::set_enc(r, enc);
+        r
     }
     defn(c, "ljust", 1, 2, |s, a, _| pad(s, a, b'l'));
     defn(c, "rjust", 1, 2, |s, a, _| pad(s, a, b'r'));

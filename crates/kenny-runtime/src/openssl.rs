@@ -784,7 +784,11 @@ fn fmt_b64(b: Vec<u8>) -> V {
 }
 
 fn init_digest(ossl: *mut Class) {
-    let d = class_under(ossl, "Digest", rt().c.object);
+    // (a Digest::Class, as in CRuby: openssl.rb requires "digest" first)
+    let sup = const_lookup(rt().c.object, sym("Digest"))
+        .and_then(|dg| const_get_under(dg as *mut Class, sym("Class")))
+        .map_or(rt().c.object, |c| c as *mut Class);
+    let d = class_under(ossl, "Digest", sup);
     *DIGEST_CLASS.get() = d;
     *DIGEST_ERROR.get() = class_under(d, "DigestError", *OSSL_ERROR.get());
     defn(d, "initialize", 0, 2, |s, a, _| {
@@ -1194,6 +1198,8 @@ fn init_cipher(ossl: *mut Class) {
 }
 
 // (after get! and the helpers it uses: macros are in scope from their definition on)
+#[path = "openssl_ec.rs"]
+mod ec;
 #[path = "openssl_pkey.rs"]
 mod pkey;
 #[path = "openssl_tls.rs"]
@@ -1259,7 +1265,8 @@ fn init_openssl() -> V {
     init_hmac(ossl);
     init_kdf(ossl);
     init_cipher(ossl);
-    pkey::init_pkey(ossl);
+    let (pk, pkey_base) = pkey::init_pkey(ossl);
+    ec::init_ec(pk, pkey_base);
     tls::init_tls(ssl);
     x509::init_x509(ossl);
     ossl as V

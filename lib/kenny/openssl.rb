@@ -5,11 +5,14 @@
 # openssl_pkey.rs); this file adds the Ruby-level conveniences of the openssl gem
 # on top. OpenSSL::ASN1 and OpenSSL::X509 (certificates, names, extensions, CSRs, CRLs,
 # and a Store that verifies chains as OpenSSL 3.6 does) are Ruby, in kenny/openssl_asn1.rb
-# and kenny/openssl_x509*.rb, with signatures checked natively (openssl_x509.rs); EC keys
-# are public only (kenny/openssl_ec.rb). TLS (SSLContext, SSLSocket) runs on rustls
+# and kenny/openssl_x509*.rb, with signatures checked natively (openssl_x509.rs). EC keys
+# (kenny/openssl_ec.rb) and Ed25519 keys (kenny/openssl_ed25519.rb) have their arithmetic in
+# openssl_ec.rs. TLS (SSLContext, SSLSocket) runs on rustls
 # (kenny/openssl_ssl.rb, openssl_tls.rs) under the gem's own openssl/ssl.rb. DSA and DH
 # keys are not provided: their classes exist (gems refer to them when loading), and using
 # them raises NotImplementedError.
+# (OpenSSL::Digest is a Digest::Class, as in CRuby, whose openssl.so requires "digest")
+require "digest"
 __kenny_openssl_init
 
 module OpenSSL
@@ -234,18 +237,7 @@ module OpenSSL
       String.try_convert(data) or raise TypeError, "no implicit conversion of #{data.class} into String"
     end
 
-    # Kenny reads RSA keys (PKCS#1, PKCS#8 and SPKI, in PEM or DER); encrypted keys are not supported.
-    def self.read(data, pass = nil)
-      key = RSA.allocate
-      return key if key.__send__(:__load, __kenny_input(data))
-      raise PKeyError, "Could not parse PKey"
-    end
-
-    def self.generate_key(algo, options = {})
-      raise NotImplementedError, "OpenSSL::PKey.generate_key(#{algo.inspect}) is not supported by Kenny (RSA keys are)" unless algo.to_s.casecmp?("RSA")
-      opts = options.to_h { |k, v| [k.to_s, v] }
-      RSA.new(Integer(opts.fetch("rsa_keygen_bits", 2048)), Integer(opts.fetch("rsa_keygen_pubexp", 65537)))
-    end
+    # (PKey.read, PKey.generate_key and friends: kenny/openssl_ed25519.rb)
 
     class PKey
       def oid = raise(NotImplementedError)
@@ -264,7 +256,15 @@ module OpenSSL
       def initialize(arg = nil, pass = nil)
         return if arg.nil?
         return __generate(arg, pass.nil? ? 65537 : Integer(pass)) if arg.is_a?(Integer)
-        __load(OpenSSL::PKey.__kenny_input(arg)) or raise RSAError, "Neither PUB key nor PRIV key"
+        s = OpenSSL::PKey.__kenny_input(arg)
+        return if __load(s)
+        k = begin
+          Kenny::PKeyDER.decode_input(s)
+        rescue OpenSSL::ASN1::ASN1Error, NotImplementedError
+          nil
+        end
+        raise RSAError, "incorrect pkey type: #{OpenSSL::PKey.__kenny_type_name(k)}" if k && k[0] != :encrypted
+        raise RSAError, "Neither PUB key nor PRIV key"
       end
 
       def initialize_copy(other)
@@ -368,14 +368,14 @@ module OpenSSL
     end
 
     # DSA and DH keys aren't implemented; the classes exist for the gems that name them. (EC
-    # public keys, what certificates carry, are in kenny/openssl_ec.rb.)
+    # keys are in kenny/openssl_ec.rb, Ed25519 keys in kenny/openssl_ed25519.rb.)
     { DSA: DSAError, DH: DHError }.each do |name, _err|
       const_set(name, Class.new(PKey) {
         define_method(:initialize) do |*|
-          raise NotImplementedError, "OpenSSL::PKey::#{name} keys are not supported by Kenny (RSA keys are)"
+          raise NotImplementedError, "OpenSSL::PKey::#{name} keys are not supported by Kenny (RSA, EC and Ed25519 keys are)"
         end
         define_singleton_method(:generate) do |*|
-          raise NotImplementedError, "OpenSSL::PKey::#{name} keys are not supported by Kenny (RSA keys are)"
+          raise NotImplementedError, "OpenSSL::PKey::#{name} keys are not supported by Kenny (RSA, EC and Ed25519 keys are)"
         end
       })
     end

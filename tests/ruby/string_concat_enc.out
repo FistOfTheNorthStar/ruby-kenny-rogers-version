@@ -22,3 +22,15 @@ false
 [[233, 97], "ISO-8859-1", true]
 Encoding::CompatibilityError
 [[195, 169], "UTF-8", true]
+["\x00\x00\xFC\x1E7", #<Encoding:BINARY (ASCII-8BIT)>, 5]
+["\xFC\x1E7\x00\x00", #<Encoding:BINARY (ASCII-8BIT)>, 5]
+["ab\xFC\x1E7aba", #<Encoding:BINARY (ASCII-8BIT)>, 8]
+["\xFC\x1E7", #<Encoding:BINARY (ASCII-8BIT)>, 3]
+["\xFF\xFFab", #<Encoding:BINARY (ASCII-8BIT)>, 4]
+["éééhéllo", #<Encoding:UTF-8>, 12]
+["*-héllo*-", #<Encoding:UTF-8>, 10]
+#<Encoding:UTF-8>
+#<Encoding:US-ASCII>
+[Encoding::CompatibilityError, "incompatible character encodings: BINARY (ASCII-8BIT) and UTF-8"]
+[Encoding::CompatibilityError, "incompatible character encodings: UTF-8 and BINARY (ASCII-8BIT)"]
+[ArgumentError, "zero width padding"]

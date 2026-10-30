@@ -35,6 +35,12 @@ unicode-normalization = "0.1.26"
 ruby-prism-sys = "1.9.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 ring = "0.17"
+p256 = { version = "0.14.0", default-features = false, features = ["std", "ecdsa", "ecdh", "pkcs8", "pem", "arithmetic", "sha2"] }
+p384 = { version = "0.14.0", default-features = false, features = ["std", "ecdsa", "ecdh", "pkcs8", "pem", "arithmetic", "sha2"] }
+k256 = { version = "0.14.0", default-features = false, features = ["std", "ecdsa", "ecdh", "pkcs8", "pem", "arithmetic", "sha2"] }
+p521 = { version = "0.14.0", default-features = false, features = ["std", "ecdsa", "ecdh", "pkcs8", "pem", "arithmetic"] }
+ecdsa = { version = "0.17.0", default-features = false, features = ["std", "der", "algorithm"] }
+elliptic-curve = { version = "0.14.3", default-features = false, features = ["std", "arithmetic", "ecdh"] }
 
 [lib]
 crate-type = ["staticlib", "rlib"]

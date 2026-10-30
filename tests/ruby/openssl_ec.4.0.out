@@ -1,0 +1,144 @@
+-- prime256v1
+key: [OpenSSL::PKey::EC, true, true, false, "prime256v1", 256, 1, 256]
+formats: [true, "42d0d9cb8d925290", "e304284333a10d0e", "2421564e5e457c57", true]
+reread: [true, true, true]
+OpenSSL's signature: [true, false]
+sign: [[true, false], [true, false], [true, false], [true, false]]
+sign Digest: true
+dsa_sign_asn1: [true, true, true, true, true]
+private key: [OpenSSL::BN, "ab42628fd96ce71c"]
+public key: ["c4d314fb4e4feffa", "688969c6e5cb84ea", 6]
+generator: "5baff89de7de5c1d"
+k * G: true
+mul: ["1ae5c7e114881c14", "f47bfa4af59b12a0"]
+add: true
+invert: [true, "00ec4fd11f8d5091"]
+order: [true, true, true]
+Point.new: [true, true, true, true, true]
+check_key: [true, true]
+compare?: [true, true, false]
+generate: [true, true, true]
+ECDH: [true, true]
+group der: ["06082a8648ce3d030107", true, false]
+-- secp384r1
+key: [OpenSSL::PKey::EC, true, true, false, "secp384r1", 384, 1, 384]
+formats: [true, "0fec146b02d900be", "d55034325c2e1093", "4df1fd1bebfa5d42", true]
+reread: [true, true, true]
+OpenSSL's signature: [true, false]
+sign: [[true, false], [true, false], [true, false], [true, false]]
+sign Digest: true
+dsa_sign_asn1: [true, true, true, true, true]
+private key: [OpenSSL::BN, "ff7ddb62354add17"]
+public key: ["445cfb7b918a68ac", "c289815ba5fa0675", 7]
+generator: "617e8efc7b1c96fc"
+k * G: true
+mul: ["0791875e27be3514", "aa3da32137e3652d"]
+add: true
+invert: [true, "303f4dc91e0ae0c3"]
+order: [true, true, true]
+Point.new: [true, true, true, true, true]
+check_key: [true, true]
+compare?: [true, true, false]
+generate: [true, true, true]
+ECDH: [true, true]
+group der: ["06052b81040022", true, false]
+-- secp521r1
+key: [OpenSSL::PKey::EC, true, true, false, "secp521r1", 521, 1, 521]
+formats: [true, "96361867f43951ec", "0ca1760b1ac2a8c9", "65f0054a5a376284", true]
+reread: [true, true, true]
+OpenSSL's signature: [true, false]
+sign: [[true, false], [true, false], [true, false], [true, false]]
+sign Digest: true
+dsa_sign_asn1: [true, true, true, true, true]
+private key: [OpenSSL::BN, "5a3523af7a45dd4e"]
+public key: ["2d06f59c56e46b9f", "d9e2a57ddd6678f8", 7]
+generator: "db5e95cc032849cf"
+k * G: true
+mul: ["d4a9461dffa3959e", "d2aa244da881e8ad"]
+add: true
+invert: [true, "653d1fc21babd485"]
+order: [true, true, true]
+Point.new: [true, true, true, true, true]
+check_key: [true, true]
+compare?: [true, true, false]
+generate: [true, true, true]
+ECDH: [true, true]
+group der: ["06052b81040023", true, false]
+-- secp256k1
+key: [OpenSSL::PKey::EC, true, true, false, "secp256k1", 256, 1, 256]
+formats: [true, "3ca139e6dd749967", "2d843214b634a5f5", "e2063dea981b494d", true]
+reread: [true, true, true]
+OpenSSL's signature: [true, false]
+sign: [[true, false], [true, false], [true, false], [true, false]]
+sign Digest: true
+dsa_sign_asn1: [true, true, true, true, true]
+private key: [OpenSSL::BN, "e53531c4326c805d"]
+public key: ["db66cac9763f9fa6", "4adfe91b6aebc756", 6]
+generator: "0f715baf5d4c2ed3"
+k * G: true
+mul: ["7c84ea4302a7ee5a", "e54f7ff86cb4cfea"]
+add: true
+invert: [true, "4d7ddd02dfaad798"]
+order: [true, true, true]
+Point.new: [true, true, true, true, true]
+check_key: [true, true]
+compare?: [true, true, false]
+generate: [true, true, true]
+ECDH: [true, true]
+group der: ["06052b8104000a", true, false]
+-- P-256
+to_text: "Private-Key: (256 bit)\npriv:\n    4b:24:de:70:4e:c9:a4:d0:68:86:0f:f5:d6:a3:3e:\n    e5:ee:bb:41:ca:ec:74:f6:6f:fc:31:94:a2:bb:89:\n    1b:21\npub:\n    04:bf:52:a7:60:c2:cf:7e:39:7f:db:a2:24:69:60:\n    2f:7a:68:aa:e5:5a:67:44:3b:95:80:6f:a8:b1:3a:\n    19:24:db:b3:0e:c6:7c:11:2b:d5:1b:a3:2c:b7:5c:\n    9c:8b:0a:89:38:68:c7:3b:ec:6c:67:95:7d:fb:e3:\n    ab:a1:11:96:64\nASN1 OID: prime256v1\nNIST CURVE: P-256\n"
+public to_text: "Public-Key: (256 bit)\npub:\n    04:bf:52:a7:60:c2:cf:7e:39:7f:db:a2:24:69:60:\n    2f:7a:68:aa:e5:5a:67:44:3b:95:80:6f:a8:b1:3a:\n    19:24:db:b3:0e:c6:7c:11:2b:d5:1b:a3:2c:b7:5c:\n    9c:8b:0a:89:38:68:c7:3b:ec:6c:67:95:7d:fb:e3:\n    ab:a1:11:96:64\nASN1 OID: prime256v1\nNIST CURVE: P-256\n"
+group to_text: "ASN1 OID: prime256v1\nNIST CURVE: P-256\n"
+ECDH secret: ["d071f2a4d7a9ded2a7119eb4745a64f2e0c80321a3772e48b3cd89b7a0e1d97f", true]
+inspect: ["#<OpenSSL::PKey::EC:X oid=id-ecPublicKey type_name=EC provider=default>", "#<OpenSSL::PKey::EC:X oid=id-ecPublicKey type_name=EC>"]
+PKCS#8 read: [OpenSSL::PKey::EC, true, true]
+EC.new(name): [false, false, nil, "prime256v1"]
+EC.new(group): "secp384r1"
+PKey.generate_key EC: "secp384r1"
+PKey.generate_key params: "secp256k1"
+generate_parameters: false
+builtin_curves: [["secp256k1", "SECG curve over a 256 bit prime field"], ["secp384r1", "NIST/SECG curve over a 384 bit prime field"], ["secp521r1", "NIST/SECG curve over a 521 bit prime field"], ["prime256v1", "X9.62/SECG curve over a 256 bit prime field"]]
+-- errors
+public sign: ArgumentError: private key is needed
+public dsa_sign_asn1: OpenSSL::PKey::PKeyError: EVP_PKEY_sign: provider signature failure (ECDSA sign:)
+public private_to_der: OpenSSL::PKey::PKeyError: i2d_PKCS8PrivateKey_bio: ASN1 lib
+public derive: OpenSSL::PKey::PKeyError: EVP_PKEY_derive: missing private key
+verify garbage: OpenSSL::PKey::PKeyError: EVP_DigestVerify
+verify r=1 s=1: false
+dsa_verify garbage: OpenSSL::PKey::PKeyError: EVP_PKEY_verify: provider signature failure (ECDSA verify:)
+generate_key!: OpenSSL::PKey::PKeyError: pkeys are immutable on OpenSSL 3.0
+private_key=: OpenSSL::PKey::PKeyError: pkeys are immutable on OpenSSL 3.0
+bad curve: OpenSSL::PKey::PKeyError: invalid curve name
+NIST name: OpenSSL::PKey::PKeyError: invalid curve name
+Group NIST name: OpenSSL::PKey::EC::Group::Error: unknown curve name (P-521)
+bad point: OpenSSL::PKey::EC::Point::Error: EC_POINT_oct2point: point is not on curve
+bad encoding: OpenSSL::PKey::EC::Point::Error: EC_POINT_oct2point: invalid encoding
+garbage key: OpenSSL::PKey::PKeyError: invalid curve name
+read garbage: OpenSSL::PKey::PKeyError: Could not parse PKey
+RSA as EC: OpenSSL::PKey::PKeyError: incorrect pkey type: rsaEncryption
+EC as RSA: OpenSSL::PKey::PKeyError: incorrect pkey type: id-ecPublicKey
+other curve, other digest: OpenSSL::PKey::PKeyError: EVP_PKEY_derive_set_peer: mismatching domain parameters
+-- Ed25519
+key: [OpenSSL::PKey::PKey, "ED25519", "#<OpenSSL::PKey::PKey:X oid=ED25519 type_name=ED25519 provider=default>", true]
+raw: [32, "054847e810a15b3bd36996a8b967015d9e37736f6e75a2f9a28ee441daa89769", true]
+public_to_pem: "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEABUhH6BChWzvTaZaouWcBXZ43c29udaL5oo7kQdqol2k=\n-----END PUBLIC KEY-----\n"
+sign: ["cadd2d8b96910589a60f7b2adb7bd6320620121376fe285a4391828ef69a6d68895f70e7380f18491324a0ffa7654752dafcb47c04a018fdf035abf88d913c06", true, false, false]
+to_text: "ED25519 Private-Key:\npriv:\n    fe:ae:3e:3b:4d:a1:fe:a8:99:b7:d5:db:6e:b4:6d:\n    65:07:0e:84:6b:ad:a4:e7:ed:1e:78:06:94:69:a6:\n    c3:85\npub:\n    05:48:47:e8:10:a1:5b:3b:d3:69:96:a8:b9:67:01:\n    5d:9e:37:73:6f:6e:75:a2:f9:a2:8e:e4:41:da:a8:\n    97:69\n"
+public to_text: "ED25519 Public-Key:\npub:\n    05:48:47:e8:10:a1:5b:3b:d3:69:96:a8:b9:67:01:\n    5d:9e:37:73:6f:6e:75:a2:f9:a2:8e:e4:41:da:a8:\n    97:69\n"
+new_raw_private_key: true
+new_raw_public_key: true
+generate_key: ["ED25519", true]
+sign with a digest: OpenSSL::PKey::PKeyError: EVP_DigestSignInit: invalid digest (Explicit digest not allowed with EdDSA operations)
+public sign: OpenSSL::PKey::PKeyError: EVP_DigestSign: not a private key
+public raw_private_key: OpenSSL::PKey::PKeyError: EVP_PKEY_get_raw_private_key
+bad raw key: OpenSSL::PKey::PKeyError: EVP_PKEY_new_raw_private_key_ex: key setup failed
+PKey.new: TypeError: OpenSSL::PKey::PKey can't be instantiated directly
+Marshal: TypeError: no _dump_data is defined for class OpenSSL::PKey::PKey
+-- X509
+certificate id-ecPublicKey SHA256: ["ecdsa-with-SHA256", true, false, OpenSSL::PKey::EC]
+certificate id-ecPublicKey SHA384: ["ecdsa-with-SHA384", true, false, OpenSSL::PKey::EC]
+certificate id-ecPublicKey SHA512: ["ecdsa-with-SHA512", true, false, OpenSSL::PKey::EC]
+certificate id-ecPublicKey SHA256: ["ecdsa-with-SHA256", true, false, OpenSSL::PKey::EC]
+certificate ED25519 : ["ED25519", true, false, OpenSSL::PKey::PKey]
+CSR: ["ecdsa-with-SHA256", true, false]

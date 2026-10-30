@@ -44,3 +44,42 @@ if rsa
   rt = JWT.encode({ "r" => 1 }, rsa, "RS256")
   p JWT.decode(rt, rsa.public_key, true, algorithm: "RS256")[0]
 end
+
+# ECDSA: a token CRuby signed, then each curve jwt has, and JWKs (export, import, thumbprint)
+es_pem = <<~PEM
+  -----BEGIN EC PRIVATE KEY-----
+  MHcCAQEEICqCYONapr4q5OUTiiMCCGasKbPE3APg1Zodp2cvmZ4AoAoGCCqGSM49
+  AwEHoUQDQgAEIu3EYoSl7QLVRQ2iEWrBBesgCJver7BUnv8s5Sp6cNf1tpvf2d89
+  GK05MLOIJO5AfdwH8lxbUfcRdqoa2wFPfw==
+  -----END EC PRIVATE KEY-----
+PEM
+es_key = OpenSSL::PKey::EC.new(es_pem)
+fixed = "eyJraWQiOiJwMjU2IiwiYWxnIjoiRVMyNTYifQ.eyJmaXhlZCI6dHJ1ZSwibiI6N30." \
+        "hUgoduuSUDH1q101yK1C8CzSkw0MzscuOKOddZ1HCilDsdstJz-YT4ndshPju6XvJGt-sDj-FCPxTN6VWJ3sHw"
+p JWT.decode(fixed, OpenSSL::PKey::EC.new(es_key.public_to_pem), true, algorithm: "ES256")
+begin
+  JWT.decode(fixed.sub(/.\z/, "A"), es_key, true, algorithm: "ES256")
+rescue JWT::VerificationError => e
+  puts "ES256 tampered: #{e.message}"
+end
+{ "ES256" => "prime256v1", "ES384" => "secp384r1", "ES512" => "secp521r1", "ES256K" => "secp256k1" }.each do |alg, curve|
+  key = OpenSSL::PKey::EC.generate(curve)
+  t = JWT.encode({ "alg" => alg }, key, alg)
+  pub = OpenSSL::PKey::EC.new(key.public_to_der)
+  p [alg, t.split(".")[2].size, JWT.decode(t, pub, true, algorithm: alg)[0]]
+  begin
+    JWT.decode(t, OpenSSL::PKey::EC.generate(curve), true, algorithm: alg)
+  rescue JWT::VerificationError => e
+    puts "#{alg} other key: #{e.message}"
+  end
+end
+jwk = JWT::JWK.new(es_key, kid: "p256")
+exported = jwk.export
+p exported
+p jwk.export(include_private: true).keys
+p JWT::JWK::Thumbprint.new(jwk).to_s
+imported = JWT::JWK.import(jwk.export(include_private: true))
+p imported.signing_key.private?, imported.verify_key.to_pem == es_key.public_to_pem
+p JWT.decode(fixed, JWT::JWK.import(exported).verify_key, true, algorithm: "ES256")[0]
+jwks = JWT::JWK::Set.new([jwk])
+p JWT.decode(JWT.encode({ "s" => 1 }, imported.signing_key, "ES256", { kid: "p256" }), nil, true, algorithms: ["ES256"], jwks: jwks)[0]
