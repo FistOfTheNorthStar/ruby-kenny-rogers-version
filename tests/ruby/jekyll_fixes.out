@@ -1,0 +1,39 @@
+false
+"cb00753f45a35e8b"
+32
+"unsupported bit length: 100"
+[Socket]
+"127.0.0.1"
+false
+"quiet"
+[:main, "aborted"]
+"a\\/b"
+"a/b"
+"a!b"
+"a\\}b"
+"\\d\\s\\."
+"x\\-y1\\/"
+"invalid byte sequence in UTF-8"
+"invalid byte sequence in UTF-8"
+"invalid byte sequence in UTF-8"
+"invalid byte sequence in UTF-8"
+2
+"---\nx: 1\n---\n"
+"---\n"
+6
+"ASCII incompatible encoding needs binmode"
+[#<Encoding:UTF-16LE>, #<Encoding:UTF-16LE>, 8]
+["s/.", "s/.h"]
+[".", "bom.md", "s", "s/.h"]
+["s/.", "s/.h"]
+["s/./"]
+:found
+"constant"
+:found
+false
+false
+[true, false, true]
+true
+"x"
+1
+[:helper]

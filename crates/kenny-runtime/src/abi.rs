@@ -1239,7 +1239,7 @@ pub unsafe extern "C" fn kn_const_get_l(cache: *mut ConstCache, crefp: *const [V
                     break;
                 }
             }
-            match r.or_else(|| unsafe { (*rt().c.object).consts.get(&id).copied() }) {
+            match r.or_else(|| crate::core::object_const(id)) {
                 Some(v) => {
                     settle_id(id);
                     v
@@ -1269,8 +1269,9 @@ pub extern "C" fn kn_const_defined_l(crefp: *const [V; 2], id: V) -> u64 {
             return 1;
         }
     }
+    // (the top level: Object and the modules included into it)
     let o = rt().c.object;
-    (unsafe { (*o).consts.contains_key(&id) } || has_autoload(o, id)) as u64
+    ancestors_rc(o).iter().any(|&a| unsafe { (*a).consts.contains_key(&id) } || has_autoload(a, id)) as u64
 }
 
 pub fn const_missing(c: *mut Class, id: u32) -> V {
