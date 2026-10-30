@@ -411,6 +411,17 @@ pub fn init_complex() {
     let cc = new_class("Complex", rt().c.numeric);
     set_global_const("Complex", cc as V);
     *COMPLEX.get() = cc;
+    // (Numeric's methods Complex doesn't have, as CRuby's complex.c undefines them)
+    for name in ["%", "div", "divmod", "floor", "ceil", "modulo", "remainder", "round", "step", "truncate", "positive?", "negative?"] {
+        add_method(cc, sym(name), Body::Undefined);
+    }
+    defn(cc, "fdiv", 1, 1, |s, a, _| {
+        let re = tri!(send0(s, "real"));
+        let im = tri!(send0(s, "imaginary"));
+        let re = tri!(send(re, sym("fdiv"), &[a[0]], QNIL));
+        let im = tri!(send(im, sym("fdiv"), &[a[0]], QNIL));
+        complex_new(re, im)
+    });
     defs(cc, "rectangular", 1, 2, |_, a, _| complex_new(a[0], a.get(1).copied().unwrap_or(mkfix(0))));
     defs(cc, "rect", 1, 2, |_, a, _| complex_new(a[0], a.get(1).copied().unwrap_or(mkfix(0))));
     defs(cc, "polar", 1, 2, |_, a, _| {

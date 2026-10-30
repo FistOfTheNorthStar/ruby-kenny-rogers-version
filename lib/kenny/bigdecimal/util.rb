@@ -36,6 +36,22 @@ class BigDecimal < Numeric
   end
 end
 
+class Rational < Numeric
+  def to_d(precision)
+    BigDecimal(self, precision)
+  end
+end
+
+class Complex < Numeric
+  def to_d(*args)
+    BigDecimal(self) unless imag.zero? # (raises)
+    if args.empty? && real.is_a?(Rational)
+      BigDecimal(real) # (raises: a precision is needed)
+    end
+    real.to_d(*args)
+  end
+end
+
 class NilClass
   def to_d
     BigDecimal(0)

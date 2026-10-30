@@ -1725,7 +1725,15 @@ impl<M: Module> Compiler<M> {
             p.keywords().iter().next().is_some() || p.keyword_rest().is_some_and(|k| k.as_keyword_rest_parameter_node().is_some())
         });
         let flags = self.iconst(fx, (arity.autosplat as i64) | if lambda { 2 } else { 0 } | if takes_kw { 4 } else { 0 });
-        self.call(fx, "kn_proc_new", &[addr, env, s, min, max, flags])
+        let p = self.call(fx, "kn_proc_new", &[addr, env, s, min, max, flags]);
+        // Proc#binding's locals (a snapshot of those visible here): for blocks in the program's
+        // own code and in code compiled at runtime (templates: ActionView's atom_feed reads
+        // `xml` through the block's binding); gems' blocks don't pay for it
+        if (self.eval_unit || !self.in_dependency()) && !self.visible_locals(fx).is_empty() {
+            let l = self.locals_snapshot(fx);
+            return self.call(fx, "kn_proc_set_locals", &[p, l]);
+        }
+        p
     }
 
     pub(crate) fn class_body(&mut self, fx: &mut Fx, target: Value, label: &str, locals: Vec<Vec<u8>>, body: Option<Node>) -> Value {

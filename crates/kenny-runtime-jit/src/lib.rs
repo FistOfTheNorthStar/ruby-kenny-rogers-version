@@ -143,6 +143,7 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_rational_lit", kenny_runtime::rational::kn_rational_lit as *const u8),
         ("kn_binding_new", kenny_runtime::compat::kn_binding_new as *const u8),
         ("kn_binding_new_l", kenny_runtime::compat::kn_binding_new_l as *const u8),
+        ("kn_proc_set_locals", kenny_runtime::compat::kn_proc_set_locals as *const u8),
         ("kn_eval_locals", kenny_runtime::compat::kn_eval_locals as *const u8),
         ("kn_register_file", kenny_runtime::compat::kn_register_file as *const u8),
         ("kn_register_debug", kenny_runtime::backtrace::kn_register_debug as *const u8),

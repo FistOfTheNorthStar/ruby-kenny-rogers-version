@@ -1,0 +1,71 @@
+"builder"
+"builder from eval"
+true
+1
+["rails_fixes_2.rb", 27]
+13
+3600
+#<Zone>
+2000-01-01 13:00:00 +0100
+false
+true
+3600
+14
+"can't convert Object into an exact number"
+30
+0.15e1
+0.333e0
+[:hour, 0, true]
+[:min, 0, true]
+[:minute, 0, true]
+[:sec, 0, true]
+[:second, 0, true]
+[7, 8, 9]
+false
+true
+true
+false
+true
+false
+true
+false
+true
+false
+true
+true
+false
+false
+0
+true
+true
+nil
+500000
+500000
+750000
+true
+nil
+S(5)
+false
+true
+false
+false
+true
+nil
+S(5)
+S(5)
+2
+2.5
+5
+5
+S(3)
+S(-5)
+true
+:b
+"aborting"
+"Pay can't be coerced into Integer"
+"Pay can't be coerced into Float"
+"nil can't be coerced into Integer"
+":a can't be coerced into Integer"
+"no implicit conversion of nil into Integer"
+"no implicit conversion of String into Integer"
+Integer

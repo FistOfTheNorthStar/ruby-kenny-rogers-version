@@ -2529,6 +2529,17 @@ pub fn init() {
         same(s, D::from_abs(d.abs(), of))
     });
 
+    // Date's own hour/min/sec are private (date_core.c; DateTime's are public)
+    defn(dc, "hour", 0, 0, |s, _, _| mkfix(dget(s).df / 3600));
+    for name in ["min", "minute"] {
+        defn(dc, name, 0, 0, |s, _, _| mkfix(dget(s).df % 3600 / 60));
+    }
+    for name in ["sec", "second"] {
+        defn(dc, name, 0, 0, |s, _, _| mkfix(dget(s).df % 60));
+    }
+    for name in ["hour", "min", "minute", "sec", "second"] {
+        unsafe { (*find_method(dc, sym(name)).cast_mut()).vis = VIS_PRIVATE };
+    }
     // ---- DateTime ----
     defn(dtc, "hour", 0, 0, |s, _, _| mkfix(dget(s).df / 3600));
     defn(dtc, "min", 0, 0, |s, _, _| mkfix(dget(s).df % 3600 / 60));

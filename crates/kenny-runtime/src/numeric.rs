@@ -39,13 +39,8 @@ fn flt(n: &N) -> f64 {
     }
 }
 fn coerce_fail(a: V, b: V) -> V {
-    let what = if b == QNIL {
-        "nil".to_string()
-    } else if is_str(b) || is_ary(b) || is_hash(b) {
-        class_name(real_class(b))
-    } else {
-        inspect_lossy(b)
-    };
+    // (CRuby's coerce_failed: special constants, Symbols and Floats inspected, others by class)
+    let what = if !is_heap(b) || is_sym(b) || is_float(b) { inspect_lossy(b) } else { class_name(real_class(b)) };
     type_error(&format!("{} can't be coerced into {}", what, class_name(real_class(a))))
 }
 fn zerodiv() -> V {

@@ -490,6 +490,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_rational_lit", &[I64, I64], &[I64]),
     ("kn_binding_new", &[I64], &[I64]),
     ("kn_binding_new_l", &[I64, I64], &[I64]),
+    ("kn_proc_set_locals", &[I64, I64], &[I64]),
     ("kn_eval_locals", &[I64, I64], &[I64]),
     ("kn_register_file", &[I64, I64, I64, I64, I64], &[]),
     ("kn_register_debug", &[I64, I64, I64, I64], &[]),
