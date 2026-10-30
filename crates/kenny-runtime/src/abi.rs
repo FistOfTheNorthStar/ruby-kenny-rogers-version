@@ -1242,21 +1242,29 @@ pub unsafe extern "C" fn kn_const_get_l(cache: *mut ConstCache, crefp: *const [V
         (None, Some(owner)) => const_missing_in(k, id, Some(owner)),
         (None, None) => {
             let mut r = None;
+            let mut owner = None;
             for &a in ancestors_rc(k).iter() {
                 if let Some(&v) = unsafe { (*a).consts.get(&id) } {
                     r = Some(v);
                     break;
                 }
                 if has_autoload(a, id) {
+                    owner = Some(a);
                     break;
                 }
             }
-            match r.or_else(|| crate::core::object_const(id)) {
+            match r.or_else(|| if owner.is_some() { None } else { crate::core::object_const(id) }) {
                 Some(v) => {
                     settle_id(id);
                     v
                 }
-                None => const_missing_in(k, id, chain.iter().copied().find(|&l| has_autoload(l, id))),
+                // (the autoload this scope sees: in the cref's ancestors, else at the top
+                // level — not one in the class's lexical parent, which `module A::B` doesn't
+                // have in scope)
+                None => {
+                    let owner = owner.or_else(|| ancestors_rc(rt().c.object).iter().copied().find(|&a| has_autoload(a, id)));
+                    const_missing_in(k, id, owner)
+                }
             }
         }
     };

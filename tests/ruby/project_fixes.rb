@@ -97,3 +97,15 @@ def runaway(a) = [a].map { |x| runaway(x) }
 t = Time.now
 begin; runaway(1); rescue SystemStackError; p :stack_error; end
 p Time.now - t < 5
+
+# `module A::B` doesn't have A in scope: the top-level autoload, not A's
+d = __dir__
+Object.autoload(:Trx, "#{d}/project_fixes/top_trx.rb")
+module Adm; end
+Adm.autoload(:Trx, "#{d}/project_fixes/adm_trx.rb")
+module Adm::FH
+  p Trx
+end
+module Adm
+  p Trx
+end
