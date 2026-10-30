@@ -341,7 +341,8 @@ fn is_bin(v: V) -> bool {
 fn new_like(src: V, b: Vec<u8>) -> V {
     let r = str_new(b);
     if is_bin(src) {
-        hdr(r).flags |= FL_BINARY;
+        // (Windows-1252 ... too)
+        crate::transcode::like(r, src);
     }
     r
 }
@@ -1780,7 +1781,50 @@ pub fn init() {
             }
         }
     });
-    defn(md, "const_source_location", 1, 2, |_, _, _| QNIL);
+    // [file, line] where the constant was set; [] for one Kenny's runtime defines; nil if
+    // there's no such constant
+    defn(md, "const_source_location", 1, 2, |s, a, _| {
+        let inherit = a.get(1).is_none_or(|v| truthy(*v));
+        let name = if is_sym(a[0]) {
+            sym_str(sym_id(a[0]))
+        } else if is_str(a[0]) {
+            String::from_utf8_lossy(&rstr(a[0]).b).into_owned()
+        } else {
+            return type_error(&format!("{} is not a symbol nor a string", inspect_lossy(a[0])));
+        };
+        let mut cur = s as *mut Class;
+        let mut parts: Vec<&str> = name.split("::").collect();
+        if parts.first() == Some(&"") {
+            cur = rt().c.object;
+            parts.remove(0);
+        }
+        let Some((last, path)) = parts.split_last() else { return QNIL };
+        for p in path {
+            match const_get_under(cur, sym(p)) {
+                Some(v) if is_class(v) => cur = v as *mut Class,
+                _ => return QNIL,
+            }
+        }
+        let id = sym(last);
+        let mut owners = vec![cur];
+        if inherit {
+            owners = ancestors(cur);
+            if unsafe { (*cur).is_module } {
+                owners.push(rt().c.object);
+            }
+        }
+        for o in owners {
+            if !unsafe { (*o).consts.contains_key(&id) } {
+                continue;
+            }
+            let pc = crate::core::CONST_LOCS.lock().unwrap().as_ref().and_then(|m| m.get(&(o as usize, id)).copied());
+            return match pc.and_then(crate::backtrace::symbolize) {
+                Some((file, line, _)) => ary_new(vec![str_from(&file), mkfix(line)]),
+                None => ary_new(vec![]),
+            };
+        }
+        QNIL
+    });
     defn(md, "deprecate_constant", 0, -1, |s, _, _| s);
     defn(md, "protected_method_defined?", 1, 2, |_, _, _| QFALSE);
     defn(md, "public_instance_method", 1, 1, |s, a, _| send(s, sym("instance_method"), a, QNIL));

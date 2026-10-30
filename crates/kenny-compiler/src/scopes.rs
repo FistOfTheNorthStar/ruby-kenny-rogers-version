@@ -315,6 +315,8 @@ impl<M: Module> Compiler<M> {
         F: for<'b> FnOnce(&mut Compiler<M>, &mut Fx<'b>) -> Value,
     {
         let is_block = spec.kind == ScopeKind::Block;
+        let saved_bm = self.in_bmethod;
+        self.in_bmethod = is_block && (spec.bmethod || saved_bm);
         let sig = match spec.fast_arity {
             Some(n) => self.fast_sig(n),
             None if is_block => self.block_sig(),
@@ -537,6 +539,7 @@ impl<M: Module> Compiler<M> {
                 inl_self: Vec::new(),
                 bools: HashMap::new(),
                 owned: HashMap::new(),
+                match_saved: None,
             };
             if self.refine_scope.is_none() && std::env::var_os("KENNY_NO_OWNED").is_none() {
                 for n in crate::owned::append_locals(&spec.analysis) {
@@ -556,13 +559,22 @@ impl<M: Module> Compiler<M> {
             if spec.entry_check {
                 self.entry_check(&mut fx);
             }
+            // a method with a `$~` of its own (backref.rs)
+            if spec.kind == ScopeKind::Method && crate::backref::uses_backref(&spec.analysis) {
+                let saved = self.call(&mut fx, "kn_match_save", &[]);
+                let var = fx.b.declare_var(I64);
+                fx.b.def_var(var, saved);
+                fx.match_saved = Some(var);
+            }
             let v = body(self, &mut fx);
+            self.match_restore(&mut fx);
             fx.b.ins().return_(&[v]);
             // unwinding out of this function
             fx.b.switch_to_block(exit);
             if fx.kind == ScopeKind::Method || fx.ret_here {
                 let tag = fx.b.use_var(fx.tag_v);
                 let r = self.call(&mut fx, "kn_catch_return", &[tag]);
+                self.match_restore(&mut fx);
                 fx.b.ins().return_(&[r]);
             } else {
                 let u = fx.b.ins().iconst(I64, UNDEF);
@@ -576,6 +588,7 @@ impl<M: Module> Compiler<M> {
         self.fn_labels.pop();
         self.dbg_frames = saved_dbg;
         self.block_parent = saved_parent;
+        self.in_bmethod = saved_bm;
         let mut ctx = cranelift_codegen::Context::for_function(func);
         if let Err(e) = self.module.define_function(id, &mut ctx) {
             self.errors.push(format!("internal codegen error in {name}: {e:?}"));

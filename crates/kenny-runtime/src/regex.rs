@@ -248,6 +248,8 @@ struct Subj {
     b: Vec<u8>,
     bin: bool,
     raw: bool,
+    /// the subject's foreign encoding's name (transcode.rs `foreign_name`), or nil
+    fenc: V,
 }
 impl Subj {
     fn len(&self) -> usize {
@@ -275,6 +277,7 @@ impl Subj {
         let v = str_new(bytes.to_vec());
         if self.bin {
             hdr(v).flags |= crate::compat::FL_BINARY;
+            crate::transcode::set_foreign(v, self.fenc);
         }
         v
     }
@@ -284,7 +287,8 @@ fn text(s: V) -> Subj {
     let bin = hdr(s).flags & crate::compat::FL_BINARY != 0;
     let raw = bin && !b.is_ascii();
     let b = if raw || std::str::from_utf8(b).is_ok() { b.to_vec() } else { String::from_utf8_lossy(b).into_owned().into_bytes() };
-    Subj { b, bin, raw }
+    let fenc = if bin { crate::transcode::foreign_name(s) } else { QNIL };
+    Subj { b, bin, raw, fenc }
 }
 /// Search `t` from `start` towards `range` (before `start`: backwards).
 fn search_range(r: &Re, t: &Subj, start: usize, range: usize, region: Option<&mut Region>) -> bool {
@@ -393,12 +397,14 @@ pub fn last_match() -> V {
     pst().last_match
 }
 
-fn matchdata_new(re: V, s_bytes: Vec<u8>, bin: bool, pos: Vec<i64>) -> V {
+/// `bin`: whether the subject is binary, and its foreign encoding's name (or nil)
+fn matchdata_new(re: V, s_bytes: Vec<u8>, bin: (bool, V), pos: Vec<i64>) -> V {
     let m = object_new(*MATCHDATA.get());
     let s = str_new(s_bytes);
     hdr(s).flags |= FL_FROZEN;
-    if bin {
+    if bin.0 {
         hdr(s).flags |= crate::compat::FL_BINARY;
+        crate::transcode::set_foreign(s, bin.1);
     }
     ivar_set(m, sym("@__str"), s);
     ivar_set(m, sym("@__re"), re);
@@ -423,7 +429,7 @@ pub fn md_group(m: V, i: usize) -> V {
 fn md_piece(m: V, bytes: &[u8]) -> V {
     let v = str_new(bytes.to_vec());
     if hdr(md_str(m)).flags & crate::compat::FL_BINARY != 0 {
-        hdr(v).flags |= crate::compat::FL_BINARY;
+        crate::transcode::like(v, md_str(m));
     }
     v
 }
@@ -446,7 +452,7 @@ pub fn do_match(re: V, s: V, pos: usize, set: bool) -> V {
     let start = t.byte_index(pos);
     match search(re, &t, start) {
         Some(p) => {
-            let bin = t.bin;
+            let bin = (t.bin, t.fenc);
             let m = matchdata_new(re, t.into_bytes(), bin, p);
             if set {
                 set_last(m);
@@ -645,7 +651,7 @@ pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<(
             if !is_proc(blk) {
                 return Err(arity_error(1, 2, 2));
             }
-            let m = matchdata_new(re, src.to_vec(), t.bin, region_pos(&region));
+            let m = matchdata_new(re, src.to_vec(), (t.bin, t.fenc), region_pos(&region));
             set_last(m);
             let v = call_block(blk, &[t.str(&src[b..e])]);
             if v == UNDEF {
@@ -683,7 +689,7 @@ pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<(
     if rep.is_some() {
         // $~ is the last match (as in CRuby): found again from where it began
         if let Some(pos) = search(re, &t, last_begin) {
-            let bin = t.bin;
+            let bin = (t.bin, t.fenc);
             set_last(matchdata_new(re, t.into_bytes(), bin, pos));
         }
     }
@@ -706,7 +712,7 @@ pub fn scan(s: V, re: V, blk: V) -> V {
         } else {
             t.str(&src[b..e])
         };
-        let m = matchdata_new(re, src.clone(), t.bin, pos);
+        let m = matchdata_new(re, src.clone(), (t.bin, t.fenc), pos);
         set_last(m);
         if is_proc(blk) {
             tri!(call_block(blk, &[item]));
@@ -763,6 +769,8 @@ pub fn split(s: V, re: V, limit: i64) -> V {
             parts.pop();
         }
     }
+    // (CRuby's split leaves $~ nil: its last search failed)
+    set_last(QNIL);
     ary_new(parts)
 }
 
@@ -801,7 +809,7 @@ pub fn str_rindex(s: V, re: V, pos: usize) -> V {
     }
     let p = region_pos(&region);
     let at = p[0] as usize;
-    let bin = t.bin;
+    let bin = (t.bin, t.fenc);
     let m = matchdata_new(re, t.into_bytes(), bin, p);
     set_last(m);
     mkfix(md_char_index(m, at) as i64)
@@ -820,7 +828,7 @@ pub fn str_byte_search(s: V, re: V, from: usize, back: bool) -> V {
     }
     let p = region_pos(&region);
     let at = p[0];
-    let bin = t.bin;
+    let bin = (t.bin, t.fenc);
     set_last(matchdata_new(re, t.into_bytes(), bin, p));
     mkfix(at)
 }
@@ -853,13 +861,22 @@ pub fn partition(s: V, re: V, last: bool) -> V {
     } else {
         search(re, &t, 0)
     };
+    // ($~ is the match, as in CRuby)
     match found {
         Some(p) => {
             let (b, e) = (p[0] as usize, p[1] as usize);
-            ary_new(vec![t.str(&src[..b]), t.str(&src[b..e]), t.str(&src[e..])])
+            let r = ary_new(vec![t.str(&src[..b]), t.str(&src[b..e]), t.str(&src[e..])]);
+            set_last(matchdata_new(re, src.to_vec(), (t.bin, t.fenc), p));
+            r
         }
-        None if last => ary_new(vec![t.str(&[]), t.str(&[]), t.str(src)]),
-        None => ary_new(vec![t.str(src), t.str(&[]), t.str(&[])]),
+        None if last => {
+            set_last(QNIL);
+            ary_new(vec![t.str(&[]), t.str(&[]), t.str(src)])
+        }
+        None => {
+            set_last(QNIL);
+            ary_new(vec![t.str(src), t.str(&[]), t.str(&[])])
+        }
     }
 }
 
@@ -913,6 +930,33 @@ pub extern "C" fn kn_regexp_new(s: V, opts: u64) -> V {
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_last_match() -> V {
     last_match()
+}
+/// A method with its own `$~` starts: the caller's, which it puts back as it returns
+/// (kn_match_restore); its own starts nil.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_match_save() -> V {
+    let p = pst();
+    std::mem::replace(&mut p.last_match, QNIL)
+}
+/// `__method__` (`callee` 0) or `__callee__` (1) in a define_method body: the running
+/// method's original name, or the one it was called by (an alias is a copy of the method).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_dm_name(callee: i64) -> V {
+    let Some(&m) = pst().dm_stack.last() else { return QNIL };
+    let name = unsafe { (*m).name };
+    if callee != 0 {
+        let owner = unsafe { (*m).owner };
+        if !owner.is_null() {
+            if let Some((k, _)) = unsafe { (*owner).methods.iter() }.find(|(_, v)| **v as *const Method == m) {
+                return mksym(*k);
+            }
+        }
+    }
+    mksym(name)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_match_restore(saved: V) {
+    pst().last_match = saved;
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_nth_ref(n: u64) -> V {

@@ -1108,7 +1108,8 @@ pub fn init() {
     });
     defn(bo, "__id__", 0, 0, |s, _, _| mkfix(object_id_of(s)));
     defn(bo, "method_missing", 1, -1, |s, a, _| no_method_error(s, sym_id(a[0]), false));
-    defn(bo, "respond_to_missing?", 2, 2, |_, _, _| QFALSE);
+    // (Kernel's, private, as in CRuby: BasicObject has none)
+    defn(rt().c.kernel, "respond_to_missing?", 2, 2, |_, _, _| QFALSE);
     defn(bo, "singleton_method_added", 1, 1, |_, _, _| QNIL);
 
     // --- Module / Class ---

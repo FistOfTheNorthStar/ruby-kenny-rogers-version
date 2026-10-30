@@ -527,7 +527,13 @@ pub extern "C" fn kn_str_interp(s: V, v: V) -> V {
         return s;
     }
     if kind(v) == Some(Kind::String) {
+        // a non-ASCII binary or Windows-1252 ... string into ASCII so far: the result is in
+        // its encoding (CRuby's rb_enc_check)
+        let carry = hdr(v).flags & crate::compat::FL_BINARY != 0 && hdr(s).flags & crate::compat::FL_BINARY == 0 && !rstr(v).b.is_ascii() && b.is_ascii();
         b.extend_private(rstr(v).b.as_slice());
+        if carry {
+            crate::transcode::like(s, v);
+        }
         return s;
     }
     match crate::fmt::to_s(v) {

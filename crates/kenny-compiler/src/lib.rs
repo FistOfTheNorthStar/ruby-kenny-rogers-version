@@ -7,6 +7,7 @@
 //! loops in the caller (inline.rs).
 
 mod analysis;
+mod backref;
 mod calls;
 mod control;
 mod expr;
@@ -202,6 +203,8 @@ pub(crate) struct Fx<'a> {
     pub vlocals: HashMap<Vec<u8>, std::rc::Rc<vobj::VLocal>>,
     /// owned.rs: locals appended to in place, and their i8 "owned" registers
     pub owned: HashMap<Vec<u8>, Variable>,
+    /// The caller's `$~`, saved on entry by a method that has its own (backref.rs)
+    pub match_saved: Option<Variable>,
     /// vobj.rs: compiling a virtual object's `initialize`: its instance variables
     pub vself: Option<HashMap<Vec<u8>, Variable>>,
     /// ... for the next inlined method body only
@@ -260,6 +263,8 @@ pub struct Compiler<M: Module> {
     pub(crate) yield_targets: Vec<statics::YieldTarget>,
     /// the next literal block (`block_proc`) is a `define_method` body
     pub(crate) bmethod_next: bool,
+    /// Compiling a define_method body (or a block in one): its `__method__` is the runtime's
+    pub(crate) in_bmethod: bool,
     /// (file, offset) of the `def`s whose bodies are being compiled
     pub(crate) def_stack: Vec<(PathBuf, usize)>,
     /// (file, offset) of a compiled `def` -> the cache slot of its constant scope (cref)
@@ -471,6 +476,9 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_backref", &[I64], &[I64]),
     ("kn_match_named", &[I64], &[I64]),
     ("kn_last_match", &[], &[I64]),
+    ("kn_match_save", &[], &[I64]),
+    ("kn_dm_name", &[I64], &[I64]),
+    ("kn_match_restore", &[I64], &[]),
     ("kn_pm_deconstruct", &[I64], &[I64]),
     ("kn_pm_deconstruct_keys", &[I64, I64], &[I64]),
     ("kn_pm_key", &[I64, I64], &[I64]),
@@ -487,6 +495,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_super_blk", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_clear_pending", &[], &[I64]),
     ("kn_set_lexical_parent", &[I64, I64], &[I64]),
+    ("kn_eval_scope", &[I64, I64], &[I64]),
     ("kn_rational_lit", &[I64, I64], &[I64]),
     ("kn_binding_new", &[I64], &[I64]),
     ("kn_binding_new_l", &[I64, I64], &[I64]),
@@ -653,6 +662,7 @@ impl<M: Module> Compiler<M> {
             inline_ctx: Vec::new(),
             yield_targets: Vec::new(),
             bmethod_next: false,
+            in_bmethod: false,
             def_stack: Vec::new(),
             def_cref: HashMap::new(),
             class_getters: HashMap::new(),

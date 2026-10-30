@@ -633,6 +633,30 @@ pub extern "C" fn kn_set_lexical_parent(c: V, cref: V) -> V {
     c
 }
 
+/// `m.module_eval(string)` on an anonymous module: in CRuby the string's constants resolve
+/// through the caller's lexical scope too (dry-logic's `Rule::Interface < Module`), which the
+/// module's lexical parent stands for here.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_eval_scope(m: V, cref: V) -> V {
+    if !is_class(m) || !is_class(cref) || m == cref || cref == rt().c.object as V {
+        return QNIL;
+    }
+    let k = rclass(m);
+    if !k.name.is_empty() || k.is_singleton || !k.lexical_parent.is_null() {
+        return QNIL;
+    }
+    // (no cycle: the caller's scope isn't inside this module)
+    let mut p = cref as *mut Class;
+    while !p.is_null() {
+        if p == m as *mut Class {
+            return QNIL;
+        }
+        p = unsafe { (*p).lexical_parent };
+    }
+    k.lexical_parent = cref as *mut Class;
+    QNIL
+}
+
 // ---------- runtime-provided features (native replacements for C extensions) ----------
 
 struct Feature {
@@ -649,6 +673,17 @@ pub fn provide_feature(names: &'static [&'static str], init: Option<fn()>) {
 }
 
 /// Kernel#require hook: Some(true/false) if `base` names a runtime-provided feature.
+/// How $LOADED_FEATURES lists a library: `name.rb`, or for one CRuby ships as a C extension
+/// alone, `name.bundle` (`.so` off macOS).
+fn feature_name(key: &str) -> String {
+    const EXTS: &[&str] = &["stringio", "strscan", "etc", "io/console", "io/wait", "io/nonblock", "zlib", "fcntl", "pty", "continuation", "cgi/escape"];
+    if EXTS.contains(&key) {
+        format!("{key}.{}", if cfg!(target_os = "macos") { "bundle" } else { "so" })
+    } else {
+        format!("{key}.rb")
+    }
+}
+
 pub fn require_feature(base: &str) -> Option<V> {
     // the lock is held while `init` runs, so a second thread requiring it waits
     let mut fs = FEATURES.get();
@@ -659,6 +694,13 @@ pub fn require_feature(base: &str) -> Option<V> {
     fs[i].loaded = true;
     if let Some(init) = fs[i].init {
         init();
+    }
+    drop(fs);
+    // listed like a file (CRuby lists the library's path; `json.rb`, `strscan.bundle` ...)
+    if let Some(&lf) = rt().gvars.get(&sym("$LOADED_FEATURES")) {
+        if is_ary(lf) {
+            rary(lf).v.push(str_from(&feature_name(base)));
+        }
     }
     Some(QTRUE)
 }
@@ -728,6 +770,9 @@ fn disk_source(name: &str, with_rb: bool) -> Option<(String, Vec<u8>, bool)> {
 /// (real path, the path listed in $LOADED_FEATURES)
 static DISK_REQUIRED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
+/// Files being `require`d from disk right now (a circular require of one returns false).
+static DISK_LOADING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// `require "/abs/path"` of a file that isn't compiled in but exists (e.g. a file added to a
 /// Rails app while it runs in development): compile it at runtime, once.
 pub fn require_from_disk(name: &str) -> Option<V> {
@@ -744,6 +789,9 @@ pub fn require_from_disk(name: &str) -> Option<V> {
     if abs.ends_with(".rb") && !feature.ends_with(".rb") {
         feature.push_str(".rb");
     }
+    if DISK_LOADING.lock().unwrap_or_else(|e| e.into_inner()).contains(&abs) {
+        return Some(QFALSE);
+    }
     {
         let lf = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf));
         let mut d = DISK_REQUIRED.lock().unwrap_or_else(|e| e.into_inner());
@@ -757,12 +805,23 @@ pub fn require_from_disk(name: &str) -> Option<V> {
         }
         d.push((abs.clone(), feature.clone()));
     }
-    if let Some(&lf) = rt().gvars.get(&sym("$LOADED_FEATURES")) {
+    DISK_LOADING.lock().unwrap_or_else(|e| e.into_inner()).push(abs.clone());
+    let r = hook(&src, &abs);
+    {
+        let mut l = DISK_LOADING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = l.iter().rposition(|x| *x == abs) {
+            l.remove(i);
+        }
+    }
+    // (listed once it has run, as in CRuby)
+    if r == UNDEF {
+        DISK_REQUIRED.lock().unwrap_or_else(|e| e.into_inner()).retain(|(a, _)| *a != abs);
+    } else if let Some(&lf) = rt().gvars.get(&sym("$LOADED_FEATURES")) {
         if is_ary(lf) {
             rary(lf).v.push(str_from(&feature));
         }
     }
-    Some(hook(&src, &abs))
+    Some(r)
 }
 
 /// Run a precompiled file for `require name`: Some(true) loaded now, Some(false) already loaded,
@@ -841,26 +900,19 @@ fn was_unloaded(lf: Option<V>, feature: &str) -> bool {
 pub fn require_compiled(name: &str) -> Option<V> {
     let key = name.trim_end_matches(".rb");
     let (f, flag, _) = *FILE_TABLE.get().as_ref()?.get(key)?;
-    let feature = format!("{key}.rb");
+    let feature = feature_name(key);
     let lf = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf));
     let fl = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) };
     if fl.load(std::sync::atomic::Ordering::Acquire) == 1 && was_unloaded(lf, &feature) {
         let _ = fl.compare_exchange(1, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
     }
-    let st = fl.load(std::sync::atomic::Ordering::Acquire);
-    if st == 0 {
-        if let Some(lf) = lf {
+    // listed once the file has run, as in CRuby (Zeitwerk's require hook reads
+    // `$LOADED_FEATURES.last`); a circular require sees the file's loading flag instead
+    let r = run_file_once(f, flag);
+    if r == QTRUE {
+        if let Some(lf) = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf)) {
             rary(lf).v.push(str_from(&feature));
             note_pushed(&feature);
-        }
-    }
-    let r = run_file_once(f, flag);
-    if r == UNDEF && st == 0 {
-        if let Some(lf) = lf {
-            let v = &mut rary(lf).v;
-            if let Some(i) = v.iter().rposition(|x| is_str(*x) && rstr(*x).b[..] == *feature.as_bytes()) {
-                v.remove(i);
-            }
         }
     }
     Some(r)

@@ -185,6 +185,41 @@ pub fn capture() -> Vec<usize> {
     out
 }
 
+/// The return address of the innermost Ruby frame on the stack (for `symbolize`), cheaply:
+/// the walk stops there.
+pub fn innermost() -> Option<usize> {
+    if !TABLE.read().unwrap().sorted {
+        let mut w = TABLE.write().unwrap();
+        if !w.sorted {
+            w.funcs.sort_by_key(|f| f.start);
+            w.sorted = true;
+        }
+    }
+    let t = TABLE.read().unwrap();
+    if t.funcs.is_empty() {
+        return None;
+    }
+    // (the frame pointer before the stack bounds: current_stack's `lo` is its own frame's)
+    let mut fp = frame_pointer();
+    let (lo, hi) = crate::thread::current_stack()?;
+    let mut n = 0;
+    while fp >= lo && fp + 16 <= hi && fp % 8 == 0 && n < 100_000 {
+        let next = unsafe { *(fp as *const usize) };
+        let ret = unsafe { *((fp + 8) as *const usize) } & 0x0000_ffff_ffff_ffff;
+        if let Some(f) = find(&t.funcs, ret) {
+            if !f.exact || f.calls.iter().any(|c| f.start + c[0] as usize == ret) {
+                return Some(ret);
+            }
+        }
+        if next <= fp {
+            break;
+        }
+        fp = next;
+        n += 1;
+    }
+    None
+}
+
 fn find(funcs: &[Func], addr: usize) -> Option<&Func> {
     let i = funcs.partition_point(|f| f.start < addr);
     let f = funcs.get(i.checked_sub(1)?)?;

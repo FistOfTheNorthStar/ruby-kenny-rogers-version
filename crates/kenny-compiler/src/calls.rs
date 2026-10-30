@@ -262,11 +262,15 @@ impl<M: Module> Compiler<M> {
 
         // `Kernel.block_given?` / `::Kernel.block_given?` (BasicObject subclasses such as
         // Jbuilder write it so): like the bare call, it asks about the current method's block
-        if matches!(name.as_slice(), b"block_given?" | b"iterator?") && arg_nodes.is_empty() && block.is_none() {
+        // (`Kernel.__method__` / `__callee__` too: sorbet-runtime)
+        if matches!(name.as_slice(), b"block_given?" | b"iterator?" | b"__method__" | b"__callee__") && arg_nodes.is_empty() && block.is_none() {
             let kernel_recv = recv_node.as_ref().is_some_and(|r| {
                 r.as_constant_read_node().is_some_and(|k| k.name().as_slice() == b"Kernel")
                     || r.as_constant_path_node().is_some_and(|k| k.parent().is_none() && k.name().is_some_and(|n| n.as_slice() == b"Kernel"))
             });
+            if kernel_recv && matches!(name.as_slice(), b"__method__" | b"__callee__") {
+                return self.method_name_val(fx, name.as_slice() == b"__callee__");
+            }
             if kernel_recv {
                 let b = self.method_block(fx);
                 let c = fx.b.ins().icmp_imm_s(IntCC::NotEqual, b, QNIL);
@@ -290,10 +294,7 @@ impl<M: Module> Compiler<M> {
                 // `__callee__` (the alias a method was called by) as `__method__`: Rails uses
                 // it to name the method in an error message
                 b"__method__" | b"__callee__" if arg_nodes.is_empty() => {
-                    return match fx.method.clone() {
-                        Some(m) => self.sym_val(fx, &m.name),
-                        None => self.nil(fx),
-                    };
+                    return self.method_name_val(fx, name.as_slice() == b"__callee__");
                 }
                 b"__dir__" if arg_nodes.is_empty() => {
                     let abs = self.file.canonicalize().unwrap_or(self.file.clone());
@@ -556,6 +557,11 @@ impl<M: Module> Compiler<M> {
                 let l = self.locals_snapshot(fx);
                 let src = args.vals[0];
                 self.call(fx, "kn_eval_locals", &[l, src]);
+                // a string class_eval'd on an anonymous module sees the caller's constants
+                if matches!(name.as_slice(), b"class_eval" | b"module_eval") {
+                    let cref = self.cref(fx);
+                    self.call(fx, "kn_eval_scope", &[recv, cref]);
+                }
             }
             let forwards = arg_nodes.iter().any(|n| n.as_forwarding_arguments_node().is_some());
             let no_block = block.is_none() && !forwards;
