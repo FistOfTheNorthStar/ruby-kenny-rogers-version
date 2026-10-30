@@ -75,7 +75,7 @@ pub fn new_str_v(s: String) -> V {
     str_new(s.into_bytes())
 }
 
-fn is_user_method(v: V, name: &str) -> bool {
+pub(crate) fn is_user_method(v: V, name: &str) -> bool {
     let m = find_method(class_of(v), sym(name));
     !m.is_null() && !matches!(unsafe { &(*m).body }, Body::Native(..))
 }
@@ -1145,7 +1145,8 @@ pub fn init() {
         }
         no_method_error(s, sym_id(a[0]), false)
     });
-    defn(bo, "respond_to_missing?", 2, 2, |_, _, _| QFALSE);
+    // (Kernel's, private, as in CRuby: BasicObject has none)
+    defn(rt().c.kernel, "respond_to_missing?", 2, 2, |_, _, _| QFALSE);
     defn(bo, "singleton_method_added", 1, 1, |_, _, _| QNIL);
 
     // --- Module / Class ---

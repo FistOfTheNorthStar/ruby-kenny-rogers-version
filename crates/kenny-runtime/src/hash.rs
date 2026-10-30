@@ -30,6 +30,14 @@ pub fn hget(h: V, k: V) -> V {
     if let Some(v) = hh.m.get(&HKey(k)) {
         return *v;
     }
+    // a subclass's own #default(key) (CRuby's rb_hash_default_value; hashie, AS's
+    // HashWithIndifferentAccess)
+    if real_class(h) != rt().c.hash {
+        let m = find_method(class_of(h), sym("default"));
+        if !m.is_null() && !matches!(unsafe { &(*m).body }, Body::Native(..)) {
+            return send(h, sym("default"), &[k], QNIL);
+        }
+    }
     if hh.default_proc != QNIL {
         return call_block(hh.default_proc, &[h, k]);
     }
@@ -303,6 +311,11 @@ pub fn init() {
     });
     defn(c, "merge", 0, -1, |s, a, b| {
         let out = new_like(s);
+        // (the receiver's class, as CRuby's rb_hash_dup keeps it)
+        let k = real_class(s);
+        if k != rt().c.hash {
+            hdr(out).klass = k;
+        }
         merge_into(out, s, QNIL);
         crate::gc::wb_obj(out);
         rhash(out).default = rhash(s).default;

@@ -246,7 +246,8 @@ fn call(s: V, a: &[V], b: V) -> V {
 pub fn method_object(recv: V, name: u32) -> V {
     let m = find_method(class_of(recv), name);
     if m.is_null() {
-        let rm = send(recv, sym("respond_to_missing?"), &[mksym(name), QTRUE], QNIL);
+        let has_rm = !find_method(class_of(recv), sym("respond_to_missing?")).is_null();
+        let rm = if has_rm { send(recv, sym("respond_to_missing?"), &[mksym(name), QTRUE], QNIL) } else { QFALSE };
         if !truthy(rm) {
             return raise(
                 rt().c.name_error,

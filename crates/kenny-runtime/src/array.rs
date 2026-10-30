@@ -923,10 +923,11 @@ pub fn init() {
         match join(s, &sep, &mut vec![s]) {
             Ok(b) => {
                 // joining binary (ASCII-8BIT) strings yields a binary string
-                let bin = !b.is_ascii() && rary(s).v.iter().any(|x| is_str(*x) && hdr(*x).flags & crate::compat::FL_BINARY != 0);
+                // (Windows-1252 ones yield Windows-1252: the first non-ASCII binary one's)
+                let bin = if b.is_ascii() { None } else { rary(s).v.iter().copied().find(|x| is_str(*x) && hdr(*x).flags & crate::compat::FL_BINARY != 0 && !rstr(*x).b.is_ascii()) };
                 let r = str_new(b);
-                if bin {
-                    hdr(r).flags |= crate::compat::FL_BINARY;
+                if let Some(x) = bin {
+                    crate::transcode::like(r, x);
                 }
                 r
             }

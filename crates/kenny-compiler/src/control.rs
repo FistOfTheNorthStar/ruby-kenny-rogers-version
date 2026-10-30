@@ -329,13 +329,18 @@ impl<M: Module> Compiler<M> {
         fx.b.block_params(done)[0]
     }
 
+    /// A bare `rescue`'s class: ::StandardError, never a lexical StandardError (Liquid has one).
+    fn top_standard_error(&mut self, fx: &mut Fx) -> Value {
+        let o = self.call(fx, "kn_object_class", &[]);
+        let s = self.sym_val(fx, b"StandardError");
+        self.callc(fx, "kn_const_get_under", &[o, s])
+    }
+
     /// Exception classes of a rescue clause (default StandardError).
     fn rescue_classes(&mut self, fx: &mut Fx, r: &RescueNode) -> Vec<Value> {
         let ex: Vec<Node> = r.exceptions().iter().collect();
         if ex.is_empty() {
-            let cref = self.cref(fx);
-            let s = self.sym_val(fx, b"StandardError");
-            return vec![self.callc(fx, "kn_const_get", &[cref, s])];
+            return vec![self.top_standard_error(fx)];
         }
         ex.iter()
             .map(|e| {
@@ -477,9 +482,7 @@ impl<M: Module> Compiler<M> {
         let outer = *fx.unwind.last().unwrap();
         fx.b.ins().brif(is_nil, outer, &[], check_bb, &[]);
         fx.b.switch_to_block(check_bb);
-        let cref = self.cref(fx);
-        let s = self.sym_val(fx, b"StandardError");
-        let cls = self.callc(fx, "kn_const_get", &[cref, s]);
+        let cls = self.top_standard_error(fx);
         let m = self.callc(fx, "kn_exc_match", &[exc, cls]);
         let t = self.truthy_br(fx, m);
         let body_bb = fx.b.create_block();
@@ -560,11 +563,33 @@ impl<M: Module> Compiler<M> {
             }
             _ => {
                 self.restore_errinfo_to(fx, 0);
+                self.match_restore(fx);
                 fx.b.ins().return_(&[v]);
                 self.dead_block(fx);
             }
         }
         self.nil(fx)
+    }
+
+    /// `__method__` (or `__callee__`): the def's name, or in a define_method body the
+    /// running method's (abi.rs `kn_dm_name`).
+    pub(crate) fn method_name_val(&mut self, fx: &mut Fx, callee: bool) -> Value {
+        if self.in_bmethod {
+            let c = self.iconst(fx, callee as i64);
+            return self.call(fx, "kn_dm_name", &[c]);
+        }
+        match fx.method.clone() {
+            Some(m) => self.sym_val(fx, &m.name),
+            None => self.nil(fx),
+        }
+    }
+
+    /// Leaving a method that saved its caller's `$~` (backref.rs): put it back.
+    pub(crate) fn match_restore(&mut self, fx: &mut Fx) {
+        if let Some(var) = fx.match_saved {
+            let saved = fx.b.use_var(var);
+            self.call(fx, "kn_match_restore", &[saved]);
+        }
     }
 
     /// Before a jump out of the rescue bodies entered since `depth`: restore `$!`.

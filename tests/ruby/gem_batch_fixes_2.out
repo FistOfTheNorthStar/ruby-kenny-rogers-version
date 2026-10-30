@@ -1,0 +1,63 @@
+["app", "js", "rest"]
+"app.js:rest"
+""
+nil
+"q"
+"z"
+nil
+"-"
+"a-b"
+"bare"
+"mod"
+1
+3
+2
+3
+1
+0
+-3
+0
+3
+1
+"no implicit conversion of String into Integer"
+"no implicit conversion of Symbol into Integer"
+"no implicit conversion of nil into Integer"
+"The beginless range for Integer#[] results in infinity"
+1
+0
+:respond_to_missing?
+Kernel
+true
+Bo
+true
+1
+"stringio.bundle"
+:outer_result
+:outer_result
+Opts
+Hash
+Hash
+1
+"dflt(\"bar\")"
+1
+1
+["gem_batch_fixes_2.rb", 0]
+1
+nil
+[]
+[:orig, :orig]
+[:aka, :orig]
+[:nested]
+[:k, :k]
+[#<Encoding:Windows-1252>]
+#<Encoding:Windows-1252>
+[#<Encoding:Windows-1252>]
+[#<Encoding:Windows-1252>]
+#<Encoding:Windows-1252>
+#<Encoding:Windows-1252>
+#<Encoding:Windows-1252>
+#<Encoding:Windows-1252>
+true
+#<Encoding:Windows-1252>
+5
+[[[233, 32], #<Encoding:BINARY (ASCII-8BIT)>], [[102, 233], #<Encoding:BINARY (ASCII-8BIT)>], [[99, 32], #<Encoding:BINARY (ASCII-8BIT)>], [[233, 32], #<Encoding:BINARY (ASCII-8BIT)>], [[233, 32], #<Encoding:BINARY (ASCII-8BIT)>], [[233], #<Encoding:BINARY (ASCII-8BIT)>]]

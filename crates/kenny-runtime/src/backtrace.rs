@@ -187,31 +187,42 @@ pub fn capture() -> Vec<usize> {
 
 /// The label of the innermost compiled-code frame on the stack ("A#foo", "block in A#foo",
 /// "<main>" ...), cached by return address.
-#[inline(never)]
 pub fn caller_label() -> Option<String> {
     static CACHE: std::sync::Mutex<Option<rustc_hash::FxHashMap<usize, Option<String>>>> = std::sync::Mutex::new(None);
-    let (lo, hi) = crate::thread::current_stack()?;
-    let mut fp = frame_pointer();
-    let mut n = 0;
-    let mut ret_found = None;
-    {
-        let t = TABLE.read().unwrap();
-        if !t.sorted {
-            drop(t);
-            let mut w = TABLE.write().unwrap();
-            if !w.sorted {
-                w.funcs.sort_by_key(|f| f.start);
-                w.sorted = true;
-            }
+    let ret = innermost()?;
+    if let Some(l) = CACHE.lock().unwrap().as_ref().and_then(|c| c.get(&ret)) {
+        return l.clone();
+    }
+    let l = symbolize(ret).map(|x| x.2);
+    CACHE.lock().unwrap().get_or_insert_with(Default::default).insert(ret, l.clone());
+    l
+}
+
+/// The return address of the innermost Ruby frame on the stack (for `symbolize`), cheaply:
+/// the walk stops there.
+pub fn innermost() -> Option<usize> {
+    if !TABLE.read().unwrap().sorted {
+        let mut w = TABLE.write().unwrap();
+        if !w.sorted {
+            w.funcs.sort_by_key(|f| f.start);
+            w.sorted = true;
         }
     }
     let t = TABLE.read().unwrap();
-    while fp >= lo && fp + 16 <= hi && fp % 8 == 0 && n < 64 {
+    if t.funcs.is_empty() {
+        return None;
+    }
+    // (the frame pointer before the stack bounds: current_stack's `lo` is its own frame's)
+    let mut fp = frame_pointer();
+    let (lo, hi) = crate::thread::current_stack()?;
+    let mut n = 0;
+    while fp >= lo && fp + 16 <= hi && fp % 8 == 0 && n < 100_000 {
         let next = unsafe { *(fp as *const usize) };
         let ret = unsafe { *((fp + 8) as *const usize) } & 0x0000_ffff_ffff_ffff;
-        if find(&t.funcs, ret).is_some() {
-            ret_found = Some(ret);
-            break;
+        if let Some(f) = find(&t.funcs, ret) {
+            if !f.exact || f.calls.iter().any(|c| f.start + c[0] as usize == ret) {
+                return Some(ret);
+            }
         }
         if next <= fp {
             break;
@@ -219,14 +230,7 @@ pub fn caller_label() -> Option<String> {
         fp = next;
         n += 1;
     }
-    drop(t);
-    let ret = ret_found?;
-    if let Some(l) = CACHE.lock().unwrap().as_ref().and_then(|c| c.get(&ret)) {
-        return l.clone();
-    }
-    let l = symbolize(ret).map(|x| x.2);
-    CACHE.lock().unwrap().get_or_insert_with(Default::default).insert(ret, l.clone());
-    l
+    None
 }
 
 fn find(funcs: &[Func], addr: usize) -> Option<&Func> {

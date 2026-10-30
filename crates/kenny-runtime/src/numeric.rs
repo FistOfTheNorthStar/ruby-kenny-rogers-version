@@ -4,7 +4,7 @@ use crate::core::*;
 use crate::fmt::*;
 use crate::kernel::new_str_v;
 use crate::tri;
-use num_bigint::BigInt;
+use num_bigint::{BigInt, Sign};
 use num_integer::Integer as _;
 use num_traits::{Signed, ToPrimitive, Zero};
 
@@ -673,9 +673,86 @@ pub fn init() {
         }
         shift_left(s, n)
     });
-    defn(int, "[]", 1, 1, |s, a, _| {
-        let b = big(&num(s).unwrap());
-        mkfix(((b >> fix(a[0]) as usize) & BigInt::from(1)).to_i64().unwrap_or(0))
+    // Integer#[](i), [](offset, len), [](range): bits, as CRuby's int_aref1/int_aref2
+    defn(int, "[]", 1, 2, |s, a, _| {
+        let n = big(&num(s).unwrap());
+        // an index: an Integer, else through to_int (a Float truncates)
+        let index = |v: V| -> Result<BigInt, V> {
+            if is_int(v) {
+                return Ok(big(&num(v).unwrap()));
+            }
+            if is_float(v) {
+                return Ok(BigInt::from(float_val(v).trunc() as i64));
+            }
+            if v == QNIL {
+                return Err(type_error(if is_fix(s) { "no implicit conversion of nil into Integer" } else { "no implicit conversion from nil to integer" }));
+            }
+            if is_heap(v) && respond_to(v, sym("to_int")) {
+                let r = send0(v, "to_int");
+                if r == UNDEF {
+                    return Err(UNDEF);
+                }
+                if is_int(r) {
+                    return Ok(big(&num(r).unwrap()));
+                }
+            }
+            Err(type_error(&format!("no implicit conversion of {} into Integer", class_name(real_class(v)))))
+        };
+        // n >> k for any k (a negative one shifts left)
+        let shr = |n: &BigInt, k: &BigInt| -> BigInt {
+            match k.to_i64() {
+                Some(k) if k >= 0 => if k > (1 << 40) { if n.sign() == Sign::Minus { BigInt::from(-1) } else { BigInt::from(0) } } else { n >> (k as usize) },
+                Some(k) => n << ((-k).min(1 << 20) as usize),
+                None if k.sign() == Sign::Minus => n << (1usize << 20),
+                None => if n.sign() == Sign::Minus { BigInt::from(-1) } else { BigInt::from(0) },
+            }
+        };
+        let mask = |len: &BigInt| -> BigInt { shr(&BigInt::from(1), &-len) - BigInt::from(1) };
+        let bit = |n: &BigInt, i: &BigInt| -> V {
+            if i.sign() == Sign::Minus {
+                return mkfix(0);
+            }
+            mkfix((shr(n, i) & BigInt::from(1)).to_i64().unwrap_or(0))
+        };
+        if a.len() == 2 {
+            let (b, l) = match (index(a[0]), index(a[1])) {
+                (Ok(b), Ok(l)) => (b, l),
+                (Err(e), _) | (_, Err(e)) => return e,
+            };
+            return int_from_big(shr(&n, &b) & mask(&l));
+        }
+        if is_range(a[0]) {
+            let r = rrange(a[0]);
+            let end = if r.hi == QNIL { None } else { Some(match index(r.hi) { Ok(x) => x, Err(e) => return e }) };
+            if r.lo == QNIL {
+                let Some(e) = end else { return arg_error("The beginless range for Integer#[] results in infinity") };
+                if e.sign() == Sign::Minus {
+                    return mkfix(0);
+                }
+                let e = if r.excl { e } else { e + 1 };
+                if (&n & mask(&e)) == BigInt::from(0) {
+                    return mkfix(0);
+                }
+                return arg_error("The beginless range for Integer#[] results in infinity");
+            }
+            let b = match index(r.lo) {
+                Ok(x) => x,
+                Err(e) => return e,
+            };
+            let shifted = shr(&n, &b);
+            return match end {
+                Some(e) if b < e => {
+                    let len = &e - &b + if r.excl { 0 } else { 1 };
+                    int_from_big(shifted & mask(&len))
+                }
+                Some(e) if b == e => if r.excl { mkfix(0) } else { bit(&n, &b) },
+                _ => int_from_big(shifted),
+            };
+        }
+        match index(a[0]) {
+            Ok(i) => bit(&n, &i),
+            Err(e) => e,
+        }
     });
     defs(int, "sqrt", 1, 1, |_, a, _| int_from_big(big(&num(a[0]).unwrap()).sqrt()));
 

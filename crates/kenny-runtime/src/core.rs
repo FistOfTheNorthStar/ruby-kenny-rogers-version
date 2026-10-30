@@ -2385,7 +2385,13 @@ pub fn set_temp_named(c: *mut Class, on: bool) {
         s.remove(&(c as usize));
     }
 }
+/// Where Ruby code set each constant: (module, name) -> the setting frame's return address
+/// (Module#const_source_location symbolizes it).
+pub static CONST_LOCS: std::sync::Mutex<Option<rustc_hash::FxHashMap<(usize, u32), usize>>> = std::sync::Mutex::new(None);
 pub fn const_set(c: *mut Class, id: u32, v: V) {
+    if let Some(pc) = crate::backtrace::innermost() {
+        CONST_LOCS.lock().unwrap().get_or_insert_with(Default::default).insert((c as usize, id), pc);
+    }
     unsafe {
         if is_class(v) {
             let k = rclass(v);
