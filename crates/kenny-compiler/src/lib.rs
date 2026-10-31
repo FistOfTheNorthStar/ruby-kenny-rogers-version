@@ -7,6 +7,7 @@
 //! loops in the caller (inline.rs).
 
 mod analysis;
+mod backref;
 mod calls;
 mod control;
 mod expr;
@@ -202,6 +203,8 @@ pub(crate) struct Fx<'a> {
     pub vlocals: HashMap<Vec<u8>, std::rc::Rc<vobj::VLocal>>,
     /// owned.rs: locals appended to in place, and their i8 "owned" registers
     pub owned: HashMap<Vec<u8>, Variable>,
+    /// The caller's `$~`, saved on entry by a method that has its own (backref.rs)
+    pub match_saved: Option<Variable>,
     /// vobj.rs: compiling a virtual object's `initialize`: its instance variables
     pub vself: Option<HashMap<Vec<u8>, Variable>>,
     /// ... for the next inlined method body only
@@ -260,6 +263,8 @@ pub struct Compiler<M: Module> {
     pub(crate) yield_targets: Vec<statics::YieldTarget>,
     /// the next literal block (`block_proc`) is a `define_method` body
     pub(crate) bmethod_next: bool,
+    /// Compiling a define_method body (or a block in one): its `__method__` is the runtime's
+    pub(crate) in_bmethod: bool,
     /// (file, offset) of the `def`s whose bodies are being compiled
     pub(crate) def_stack: Vec<(PathBuf, usize)>,
     /// (file, offset) of a compiled `def` -> the cache slot of its constant scope (cref)
@@ -471,6 +476,10 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_backref", &[I64], &[I64]),
     ("kn_match_named", &[I64], &[I64]),
     ("kn_last_match", &[], &[I64]),
+    ("kn_match_save", &[], &[I64]),
+    ("kn_dm_name", &[I64], &[I64]),
+    ("kn_dm_name_for", &[I64, I64, I64], &[I64]),
+    ("kn_match_restore", &[I64], &[]),
     ("kn_pm_deconstruct", &[I64], &[I64]),
     ("kn_pm_deconstruct_keys", &[I64, I64], &[I64]),
     ("kn_pm_key", &[I64, I64], &[I64]),
@@ -487,9 +496,11 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_super_blk", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_clear_pending", &[], &[I64]),
     ("kn_set_lexical_parent", &[I64, I64], &[I64]),
+    ("kn_eval_scope", &[I64, I64], &[I64]),
     ("kn_rational_lit", &[I64, I64], &[I64]),
     ("kn_binding_new", &[I64], &[I64]),
     ("kn_binding_new_l", &[I64, I64], &[I64]),
+    ("kn_proc_set_locals", &[I64, I64], &[I64]),
     ("kn_eval_locals", &[I64, I64], &[I64]),
     ("kn_register_file", &[I64, I64, I64, I64, I64], &[]),
     ("kn_register_debug", &[I64, I64, I64, I64], &[]),
@@ -653,6 +664,7 @@ impl<M: Module> Compiler<M> {
             inline_ctx: Vec::new(),
             yield_targets: Vec::new(),
             bmethod_next: false,
+            in_bmethod: false,
             def_stack: Vec::new(),
             def_cref: HashMap::new(),
             class_getters: HashMap::new(),
@@ -1221,21 +1233,25 @@ impl<M: Module> Compiler<M> {
 
     /// (require key, function, loaded-flag slot) for every compiled file, keyed by path relative
     /// to each load path (without .rb) and by absolute path.
+    /// The runtime keeps the first entry for a key (`kn_register_file`), so the order is
+    /// CRuby's precedence: absolute paths, then each key under the earliest load path (the
+    /// overlay, -I dirs, gems, stdlib), whatever order the files were compiled in.
     pub(crate) fn file_table(&self) -> Vec<(String, FuncId, usize, u64)> {
-        let mut out = Vec::new();
+        let mut keyed: Vec<(usize, String, String, FuncId, usize, u64)> = Vec::new();
         let lps: Vec<PathBuf> = self.load_paths.iter().map(|p| p.canonicalize().unwrap_or(p.clone())).collect();
         for (path, (fid, flag)) in &self.loaded {
             let hash = self.src_hashes.get(path).copied().unwrap_or(0);
             let abs = path.display().to_string();
-            out.push((abs.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
-            for lp in &lps {
+            keyed.push((0, abs.clone(), abs.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
+            for (i, lp) in lps.iter().enumerate() {
                 if let Ok(rel) = path.strip_prefix(lp) {
                     let r = rel.display().to_string();
-                    out.push((r.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
+                    keyed.push((1 + i, abs.clone(), r.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
                 }
             }
         }
-        out
+        keyed.sort_by(|a, b| (a.0, &a.1, &a.2).cmp(&(b.0, &b.1, &b.2)));
+        keyed.into_iter().map(|(_, _, k, f, fl, h)| (k, f, fl, h)).collect()
     }
 
     /// GC safepoint for loop back-edges: a load and a rarely taken branch.

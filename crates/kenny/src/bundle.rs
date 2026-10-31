@@ -410,7 +410,10 @@ fn locate(s: &Spec, gem_dirs: &[PathBuf], _root: &Path) -> Option<Located> {
     let full = format!("{}-{}", s.name, s.version);
     match &s.source {
         Source::Path(dir) => {
-            let req = gemspec_in(dir).map(|g| require_paths(&g)).unwrap_or_else(|| vec!["lib".into()]);
+            // (Bundler looks for each gem's gemspec at `{,*,*/*}.gemspec` under the path: a
+            // repository of several gems, like rails/rails, has them in subdirectories)
+            let dir = path_gem_dir(dir, &s.name);
+            let req = gemspec_in(&dir).map(|g| require_paths(&g)).unwrap_or_else(|| vec!["lib".into()]);
             let dir = dir.canonicalize().unwrap_or(dir.clone());
             let ext = find_extconfs(&dir);
             return Some(Located::Dir(dir, req, ext));
@@ -429,11 +432,23 @@ fn locate(s: &Spec, gem_dirs: &[PathBuf], _root: &Path) -> Option<Located> {
         }
         Source::Gem => {}
     }
+    let installed = |d: &Path, full: &str| -> Option<Located> {
+        let dir = d.join("gems").join(full);
+        if !dir.is_dir() {
+            return None;
+        }
+        let spec = std::fs::read_to_string(d.join("specifications").join(format!("{full}.gemspec"))).unwrap_or_default();
+        let mut ext = spec_list(&spec, ".extensions").unwrap_or_default();
+        // a precompiled platform gem (pg-1.6.3-arm64-darwin) lists no extensions, its
+        // binaries being built for CRuby: build the C sources it ships instead
+        if ext.is_empty() && full.len() > s.name.len() + 1 + version_part(&s.version).len() {
+            ext = find_extconfs(&dir);
+        }
+        Some(Located::Dir(dir, require_paths(&spec), ext))
+    };
     for d in gem_dirs {
-        let dir = d.join("gems").join(&full);
-        if dir.is_dir() {
-            let spec = std::fs::read_to_string(d.join("specifications").join(format!("{full}.gemspec"))).unwrap_or_default();
-            return Some(Located::Dir(dir, require_paths(&spec), spec_list(&spec, ".extensions").unwrap_or_default()));
+        if let Some(l) = installed(d, &full) {
+            return Some(l);
         }
     }
     for d in gem_dirs {
@@ -441,7 +456,71 @@ fn locate(s: &Spec, gem_dirs: &[PathBuf], _root: &Path) -> Option<Located> {
             return Some(Located::Default);
         }
     }
+    // locked for the `ruby` platform but installed for this one (pg-1.6.3-arm64-darwin), or
+    // the other way round
+    for d in gem_dirs {
+        let base = format!("{}-{}", s.name, version_part(&s.version));
+        let Ok(rd) = std::fs::read_dir(d.join("gems")) else { continue };
+        let mut cands: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| *n == base || n.strip_prefix(&format!("{base}-")).is_some_and(host_platform))
+            .collect();
+        cands.sort();
+        for c in cands {
+            if let Some(l) = installed(d, &c) {
+                return Some(l);
+            }
+        }
+    }
     None
+}
+
+/// The version without a platform suffix ("1.6.3-arm64-darwin" -> "1.6.3").
+fn version_part(v: &str) -> &str {
+    v.split_once('-').map(|x| x.0).unwrap_or(v)
+}
+
+/// Whether a gem platform ("arm64-darwin", "x86_64-linux-gnu") is this machine's.
+fn host_platform(p: &str) -> bool {
+    let arch_ok = match std::env::consts::ARCH {
+        "aarch64" => p.starts_with("arm64-") || p.starts_with("aarch64-"),
+        "x86_64" => p.starts_with("x86_64-") || p.starts_with("x64-"),
+        _ => false,
+    };
+    let os_ok = match std::env::consts::OS {
+        "macos" => p.contains("darwin"),
+        "linux" => p.contains("linux"),
+        _ => false,
+    };
+    arch_ok && os_ok
+}
+
+/// The directory of gem `name` in a path source: where its `<name>.gemspec` is (the path
+/// itself, or one or two levels down), else the path.
+fn path_gem_dir(dir: &Path, name: &str) -> PathBuf {
+    let file = format!("{name}.gemspec");
+    if dir.join(&file).is_file() {
+        return dir.to_path_buf();
+    }
+    let subdirs = |d: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(d).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect()).unwrap_or_default();
+        v.sort();
+        v
+    };
+    for d1 in subdirs(dir) {
+        if d1.join(&file).is_file() {
+            return d1;
+        }
+    }
+    for d1 in subdirs(dir) {
+        for d2 in subdirs(&d1) {
+            if d2.join(&file).is_file() {
+                return d2;
+            }
+        }
+    }
+    dir.to_path_buf()
 }
 
 fn gemspec_in(dir: &Path) -> Option<String> {

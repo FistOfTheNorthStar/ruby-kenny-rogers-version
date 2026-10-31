@@ -1,0 +1,20 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    json (3.1.0)
+    pagy (43.8.1)
+      json
+      uri
+      yaml
+    uri (1.1.2)
+    yaml (0.4.0)
+
+PLATFORMS
+  arm64-darwin-27
+  ruby
+
+DEPENDENCIES
+  pagy
+
+BUNDLED WITH
+   2.6.9

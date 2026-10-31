@@ -1,0 +1,4 @@
+source "https://rubygems.org"
+# the source gem (the precompiled platform gems carry no C sources for Kenny to compile)
+gem "pg", force_ruby_platform: true
+gem "bigdecimal"

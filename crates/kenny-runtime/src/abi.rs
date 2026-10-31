@@ -378,7 +378,7 @@ fn super_owner(owner_slot: *const V, self_: V, mid: u32) -> *mut Class {
 pub unsafe extern "C" fn kn_super(owner_slot: *const V, self_: V, mid: V, argc: u64, argv: *const V, blk: V) -> V {
     let owner = super_owner(owner_slot, self_, sym_id(mid));
     let args = unsafe { args_slice(argc, argv) };
-    let m = find_super_method(self_, owner, sym_id(mid));
+    let (m, at) = crate::core::find_super_method_at(self_, owner, sym_id(mid));
     if m.is_null() {
         if sym_str(sym_id(mid)) == "respond_to_missing?" {
             return QFALSE;
@@ -397,7 +397,7 @@ pub unsafe extern "C" fn kn_super(owner_slot: *const V, self_: V, mid: V, argc: 
             &format!("super: no superclass method '{}' for {}", sym_str(sym_id(mid)), describe_recv(self_)),
         );
     }
-    invoke(m, self_, args, blk)
+    crate::core::invoke_super(m, at, self_, args, blk)
 }
 
 /// `defined?(super)`: 1 if a superclass method exists.
@@ -527,7 +527,15 @@ pub extern "C" fn kn_str_interp(s: V, v: V) -> V {
         return s;
     }
     if kind(v) == Some(Kind::String) {
-        b.extend_private(rstr(v).b.as_slice());
+        // (a String in another encoding: the result's, as CRuby's rb_str_buf_append)
+        if !crate::transcode::same_native(s, v) {
+            match crate::transcode::concat_enc(s, rstr(v).b.as_slice(), crate::transcode::enc_of(v)) {
+                Ok(Some(e)) => crate::transcode::set_enc(s, e),
+                Ok(None) => {}
+                Err(e) => return e,
+            }
+        }
+        rstr(s).b.extend_private(rstr(v).b.as_slice());
         return s;
     }
     match crate::fmt::to_s(v) {
@@ -1115,6 +1123,10 @@ static AUTOLOADS: crate::mt::L<std::collections::HashMap<(usize, u32), Autoload,
 fn autoloads() -> crate::mt::LGuard<'static, std::collections::HashMap<(usize, u32), Autoload, FxBuild>> {
     AUTOLOADS.get()
 }
+/// Drops a pending autoload for `id` in `k` (remove_const): whether there was one.
+pub fn remove_autoload(k: *mut Class, id: u32) -> bool {
+    autoloads().remove(&(k as usize, id)).is_some()
+}
 /// A pending autoload for `id` directly in `k`.
 pub fn has_autoload(k: *mut Class, id: u32) -> bool {
     let a = autoloads();
@@ -1230,21 +1242,29 @@ pub unsafe extern "C" fn kn_const_get_l(cache: *mut ConstCache, crefp: *const [V
         (None, Some(owner)) => const_missing_in(k, id, Some(owner)),
         (None, None) => {
             let mut r = None;
+            let mut owner = None;
             for &a in ancestors_rc(k).iter() {
                 if let Some(&v) = unsafe { (*a).consts.get(&id) } {
                     r = Some(v);
                     break;
                 }
                 if has_autoload(a, id) {
+                    owner = Some(a);
                     break;
                 }
             }
-            match r.or_else(|| unsafe { (*rt().c.object).consts.get(&id).copied() }) {
+            match r.or_else(|| if owner.is_some() { None } else { crate::core::object_const(id) }) {
                 Some(v) => {
                     settle_id(id);
                     v
                 }
-                None => const_missing_in(k, id, chain.iter().copied().find(|&l| has_autoload(l, id))),
+                // (the autoload this scope sees: in the cref's ancestors, else at the top
+                // level — not one in the class's lexical parent, which `module A::B` doesn't
+                // have in scope)
+                None => {
+                    let owner = owner.or_else(|| ancestors_rc(rt().c.object).iter().copied().find(|&a| has_autoload(a, id)));
+                    const_missing_in(k, id, owner)
+                }
             }
         }
     };
@@ -1269,8 +1289,9 @@ pub extern "C" fn kn_const_defined_l(crefp: *const [V; 2], id: V) -> u64 {
             return 1;
         }
     }
+    // (the top level: Object and the modules included into it)
     let o = rt().c.object;
-    (unsafe { (*o).consts.contains_key(&id) } || has_autoload(o, id)) as u64
+    ancestors_rc(o).iter().any(|&a| unsafe { (*a).consts.contains_key(&id) } || has_autoload(a, id)) as u64
 }
 
 pub fn const_missing(c: *mut Class, id: u32) -> V {
@@ -1524,6 +1545,9 @@ pub fn const_added(c: *mut Class, id: u32) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_const_set(cref: V, id: V, v: V) -> V {
     let c = cref_class(cref);
+    if check_frozen_definee(c) == UNDEF {
+        return UNDEF;
+    }
     const_set(c, sym_id(id), v);
     if !const_added(c, sym_id(id)) {
         return UNDEF;
@@ -1690,6 +1714,9 @@ pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn
             }
         },
     };
+    if check_frozen_definee(cls) == UNDEF {
+        return UNDEF;
+    }
     let name = sym_str(sym_id(id));
     if (cls == r.c.integer || cls == r.c.float) && PROTECTED_OPS.contains(&name.as_str()) {
         return raise(
@@ -2291,12 +2318,12 @@ pub extern "C" fn kn_super_dyn(self_: V, args: V, blk: V) -> V {
         return raise(rt().c.runtime_error, "super called outside of method");
     };
     let (owner, name) = unsafe { ((*m).owner, (*m).name) };
-    let sm = find_super_method(self_, owner, name);
+    let (sm, at) = crate::core::find_super_method_at(self_, owner, name);
     if sm.is_null() {
         return raise(rt().c.no_method_error, &format!("super: no superclass method '{}'", sym_str(name)));
     }
     let a = rary(args).v.clone();
-    invoke(sm, self_, &a, blk)
+    crate::core::invoke_super(sm, at, self_, &a, blk)
 }
 
 /// A call with an explicit receiver (`obj.foo`): private methods are not callable this way.
@@ -2310,6 +2337,9 @@ pub unsafe extern "C" fn kn_send_pub(cache: *mut CallCache, recv: V, mid: V, arg
     if unsafe { (*m).vis } == VIS_PRIVATE {
         return crate::visibility::private_call_error(recv, sym_id(mid), args, blk);
     }
+    if unsafe { (*m).vis } == VIS_PROTECTED && !crate::visibility::protected_ok(m) {
+        return crate::visibility::protected_call_error(recv, sym_id(mid), args, blk);
+    }
     invoke(m, recv, args, blk)
 }
 
@@ -2320,6 +2350,7 @@ pub unsafe extern "C" fn kn_send_pub(cache: *mut CallCache, recv: V, mid: V, arg
 pub extern "C" fn kn_class_enter(c: V) -> V {
     if is_class(c) {
         rclass(c).default_vis = VIS_PUBLIC;
+        rclass(c).module_function = false;
         pst().definee.push(c as *mut Class);
     }
     c
@@ -2329,6 +2360,7 @@ pub extern "C" fn kn_class_enter(c: V) -> V {
 pub extern "C" fn kn_class_leave(c: V) -> V {
     if is_class(c) {
         rclass(c).default_vis = VIS_PUBLIC;
+        rclass(c).module_function = false;
         pst().definee.pop();
     }
     c

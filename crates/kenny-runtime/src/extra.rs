@@ -341,7 +341,8 @@ fn is_bin(v: V) -> bool {
 fn new_like(src: V, b: Vec<u8>) -> V {
     let r = str_new(b);
     if is_bin(src) {
-        hdr(r).flags |= FL_BINARY;
+        // (Windows-1252 ... too)
+        crate::transcode::like(r, src);
     }
     r
 }
@@ -648,7 +649,15 @@ fn parse_zone(v: V) -> Result<Zone, V> {
         return Ok(zone_of(v));
     }
     if !is_str(v) {
-        return Err(zone_err(v));
+        if is_sym(v) || v == QTRUE || v == QFALSE {
+            return Err(zone_err(v));
+        }
+        // a number of seconds (Float, Rational, ...: CRuby's num_exact)
+        let o = exact_ns(v)?.div_euclid(NS) as i64;
+        if o.abs() >= 86400 {
+            return Err(arg_error("utc_offset out of range"));
+        }
+        return Ok(Zone::Off(o));
     }
     let s = s_of(v);
     match s.as_str() {
@@ -897,6 +906,58 @@ fn time_round(t: V, a: &[V], mode: u8) -> V {
     };
     time_make(real_class(t), r, zone_of(t))
 }
+fn int_i128(v: V) -> Option<i128> {
+    if is_fix(v) {
+        Some(fix(v) as i128)
+    } else if is_big(v) {
+        rbig(v).n.to_i128()
+    } else {
+        None
+    }
+}
+/// Seconds as nanoseconds, as CRuby's num_exact takes them: an Integer, a Float, a Rational,
+/// or an object with to_r (or else to_int) — ActiveSupport::Duration.
+fn exact_ns(x: V) -> Result<i128, V> {
+    if is_fix(x) {
+        return Ok(fix(x) as i128 * NS);
+    }
+    if is_big(x) {
+        return Ok(rbig(x).n.to_i128().unwrap_or(0).saturating_mul(NS));
+    }
+    if is_float(x) {
+        return Ok((float_val(x) * 1e9).round() as i128);
+    }
+    let err = || type_error(&format!("can't convert {} into an exact number", cname(x)));
+    let r = if crate::rational::is_rational(x) {
+        x
+    } else if x != QNIL && is_heap(x) && respond_to(x, sym("to_r")) {
+        let r = send0(x, "to_r");
+        if r == UNDEF {
+            return Err(r);
+        }
+        r
+    } else if x != QNIL && is_heap(x) && respond_to(x, sym("to_int")) {
+        let i = send0(x, "to_int");
+        if i == UNDEF {
+            return Err(i);
+        }
+        return int_i128(i).map(|n| n.saturating_mul(NS)).ok_or_else(err);
+    } else {
+        return Err(err());
+    };
+    if is_fix(r) || is_big(r) {
+        return int_i128(r).map(|n| n.saturating_mul(NS)).ok_or_else(err);
+    }
+    if !crate::rational::is_rational(r) {
+        return Err(err());
+    }
+    let n = send0(r, "numerator");
+    let d = send0(r, "denominator");
+    match (int_i128(n), int_i128(d)) {
+        (Some(n), Some(d)) if d != 0 => Ok((n.saturating_mul(NS)).div_euclid(d)),
+        _ => Err(err()),
+    }
+}
 fn time_at(s: V, a: &[V]) -> V {
     let zone_kw = kwarg(a, "in");
     let a = positional(a);
@@ -905,14 +966,11 @@ fn time_at(s: V, a: &[V]) -> V {
     let mut ns: i128 = if is_time(x) {
         z = zone_of(x);
         time_ns(x)
-    } else if is_fix(x) {
-        fix(x) as i128 * NS
-    } else if is_big(x) {
-        rbig(x).n.to_i128().unwrap_or(0).saturating_mul(NS)
-    } else if is_float(x) {
-        (float_val(x) * 1e9).round() as i128
     } else {
-        return type_error(&format!("can't convert {} into an exact number", cname(x)));
+        match exact_ns(x) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
     };
     if let Some(&sub) = a.get(1) {
         let unit = match a.get(2) {
@@ -1042,6 +1100,13 @@ fn rng_number(r: V, a: &[V], strict: bool) -> V {
 
 static THREAD_REPORT: G<V> = G::new(QTRUE);
 static THREAD_ABORT: G<V> = G::new(QFALSE);
+/// Thread.report_on_exception / Thread.abort_on_exception (what a new thread starts with)
+pub fn thread_report_default() -> V {
+    *THREAD_REPORT.get()
+}
+pub fn thread_abort_default() -> V {
+    *THREAD_ABORT.get()
+}
 
 /// String encodings: UTF-8 unless flagged binary (ASCII-8BIT), plus the Encoding class API.
 fn init_encoding(st: *mut Class, enc: *mut Class) {
@@ -1493,6 +1558,84 @@ pub fn init() {
     // ===== Numeric / Integer / Float =====
     let nu = c.numeric;
     defn(nu, "abs2", 0, 0, |s, _, _| send(s, sym("*"), &[s], QNIL));
+    // CRuby's generic Numeric methods (numeric.c), for Numeric subclasses (Integer, Float,
+    // Rational ... have their own): built on ==, <, >, coerce and the operators
+    defn(nu, "zero?", 0, 0, |s, _, _| bool_v(truthy(tri!(send1(s, "==", mkfix(0))))));
+    defn(nu, "nonzero?", 0, 0, |s, _, _| if truthy(tri!(send0(s, "zero?"))) { QNIL } else { s });
+    defn(nu, "positive?", 0, 0, |s, _, _| send1(s, ">", mkfix(0)));
+    defn(nu, "negative?", 0, 0, |s, _, _| send1(s, "<", mkfix(0)));
+    defn(nu, "finite?", 0, 0, |_, _, _| QTRUE);
+    defn(nu, "infinite?", 0, 0, |_, _, _| QNIL);
+    defn(nu, "integer?", 0, 0, |_, _, _| QFALSE);
+    defn(nu, "+@", 0, 0, |s, _, _| s);
+    // -num: 0 - num, with 0 coerced first (num_uminus)
+    defn(nu, "-@", 0, 0, |s, _, _| {
+        let pair = tri!(send1(s, "coerce", mkfix(0)));
+        if !is_ary(pair) || rary(pair).v.len() != 2 {
+            return type_error("coerce must return [x, y]");
+        }
+        let (z, n) = (rary(pair).v[0], rary(pair).v[1]);
+        send1(z, "-", n)
+    });
+    for name in ["abs", "magnitude"] {
+        defn(nu, name, 0, 0, |s, _, _| if truthy(tri!(send1(s, "<", mkfix(0)))) { send0(s, "-@") } else { s });
+    }
+    defn(nu, "<=>", 1, 1, |s, a, _| if s == a[0] { mkfix(0) } else { QNIL });
+    defn(nu, "eql?", 1, 1, |s, a, _| bool_v(class_of(s) == class_of(a[0]) && truthy(tri!(send1(s, "==", a[0])))));
+    // coerce: an object of the same class as is, else both as Floats
+    defn(nu, "coerce", 1, 1, |s, a, _| {
+        if class_of(s) == class_of(a[0]) {
+            return ary_new(vec![a[0], s]);
+        }
+        let k = rt().main_obj;
+        let x = tri!(send(k, sym("Float"), &[a[0]], QNIL));
+        let y = tri!(send(k, sym("Float"), &[s], QNIL));
+        ary_new(vec![x, y])
+    });
+    defn(nu, "div", 1, 1, |s, a, _| {
+        if truthy(tri!(send1(a[0], "==", mkfix(0)))) {
+            return raise(rt().c.zero_div_error, "divided by 0");
+        }
+        let q = tri!(send1(s, "/", a[0]));
+        send0(q, "floor")
+    });
+    for name in ["modulo", "%"] {
+        defn(nu, name, 1, 1, |s, a, _| {
+            let q = tri!(send1(s, "div", a[0]));
+            let m = tri!(send1(a[0], "*", q));
+            send1(s, "-", m)
+        });
+    }
+    defn(nu, "remainder", 1, 1, |s, a, _| {
+        let z = tri!(send1(s, "%", a[0]));
+        if !truthy(tri!(send0(z, "zero?"))) {
+            let sn = truthy(tri!(send1(s, "<", mkfix(0))));
+            let sp = truthy(tri!(send1(s, ">", mkfix(0))));
+            let yn = truthy(tri!(send1(a[0], "<", mkfix(0))));
+            let yp = truthy(tri!(send1(a[0], ">", mkfix(0))));
+            if (sn && yp) || (sp && yn) {
+                return send1(z, "-", a[0]);
+            }
+        }
+        z
+    });
+    defn(nu, "divmod", 1, 1, |s, a, _| {
+        let d = tri!(send1(s, "div", a[0]));
+        let m = tri!(send1(s, "modulo", a[0]));
+        ary_new(vec![d, m])
+    });
+    defn(nu, "fdiv", 1, 1, |s, a, _| {
+        let f = tri!(send0(s, "to_f"));
+        send1(f, "/", a[0])
+    });
+    // floor/ceil/round/truncate: the Float's (num_floor ...)
+    fn as_float(s: V) -> V {
+        send(rt().main_obj, sym("Float"), &[s], QNIL)
+    }
+    defn(nu, "floor", 0, -1, |s, a, b| send(tri!(as_float(s)), sym("floor"), a, b));
+    defn(nu, "ceil", 0, -1, |s, a, b| send(tri!(as_float(s)), sym("ceil"), a, b));
+    defn(nu, "round", 0, -1, |s, a, b| send(tri!(as_float(s)), sym("round"), a, b));
+    defn(nu, "truncate", 0, -1, |s, a, b| send(tri!(as_float(s)), sym("truncate"), a, b));
     for name in ["conj", "conjugate", "real"] {
         defn(nu, name, 0, 0, |s, _, _| s);
     }
@@ -1774,13 +1917,61 @@ pub fn init() {
                 bump_serial();
                 v
             }
+            // (a pending autoload: dropped, its file not loaded)
+            None if crate::abi::remove_autoload(s as *mut Class, id) => {
+                bump_serial();
+                QNIL
+            }
             None => {
                 let prefix = if s as *mut Class == rt().c.object { String::new() } else { format!("{}::", class_name(s as *mut Class)) };
                 raise(rt().c.name_error, &format!("constant {}{} not defined", prefix, sym_str(id)))
             }
         }
     });
-    defn(md, "const_source_location", 1, 2, |_, _, _| QNIL);
+    // [file, line] where the constant was set; [] for one Kenny's runtime defines; nil if
+    // there's no such constant
+    defn(md, "const_source_location", 1, 2, |s, a, _| {
+        let inherit = a.get(1).is_none_or(|v| truthy(*v));
+        let name = if is_sym(a[0]) {
+            sym_str(sym_id(a[0]))
+        } else if is_str(a[0]) {
+            String::from_utf8_lossy(&rstr(a[0]).b).into_owned()
+        } else {
+            return type_error(&format!("{} is not a symbol nor a string", inspect_lossy(a[0])));
+        };
+        let mut cur = s as *mut Class;
+        let mut parts: Vec<&str> = name.split("::").collect();
+        if parts.first() == Some(&"") {
+            cur = rt().c.object;
+            parts.remove(0);
+        }
+        let Some((last, path)) = parts.split_last() else { return QNIL };
+        for p in path {
+            match const_get_under(cur, sym(p)) {
+                Some(v) if is_class(v) => cur = v as *mut Class,
+                _ => return QNIL,
+            }
+        }
+        let id = sym(last);
+        let mut owners = vec![cur];
+        if inherit {
+            owners = ancestors(cur);
+            if unsafe { (*cur).is_module } {
+                owners.push(rt().c.object);
+            }
+        }
+        for o in owners {
+            if !unsafe { (*o).consts.contains_key(&id) } {
+                continue;
+            }
+            let pc = crate::core::CONST_LOCS.lock().unwrap().as_ref().and_then(|m| m.get(&(o as usize, id)).copied());
+            return match pc.and_then(crate::backtrace::symbolize) {
+                Some((file, line, _)) => ary_new(vec![str_from(&file), mkfix(line)]),
+                None => ary_new(vec![]),
+            };
+        }
+        QNIL
+    });
     defn(md, "deprecate_constant", 0, -1, |s, _, _| s);
     defn(md, "protected_method_defined?", 1, 2, |_, _, _| QFALSE);
     defn(md, "public_instance_method", 1, 1, |s, a, _| send(s, sym("instance_method"), a, QNIL));
@@ -2461,12 +2652,9 @@ pub fn init() {
         if is_time(x) {
             return type_error("time + time?");
         }
-        let d: i128 = if is_fix(x) {
-            fix(x) as i128 * NS
-        } else if let Some(f) = num_to_f(x) {
-            (f * 1e9).round() as i128
-        } else {
-            return type_error(&format!("can't convert {} into an exact number", cname(x)));
+        let d = match exact_ns(x) {
+            Ok(n) => n,
+            Err(e) => return e,
         };
         time_make(real_class(s), time_ns(s) + d, zone_of(s))
     });
@@ -2476,23 +2664,46 @@ pub fn init() {
             let d = time_ns(s) - time_ns(x);
             return float_new(d.div_euclid(NS) as f64 + d.rem_euclid(NS) as f64 / 1e9);
         }
-        let d: i128 = if is_fix(x) {
-            fix(x) as i128 * NS
-        } else if let Some(f) = num_to_f(x) {
-            (f * 1e9).round() as i128
-        } else {
-            return type_error(&format!("can't convert {} into an exact number", cname(x)));
+        let d = match exact_ns(x) {
+            Ok(n) => n,
+            Err(e) => return e,
         };
         time_make(real_class(s), time_ns(s) - d, zone_of(s))
     });
     defn(tm, "succ", 0, 0, |s, _, _| time_make(real_class(s), time_ns(s) + NS, zone_of(s)));
+    // with a non-Time: the inverse of `other <=> self` (rb_invcmp; ActiveSupport's
+    // TimeWithZone)
+    fn time_invcmp(s: V, o: V) -> V {
+        if !is_heap(o) || !respond_to(o, sym("<=>")) {
+            return QNIL;
+        }
+        let r = tri!(send1(o, "<=>", s));
+        if r == QNIL {
+            return QNIL;
+        }
+        if is_fix(r) {
+            return mkfix(-fix(r).signum());
+        }
+        let pos = tri!(send1(r, ">", mkfix(0)));
+        if truthy(pos) {
+            return mkfix(-1);
+        }
+        let neg = tri!(send1(r, "<", mkfix(0)));
+        mkfix(if truthy(neg) { 1 } else { 0 })
+    }
     defn(tm, "<=>", 1, 1, |s, a, _| {
         if !is_time(a[0]) {
-            return QNIL;
+            return time_invcmp(s, a[0]);
         }
         mkfix(time_ns(s).cmp(&time_ns(a[0])) as i64)
     });
-    defn(tm, "==", 1, 1, |s, a, _| bool_v(is_time(a[0]) && time_ns(s) == time_ns(a[0])));
+    defn(tm, "==", 1, 1, |s, a, _| {
+        if is_time(a[0]) {
+            return bool_v(time_ns(s) == time_ns(a[0]));
+        }
+        let c = tri!(time_invcmp(s, a[0]));
+        bool_v(c == mkfix(0))
+    });
     defn(tm, "eql?", 1, 1, |s, a, _| bool_v(is_time(a[0]) && time_ns(s) == time_ns(a[0])));
     defn(tm, "hash", 0, 0, |s, _, _| {
         let ns = time_ns(s);
@@ -2523,20 +2734,64 @@ pub fn init() {
     for name in ["getutc", "getgm"] {
         defn(tm, name, 0, 0, |s, _, _| time_make(real_class(s), time_ns(s), Zone::Utc));
     }
-    defn(tm, "localtime", 0, 1, |s, a, _| {
-        let z = match a.first() {
-            Some(&v) if v != QNIL => tryr!(parse_zone(v)),
-            _ => Zone::Local,
+    // a timezone object (CRuby's protocol: utc_to_local / local_to_utc, ActiveSupport's
+    // TimeZone): its offset at time s, from utc_to_local's wall clock
+    fn zone_obj_offset(s: V, z: V) -> Result<Option<i64>, V> {
+        if !is_heap(z) || is_str(z) || is_time(z) || !respond_to(z, sym("utc_to_local")) {
+            return Ok(None);
+        }
+        let utc = time_make(real_class(s), time_ns(s), Zone::Utc);
+        let local = send1(z, "utc_to_local", utc);
+        if local == UNDEF {
+            return Err(local);
+        }
+        let wall = if is_time(local) {
+            let off = match zone_of(local) {
+                Zone::Utc => 0,
+                Zone::Off(o) => o,
+                Zone::Local => crate::misc::tm_of(local).tm_gmtoff,
+            };
+            time_ns(local).div_euclid(NS) as i64 + off
+        } else {
+            let i = send0(local, "to_i");
+            if i == UNDEF {
+                return Err(i);
+            }
+            let o = send0(local, "utc_offset");
+            if o == UNDEF {
+                return Err(o);
+            }
+            if !is_fix(i) || !is_fix(o) {
+                return Err(type_error("utc_to_local must return a Time"));
+            }
+            fix(i) + fix(o)
         };
+        Ok(Some(wall - time_ns(s).div_euclid(NS) as i64))
+    }
+    fn local_zone(s: V, a: &[V]) -> Result<(Zone, V), V> {
+        match a.first() {
+            Some(&v) if v != QNIL => {
+                if let Some(off) = zone_obj_offset(s, v)? {
+                    return Ok((Zone::Off(off), v));
+                }
+                Ok((parse_zone(v)?, QNIL))
+            }
+            _ => Ok((Zone::Local, QNIL)),
+        }
+    }
+    defn(tm, "localtime", 0, 1, |s, a, _| {
+        let (z, zobj) = tryr!(local_zone(s, a));
         set_time(s, time_ns(s), z);
+        ivar_set(s, sym("@__zobj"), zobj);
         s
     });
     defn(tm, "getlocal", 0, 1, |s, a, _| {
-        let z = match a.first() {
-            Some(&v) if v != QNIL => tryr!(parse_zone(v)),
-            _ => Zone::Local,
-        };
-        time_make(real_class(s), time_ns(s), z)
+        let (z, zobj) = tryr!(local_zone(s, a));
+        let t = time_make(real_class(s), time_ns(s), z);
+        if zobj != QNIL {
+            ivar_set(t, sym("@__zobj"), zobj);
+        }
+        t
     });
     for name in ["utc?", "gmt?"] {
         defn(tm, name, 0, 0, |s, _, _| bool_v(zone_of(s) == Zone::Utc));
@@ -2553,7 +2808,8 @@ pub fn init() {
     }
     defn(tm, "zone", 0, 0, |s, _, _| match zone_of(s) {
         Zone::Utc => str_from("UTC"),
-        Zone::Off(_) => QNIL,
+        // (the timezone object it was given, if any)
+        Zone::Off(_) => ivar_get(s, sym("@__zobj")),
         Zone::Local => new_str_v(time_strftime(s, "%Z")),
     });
     defn(tm, "to_a", 0, 0, |s, _, _| {

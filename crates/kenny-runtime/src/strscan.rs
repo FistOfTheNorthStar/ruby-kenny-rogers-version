@@ -454,6 +454,31 @@ fn init_scanner() {
     defn(c, "inspect", 0, 0, |s, _, _| inspect(s));
 }
 
+/// `require "fcntl"`: the Fcntl module's constants (CRuby's fcntl extension).
+fn init_fcntl() {
+    let m = new_module("Fcntl");
+    set_global_const("Fcntl", m as V);
+    let mut cs: Vec<(&str, i64)> = vec![
+        ("F_DUPFD", libc::F_DUPFD as i64), ("F_GETFD", libc::F_GETFD as i64), ("F_SETFD", libc::F_SETFD as i64),
+        ("F_GETFL", libc::F_GETFL as i64), ("F_SETFL", libc::F_SETFL as i64), ("F_GETLK", libc::F_GETLK as i64),
+        ("F_SETLK", libc::F_SETLK as i64), ("F_SETLKW", libc::F_SETLKW as i64), ("FD_CLOEXEC", libc::FD_CLOEXEC as i64),
+        ("F_RDLCK", libc::F_RDLCK as i64), ("F_UNLCK", libc::F_UNLCK as i64), ("F_WRLCK", libc::F_WRLCK as i64),
+        ("O_CREAT", libc::O_CREAT as i64), ("O_EXCL", libc::O_EXCL as i64), ("O_NOCTTY", libc::O_NOCTTY as i64),
+        ("O_TRUNC", libc::O_TRUNC as i64), ("O_APPEND", libc::O_APPEND as i64), ("O_NONBLOCK", libc::O_NONBLOCK as i64),
+        ("O_NDELAY", libc::O_NONBLOCK as i64), ("O_RDONLY", libc::O_RDONLY as i64), ("O_RDWR", libc::O_RDWR as i64),
+        ("O_WRONLY", libc::O_WRONLY as i64), ("O_ACCMODE", libc::O_ACCMODE as i64),
+    ];
+    #[cfg(target_os = "macos")]
+    if crate::misc::ruby4() {
+        cs.extend([("F_ALLOCATECONTIG", 2), ("F_ALLOCATEALL", 4), ("F_ALLOCATEPERSIST", 8), ("F_PREALLOCATE", 42), ("F_PEOFPOSMODE", 3), ("F_VOLPOSMODE", 4)]);
+    }
+    for (n, v) in cs {
+        const_set(m, sym(n), mkfix(v));
+    }
+    const_set(m, sym("VERSION"), str_from(if crate::misc::ruby4() { "1.3.0" } else { "1.2.0" }));
+}
+
 pub fn init() {
+    crate::compat::provide_feature(&["fcntl"], Some(init_fcntl));
     crate::compat::provide_feature(&["strscan"], Some(init_scanner));
 }

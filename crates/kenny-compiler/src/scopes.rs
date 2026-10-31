@@ -315,6 +315,8 @@ impl<M: Module> Compiler<M> {
         F: for<'b> FnOnce(&mut Compiler<M>, &mut Fx<'b>) -> Value,
     {
         let is_block = spec.kind == ScopeKind::Block;
+        let saved_bm = self.in_bmethod;
+        self.in_bmethod = is_block && (spec.bmethod || saved_bm);
         let sig = match spec.fast_arity {
             Some(n) => self.fast_sig(n),
             None if is_block => self.block_sig(),
@@ -537,6 +539,7 @@ impl<M: Module> Compiler<M> {
                 inl_self: Vec::new(),
                 bools: HashMap::new(),
                 owned: HashMap::new(),
+                match_saved: None,
             };
             if self.refine_scope.is_none() && std::env::var_os("KENNY_NO_OWNED").is_none() {
                 for n in crate::owned::append_locals(&spec.analysis) {
@@ -556,13 +559,22 @@ impl<M: Module> Compiler<M> {
             if spec.entry_check {
                 self.entry_check(&mut fx);
             }
+            // a method with a `$~` of its own (backref.rs)
+            if spec.kind == ScopeKind::Method && crate::backref::uses_backref(&spec.analysis) {
+                let saved = self.call(&mut fx, "kn_match_save", &[]);
+                let var = fx.b.declare_var(I64);
+                fx.b.def_var(var, saved);
+                fx.match_saved = Some(var);
+            }
             let v = body(self, &mut fx);
+            self.match_restore(&mut fx);
             fx.b.ins().return_(&[v]);
             // unwinding out of this function
             fx.b.switch_to_block(exit);
             if fx.kind == ScopeKind::Method || fx.ret_here {
                 let tag = fx.b.use_var(fx.tag_v);
                 let r = self.call(&mut fx, "kn_catch_return", &[tag]);
+                self.match_restore(&mut fx);
                 fx.b.ins().return_(&[r]);
             } else {
                 let u = fx.b.ins().iconst(I64, UNDEF);
@@ -576,6 +588,7 @@ impl<M: Module> Compiler<M> {
         self.fn_labels.pop();
         self.dbg_frames = saved_dbg;
         self.block_parent = saved_parent;
+        self.in_bmethod = saved_bm;
         let mut ctx = cranelift_codegen::Context::for_function(func);
         if let Err(e) = self.module.define_function(id, &mut ctx) {
             self.errors.push(format!("internal codegen error in {name}: {e:?}"));
@@ -1725,7 +1738,15 @@ impl<M: Module> Compiler<M> {
             p.keywords().iter().next().is_some() || p.keyword_rest().is_some_and(|k| k.as_keyword_rest_parameter_node().is_some())
         });
         let flags = self.iconst(fx, (arity.autosplat as i64) | if lambda { 2 } else { 0 } | if takes_kw { 4 } else { 0 });
-        self.call(fx, "kn_proc_new", &[addr, env, s, min, max, flags])
+        let p = self.call(fx, "kn_proc_new", &[addr, env, s, min, max, flags]);
+        // Proc#binding's locals (a snapshot of those visible here): for blocks in the program's
+        // own code and in code compiled at runtime (templates: ActionView's atom_feed reads
+        // `xml` through the block's binding); gems' blocks don't pay for it
+        if (self.eval_unit || !self.in_dependency()) && !self.visible_locals(fx).is_empty() {
+            let l = self.locals_snapshot(fx);
+            return self.call(fx, "kn_proc_set_locals", &[p, l]);
+        }
+        p
     }
 
     pub(crate) fn class_body(&mut self, fx: &mut Fx, target: Value, label: &str, locals: Vec<Vec<u8>>, body: Option<Node>) -> Value {

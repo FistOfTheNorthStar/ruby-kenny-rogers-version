@@ -75,7 +75,7 @@ pub fn new_str_v(s: String) -> V {
     str_new(s.into_bytes())
 }
 
-fn is_user_method(v: V, name: &str) -> bool {
+pub(crate) fn is_user_method(v: V, name: &str) -> bool {
     let m = find_method(class_of(v), sym(name));
     !m.is_null() && !matches!(unsafe { &(*m).body }, Body::Native(..))
 }
@@ -183,7 +183,7 @@ pub fn class_new_instance(c: V, args: &[V], blk: V) -> V {
     let k = c as *mut Class;
     unsafe {
         if (*k).is_module {
-            return raise(rt().c.no_method_error, &format!("undefined method 'new' for module {}", (*k).name));
+            return raise(rt().c.no_method_error, &format!("undefined method 'new' for module {}", class_name(k)));
         }
     }
     let o = tri!(alloc_instance(k));
@@ -299,7 +299,7 @@ fn cmp_int(a: V, b: V) -> Result<Option<i64>, ()> {
     if r == QNIL { Ok(None) } else if is_fix(r) { Ok(Some(fix(r))) } else { Ok(None) }
 }
 fn cmp_fail(a: V, b: V) -> V {
-    arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), inspect_lossy(b)))
+    arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), crate::kernel::cmperr_desc(b)))
 }
 
 pub fn parse_int(b: &[u8], strict: bool) -> Option<V> {
@@ -573,6 +573,31 @@ pub fn init() {
         let a: Vec<V> = a.iter().copied().filter(|x| !is_hash(*x)).collect();
         puts_to(&a, &mut |b| err_out(b))
     });
+    fn feature_listed(base: &str) -> bool {
+        let strs = |g: &str| -> Vec<String> {
+            match rt().gvars.get(&sym(g)).copied().filter(|v| is_ary(*v)) {
+                Some(a) => rary(a).v.iter().filter(|x| is_str(**x)).map(|x| String::from_utf8_lossy(&rstr(*x).b).into_owned()).collect(),
+                None => vec![],
+            }
+        };
+        let lf = strs("$LOADED_FEATURES");
+        if lf.is_empty() {
+            return false;
+        }
+        let lp = strs("$LOAD_PATH");
+        lf.iter().any(|f| {
+            [".rb", ".so", ".bundle", ""].iter().any(|ext| {
+                let want = format!("{base}{ext}");
+                if *f == want {
+                    return !ext.is_empty() || !base.starts_with('/') && base.contains('.');
+                }
+                if base.starts_with('/') || ext.is_empty() {
+                    return false;
+                }
+                f.strip_suffix(&want).and_then(|d| d.strip_suffix('/')).is_some_and(|d| lp.iter().any(|l| l.trim_end_matches('/') == d))
+            })
+        })
+    }
     defn(k, "require", 1, 1, |_, a, _| {
         let name = match crate::fmt::to_s(a[0]) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -592,11 +617,17 @@ pub fn init() {
         const BUILTIN: &[&str] = &[
             "stringio", "thread", "enumerator", "fiber", "monitor", "rbconfig", "rational", "complex", "etc",
             "io/console", "io/wait", "io/nonblock", "continuation", "rubygems", "bundler/setup", "bundler",
+            "ruby2_keywords",
         ];
         if let Some(r) = crate::compat::require_feature(base) {
             return r;
         }
         if BUILTIN.contains(&base) {
+            return QFALSE;
+        }
+        // a feature added to $LOADED_FEATURES by hand counts as loaded (as in CRuby: the name
+        // with an extension, or under a $LOAD_PATH directory)
+        if feature_listed(base) {
             return QFALSE;
         }
         let le = const_lookup(rt().c.object, sym("LoadError")).unwrap() as *mut Class;
@@ -911,7 +942,10 @@ pub fn init() {
         tri!(check_singleton_ok(s));
         singleton_class(s) as V
     });
-    defn(k, "frozen?", 0, 0, |s, _, _| bool_v(is_frozen(s)));
+    defn(k, "frozen?", 0, 0, |s, _, _| {
+        // (a singleton class is frozen with its object)
+        bool_v(is_frozen(s) || is_class(s) && rclass(s).is_singleton && is_heap(rclass(s).attached) && is_frozen(rclass(s).attached))
+    });
     defn(k, "freeze", 0, 0, |s, _, _| {
         if is_heap(s) {
             hdr(s).flags = (hdr(s).flags | FL_FROZEN) & !FL_CHILLED;
@@ -920,7 +954,6 @@ pub fn init() {
     });
     defn(k, "nil?", 0, 0, |s, _, _| bool_v(s == QNIL));
     defn(k, "===", 1, 1, |s, a, _| equal(s, a[0]));
-    defn(k, "=~", 1, 1, |_, _, _| QNIL);
     // Object#eql? is identity (plus value equality of the core value types); unlike the
     // hash-key `eql`, it must not dispatch to a user eql? (`super` from Mime::Type#eql?)
     defn(k, "eql?", 1, 1, |s, a, _| {
@@ -1107,8 +1140,16 @@ pub fn init() {
         bool_v(!truthy(r))
     });
     defn(bo, "__id__", 0, 0, |s, _, _| mkfix(object_id_of(s)));
-    defn(bo, "method_missing", 1, -1, |s, a, _| no_method_error(s, sym_id(a[0]), false));
-    defn(bo, "respond_to_missing?", 2, 2, |_, _, _| QFALSE);
+    defn(bo, "method_missing", 1, -1, |s, a, _| {
+        // (after a private/protected call was refused: that's what it reports)
+        let why = crate::visibility::MM_REASON.with(|r| r.replace(""));
+        if !why.is_empty() {
+            return crate::visibility::vis_error(s, sym_id(a[0]), why);
+        }
+        no_method_error(s, sym_id(a[0]), false)
+    });
+    // (Kernel's, private, as in CRuby: BasicObject has none)
+    defn(rt().c.kernel, "respond_to_missing?", 2, 2, |_, _, _| QFALSE);
     defn(bo, "singleton_method_added", 1, 1, |_, _, _| QNIL);
 
     // --- Module / Class ---
@@ -1116,6 +1157,37 @@ pub fn init() {
     defn(md, "name", 0, 0, |s, _, _| {
         let c = rclass(s);
         if c.name.is_empty() || c.is_singleton { QNIL } else { str_from(&c.name.clone()) }
+    });
+    // Module#set_temporary_name(name or nil) (Ruby 3.3+)
+    defn(md, "set_temporary_name", 1, 1, |s, a, _| {
+        let c = rclass(s);
+        let k = s as *mut Class;
+        if c.is_singleton || (!c.name.is_empty() && !crate::core::temp_named(k)) {
+            return raise(rt().c.runtime_error, "can't change permanent name");
+        }
+        if a[0] == QNIL {
+            c.name.clear();
+            crate::core::set_temp_named(k, false);
+            return s;
+        }
+        let name = match crate::string::want_str(a[0]) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => return e,
+        };
+        if name.is_empty() {
+            return arg_error("empty class/module name");
+        }
+        let const_seg = |seg: &str| {
+            let mut cs = seg.chars();
+            cs.next().is_some_and(|f| f.is_uppercase()) && cs.all(|ch| ch.is_alphanumeric() || ch == '_' || !ch.is_ascii())
+        };
+        let path = name.strip_prefix("::").unwrap_or(&name);
+        if path.split("::").all(const_seg) {
+            return arg_error("the temporary name must not be a constant path to avoid confusion");
+        }
+        c.name = name;
+        crate::core::set_temp_named(k, true);
+        s
     });
     defn(md, "to_s", 0, 0, |s, _, _| new_str_v(class_name(s as *mut Class)));
     defn(md, "inspect", 0, 0, |s, _, _| new_str_v(class_name(s as *mut Class)));
@@ -1309,6 +1381,8 @@ pub fn init() {
                 }
             }
         }
+        // (the instance methods become private: `module_function :URI` in uri/common.rb)
+        tri!(send(s, sym("private"), a, QNIL));
         visibility(s, a)
     });
     defn(md, "method_defined?", 1, 2, |s, a, _| match sym_arg(a[0]) {
@@ -1384,6 +1458,7 @@ pub fn init() {
     });
     defn(md, "const_set", 2, 2, |s, a, _| match sym_arg(a[0]) {
         Ok(id) => {
+            tri!(check_frozen_definee(s as *mut Class));
             const_set(s as *mut Class, id, a[1]);
             if !crate::abi::const_added(s as *mut Class, id) {
                 return UNDEF;
@@ -1525,7 +1600,10 @@ pub fn init() {
         Ok(id) => bool_v(ancestors(s as *mut Class).iter().any(|c| unsafe { (**c).cvars.contains_key(&id) })),
         Err(e) => e,
     });
-    defn(md, "freeze", 0, 0, |s, _, _| s);
+    defn(md, "freeze", 0, 0, |s, _, _| {
+        hdr(s).flags |= FL_FROZEN;
+        s
+    });
     // `Module.new { }`, and `Sub.new(args)` for subclasses of Module (ActiveModel's
     // `AcceptsMultiparameterTime < Module` defines `initialize(defaults: {})`).
     defs(md, "new", 0, -1, |s, a, b| {
@@ -1628,24 +1706,7 @@ pub fn init() {
         };
         bool_v(lo >= 0 && hi <= 0)
     });
-    defn(cm, "clamp", 1, 2, |s, a, _| {
-        let (lo, hi) = if a.len() == 2 { (a[0], a[1]) } else if is_range(a[0]) { (rrange(a[0]).lo, rrange(a[0]).hi) } else { return type_error("wrong argument type") };
-        if lo != QNIL {
-            if let Ok(Some(o)) = cmp_int(s, lo) {
-                if o < 0 {
-                    return lo;
-                }
-            }
-        }
-        if hi != QNIL {
-            if let Ok(Some(o)) = cmp_int(s, hi) {
-                if o > 0 {
-                    return hi;
-                }
-            }
-        }
-        s
-    });
+    defn(cm, "clamp", 1, 2, |s, a, _| clamp(s, a));
 
     // --- Exception ---
     let ex = c.exception;
@@ -1690,11 +1751,18 @@ pub fn init() {
     });
     defn(ex, "backtrace", 0, 0, |s, _, _| crate::backtrace::exc_backtrace(s));
     defn(ex, "backtrace_locations", 0, 0, |s, _, _| {
+        // (the same Array each call, as CRuby's: callers trim it in place)
+        let memo = ivar_get(s, sym("@__bt_locs"));
+        if memo != QNIL {
+            return memo;
+        }
         let raw = ivar_get(s, sym("@__bt_raw"));
         if raw == QNIL {
             return QNIL;
         }
-        crate::backtrace::locations(&crate::backtrace::unpack(raw))
+        let l = crate::backtrace::locations(&crate::backtrace::unpack(raw));
+        ivar_set(s, sym("@__bt_locs"), l);
+        l
     });
     // nil, a String, or an Array of Strings or of Thread::Backtrace::Locations
     defn(ex, "set_backtrace", 1, 1, |s, a, _| {
@@ -1722,8 +1790,35 @@ pub fn init() {
     });
     defs(ex, "exception", 0, -1, |s, a, b| class_new_instance(s, a, b));
     defn(c.stop_iteration, "result", 0, 0, |s, _, _| ivar_get(s, sym("@__result")));
-    defn(c.key_error, "key", 0, 0, |s, _, _| ivar_get(s, sym("@key")));
-    defn(c.key_error, "receiver", 0, 0, |s, _, _| ivar_get(s, sym("@receiver")));
+    // KeyError.new(msg = nil, receiver: obj, key: k); #key / #receiver raise when not given
+    defn(c.key_error, "initialize", 0, -1, |s, a, _| {
+        let mut a = a.to_vec();
+        if a.last().is_some_and(|x| is_hash(*x) && hdr(*x).flags & FL_KWHASH != 0) {
+            let h = a.pop().unwrap();
+            for (k, v) in crate::hash::pairs(h).iter().copied() {
+                match if is_sym(k) { sym_name(sym_id(k)) } else { b"" } {
+                    b"receiver" => {
+                        ivar_set(s, sym("@receiver"), v);
+                    }
+                    b"key" => {
+                        ivar_set(s, sym("@key"), v);
+                    }
+                    _ => return arg_error(&format!("unknown keyword: {}", crate::fmt::inspect_lossy(k))),
+                }
+            }
+        }
+        if a.len() > 1 {
+            return arg_error(&format!("wrong number of arguments (given {}, expected 0..1)", a.len()));
+        }
+        ivar_set(s, sym("@__message"), a.first().copied().unwrap_or(QNIL));
+        QNIL
+    });
+    defn(c.key_error, "key", 0, 0, |s, _, _| {
+        if ivar_defined(s, sym("@key")) { ivar_get(s, sym("@key")) } else { arg_error("no key is available") }
+    });
+    defn(c.key_error, "receiver", 0, 0, |s, _, _| {
+        if ivar_defined(s, sym("@receiver")) { ivar_get(s, sym("@receiver")) } else { arg_error("no receiver is available") }
+    });
     let le = const_lookup(rt().c.object, sym("LoadError")).unwrap() as *mut Class;
     defn(le, "path", 0, 0, |s, _, _| ivar_get(s, sym("@path")));
     defn(c.name_error, "name", 0, 0, |s, _, _| ivar_get(s, sym("@name")));
@@ -1990,4 +2085,58 @@ pub fn init_system_exit() {
         if v == QNIL { mkfix(0) } else { v }
     });
     defn(c, "success?", 0, 0, |s, _, _| bool_v(system_exit_status(s) == 0));
+}
+
+/// How a comparison error names the other operand (CRuby's rb_cmperr): special constants
+/// (nil, true, false, small Integers, Symbols, Floats) by inspect, the rest by class.
+pub fn cmperr_desc(b: V) -> String {
+    if b == QNIL || b == QTRUE || b == QFALSE || is_fix(b) || is_sym(b) || is_float(b) {
+        inspect_lossy(b)
+    } else {
+        class_name(real_class(b))
+    }
+}
+
+/// Comparable#clamp(min, max) / clamp(range), as CRuby's cmp_clamp.
+pub fn clamp(s: V, a: &[V]) -> V {
+    let (lo, hi) = if a.len() == 2 {
+        (a[0], a[1])
+    } else if is_range(a[0]) {
+        let r = rrange(a[0]);
+        if r.hi != QNIL && r.excl {
+            return arg_error("cannot clamp with an exclusive range");
+        }
+        (r.lo, r.hi)
+    } else {
+        return type_error(&format!("wrong argument type {} (expected Range)", class_name(real_class(a[0]))));
+    };
+    let c = |x: V, y: V| -> Result<i64, V> {
+        match cmp_int(x, y).map_err(|_| UNDEF)? {
+            Some(o) => Ok(o),
+            None => Err(cmp_fail(x, y)),
+        }
+    };
+    if lo != QNIL && hi != QNIL {
+        match c(lo, hi) {
+            Ok(o) if o > 0 => return arg_error("min argument must be less than or equal to max argument"),
+            Ok(_) => {}
+            Err(e) => return e,
+        }
+    }
+    if lo != QNIL {
+        match c(s, lo) {
+            Ok(0) => return s,
+            Ok(o) if o < 0 => return lo,
+            Ok(_) => {}
+            Err(e) => return e,
+        }
+    }
+    if hi != QNIL {
+        match c(s, hi) {
+            Ok(o) if o > 0 => return hi,
+            Ok(_) => {}
+            Err(e) => return e,
+        }
+    }
+    s
 }

@@ -175,11 +175,19 @@ fn enum_size(recv: V, m: &str, args: &[V]) -> V {
         | "each_with_index" | "each_entry" | "sort_by" | "min_by" | "max_by" | "minmax_by" | "group_by" | "partition"
         | "each_with_object" | "with_index" | "with_object" | "each_index" | "reverse_each" | "each_key" | "each_value"
         | "each_pair" | "delete_if" | "keep_if" | "select!" | "filter!" | "reject!" | "map!" | "collect!" | "each_char"
-        | "chars" | "each_codepoint" | "codepoints" | "each_grapheme_cluster" | "transform_values" | "transform_keys"
+        | "chars" | "each_codepoint" | "codepoints" | "transform_values" | "transform_keys"
         | "transform_values!" | "transform_keys!" | "filter_map!" | "sum" | "uniq" | "to_h" | "each_child" => {
             size()
         }
         "each_byte" | "bytes" => send(recv, sym("bytesize"), &[], QNIL),
+        "each_grapheme_cluster" => {
+            let g = send(recv, sym("grapheme_clusters"), &[], QNIL);
+            if g == UNDEF || !is_ary(g) {
+                pst().pending = Throw::None;
+                return QNIL;
+            }
+            mkfix(rary(g).v.len() as i64)
+        }
         "times" if is_fix(recv) => mkfix(fix(recv).max(0)),
         "upto" if is_fix(recv) => n_arg(0).map(|t| mkfix((t - fix(recv) + 1).max(0))).unwrap_or(QNIL),
         "downto" if is_fix(recv) => n_arg(0).map(|t| mkfix((fix(recv) - t + 1).max(0))).unwrap_or(QNIL),
@@ -224,24 +232,13 @@ fn range_items(r: V) -> Option<Vec<V>> {
         return Some((fix(rg.lo)..=hi).map(mkfix).collect());
     }
     if is_str(rg.lo) && is_str(rg.hi) {
-        let mut out = RVec::new();
-        let end = rstr(rg.hi).b.clone();
-        let mut cur = rg.lo;
-        loop {
-            let cb = rstr(cur).b.clone();
-            if cb.len() > end.len() {
-                break;
-            }
-            if cb == end {
-                if !rg.excl {
-                    out.push(cur);
-                }
-                break;
-            }
-            out.push(cur);
-            cur = send0(cur, "succ");
+        // (String#upto's elements: CRuby's String ranges iterate with it)
+        let en = send(rg.lo, sym("enum_for"), &[mksym(sym("upto")), rg.hi, bool_v(rg.excl)], QNIL);
+        let a = if en == UNDEF { UNDEF } else { send0(en, "to_a") };
+        if a == UNDEF || !is_ary(a) {
+            return Some(Vec::new());
         }
-        return Some(out.take());
+        return Some(rary(a).v.to_vec());
     }
     None
 }
@@ -295,6 +292,90 @@ fn range_each(s: V, b: V) -> V {
             }
             s
         }
+    }
+}
+
+/// a <=> b as -1/0/1, or None when they don't compare (CRuby's r_less: INT_MAX)
+fn r_less(a: V, b: V) -> Result<Option<i64>, V> {
+    let c = send1(a, "<=>", b);
+    if c == UNDEF {
+        return Err(c);
+    }
+    if c == QNIL {
+        return Ok(None);
+    }
+    if is_fix(c) {
+        return Ok(Some(fix(c).signum()));
+    }
+    let gt = send1(c, ">", mkfix(0));
+    if gt == UNDEF {
+        return Err(gt);
+    }
+    if truthy(gt) {
+        return Ok(Some(1));
+    }
+    let lt = send1(c, "<", mkfix(0));
+    if lt == UNDEF {
+        return Err(lt);
+    }
+    Ok(Some(if truthy(lt) { -1 } else { 0 }))
+}
+
+/// Range#cover?(range): CRuby's r_cover_range_p
+fn range_cover_range(s: V, v: V) -> V {
+    macro_rules! tri_r {
+        ($e:expr) => {
+            match $e {
+                Ok(x) => x,
+                Err(e) => return e,
+            }
+        };
+    }
+    let (r, o) = (rrange(s), rrange(v));
+    if (r.hi != QNIL && o.hi == QNIL) || (r.lo != QNIL && o.lo == QNIL) {
+        return QFALSE;
+    }
+    // an empty (or backwards) range is covered by none
+    if o.lo != QNIL && o.hi != QNIL {
+        match tri_r!(r_less(o.lo, o.hi)) {
+            None => return QFALSE,
+            Some(c) if c > if o.excl { -1 } else { 0 } => return QFALSE,
+            _ => {}
+        }
+    }
+    if o.lo != QNIL && !truthy(tri!(range_cover(s, o.lo))) {
+        return QFALSE;
+    }
+    let cmp_end = match tri_r!(r_less(r.hi, o.hi)) {
+        Some(c) => c,
+        None => return QFALSE,
+    };
+    if r.excl == o.excl {
+        return bool_v(cmp_end >= 0);
+    }
+    if r.excl {
+        return bool_v(cmp_end > 0);
+    }
+    if cmp_end >= 0 {
+        return QTRUE;
+    }
+    // (1..5).cover?(1...6): the other's last element
+    let max = send0(v, "max");
+    if max == UNDEF {
+        if let Throw::Raise(e) = pst().pending {
+            if is_a(e, rt().c.type_error) {
+                pst().pending = Throw::None;
+                return QFALSE;
+            }
+        }
+        return UNDEF;
+    }
+    if max == QNIL {
+        return QFALSE;
+    }
+    match tri_r!(r_less(r.hi, max)) {
+        Some(c) => bool_v(c >= 0),
+        None => QFALSE,
     }
 }
 
@@ -518,7 +599,52 @@ pub fn init() {
 
     // ---- Range ----
     let rg = c.range;
-    defs(rg, "new", 2, 3, |_, a, _| range_new(a[0], a[1], a.get(2).is_some_and(|x| truthy(*x))));
+    // Range.new(begin, end, exclusive = false); a subclass's instance is allocated and given
+    // to its initialize (`super(a, b)` reaches Range#initialize)
+    fn range_check(lo: V, hi: V) -> Result<(), V> {
+        if lo == QNIL || hi == QNIL || (is_fix(lo) && is_fix(hi)) {
+            return Ok(());
+        }
+        let c = send(lo, sym("<=>"), &[hi], QNIL);
+        if c == UNDEF {
+            // (CRuby rescues the error <=> raises)
+            if !matches!(pst().pending, Throw::Raise(_)) {
+                return Err(UNDEF);
+            }
+            pst().pending = Throw::None;
+            return Err(arg_error("bad value for range"));
+        }
+        if c == QNIL {
+            return Err(arg_error("bad value for range"));
+        }
+        Ok(())
+    }
+    defs(rg, "new", 0, -1, |s, a, b| {
+        if s as *mut Class == rt().c.range {
+            if !(2..=3).contains(&a.len()) {
+                return crate::core::arity_error(a.len() as i32, 2, 3);
+            }
+            if let Err(e) = range_check(a[0], a[1]) {
+                return e;
+            }
+            return range_new(a[0], a[1], a.get(2).is_some_and(|x| truthy(*x)));
+        }
+        let r = range_new(QNIL, QNIL, false);
+        hdr(r).klass = s as *mut Class;
+        hdr(r).flags &= !FL_FROZEN;
+        tri!(send(r, sym("initialize"), a, b));
+        r
+    });
+    defn(rg, "initialize", 2, 3, |s, a, _| {
+        if let Err(e) = range_check(a[0], a[1]) {
+            return e;
+        }
+        let r = rrange(s);
+        r.lo = a[0];
+        r.hi = a[1];
+        r.excl = a.get(2).is_some_and(|x| truthy(*x));
+        QNIL
+    });
     defn(rg, "each", 0, 0, |s, _, b| if is_proc(b) { range_each(s, b) } else { enum_for(s, "each", &[]) });
     defn(rg, "reverse_each", 0, 0, |s, _, b| match range_items(s) {
         Some(items) => {
@@ -762,17 +888,36 @@ pub fn init() {
             Err(e) => e,
         }
     });
-    for name in ["include?", "member?", "===", "cover?"] {
+    // include?/member? of a String range: whether succ from the beginning reaches the value
+    // (CRuby's rb_str_include_range_p), not cover?
+    for name in ["include?", "member?"] {
         defn(rg, name, 1, 1, |s, a, _| {
-            if is_range(a[0]) {
-                let o = rrange(a[0]);
-                let lo = tri!(range_cover(s, o.lo));
-                let hi = if o.excl { tri!(range_cover(s, o.hi)) } else { tri!(range_cover(s, o.hi)) };
-                return bool_v(truthy(lo) && truthy(hi));
+            let r = rrange(s);
+            if is_str(r.lo) && is_str(r.hi) {
+                let v = if is_str(a[0]) {
+                    a[0]
+                } else if is_heap(a[0]) && respond_to(a[0], sym("to_str")) {
+                    tri!(send0(a[0], "to_str"))
+                } else {
+                    return QFALSE;
+                };
+                let en = tri!(send(r.lo, sym("enum_for"), &[mksym(sym("upto")), r.hi, bool_v(r.excl)], QNIL));
+                return send(en, sym("include?"), &[v], QNIL);
+            }
+            if (is_str(r.lo) && r.hi == QNIL) || (r.lo == QNIL && (is_str(r.hi) || r.hi == QNIL)) {
+                return type_error("cannot determine inclusion in beginless/endless ranges");
             }
             range_cover(s, a[0])
         });
     }
+    // (=== with a Range compares it as one value, as CRuby's does)
+    defn(rg, "===", 1, 1, |s, a, _| range_cover(s, a[0]));
+    defn(rg, "cover?", 1, 1, |s, a, _| {
+        if is_range(a[0]) {
+            return range_cover_range(s, a[0]);
+        }
+        range_cover(s, a[0])
+    });
     defn(rg, "exclude_end?", 0, 0, |s, _, _| bool_v(rrange(s).excl));
     defn(rg, "to_s", 0, 0, |s, _, _| range_to_s(s, false));
     defn(rg, "inspect", 0, 0, |s, _, _| range_to_s(s, true));

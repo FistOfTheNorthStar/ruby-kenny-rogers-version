@@ -47,13 +47,23 @@ fn num_from_digits(d: &[u32]) -> String {
     String::from_utf8(out).unwrap()
 }
 
-/// Regex literal source as Onigmo sees it (only `\/` is unescaped).
-fn regex_source(raw: &[u8]) -> Vec<u8> {
+/// A regexp literal's source as CRuby's parser makes it from what is written between the
+/// delimiters (`term` is the closing one): an escaped `term` loses its backslash unless it's
+/// a regexp metacharacter (`\/` in /../ is "/", `\!` in %r!..! is "!", `\)` in %r(..)
+/// stays), a backslash-newline goes, and every other escape (`\\` included) stays as written.
+fn regex_source(raw: &[u8], term: u8) -> Vec<u8> {
+    let meta = matches!(term, b'$' | b'*' | b'+' | b'.' | b'?' | b'^' | b'|' | b')' | b']' | b'}' | b'>');
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
     while i < raw.len() {
-        if raw[i] == b'\\' && raw.get(i + 1) == Some(&b'/') {
-            out.push(b'/');
+        if raw[i] == b'\\' && i + 1 < raw.len() {
+            let c = raw[i + 1];
+            if c == term && !meta {
+                out.push(c);
+            } else if c != b'\n' {
+                out.push(b'\\');
+                out.push(c);
+            }
             i += 2;
         } else {
             out.push(raw[i]);
@@ -454,7 +464,7 @@ impl<M: Module> Compiler<M> {
             }
             Node::RegularExpressionNode { .. } => {
                 let r = node.as_regular_expression_node().unwrap();
-                let src = regex_source(r.content_loc().as_slice());
+                let src = regex_source(r.content_loc().as_slice(), r.closing_loc().as_slice().first().copied().unwrap_or(b'/'));
                 // 32: /n (ASCII-8BIT), so `\xHH` escapes match bytes
                 let opts = (r.is_ignore_case() as i64) | ((r.is_extended() as i64) << 1) | ((r.is_multi_line() as i64) << 2) | ((r.is_ascii_8bit() as i64) << 5);
                 let slot = self.cache_ptr(fx, 1);
@@ -464,11 +474,12 @@ impl<M: Module> Compiler<M> {
             }
             Node::InterpolatedRegularExpressionNode { .. } => {
                 let r = node.as_interpolated_regular_expression_node().unwrap();
+                let term = r.closing_loc().as_slice().first().copied().unwrap_or(b'/');
                 let (p, l) = self.str_ptr(fx, b"");
                 let st = self.call(fx, "kn_str_new", &[p, l]);
                 for part in r.parts().iter() {
                     if let Some(sn) = part.as_string_node() {
-                        let src = regex_source(sn.content_loc().as_slice());
+                        let src = regex_source(sn.content_loc().as_slice(), term);
                         let (p, l) = self.str_ptr(fx, &src);
                         self.call(fx, "kn_str_append_raw", &[st, p, l]);
                     } else {

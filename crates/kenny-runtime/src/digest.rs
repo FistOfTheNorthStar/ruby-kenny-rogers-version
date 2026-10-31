@@ -323,7 +323,8 @@ fn init_digest() {
         CLASSES.get().push((k, al));
     }
     // Digest(:SHA256) helper
-    defn(r.c.kernel, "Digest", 1, 1, |_, a, _| {
+    // (a private method of Object, as digest.rb's top-level def)
+    defn(r.c.object, "Digest", 1, 1, |_, a, _| {
         let name = match crate::kernel::sym_arg(a[0]) {
             Ok(id) => id,
             Err(e) => return e,
@@ -338,6 +339,10 @@ fn init_digest() {
             }
         }
     });
+    if let Some(&m) = unsafe { (*r.c.object).methods.get(&sym("Digest")) } {
+        unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
+        bump_serial();
+    }
 }
 
 pub fn init() {

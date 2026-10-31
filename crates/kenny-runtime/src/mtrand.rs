@@ -290,7 +290,7 @@ fn rand_value(g: &Gen, arg: V, strict: bool) -> V {
             return int_from_big(l + r);
         }
         let (Some(l), Some(h)) = (crate::fmt::num_to_f(lo), crate::fmt::num_to_f(hi)) else {
-            return if strict { invalid(arg) } else { QNIL };
+            return rand_other_range(g, lo, hi, excl, strict, arg);
         };
         if h < l || (excl && h == l) {
             return QNIL;
@@ -304,6 +304,53 @@ fn rand_value(g: &Gen, arg: V, strict: bool) -> V {
     // Kernel#rand(x): x.to_i
     let i = tri!(send(arg, sym("to_i"), &[], QNIL));
     rand_value(g, i, false)
+}
+
+/// rand(a..b) of other objects (Date..Date, Rational ends), as CRuby's rand_range: the span
+/// is `b - a`; a Float span picks a Float offset in [0, span], any other that converts with
+/// `to_int` (Integer, Rational, ...) an Integer one, another Numeric a Float one; the result
+/// is `a + offset`. Ends without `-` raise TypeError as CRuby's fallback to `to_int` does.
+fn rand_other_range(g: &Gen, lo: V, hi: V, excl: bool, strict: bool, arg: V) -> V {
+    if lo == QNIL || hi == QNIL {
+        return if strict { invalid(arg) } else { QNIL };
+    }
+    if !respond_to(hi, sym("-")) {
+        return type_error("no implicit conversion of Range into Integer");
+    }
+    let span = tri!(send(hi, sym("-"), &[lo], QNIL));
+    let float_off = |f: f64| -> Option<V> {
+        if f > 0.0 {
+            Some(float_new(g.with(|m| if excl { m.real() } else { m.real_incl() }) * f))
+        } else if f == 0.0 && !excl {
+            Some(float_new(0.0))
+        } else {
+            None
+        }
+    };
+    let off = if is_float(span) {
+        float_off(float_val(span))
+    } else if int_big(span).is_some() || respond_to(span, sym("to_int")) {
+        let n = if int_big(span).is_some() { span } else { tri!(send(span, sym("to_int"), &[], QNIL)) };
+        let Some(n) = int_big(n) else { return type_error("can't convert to Integer") };
+        let n: BigInt = n - BigInt::from(if excl { 1 } else { 0 });
+        if n.is_negative() {
+            None
+        } else {
+            Some(match n.to_u64() {
+                Some(s) => int_from_big(BigInt::from(g.with(|m| m.limited(s)))),
+                None => int_from_big(g.with(|m| m.limited_big(&n))),
+            })
+        }
+    } else if is_a(span, rt().c.numeric) {
+        let f = tri!(send(span, sym("to_f"), &[], QNIL));
+        float_off(float_val(f))
+    } else {
+        return type_error("no implicit conversion of Range into Integer");
+    };
+    match off {
+        Some(o) => send(lo, sym("+"), &[o], QNIL),
+        None => QNIL,
+    }
 }
 
 /// [0, limit] from `random:` (a Random, or any object with `rand`), or the default generator.
@@ -419,14 +466,22 @@ pub fn init() {
     });
     fn srand(a: &[V]) -> V {
         let seed = match a.first() {
-            Some(&x) if x != QNIL => match int_big(x) {
+            Some(&x) => match int_big(x) {
                 Some(n) => n,
-                None => {
+                None if x != QNIL && respond_to(x, sym("to_int")) => {
                     let i = tri!(send(x, sym("to_int"), &[], QNIL));
+                    if int_big(i).is_none() {
+                        return type_error(&format!("can't convert {0} to Integer ({0}#to_int gives {1})", class_name(real_class(x)), class_name(real_class(i))));
+                    }
                     return srand(&[i]);
                 }
+                // (rb_to_int: nil, Strings ... are no seed)
+                None => {
+                    let what = if x == QNIL { "nil".to_string() } else if x == QTRUE { "true".into() } else if x == QFALSE { "false".into() } else { class_name(real_class(x)) };
+                    return type_error(&format!("no implicit conversion of {what} into Integer"));
+                }
             },
-            _ => new_seed(),
+            None => new_seed(),
         };
         let mut d = DEFAULT.lock().unwrap();
         let old = d.take().map(|(_, s)| s).unwrap_or_else(BigInt::zero);

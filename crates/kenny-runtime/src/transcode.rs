@@ -96,6 +96,36 @@ pub fn enc_of(v: V) -> Enc {
     }
 }
 
+/// The name (a String) of the single-byte encoding other than BINARY that String `v` has
+/// (Windows-1252, ISO-8859-1 ...: kept as BINARY plus this name), or nil.
+pub fn foreign_name(v: V) -> V {
+    if hdr(v).flags & FL_BINARY != 0 {
+        let n = ivar_get(v, enc_ivar());
+        if is_str(n) {
+            return n;
+        }
+    }
+    QNIL
+}
+/// Mark a binary String as being in the encoding `name` (foreign_name's), unless nil.
+pub fn set_foreign(v: V, name: V) {
+    if name != QNIL {
+        hdr(v).flags |= FL_BINARY;
+        gen_ivar_set(v, enc_ivar(), name);
+    }
+}
+/// Give `dst` the encoding of String `src` (a piece of it: scan, [], split ...).
+pub fn like(dst: V, src: V) -> V {
+    let f = hdr(src).flags;
+    if f & FL_BINARY != 0 {
+        hdr(dst).flags = (hdr(dst).flags & !ENC_MASK) | FL_BINARY;
+        set_foreign(dst, foreign_name(src));
+    } else {
+        set_enc(dst, enc_of(src));
+    }
+    dst
+}
+
 /// The encoding of `sub`/`gsub`'s result: the subject's, or (as CRuby's rb_enc_check)
 /// a non-ASCII replacement's when the subject is ASCII-only.
 pub fn note_piece(enc: &mut Enc, src_ascii: bool, piece: V) {

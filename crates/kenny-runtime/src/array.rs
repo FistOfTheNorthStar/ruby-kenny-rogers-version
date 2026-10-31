@@ -65,7 +65,7 @@ pub fn cmp(a: V, b: V) -> Result<Ordering, V> {
     if is_fix(r) {
         return Ok(fix(r).cmp(&0));
     }
-    Err(arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), inspect_lossy(b))))
+    Err(arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), crate::kernel::cmperr_desc(b))))
 }
 fn cmp_blk(blk: V, a: V, b: V) -> Result<Ordering, V> {
     let r = call_block(blk, &[a, b]);
@@ -75,7 +75,7 @@ fn cmp_blk(blk: V, a: V, b: V) -> Result<Ordering, V> {
     if is_fix(r) {
         Ok(fix(r).cmp(&0))
     } else {
-        Err(arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), inspect_lossy(b))))
+        Err(arg_error(&format!("comparison of {} with {} failed", class_name(real_class(a)), crate::kernel::cmperr_desc(b))))
     }
 }
 
@@ -293,7 +293,15 @@ fn kahan_sum(init: V, vals: &[V]) -> V {
             let mut sum = crate::fmt::num_to_f(acc).unwrap();
             let mut c = 0.0;
             while i < vals.len() {
-                let Some(f) = crate::fmt::num_to_f(vals[i]) else { break };
+                // (Rationals join the Float sum, as in CRuby; anything else is added with `+`)
+                let f = match crate::fmt::num_to_f(vals[i]) {
+                    Some(f) => f,
+                    None if crate::rational::is_rational(vals[i]) => match crate::fmt::num_to_f(tri!(send0(vals[i], "to_f"))) {
+                        Some(f) => f,
+                        None => break,
+                    },
+                    None => break,
+                };
                 i += 1;
                 // (as CRuby: NaN and infinities skip the compensation, which they'd turn into
                 // NaN: `[1, Float::INFINITY].sum` is Infinity)
@@ -320,6 +328,12 @@ fn kahan_sum(init: V, vals: &[V]) -> V {
                 sum = t;
             }
             acc = float_new(if sum.is_finite() { sum + c } else { sum });
+            if i == vals.len() {
+                break;
+            }
+            // a non-Float-able value (a Complex, ...): `+` on it, then on
+            acc = tri!(send1(acc, "+", vals[i]));
+            i += 1;
             continue;
         }
         acc = tri!(if is_fix(acc) || is_big(acc) { arith(Op::Add, acc, x) } else { send1(acc, "+", x) });
@@ -403,9 +417,13 @@ pub fn init() {
         av(target).set(v.take());
         target
     }
-    defs(c, "new", 0, 2, |s, a, b| {
+    defs(c, "new", 0, -1, |s, a, b| {
+        // (a subclass's initialize takes what it takes)
         if s as *mut Class != rt().c.array {
             return crate::kernel::class_new_instance(s, a, b);
+        }
+        if a.len() > 2 {
+            return crate::core::arity_error(a.len() as i32, 0, 2);
         }
         let r = ary_new(vec![]);
         tri!(fill_init(r, a, b));
@@ -421,7 +439,7 @@ pub fn init() {
     });
     defn(c, "initialize", 0, 2, |s, a, b| {
         tri!(fill_init(s, a, b));
-        QNIL
+        s
     });
     defn(c, "[]", 1, 2, |s, a, _| aref(s, a));
     defn(c, "slice", 1, 2, |s, a, _| aref(s, a));
@@ -776,37 +794,39 @@ pub fn init() {
     }
     defn(c, "min", 0, 1, |s, a, b| {
         if a.is_empty() && !is_proc(b) {
-            let mut best = QNIL;
+            // (as CRuby: `best <=> x`, and nil elements are values like any other)
+            let mut best: Option<V> = None;
             for x in snapshot(s) {
-                if best == QNIL {
-                    best = x;
+                let Some(b) = best else {
+                    best = Some(x);
                     continue;
-                }
-                match cmp(x, best) {
-                    Ok(Ordering::Less) => best = x,
+                };
+                match cmp(b, x) {
+                    Ok(Ordering::Greater) => best = Some(x),
                     Ok(_) => {}
                     Err(e) => return e,
                 }
             }
-            return best;
+            return best.unwrap_or(QNIL);
         }
         minmax_impl(s, a, b, Ordering::Less)
     });
     defn(c, "max", 0, 1, |s, a, b| {
         if a.is_empty() && !is_proc(b) {
-            let mut best = QNIL;
+            // (as CRuby: `best <=> x`, and nil elements are values like any other)
+            let mut best: Option<V> = None;
             for x in snapshot(s) {
-                if best == QNIL {
-                    best = x;
+                let Some(b) = best else {
+                    best = Some(x);
                     continue;
-                }
-                match cmp(x, best) {
-                    Ok(Ordering::Greater) => best = x,
+                };
+                match cmp(b, x) {
+                    Ok(Ordering::Less) => best = Some(x),
                     Ok(_) => {}
                     Err(e) => return e,
                 }
             }
-            return best;
+            return best.unwrap_or(QNIL);
         }
         minmax_impl(s, a, b, Ordering::Greater)
     });
@@ -827,30 +847,29 @@ pub fn init() {
             None => v.first().copied().unwrap_or(QNIL),
         }
     }
-    defn(c, "min_by", 0, 1, |s, a, b| enum_or(s, "min_by", a, b, || by(s, a, b, false)));
+    // the first minimal (Less) / maximal (Greater) element by key, comparing `key <=> best`
+    // as CRuby does
+    fn best_by(s: V, b: V, want: Ordering) -> V {
+        let mut best: Option<(V, V)> = None;
+        for x in snapshot(s) {
+            let k = tri!(call_block(b, &[x]));
+            let Some((_, bk)) = best else {
+                best = Some((x, k));
+                continue;
+            };
+            match cmp(k, bk) {
+                Ok(o) if o == want => best = Some((x, k)),
+                Ok(_) => {}
+                Err(e) => return e,
+            }
+        }
+        best.map_or(QNIL, |(x, _)| x)
+    }
+    defn(c, "min_by", 0, 1, |s, a, b| enum_or(s, "min_by", a, b, || if a.is_empty() { best_by(s, b, Ordering::Less) } else { by(s, a, b, false) }));
     defn(c, "max_by", 0, 1, |s, a, b| {
         enum_or(s, "max_by", a, b, || {
             if a.is_empty() {
-                // first maximal element, like CRuby
-                let mut best = QNIL;
-                let mut bestk = QNIL;
-                for x in snapshot(s) {
-                    let k = tri!(call_block(b, &[x]));
-                    if best == QNIL && bestk == QNIL {
-                        best = x;
-                        bestk = k;
-                        continue;
-                    }
-                    match cmp(k, bestk) {
-                        Ok(Ordering::Greater) => {
-                            best = x;
-                            bestk = k
-                        }
-                        Ok(_) => {}
-                        Err(e) => return e,
-                    }
-                }
-                return best;
+                return best_by(s, b, Ordering::Greater);
             }
             by(s, a, b, true)
         })
@@ -904,10 +923,11 @@ pub fn init() {
         match join(s, &sep, &mut vec![s]) {
             Ok(b) => {
                 // joining binary (ASCII-8BIT) strings yields a binary string
-                let bin = !b.is_ascii() && rary(s).v.iter().any(|x| is_str(*x) && hdr(*x).flags & crate::compat::FL_BINARY != 0);
+                // (Windows-1252 ones yield Windows-1252: the first non-ASCII binary one's)
+                let bin = if b.is_ascii() { None } else { rary(s).v.iter().copied().find(|x| is_str(*x) && hdr(*x).flags & crate::compat::FL_BINARY != 0 && !rstr(*x).b.is_ascii()) };
                 let r = str_new(b);
-                if bin {
-                    hdr(r).flags |= crate::compat::FL_BINARY;
+                if let Some(x) = bin {
+                    crate::transcode::like(r, x);
                 }
                 r
             }

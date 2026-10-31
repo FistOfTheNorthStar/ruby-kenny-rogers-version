@@ -6,19 +6,85 @@ use crate::kernel::sym_arg;
 use crate::tri;
 
 pub fn private_call_error(recv: V, mid: u32, args: &[V], blk: V) -> V {
+    vis_call_error(recv, mid, args, blk, "private")
+}
+pub fn protected_call_error(recv: V, mid: u32, args: &[V], blk: V) -> V {
+    vis_call_error(recv, mid, args, blk, "protected")
+}
+thread_local! {
+    /// Why method_missing was called ("private"/"protected" for a visibility violation), for
+    /// the default method_missing's message (CRuby's method_missing_reason).
+    pub static MM_REASON: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+fn vis_call_error(recv: V, mid: u32, args: &[V], blk: V, what: &'static str) -> V {
     // like CRuby, method_missing gets a chance first
     let mm = find_method(class_of(recv), sym("method_missing"));
     if !mm.is_null() && !matches!(unsafe { &(*mm).body }, Body::Native(..)) {
         let mut a = vec![mksym(mid)];
         a.extend_from_slice(args);
-        return invoke(mm, recv, &a, blk);
+        MM_REASON.with(|r| r.set(what));
+        let r = invoke(mm, recv, &a, blk);
+        MM_REASON.with(|r| r.set(""));
+        return r;
     }
-    let e = exc_new(
-        rt().c.no_method_error,
-        &format!("private method '{}' called for {}", sym_str(mid), describe(recv)),
-    );
+    vis_error(recv, mid, what)
+}
+pub fn vis_error(recv: V, mid: u32, what: &str) -> V {
+    let e = exc_new(rt().c.no_method_error, &format!("{what} method '{}' called for {}", sym_str(mid), describe(recv)));
     ivar_set(e, sym("@name"), mksym(mid));
+    ivar_set(e, sym("@receiver"), recv);
     raise_exc(e)
+}
+
+/// Whether the running code may call protected method `m` on a receiver: CRuby's rule is
+/// `self.kind_of?(m's owner)`. Compiled call sites don't pass their self, so the caller is
+/// told by its frame's label ("A#foo", "block in A#foo", "<class:A>", "<main>"): the call is
+/// refused only when that caller's self can't be a kind of the owner.
+pub fn protected_ok(m: *const Method) -> bool {
+    let owner = unsafe { (*m).owner };
+    let Some(label) = crate::backtrace::caller_label() else { return true };
+    let mut l = label.as_str();
+    if let Some(i) = l.find(" in ") {
+        if l.starts_with("block") || l.starts_with("rescue") || l.starts_with("ensure") {
+            l = &l[i + 4..];
+        }
+    }
+    let lookup = |name: &str| -> Option<*mut Class> {
+        let mut cur = rt().c.object;
+        for part in name.split("::") {
+            let v = const_get_under(cur, sym(part))?;
+            if !is_class(v) {
+                return None;
+            }
+            cur = v as *mut Class;
+        }
+        Some(cur)
+    };
+    let kind_of = |obj: V| is_a(obj, owner);
+    if l == "<main>" || l == "<top (required)>" {
+        return kind_of(rt().main_obj);
+    }
+    let obj_name = l.strip_prefix("<class:").or_else(|| l.strip_prefix("<module:")).and_then(|x| x.strip_suffix('>'));
+    let (cls, singleton) = if let Some(n) = obj_name {
+        (n, true)
+    } else if let Some(i) = l.rfind('#') {
+        (&l[..i], false)
+    } else if let Some(i) = l.rfind('.') {
+        (&l[..i], true)
+    } else {
+        return true;
+    };
+    let Some(c) = lookup(cls) else { return true };
+    if singleton {
+        return kind_of(c as V);
+    }
+    // an instance of c (or of a subclass of it): refused when c and the owner are unrelated
+    // classes (a module's method can run on anything that includes it)
+    if unsafe { (*c).is_module } {
+        return true;
+    }
+    let anc = ancestors_rc(c);
+    anc.contains(&owner) || ancestors_rc(owner).contains(&c)
 }
 fn describe(v: V) -> String {
     if v == QNIL {
@@ -256,18 +322,26 @@ pub fn init() {
         "catch", "throw", "binding", "block_given?", "caller", "caller_locations", "Integer", "Float", "String",
         "Array", "Hash", "Rational", "Complex", "system", "`", "exec", "fork", "spawn", "open", "eval", "warn",
         "trap", "autoload", "readline", "readlines", "select", "local_variables", "global_variables", "gem",
-        "set_trace_func", "iterator?", "__method__", "__dir__",
+        "set_trace_func", "iterator?", "__method__", "__dir__", "BigDecimal", "__kenny_require_relative",
     ] {
-        let id = sym(name);
-        if let Some(&m) = unsafe { (*k).methods.get(&id) } {
-            unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
-            // `Kernel.format(...)`, `Kernel.raise` etc. stay callable (module_function style)
-            let ks = singleton_class(k as V);
-            if unsafe { !(*ks).methods.contains_key(&id) } {
-                let nm = add_method(ks, id, crate::kernel::clone_body(unsafe { &(*m).body }));
-                unsafe { (*(nm as *mut Method)).vis = VIS_PUBLIC };
-            }
-        }
+        global_function(name);
     }
     bump_serial();
+}
+
+/// Kernel#`name` made a private "global function", callable as `Kernel.name` too (CRuby's
+/// rb_define_global_function). For the ones a library defines when it loads (BigDecimal).
+pub fn global_function(name: &str) {
+    let k = rt().c.kernel;
+    let id = sym(name);
+    if let Some(&m) = unsafe { (*k).methods.get(&id) } {
+        unsafe { (*(m as *mut Method)).vis = VIS_PRIVATE };
+        // `Kernel.format(...)`, `Kernel.raise` etc. stay callable (module_function style)
+        let ks = singleton_class(k as V);
+        if unsafe { !(*ks).methods.contains_key(&id) } {
+            let nm = add_method(ks, id, crate::kernel::clone_body(unsafe { &(*m).body }));
+            unsafe { (*(nm as *mut Method)).vis = VIS_PUBLIC };
+        }
+        bump_serial();
+    }
 }

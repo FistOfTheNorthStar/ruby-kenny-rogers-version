@@ -13,7 +13,7 @@ fn s_of(v: V) -> String {
     String::from_utf8_lossy(&rstr(v).b).into_owned()
 }
 /// A String argument's bytes, converted with `to_str` (Err: the exception raised).
-fn want_str(v: V) -> Result<Vec<u8>, V> {
+pub(crate) fn want_str(v: V) -> Result<Vec<u8>, V> {
     if is_str(v) {
         return Ok(rstr(v).b.clone());
     }
@@ -35,6 +35,37 @@ fn nil_name(v: V) -> String {
 }
 fn chars(v: V) -> Vec<String> {
     s_of(v).chars().map(|c| c.to_string()).collect()
+}
+/// String#chars: one String per character, in v's encoding (a byte each in a binary one)
+fn char_strs(v: V) -> Vec<V> {
+    if is_binary(v) {
+        let b = rstr(v).b.clone();
+        return b.iter().map(|c| crate::transcode::like(str_new(vec![*c]), v)).collect();
+    }
+    let ascii = hdr(v).flags & crate::compat::FL_BINARY == 0 && !same_utf8(v);
+    chars(v).into_iter().map(|c| if ascii { crate::transcode::like(new_str_v(c), v) } else { new_str_v(c) }).collect()
+}
+/// A binary string's bytes as chars for the `&str` code: ASCII as is, bytes >= 0x80 as
+/// private-use characters that no case mapping touches (from_bytewise turns them back).
+fn bytewise(b: &[u8]) -> String {
+    b.iter().map(|&c| if c < 0x80 { c as char } else { char::from_u32(0xF700 + c as u32).unwrap() }).collect()
+}
+fn from_bytewise(s: &str) -> Vec<u8> {
+    s.chars()
+        .flat_map(|c| {
+            let u = c as u32;
+            if (0xF780..=0xF7FF).contains(&u) {
+                vec![(u - 0xF700) as u8]
+            } else {
+                let mut buf = [0u8; 4];
+                c.encode_utf8(&mut buf).as_bytes().to_vec()
+            }
+        })
+        .collect()
+}
+/// Whether String v is plain UTF-8 (no other encoding to carry over to pieces of it).
+fn same_utf8(v: V) -> bool {
+    hdr(v).flags & (crate::compat::FL_BINARY | (crate::compat::FL_BINARY << 1)) == 0
 }
 /// Characters in UTF-8 bytes (invalid bytes count one each, as `from_utf8_lossy` gives).
 fn char_count(b: &[u8]) -> usize {
@@ -155,8 +186,7 @@ fn substr(s: V, start: i64, len: i64) -> V {
     let bytes = &rstr(s).b;
     if is_binary(s) {
         let r = str_new(bytes[start as usize..end as usize].to_vec());
-        hdr(r).flags |= crate::compat::FL_BINARY;
-        return r;
+        return crate::transcode::like(r, s);
     }
     if ascii_only(s) {
         return str_new(bytes[start as usize..end as usize].to_vec());
@@ -297,8 +327,12 @@ fn split(s: V, sep: V, limit: i64) -> V {
             rest = strip_l(&rest[end..]);
         }
     } else if is_str(sep) && rstr(sep).b.is_empty() {
-        for c in s_of(s).chars() {
-            parts.push(c.to_string().into_bytes());
+        if is_binary(s) {
+            parts.extend(bytes.iter().map(|c| vec![*c]));
+        } else {
+            for c in s_of(s).chars() {
+                parts.push(c.to_string().into_bytes());
+            }
         }
     } else if is_str(sep) {
         let sp: &[u8] = &rstr(sep).b;
@@ -319,7 +353,8 @@ fn split(s: V, sep: V, limit: i64) -> V {
             parts.pop();
         }
     }
-    ary_new(parts.into_iter().map(str_new).collect())
+    // (the pieces keep s's encoding)
+    ary_new(parts.into_iter().map(|p| crate::transcode::like(str_new(p), s)).collect())
 }
 
 fn tr_expand(set: &str) -> (bool, Vec<char>) {
@@ -532,7 +567,7 @@ pub fn init() {
             b(s).set(rstr(x).b.clone());
             copy_enc(s, x);
         }
-        QNIL
+        s
     });
     /// `String.new(str)` keeps str's encoding
     fn copy_enc(dst: V, src: V) {
@@ -554,8 +589,8 @@ pub fn init() {
     defn(c, "inspect", 0, 0, |s, _, _| new_str_v(str_inspect_v(s)));
     defn(c, "dump", 0, 0, |s, _, _| new_str_v(str_inspect(&rstr(s).b)));
     defn(c, "hash", 0, 0, |s, _, _| mkfix((hash_self(s) >> 2) as i64));
-    defn(c, "==", 1, 1, |s, a, _| bool_v(is_str(a[0]) && rstr(s).b == rstr(a[0]).b));
-    defn(c, "===", 1, 1, |s, a, _| bool_v(is_str(a[0]) && rstr(s).b == rstr(a[0]).b));
+    defn(c, "==", 1, 1, |s, a, _| str_equal(s, a[0]));
+    defn(c, "===", 1, 1, |s, a, _| str_equal(s, a[0]));
     defn(c, "eql?", 1, 1, |s, a, _| bool_v(is_str(a[0]) && rstr(s).b == rstr(a[0]).b));
     defn(c, "<=>", 1, 1, |s, a, _| str_cmp(s, a[0]));
     defn(c, "=~", 1, 1, |s, a, _| {
@@ -603,7 +638,11 @@ pub fn init() {
         if !is_fix(a[0]) || fix(a[0]) < 0 {
             return arg_error("negative argument");
         }
-        str_new(rstr(s).b.repeat(fix(a[0]) as usize))
+        let r = str_new(rstr(s).b.repeat(fix(a[0]) as usize));
+        if !same_utf8(s) {
+            crate::transcode::like(r, s);
+        }
+        r
     });
     defn(c, "%", 1, 1, |s, a, _| {
         let args = if is_ary(a[0]) { rary(a[0]).v.clone() } else { vec![a[0]] };
@@ -739,10 +778,30 @@ pub fn init() {
         hdr(n).flags |= FL_FROZEN;
         n
     });
+    // (a binary or Windows-1252 ... string: byte by byte, its bytes >= 0x80 left as they are)
     macro_rules! map_str {
         ($name:expr, $bang:expr, $f:expr) => {
-            defn(c, $name, 0, 1, |s, _, _| new_str_v($f(&s_of(s))));
+            defn(c, $name, 0, 1, |s, _, _| {
+                if is_binary(s) {
+                    let r = str_new(from_bytewise(&$f(&bytewise(&rstr(s).b))));
+                    return crate::transcode::like(r, s);
+                }
+                new_str_v($f(&s_of(s)))
+            });
             defn(c, $bang, 0, 1, |s, _, _| {
+                if is_binary(s) {
+                    let n = from_bytewise(&$f(&bytewise(&rstr(s).b)));
+                    if n == rstr(s).b.as_slice() {
+                        return QNIL;
+                    }
+                    return match mutate(s) {
+                        Ok(bs) => {
+                            bs.set(n);
+                            s
+                        }
+                        Err(e) => e,
+                    };
+                }
                 let n: String = $f(&s_of(s));
                 if n.as_bytes() == rstr(s).b.as_slice() {
                     return QNIL;
@@ -800,11 +859,29 @@ pub fn init() {
         }
         Ok(cs[i..j].iter().collect())
     }
+    // a binary or Windows-1252 ... string stripped byte by byte, keeping its encoding
+    fn strip_bin(s: V, left: bool, right: bool) -> V {
+        let b = &rstr(s).b;
+        let mut lo = 0;
+        let mut hi = b.len();
+        if left {
+            while lo < hi && matches!(b[lo], b' ' | b'\t'..=b'\r') {
+                lo += 1;
+            }
+        }
+        if right {
+            while hi > lo && matches!(b[hi - 1], 0 | b' ' | b'\t'..=b'\r') {
+                hi -= 1;
+            }
+        }
+        let r = str_new(b[lo..hi].to_vec());
+        crate::transcode::like(r, s)
+    }
     for (name, bang, left, right) in [("strip", "strip!", true, true), ("lstrip", "lstrip!", true, false), ("rstrip", "rstrip!", false, true)] {
         let f: NativeFn = match (left, right) {
-            (true, true) => |s, a, _| match stripped(s, a, true, true) { Ok(n) => new_str_v(n), Err(e) => e },
-            (true, false) => |s, a, _| match stripped(s, a, true, false) { Ok(n) => new_str_v(n), Err(e) => e },
-            _ => |s, a, _| match stripped(s, a, false, true) { Ok(n) => new_str_v(n), Err(e) => e },
+            (true, true) => |s, a, _| if is_binary(s) && a.is_empty() { strip_bin(s, true, true) } else { match stripped(s, a, true, true) { Ok(n) => new_str_v(n), Err(e) => e } },
+            (true, false) => |s, a, _| if is_binary(s) && a.is_empty() { strip_bin(s, true, false) } else { match stripped(s, a, true, false) { Ok(n) => new_str_v(n), Err(e) => e } },
+            _ => |s, a, _| if is_binary(s) && a.is_empty() { strip_bin(s, false, true) } else { match stripped(s, a, false, true) { Ok(n) => new_str_v(n), Err(e) => e } },
         };
         defn(c, name, 0, -1, f);
         let fb: NativeFn = match (left, right) {
@@ -919,7 +996,7 @@ pub fn init() {
     defn(c, "start_with?", 0, -1, |s, a, _| {
         for &p in a {
             if crate::regex::is_regexp(p) {
-                let m = crate::regex::do_match(p, s, 0, true);
+                let m = tri!(crate::regex::do_match(p, s, 0, true));
                 if m != QNIL && fix(tri!(send1(m, "begin", mkfix(0)))) == 0 {
                     return QTRUE;
                 }
@@ -1152,7 +1229,7 @@ pub fn init() {
             Err(e) => e,
         }
     });
-    defn(c, "chars", 0, 0, |s, _, _| ary_new(chars(s).into_iter().map(new_str_v).collect()));
+    defn(c, "chars", 0, 0, |s, _, _| ary_new(char_strs(s)));
     defn(c, "bytes", 0, 0, |s, _, _| ary_new(rstr(s).b.iter().map(|x| mkfix(*x as i64)).collect()));
     defn(c, "getbyte", 1, 1, |s, a, _| {
         let i = if is_fix(a[0]) {
@@ -1188,7 +1265,7 @@ pub fn init() {
         let mut out = Vec::new();
         let Some(sep) = sep else {
             if !x.is_empty() {
-                out.push(str_new(x));
+                out.push(crate::transcode::like(str_new(x), s));
             }
             return Ok(out);
         };
@@ -1228,6 +1305,12 @@ pub fn init() {
         if start < x.len() {
             out.push(str_new(x[start..].to_vec()));
         }
+        // (the lines keep s's encoding)
+        if !same_utf8(s) {
+            for v in &out {
+                crate::transcode::like(*v, s);
+            }
+        }
         Ok(out)
     }
     defn(c, "lines", 0, 2, |s, a, blk| {
@@ -1261,8 +1344,8 @@ pub fn init() {
         if !is_proc(blk) {
             return crate::misc::enum_for(s, "each_char", &[]);
         }
-        for ch in chars(s) {
-            tri!(call_block(blk, &[new_str_v(ch)]));
+        for ch in crate::gc::Rooted::of(char_strs(s)) {
+            tri!(call_block(blk, &[ch]));
         }
         s
     });
@@ -1447,6 +1530,11 @@ pub fn init() {
     defn(c, "rjust", 1, 2, |s, a, _| pad(s, a, b'r'));
     defn(c, "center", 1, 2, |s, a, _| pad(s, a, b'c'));
     defn(c, "tr", 2, 2, |s, a, _| match (want_str(a[0]), want_str(a[1])) {
+        // (a binary or Windows-1252 ... string byte by byte: map_str!)
+        (Ok(f), Ok(t)) if is_binary(s) => {
+            let (f, t) = (bytewise(&f), bytewise(&t));
+            crate::transcode::like(str_new(from_bytewise(&tr(&bytewise(&rstr(s).b), &f, &t))), s)
+        }
         (Ok(f), Ok(t)) => new_str_v(tr(&s_of(s), &String::from_utf8_lossy(&f), &String::from_utf8_lossy(&t))),
         (Err(e), _) | (_, Err(e)) => e,
     });
@@ -1529,18 +1617,67 @@ pub fn init() {
     });
     defn(c, "succ", 0, 0, |s, _, _| str_new(succ(&rstr(s).b)));
     defn(c, "next", 0, 0, |s, _, _| str_new(succ(&rstr(s).b)));
+    // String#upto(end, exclusive = false), as CRuby's rb_str_upto_each: single ASCII
+    // characters by code, digit strings as numbers (zero-padded to the start's width), the
+    // rest by succ until end (or a longer string)
     defn(c, "upto", 1, 2, |s, a, blk| {
-        let end = rstr(a[0]).b.clone();
-        let mut cur = rstr(s).b.clone();
-        loop {
-            if cur.len() > end.len() {
+        if !is_proc(blk) {
+            return crate::misc::enum_for(s, "upto", a);
+        }
+        let end_v = match want_str(a[0]) {
+            Ok(_) if is_str(a[0]) => a[0],
+            Ok(b) => str_new(b),
+            Err(e) => return e,
+        };
+        let excl = a.get(1).is_some_and(|v| truthy(*v));
+        let enc = crate::transcode::enc_of(s);
+        let beg = rstr(s).b.clone();
+        let end = rstr(end_v).b.clone();
+        let out = |b: Vec<u8>| {
+            let v = str_new(b);
+            crate::transcode::set_enc(v, enc);
+            v
+        };
+        if beg.len() == 1 && end.len() == 1 && beg[0].is_ascii() && end[0].is_ascii() {
+            let (b, e) = (beg[0], end[0]);
+            if b > e || (excl && b == e) {
+                return s;
+            }
+            let last = if excl { e - 1 } else { e };
+            for ch in b..=last {
+                tri!(call_block(blk, &[out(vec![ch])]));
+            }
+            return s;
+        }
+        let digits = |x: &[u8]| !x.is_empty() && x.iter().all(|c| c.is_ascii_digit());
+        if digits(&beg) && digits(&end) {
+            let (Ok(b), Ok(e)) = (String::from_utf8_lossy(&beg).parse::<i128>(), String::from_utf8_lossy(&end).parse::<i128>()) else {
+                return s;
+            };
+            let width = beg.len();
+            let mut i = b;
+            while if excl { i < e } else { i <= e } {
+                tri!(call_block(blk, &[out(format!("{i:0width$}").into_bytes())]));
+                i += 1;
+            }
+            return s;
+        }
+        if beg > end || (excl && beg == end) {
+            return s;
+        }
+        let after_end = succ(&end);
+        let mut cur = beg;
+        while cur != after_end {
+            let next = if excl || cur != end { Some(succ(&cur)) } else { None };
+            tri!(call_block(blk, &[out(cur.clone())]));
+            let Some(n) = next else { break };
+            cur = n;
+            if excl && cur == end {
                 break;
             }
-            tri!(call_block(blk, &[str_new(cur.clone())]));
-            if cur == end {
+            if cur.len() > end.len() || cur.is_empty() {
                 break;
             }
-            cur = succ(&cur);
         }
         s
     });
@@ -1628,4 +1765,16 @@ pub fn init() {
     defn(y, "match?", 1, 2, |s, a, _| send(str_from(&sym_str(sym_id(s))), sym("match?"), a, QNIL));
     defn(y, "empty?", 0, 0, |s, _, _| bool_v(sym_name(sym_id(s)).is_empty()));
     let _ = sym_arg;
+}
+
+/// String#== (and ===): a non-String with to_str is asked `other == self`, as in CRuby.
+pub fn str_equal(s: V, o: V) -> V {
+    if is_str(o) {
+        return bool_v(rstr(s).b == rstr(o).b);
+    }
+    if is_heap(o) && !is_sym(o) && respond_to(o, sym("to_str")) {
+        let r = send(o, sym("=="), &[s], QNIL);
+        return if r == UNDEF { UNDEF } else { bool_v(truthy(r)) };
+    }
+    QFALSE
 }

@@ -197,6 +197,24 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn call_node(&mut self, fx: &mut Fx, c: &CallNode) -> Value {
+        // `Module.nesting`: the lexical scopes, innermost first (the cref slots of the
+        // enclosing class bodies, without the top level's)
+        if c.name().as_slice() == b"nesting"
+            && c.arguments().is_none()
+            && c.block().is_none()
+            && c.receiver().is_some_and(|r| r.as_constant_read_node().is_some_and(|k| k.name().as_slice() == b"Module"))
+        {
+            let mut vals = Vec::new();
+            let mut slot = fx.cref_slot;
+            while let Some(&parent) = self.cref_parents.get(&slot) {
+                let p = self.slot_ptr(fx, slot);
+                vals.push(fx.b.ins().load(I64, mem(), p, 0));
+                slot = parent;
+            }
+            let n = self.iconst(fx, vals.len() as i64);
+            let buf = self.args_buf(fx, &vals);
+            return self.call(fx, "kn_ary_new", &[n, buf]);
+        }
         // `refine X do ... end`: inside the block the module's refinements are active (CRuby
         // activates them in refine blocks), so its calls are refined call sites
         if c.receiver().is_none()
@@ -239,6 +257,13 @@ impl<M: Module> Compiler<M> {
                 }
             }
         }
+        // `%w[date time].each { |f| require f }` (or `require "x/#{f}"`): the files it names are
+        // compiled in, so the runtime `require` finds them (the code itself is unchanged)
+        if matches!(name.as_slice(), b"each" | b"each_with_index") && arg_nodes.is_empty() {
+            if let (Some(r), Some(b)) = (recv_node.as_ref(), block.as_ref().and_then(|b| b.as_block_node())) {
+                self.require_each_files(r, &b, at);
+            }
+        }
         // `define_method(:name) { |a| ... }` as a `def` (statics.rs `block_def`)
         if name == b"define_method" && !fx.no_block_def {
             self.cur_offset = at_loc;
@@ -255,11 +280,15 @@ impl<M: Module> Compiler<M> {
 
         // `Kernel.block_given?` / `::Kernel.block_given?` (BasicObject subclasses such as
         // Jbuilder write it so): like the bare call, it asks about the current method's block
-        if matches!(name.as_slice(), b"block_given?" | b"iterator?") && arg_nodes.is_empty() && block.is_none() {
+        // (`Kernel.__method__` / `__callee__` too: sorbet-runtime)
+        if matches!(name.as_slice(), b"block_given?" | b"iterator?" | b"__method__" | b"__callee__") && arg_nodes.is_empty() && block.is_none() {
             let kernel_recv = recv_node.as_ref().is_some_and(|r| {
                 r.as_constant_read_node().is_some_and(|k| k.name().as_slice() == b"Kernel")
                     || r.as_constant_path_node().is_some_and(|k| k.parent().is_none() && k.name().is_some_and(|n| n.as_slice() == b"Kernel"))
             });
+            if kernel_recv && matches!(name.as_slice(), b"__method__" | b"__callee__") {
+                return self.method_name_val(fx, name.as_slice() == b"__callee__");
+            }
             if kernel_recv {
                 let b = self.method_block(fx);
                 let c = fx.b.ins().icmp_imm_s(IntCC::NotEqual, b, QNIL);
@@ -283,10 +312,7 @@ impl<M: Module> Compiler<M> {
                 // `__callee__` (the alias a method was called by) as `__method__`: Rails uses
                 // it to name the method in an error message
                 b"__method__" | b"__callee__" if arg_nodes.is_empty() => {
-                    return match fx.method.clone() {
-                        Some(m) => self.sym_val(fx, &m.name),
-                        None => self.nil(fx),
-                    };
+                    return self.method_name_val(fx, name.as_slice() == b"__callee__");
                 }
                 b"__dir__" if arg_nodes.is_empty() => {
                     let abs = self.file.canonicalize().unwrap_or(self.file.clone());
@@ -549,6 +575,11 @@ impl<M: Module> Compiler<M> {
                 let l = self.locals_snapshot(fx);
                 let src = args.vals[0];
                 self.call(fx, "kn_eval_locals", &[l, src]);
+                // a string class_eval'd on an anonymous module sees the caller's constants
+                if matches!(name.as_slice(), b"class_eval" | b"module_eval") {
+                    let cref = self.cref(fx);
+                    self.call(fx, "kn_eval_scope", &[recv, cref]);
+                }
             }
             let forwards = arg_nodes.iter().any(|n| n.as_forwarding_arguments_node().is_some());
             let no_block = block.is_none() && !forwards;
@@ -718,6 +749,70 @@ impl<M: Module> Compiler<M> {
             r
         });
         Some(r)
+    }
+
+    /// The files `["a", "b"].each { |f| require f }` requires (see call_node_inner).
+    fn require_each_files(&mut self, recv: &Node, block: &BlockNode, at: usize) {
+        let Some(arr) = recv.as_array_node() else { return };
+        let names: Vec<Vec<u8>> = arr.elements().iter().filter_map(|e| e.as_string_node().map(|s| s.unescaped().to_vec())).collect();
+        if names.is_empty() || names.len() != arr.elements().iter().count() {
+            return;
+        }
+        // the block's first parameter
+        let Some(param) = block
+            .parameters()
+            .and_then(|p| p.as_block_parameters_node())
+            .and_then(|p| p.parameters())
+            .and_then(|p| p.requireds().iter().next())
+            .and_then(|r| r.as_required_parameter_node().map(|r| r.name().as_slice().to_vec()))
+        else {
+            return;
+        };
+        let Some(body) = block.body().and_then(|b| b.as_statements_node()) else { return };
+        // the require's argument as a template: literal parts and the parameter (None)
+        let mut template: Option<Vec<Option<Vec<u8>>>> = None;
+        for st in body.body().iter() {
+            let Some(call) = st.as_call_node() else { continue };
+            if call.receiver().is_some() || call.name().as_slice() != b"require" {
+                continue;
+            }
+            let Some(arg) = call.arguments().and_then(|a| a.arguments().iter().next()) else { continue };
+            let is_param = |n: &Node| n.as_local_variable_read_node().is_some_and(|l| l.depth() == 0 && l.name().as_slice() == param.as_slice());
+            if is_param(&arg) {
+                template = Some(vec![None]);
+            } else if let Some(i) = arg.as_interpolated_string_node() {
+                let mut t = Vec::new();
+                for part in i.parts().iter() {
+                    if let Some(s) = part.as_string_node() {
+                        t.push(Some(s.unescaped().to_vec()));
+                    } else if let Some(e) = part.as_embedded_statements_node() {
+                        let one = e.statements().map(|s| s.body().iter().collect::<Vec<_>>()).unwrap_or_default();
+                        if one.len() == 1 && is_param(&one[0]) {
+                            t.push(None);
+                        } else {
+                            t.clear();
+                            break;
+                        }
+                    }
+                }
+                if !t.is_empty() {
+                    template = Some(t);
+                }
+            }
+            break;
+        }
+        let Some(t) = template else { return };
+        for n in names {
+            let feature: Vec<u8> = t.iter().flat_map(|p| p.clone().unwrap_or_else(|| n.clone())).collect();
+            let feature = String::from_utf8_lossy(&feature).into_owned();
+            if feature.ends_with(".so") || feature.ends_with(".bundle") {
+                continue;
+            }
+            let found = self.load_paths.iter().map(|d| d.join(format!("{feature}.rb"))).find(|p| p.is_file());
+            if let Some(p) = found {
+                self.require_file(p, at);
+            }
+        }
     }
 
     fn require_relative(&mut self, fx: &mut Fx, arg: &Node, at: usize) -> Value {

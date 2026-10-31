@@ -348,6 +348,8 @@ pub struct IoState {
     pub mem: Option<&'static crate::vfs::Entry>,
     /// read position in `mem`
     pub mpos: usize,
+    /// the external encoding a UTF-16/32 byte order mark gave ("rb:bom|utf-8")
+    pub bom_enc: Option<crate::transcode::Enc>,
     /// Several threads may use one IO (Action Cable writes to a socket from its worker
     /// threads while its event loop reads): the buffers change under these flags, so a race
     /// mixes up data at worst and never touches freed memory.
@@ -507,6 +509,7 @@ impl IoState {
             stdio_copy: false,
             mem: None,
             mpos: 0,
+            bom_enc: None,
             wbusy: std::sync::atomic::AtomicBool::new(false),
             rbusy: std::sync::atomic::AtomicBool::new(false),
         })
@@ -1002,10 +1005,12 @@ struct Mode {
     r: bool,
     w: bool,
     bin: bool,
+    /// a "bom|..." external encoding: a byte order mark at the start is read off
+    bom: bool,
 }
 fn mode_from_flags(f: i32) -> Mode {
     let acc = f & libc::O_ACCMODE;
-    Mode { flags: f, r: acc != libc::O_WRONLY, w: acc != libc::O_RDONLY, bin: false }
+    Mode { flags: f, r: acc != libc::O_WRONLY, w: acc != libc::O_RDONLY, bin: false, bom: false }
 }
 fn parse_mode_str(s: &[u8]) -> Result<Mode, V> {
     let main = s.split(|c| *c == b':').next().unwrap_or(b"");
@@ -1031,15 +1036,26 @@ fn parse_mode_str(s: &[u8]) -> Result<Mode, V> {
             _ => return Err(bad()),
         }
     }
-    Ok(Mode { flags, r, w, bin })
+    Ok(Mode { flags, r, w, bin, bom: false })
 }
 fn parse_mode(m: Option<V>, kw: Option<V>, default: &[u8]) -> Result<Mode, V> {
     let m = m.filter(|x| *x != QNIL).or_else(|| kw_get(kw, "mode").filter(|x| *x != QNIL));
+    let mut enc: Option<Vec<u8>> = None;
     let mut mode = match m {
         None => parse_mode_str(default)?,
         Some(x) if is_fix(x) => mode_from_flags(fix(x) as i32),
-        Some(x) => parse_mode_str(&str_bytes(x)?)?,
+        Some(x) => {
+            let b = str_bytes(x)?;
+            enc = b.iter().position(|c| *c == b':').map(|i| b[i + 1..].to_vec());
+            parse_mode_str(&b)?
+        }
     };
+    for k in ["encoding", "external_encoding"] {
+        if let Some(e) = kw_get(kw, k).filter(|x| is_str(*x)) {
+            enc = Some(rstr(e).b.to_vec());
+        }
+    }
+    mode.bom = enc.is_some_and(|e| e.len() > 4 && e[..4].eq_ignore_ascii_case(b"bom|"));
     if let Some(f) = kw_get(kw, "flags").filter(|x| is_fix(*x)) {
         mode = Mode { flags: mode.flags | fix(f) as i32, ..mode };
     }
@@ -1093,6 +1109,9 @@ fn open_state(path: &[u8], mode: &Mode, perm: u32) -> Result<Box<IoState>, V> {
             st.mem = Some(e);
             st.path = Some(path.to_vec());
             st.binmode = mode.bin;
+            if mode.bom {
+                read_bom(&mut st)?;
+            }
             return Ok(st);
         }
     }
@@ -1100,7 +1119,45 @@ fn open_state(path: &[u8], mode: &Mode, perm: u32) -> Result<Box<IoState>, V> {
     let mut st = IoState::new(fd, mode.r, mode.w);
     st.path = Some(path.to_vec());
     st.binmode = mode.bin;
+    if mode.bom && mode.r {
+        if let Err(e) = read_bom(&mut st) {
+            st.close_fds();
+            return Err(e);
+        }
+    }
     Ok(st)
+}
+/// "bom|utf-8": read a byte order mark off the start of the file. A UTF-8 one is dropped;
+/// a UTF-16/32 one sets the external encoding, which (ASCII-incompatible) needs binmode,
+/// as in CRuby.
+fn read_bom(st: &mut IoState) -> Result<(), V> {
+    while st.avail() < 4 {
+        if st.fill_more()? == 0 {
+            break;
+        }
+    }
+    let b = &st.rbuf[st.rpos..];
+    let (n, name) = if b.starts_with(b"\xEF\xBB\xBF") {
+        (3, "UTF-8")
+    } else if b.starts_with(b"\xFF\xFE\0\0") {
+        (4, "UTF-32LE")
+    } else if b.starts_with(b"\0\0\xFE\xFF") {
+        (4, "UTF-32BE")
+    } else if b.starts_with(b"\xFF\xFE") {
+        (2, "UTF-16LE")
+    } else if b.starts_with(b"\xFE\xFF") {
+        (2, "UTF-16BE")
+    } else {
+        return Ok(());
+    };
+    if name != "UTF-8" {
+        if !st.binmode {
+            return Err(arg_error("ASCII incompatible encoding needs binmode"));
+        }
+        st.bom_enc = crate::transcode::lookup(name);
+    }
+    st.rpos += n;
+    Ok(())
 }
 fn with_file<T>(path: &[u8], mode: &Mode, perm: u32, f: impl FnOnce(&mut IoState) -> Result<T, V>) -> Result<T, V> {
     let mut st = open_state(path, mode, perm)?;
@@ -1735,6 +1792,8 @@ struct Globber<'a> {
     flags: i64,
     sort: bool,
     out: Vec<Vec<u8>>,
+    /// the directory `run` is about to list was reached through a `**` (no "." entry then)
+    descended: bool,
 }
 impl Globber<'_> {
     fn fs(&self, path: &[u8]) -> Vec<u8> {
@@ -1784,6 +1843,7 @@ impl Globber<'_> {
         })
     }
     fn run(&mut self, path: &[u8], pats: &[&[Seg]]) {
+        let descended = std::mem::take(&mut self.descended);
         let mut rest: Vec<&[Seg]> = Vec::new();
         let (mut match_all, mut match_dir) = (false, false);
         for p in pats {
@@ -1842,8 +1902,10 @@ impl Globber<'_> {
                 .collect()
         };
         let dotmatch = self.flags & FNM_DOTMATCH != 0;
-        if dotmatch && path.is_empty() {
-            ents.push((b".".to_vec(), false)); // Ruby 3.1+: "." (never "..") with FNM_DOTMATCH
+        // Ruby 3.1+: "." (never "..") with FNM_DOTMATCH, in a directory the pattern names (not
+        // in those a `**` walks into: "s/*" gives "s/.", "**/*" no "s/.")
+        if dotmatch && !descended {
+            ents.push((b".".to_vec(), false));
         }
         if self.sort {
             ents.sort();
@@ -1852,11 +1914,13 @@ impl Globber<'_> {
         for (name, isdir) in ents {
             let hidden = name.starts_with(b".");
             let mut next: Vec<&[Seg]> = Vec::new();
+            let mut via_rec = false;
             for p in &rest {
                 let mut p: &[Seg] = p;
                 if matches!(p[0], Seg::Rec) {
                     if isdir && (!hidden || dotmatch) {
                         next.push(p);
+                        via_rec = true;
                     }
                     p = &p[1..];
                 }
@@ -1868,13 +1932,14 @@ impl Globber<'_> {
             }
             if !next.is_empty() {
                 let np = Self::join(path, &name);
+                self.descended = via_rec;
                 self.run(&np, &next);
             }
         }
     }
 }
 fn glob(patterns: &[Vec<u8>], flags: i64, base: Option<&[u8]>, sort: bool) -> Vec<Vec<u8>> {
-    let mut g = Globber { base, flags, sort, out: Vec::new() };
+    let mut g = Globber { base, flags, sort, out: Vec::new(), descended: false };
     for pat in patterns {
         for p in brace_expand(pat, flags & FNM_NOESCAPE == 0) {
             let (root, segs) = split_glob(&p, flags);
@@ -2638,6 +2703,10 @@ pub fn init() {
     const_set(io, sym("SEEK_SET"), mkfix(libc::SEEK_SET as i64));
     const_set(io, sym("SEEK_CUR"), mkfix(libc::SEEK_CUR as i64));
     const_set(io, sym("SEEK_END"), mkfix(libc::SEEK_END as i64));
+    // IO#wait's events
+    const_set(io, sym("READABLE"), mkfix(1));
+    const_set(io, sym("PRIORITY"), mkfix(2));
+    const_set(io, sym("WRITABLE"), mkfix(4));
     for name in ["WaitReadable", "WaitWritable"] {
         let m = new_module(&format!("IO::{name}"));
         const_set(io, sym(name), m as V);
@@ -2864,6 +2933,11 @@ pub fn init() {
             }
             return buf;
         }
+        if let Some(e) = stt.bom_enc.filter(|_| a.first().is_none_or(|n| *n == QNIL)) {
+            let v = sv(r);
+            crate::transcode::set_enc(v, e);
+            return v;
+        }
         if binary { bin_v(r) } else { sv(r) }
     });
     fn readpartial(s: V, a: &[V], nonblock: bool) -> V {
@@ -3052,6 +3126,9 @@ pub fn init() {
     defn(io, "set_encoding", 0, -1, |s, _, _| s);
     defn(io, "set_encoding_by_bom", 0, 0, |_, _, _| QNIL);
     defn(io, "external_encoding", 0, 0, |s, _, _| {
+        if let Some(e) = ok!(st(s)).bom_enc {
+            return crate::transcode::encoding_obj(e);
+        }
         let enc = const_lookup(rt().c.object, sym("Encoding")).unwrap() as *mut Class;
         let name = if ok!(st(s)).binmode { "BINARY" } else { "UTF_8" };
         const_get_under(enc, sym(name)).unwrap_or(QNIL)
@@ -3082,6 +3159,106 @@ pub fn init() {
             Err(e) => e,
         }
     }
+    // the events (IO::READABLE | IO::PRIORITY | IO::WRITABLE) of `events` the IO is ready for
+    // within the timeout (nil: no limit); 0 when none
+    fn wait_events(s: V, events: i64, timeout: V) -> Result<i64, V> {
+        let stt = st(s)?;
+        stt.check_open()?;
+        // (buffered input is readable now)
+        if events & 1 != 0 && (stt.avail() > 0 || stt.mem.is_some()) {
+            return Ok(1);
+        }
+        let timeout = match Some(timeout).filter(|t| *t != QNIL) {
+            Some(t) => match num_to_f(t) {
+                Some(f) => Some(time_interval(f)?),
+                None => return Err(type_error(&format!("can't convert {} into time interval", class_desc(t)))),
+            },
+            None => None,
+        };
+        let (rfd, wfd) = if stt.std != 0 { (stt.std as i32, stt.std as i32) } else { (stt.fd, stt.wfd) };
+        let rev = (if events & 1 != 0 { libc::POLLIN } else { 0 }) | (if events & 2 != 0 { libc::POLLPRI } else { 0 });
+        let wev = if events & 4 != 0 { libc::POLLOUT } else { 0 };
+        let mut p = Vec::new();
+        if rfd == wfd || wfd < 0 {
+            p.push(libc::pollfd { fd: rfd, events: rev | wev, revents: 0 });
+        } else {
+            if rev != 0 {
+                p.push(libc::pollfd { fd: rfd, events: rev, revents: 0 });
+            }
+            if wev != 0 {
+                p.push(libc::pollfd { fd: wfd, events: wev, revents: 0 });
+            }
+        }
+        let n = poll_wait(&mut p, timeout)?;
+        if n <= 0 {
+            return Ok(0);
+        }
+        let mut ready = 0;
+        for x in &p {
+            let err = x.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+            if events & 1 != 0 && (x.revents & libc::POLLIN != 0 || (err && x.events & libc::POLLIN != 0)) {
+                ready |= 1;
+            }
+            if events & 2 != 0 && x.revents & libc::POLLPRI != 0 && priority_data(x.fd) {
+                ready |= 2;
+            }
+            if events & 4 != 0 && (x.revents & libc::POLLOUT != 0 || (err && x.events & libc::POLLOUT != 0)) {
+                ready |= 4;
+            }
+        }
+        Ok(ready)
+    }
+    // whether fd has exceptional (out-of-band) data: macOS's poll gives POLLPRI with plain
+    // data too, so it's asked of select, as CRuby (which waits with select there) does
+    fn priority_data(fd: i32) -> bool {
+        if !cfg!(target_os = "macos") || !(0..libc::FD_SETSIZE as i32).contains(&fd) {
+            return true;
+        }
+        unsafe {
+            let mut ex: libc::fd_set = std::mem::zeroed();
+            libc::FD_ZERO(&mut ex);
+            libc::FD_SET(fd, &mut ex);
+            let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+            libc::select(fd + 1, std::ptr::null_mut(), std::ptr::null_mut(), &mut ex, &mut tv) > 0
+        }
+    }
+    // IO#wait(events, timeout): the ready events, or nil on timeout; IO#wait(timeout = nil,
+    // mode = :read) (the older form, mode :read, :write or :read_write): self or nil
+    defn(io, "wait", 0, -1, |s, a, _| {
+        let legacy = a.len() != 2 || a.iter().any(|v| is_sym(*v));
+        if !legacy {
+            let ev = ok!(int_arg(a[0]));
+            return match wait_events(s, ev, a[1]) {
+                Ok(0) => QNIL,
+                Ok(r) => mkfix(r),
+                Err(e) => e,
+            };
+        }
+        let mut events = 0;
+        let mut timeout = QNIL;
+        for &v in a {
+            if is_sym(v) {
+                events |= match sym_str(sym_id(v)).as_str() {
+                    "r" | "read" | "readable" => 1,
+                    "w" | "write" | "writable" => 4,
+                    "rw" | "read_write" | "readable_writable" => 5,
+                    m => return arg_error(&format!("unsupported mode: {m}")),
+                };
+            } else {
+                timeout = v;
+            }
+        }
+        match wait_events(s, if events == 0 { 1 } else { events }, timeout) {
+            Ok(0) => QNIL,
+            Ok(_) => s,
+            Err(e) => e,
+        }
+    });
+    defn(io, "wait_priority", 0, 1, |s, a, _| match wait_events(s, 2, a.first().copied().unwrap_or(QNIL)) {
+        Ok(0) => QNIL,
+        Ok(_) => s,
+        Err(e) => e,
+    });
     defn(io, "wait_readable", 0, 1, |s, a, _| wait_ready(s, a, false));
     defn(io, "wait_writable", 0, 1, |s, a, _| wait_ready(s, a, true));
     defn(io, "stat", 0, 0, |s, _, _| {
@@ -3321,7 +3498,7 @@ pub fn init() {
             }
         } else if is_str(src) || respond_to(src, sym("to_path")) {
             let p = ok!(path_bytes(src));
-            let m = Mode { flags: libc::O_RDONLY, r: true, w: false, bin: true };
+            let m = Mode { flags: libc::O_RDONLY, r: true, w: false, bin: true, bom: false };
             ok!(with_file(&p, &m, 0, |s| {
                 if let Some(o) = off {
                     s.seek(o, libc::SEEK_SET)?;
@@ -3343,7 +3520,7 @@ pub fn init() {
             ok!(d.write(&data));
         } else if is_str(dst) || respond_to(dst, sym("to_path")) {
             let p = ok!(path_bytes(dst));
-            let m = Mode { flags: libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, r: false, w: true, bin: true };
+            let m = Mode { flags: libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, r: false, w: true, bin: true, bom: false };
             ok!(with_file(&p, &m, 0o666, |s| s.write(&data)));
         } else {
             tri!(send(dst, sym("write"), &[str_new(data.clone())], QNIL));

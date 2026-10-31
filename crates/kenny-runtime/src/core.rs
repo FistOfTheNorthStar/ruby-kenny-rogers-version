@@ -628,6 +628,23 @@ pub fn is_frozen(v: V) -> bool {
 }
 /// Before changing `v`: FrozenError if it is frozen, else nil (and a chilled String stops
 /// being one: `unchill`).
+/// Before defining a method or constant in `c`: FrozenError when it is frozen (a singleton
+/// class: when its object is), else nil.
+pub fn check_frozen_definee(c: *mut Class) -> V {
+    let k = unsafe { &*c };
+    let who = if k.is_singleton && is_heap(k.attached) && hdr(k.attached).flags & FL_FROZEN != 0 {
+        k.attached
+    } else if hdr(c as V).flags & FL_FROZEN != 0 {
+        c as V
+    } else {
+        return QNIL;
+    };
+    let what = if is_class(who) { if rclass(who).is_module { "module" } else { "class" } } else { "object" };
+    let msg = format!("can't modify frozen {what}: {}", crate::fmt::inspect_lossy(who));
+    let e = exc_new(rt().c.frozen_error, &msg);
+    ivar_set(e, sym("@receiver"), who);
+    raise_exc(e)
+}
 pub fn check_frozen(v: V) -> V {
     if is_frozen(v) {
         let msg = format!("can't modify frozen {}: {}", class_name(class_of(v)), crate::fmt::inspect_lossy(v));
@@ -1007,6 +1024,10 @@ pub struct PState {
     pub definee: Vec<*mut Class>,
     /// Methods defined with define_method that are running (for `super` inside them).
     pub dm_stack: Vec<*const Method>,
+    /// Methods running through `super` from a module that appears more than once in the
+    /// receiver's ancestors: (receiver, name, ancestor index it was found at), so a further
+    /// `super` goes on from that copy (`find_super_method_at`)
+    pub super_at: Vec<(V, u32, usize)>,
     /// Blocks passed to running C-extension functions (rb_block_given_p / rb_yield).
     pub current_block: Vec<V>,
     pub mcache: HashMap<(usize, u32), *const Method, FxBuild>,
@@ -1108,6 +1129,7 @@ pub fn new_pstate() -> *mut PState {
         stack_limit: 0,
         definee: Vec::new(),
         dm_stack: Vec::new(),
+        super_at: Vec::new(),
         current_block: Vec::new(),
         mcache: HashMap::default(),
         mcache_serial: 0,
@@ -1541,7 +1563,13 @@ pub fn class_name(c: *mut Class) -> String {
         if (*c).is_singleton {
             return format!("#<Class:{}>", crate::fmt::inspect_lossy((*c).attached));
         }
-        if (*c).name.is_empty() { format!("#<Class:0x{:016x}>", c as usize) } else { (*c).name.clone() }
+        if !(*c).name.is_empty() {
+            (*c).name.clone()
+        } else if (*c).is_module {
+            format!("#<Module:0x{:016x}>", c as usize)
+        } else {
+            format!("#<Class:0x{:016x}>", c as usize)
+        }
     }
 }
 
@@ -1875,14 +1903,50 @@ fn find_method_uncached(c: *mut Class, mid: u32) -> *const Method {
     std::ptr::null()
 }
 pub fn find_super_method(self_: V, owner: *mut Class, mid: u32) -> *const Method {
+    find_super_method_at(self_, owner, mid).0
+}
+/// The method `super` reaches, and (when `owner` is a module the receiver's ancestors list
+/// more than once) the ancestor index it was found at — the caller records it in
+/// `PState::super_at` while that method runs (see `invoke_super`); usize::MAX otherwise.
+pub fn find_super_method_at(self_: V, owner: *mut Class, mid: u32) -> (*const Method, usize) {
     let k = class_of(self_);
     let key = (k as usize, owner as usize, mid);
     if let Some(&m) = ancestor_cache().supers.get(&key) {
-        return m;
+        return (m, usize::MAX);
     }
-    let m = find_super_method_uncached(k, owner, mid);
-    ancestor_cache().supers.insert(key, m);
-    m
+    let anc = ancestors_rc(k);
+    let first = anc.iter().position(|&c| c == owner);
+    let dup = first.is_some_and(|f| anc[f + 1..].contains(&owner));
+    if !dup {
+        let m = find_super_method_uncached(k, owner, mid);
+        ancestor_cache().supers.insert(key, m);
+        return (m, usize::MAX);
+    }
+    // the copy the running method was found at (a `super` chain through this module), else
+    // the first
+    let start = pst()
+        .super_at
+        .last()
+        .filter(|&&(s, m, i)| s == self_ && m == mid && anc.get(i) == Some(&owner))
+        .map(|x| x.2)
+        .unwrap_or(first.unwrap());
+    for (i, &c) in anc.iter().enumerate().skip(start + 1) {
+        if let Some(&m) = unsafe { (*c).methods.get(&mid) } {
+            return (m, i);
+        }
+    }
+    (std::ptr::null(), usize::MAX)
+}
+/// Runs the method `super` found (see `find_super_method_at`).
+pub fn invoke_super(m: *const Method, at: usize, recv: V, args: &[V], blk: V) -> V {
+    if at == usize::MAX {
+        return invoke(m, recv, args, blk);
+    }
+    let mid = unsafe { (*m).name };
+    pst().super_at.push((recv, mid, at));
+    let r = invoke(m, recv, args, blk);
+    pst().super_at.pop();
+    r
 }
 fn find_super_method_uncached(klass: *mut Class, owner: *mut Class, mid: u32) -> *const Method {
     let anc = ancestors_rc(klass);
@@ -1990,7 +2054,7 @@ pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
         }
         Body::CFunc(f, arity) => {
             pst().current_block.push(blk);
-            crate::capi::enter_frame((*m).name, recv);
+            crate::capi::enter_frame((*m).name, recv, (*m).owner);
             let r = call_native_c(*f, *arity, recv, args);
             crate::capi::leave_frame();
             pst().current_block.pop();
@@ -2063,7 +2127,7 @@ pub fn describe_recv(v: V) -> String {
         "main".into()
     } else if is_class(v) {
         let c = rclass(v);
-        if c.is_module { format!("module {}", c.name) } else { format!("class {}", class_name(v as *mut Class)) }
+        if c.is_module { format!("module {}", class_name(v as *mut Class)) } else { format!("class {}", class_name(v as *mut Class)) }
     } else {
         format!("an instance of {}", class_name(real_class(v)))
     }
@@ -2158,7 +2222,8 @@ pub fn ivar_index_for(shape: *mut Class, id: u32) -> u32 {
     i
 }
 pub fn ivar_set(v: V, id: u32, val: V) -> V {
-    if !is_heap(v) || hdr(v).flags & (FL_FROZEN | FL_CHILLED) != 0 {
+    // (the runtime's own hidden `@__` bookkeeping goes on frozen objects too)
+    if (!is_heap(v) || hdr(v).flags & (FL_FROZEN | FL_CHILLED) != 0) && !(is_heap(v) && sym_name(id).starts_with(b"@__")) {
         let r = check_frozen(v);
         if r == UNDEF {
             return UNDEF;
@@ -2194,7 +2259,7 @@ pub fn ivar_list(v: V) -> Vec<(u32, V)> {
                 .collect()
         }
         Some(Kind::Class) => rclass(v).civars.iter().map(|(&k, &v)| (k, v)).filter(|(n, _)| !sym_name(*n).starts_with(b"@__")).collect(),
-        _ => gen_ivar_list(v),
+        _ => gen_ivar_list(v).into_iter().filter(|(n, _)| !sym_name(*n).starts_with(b"@__")).collect(),
     }
 }
 
@@ -2294,13 +2359,20 @@ pub fn const_lookup(cref: *mut Class, id: u32) -> Option<V> {
                 }
             }
         }
-        let o = rt().c.object;
-        let v = (*o).consts.get(&id).copied();
-        if v.is_some() {
-            crate::abi::settle_autoload(o, id);
-        }
-        v
+        object_const(id)
     }
+}
+/// The top level's constant `id`: Object's, then its ancestors' (modules included into Object:
+/// `include Jekyll` at the top level makes Jekyll::Utils `Utils` everywhere).
+pub fn object_const(id: u32) -> Option<V> {
+    let o = rt().c.object;
+    for &a in ancestors_rc(o).iter() {
+        if let Some(&v) = unsafe { (*a).consts.get(&id) } {
+            crate::abi::settle_autoload(a, id);
+            return Some(v);
+        }
+    }
+    None
 }
 pub fn const_get_under(c: *mut Class, id: u32) -> Option<V> {
     for &a in ancestors_rc(c).iter() {
@@ -2316,16 +2388,40 @@ pub fn const_get_under(c: *mut Class, id: u32) -> Option<V> {
     }
     None
 }
+/// Classes and modules whose name is a temporary one (Module#set_temporary_name): the
+/// first constant they're assigned to names them for good, as it does an anonymous one.
+pub static TEMP_NAMED: std::sync::Mutex<Option<rustc_hash::FxHashSet<usize>>> = std::sync::Mutex::new(None);
+pub fn temp_named(c: *mut Class) -> bool {
+    TEMP_NAMED.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(c as usize)))
+}
+pub fn set_temp_named(c: *mut Class, on: bool) {
+    let mut g = TEMP_NAMED.lock().unwrap();
+    let s = g.get_or_insert_with(Default::default);
+    if on {
+        s.insert(c as usize);
+    } else {
+        s.remove(&(c as usize));
+    }
+}
+/// Where Ruby code set each constant: (module, name) -> the setting frame's return address
+/// (Module#const_source_location symbolizes it).
+pub static CONST_LOCS: std::sync::Mutex<Option<rustc_hash::FxHashMap<(usize, u32), usize>>> = std::sync::Mutex::new(None);
 pub fn const_set(c: *mut Class, id: u32, v: V) {
+    if let Some(pc) = crate::backtrace::innermost() {
+        CONST_LOCS.lock().unwrap().get_or_insert_with(Default::default).insert((c as usize, id), pc);
+    }
     unsafe {
         if is_class(v) {
             let k = rclass(v);
-            if k.name.is_empty() && !k.is_singleton {
+            if (k.name.is_empty() || temp_named(v as *mut Class)) && !k.is_singleton {
                 k.name = if c == rt().c.object || c.is_null() {
                     sym_str(id)
                 } else {
-                    format!("{}::{}", (*c).name, sym_str(id))
+                    format!("{}::{}", class_name(c), sym_str(id))
                 };
+                // (under an anonymous or temporarily named module, the name is temporary too)
+                let parent_temp = !c.is_null() && c != rt().c.object && ((*c).name.is_empty() || temp_named(c));
+                set_temp_named(v as *mut Class, parent_temp);
             }
         }
         (*c).consts.insert(id, v);

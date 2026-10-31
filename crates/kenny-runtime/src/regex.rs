@@ -248,6 +248,8 @@ struct Subj {
     b: Vec<u8>,
     bin: bool,
     raw: bool,
+    /// the subject's foreign encoding's name (transcode.rs `foreign_name`), or nil
+    fenc: V,
 }
 impl Subj {
     fn len(&self) -> usize {
@@ -275,6 +277,7 @@ impl Subj {
         let v = str_new(bytes.to_vec());
         if self.bin {
             hdr(v).flags |= crate::compat::FL_BINARY;
+            crate::transcode::set_foreign(v, self.fenc);
         }
         v
     }
@@ -284,7 +287,8 @@ fn text(s: V) -> Subj {
     let bin = hdr(s).flags & crate::compat::FL_BINARY != 0;
     let raw = bin && !b.is_ascii();
     let b = if raw || std::str::from_utf8(b).is_ok() { b.to_vec() } else { String::from_utf8_lossy(b).into_owned().into_bytes() };
-    Subj { b, bin, raw }
+    let fenc = if bin { crate::transcode::foreign_name(s) } else { QNIL };
+    Subj { b, bin, raw, fenc }
 }
 /// Search `t` from `start` towards `range` (before `start`: backwards).
 fn search_range(r: &Re, t: &Subj, start: usize, range: usize, region: Option<&mut Region>) -> bool {
@@ -393,12 +397,14 @@ pub fn last_match() -> V {
     pst().last_match
 }
 
-fn matchdata_new(re: V, s_bytes: Vec<u8>, bin: bool, pos: Vec<i64>) -> V {
+/// `bin`: whether the subject is binary, and its foreign encoding's name (or nil)
+fn matchdata_new(re: V, s_bytes: Vec<u8>, bin: (bool, V), pos: Vec<i64>) -> V {
     let m = object_new(*MATCHDATA.get());
     let s = str_new(s_bytes);
     hdr(s).flags |= FL_FROZEN;
-    if bin {
+    if bin.0 {
         hdr(s).flags |= crate::compat::FL_BINARY;
+        crate::transcode::set_foreign(s, bin.1);
     }
     ivar_set(m, sym("@__str"), s);
     ivar_set(m, sym("@__re"), re);
@@ -423,7 +429,7 @@ pub fn md_group(m: V, i: usize) -> V {
 fn md_piece(m: V, bytes: &[u8]) -> V {
     let v = str_new(bytes.to_vec());
     if hdr(md_str(m)).flags & crate::compat::FL_BINARY != 0 {
-        hdr(v).flags |= crate::compat::FL_BINARY;
+        crate::transcode::like(v, md_str(m));
     }
     v
 }
@@ -441,12 +447,30 @@ fn md_named_index(m: V, name: &str) -> Option<usize> {
 }
 
 /// Match `re` against string `s` from char position `pos`; sets `$~`.
+/// A match against a UTF-8 (or US-ASCII) String with invalid bytes raises, as CRuby's
+/// rb_reg_prepare_enc does: Some(the raised UNDEF).
+pub fn broken_subject(s: V) -> Option<V> {
+    if !is_str(s) || hdr(s).flags & crate::compat::FL_BINARY != 0 {
+        return None;
+    }
+    let b = &rstr(s).b;
+    if b.is_ascii() || std::str::from_utf8(b).is_ok() {
+        return None;
+    }
+    let enc = crate::transcode::enc_of(s);
+    Some(arg_error(&format!("invalid byte sequence in {}", enc.name)))
+}
+
+/// MatchData of `re` on `s` from character `pos`, or nil (UNDEF: raised, see broken_subject).
 pub fn do_match(re: V, s: V, pos: usize, set: bool) -> V {
+    if let Some(e) = broken_subject(s) {
+        return e;
+    }
     let t = text(s);
     let start = t.byte_index(pos);
     match search(re, &t, start) {
         Some(p) => {
-            let bin = t.bin;
+            let bin = (t.bin, t.fenc);
             let m = matchdata_new(re, t.into_bytes(), bin, p);
             if set {
                 set_last(m);
@@ -492,6 +516,26 @@ pub fn escape(b: &[u8]) -> String {
         }
     }
     out
+}
+
+/// A regexp's source as to_s and inspect show it: a `/` not already escaped gets a backslash
+/// (CRuby's rb_reg_expr_str).
+fn slash_escaped(src: &[u8]) -> String {
+    let mut out = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        match src[i] {
+            b'\\' if i + 1 < src.len() => {
+                out.extend_from_slice(&src[i..i + 2]);
+                i += 2;
+                continue;
+            }
+            b'/' => out.extend_from_slice(b"\\/"),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn opts_str(o: u32) -> String {
@@ -568,6 +612,9 @@ pub fn expand(rep: &[u8], src: &[u8], pos: &[i64], re: V) -> Vec<u8> {
 
 /// String#sub/gsub with a Regexp pattern. Ok(None) = no change.
 pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<(Vec<u8>, crate::transcode::Enc)>, V> {
+    if let Some(e) = broken_subject(s).filter(|_| is_regexp(re)) {
+        return Err(e);
+    }
     let t = text(s);
     let r = re_of(re);
     let src_ascii = t.b.is_ascii();
@@ -625,7 +672,7 @@ pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<(
             if !is_proc(blk) {
                 return Err(arity_error(1, 2, 2));
             }
-            let m = matchdata_new(re, src.to_vec(), t.bin, region_pos(&region));
+            let m = matchdata_new(re, src.to_vec(), (t.bin, t.fenc), region_pos(&region));
             set_last(m);
             let v = call_block(blk, &[t.str(&src[b..e])]);
             if v == UNDEF {
@@ -663,7 +710,7 @@ pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<(
     if rep.is_some() {
         // $~ is the last match (as in CRuby): found again from where it began
         if let Some(pos) = search(re, &t, last_begin) {
-            let bin = t.bin;
+            let bin = (t.bin, t.fenc);
             set_last(matchdata_new(re, t.into_bytes(), bin, pos));
         }
     }
@@ -671,6 +718,9 @@ pub fn sub(s: V, re: V, rep: Option<V>, blk: V, global: bool) -> Result<Option<(
 }
 
 pub fn scan(s: V, re: V, blk: V) -> V {
+    if let Some(e) = broken_subject(s).filter(|_| is_regexp(re)) {
+        return e;
+    }
     let t = text(s);
     let src = t.as_bytes().to_vec();
     let mut out = RVec::new();
@@ -686,7 +736,7 @@ pub fn scan(s: V, re: V, blk: V) -> V {
         } else {
             t.str(&src[b..e])
         };
-        let m = matchdata_new(re, src.clone(), t.bin, pos);
+        let m = matchdata_new(re, src.clone(), (t.bin, t.fenc), pos);
         set_last(m);
         if is_proc(blk) {
             tri!(call_block(blk, &[item]));
@@ -699,6 +749,9 @@ pub fn scan(s: V, re: V, blk: V) -> V {
 }
 
 pub fn split(s: V, re: V, limit: i64) -> V {
+    if let Some(e) = broken_subject(s).filter(|_| is_regexp(re)) {
+        return e;
+    }
     let t = text(s);
     let src = t.as_bytes();
     let mut parts: Vec<V> = Vec::new();
@@ -743,6 +796,8 @@ pub fn split(s: V, re: V, limit: i64) -> V {
             parts.pop();
         }
     }
+    // (CRuby's split leaves $~ nil: its last search failed)
+    set_last(QNIL);
     ary_new(parts)
 }
 
@@ -753,8 +808,8 @@ pub fn match_index(re: V, s: V) -> V {
         return QNIL;
     }
     let m = do_match(re, s, 0, true);
-    if m == QNIL {
-        return QNIL;
+    if m == QNIL || m == UNDEF {
+        return m;
     }
     let pos = md_pos(m);
     mkfix(md_char_index(m, pos[0] as usize) as i64)
@@ -762,8 +817,8 @@ pub fn match_index(re: V, s: V) -> V {
 
 pub fn str_index(s: V, re: V, from: usize) -> V {
     let m = do_match(re, s, from, true);
-    if m == QNIL {
-        return QNIL;
+    if m == QNIL || m == UNDEF {
+        return m;
     }
     mkfix(md_char_index(m, md_pos(m)[0] as usize) as i64)
 }
@@ -781,7 +836,7 @@ pub fn str_rindex(s: V, re: V, pos: usize) -> V {
     }
     let p = region_pos(&region);
     let at = p[0] as usize;
-    let bin = t.bin;
+    let bin = (t.bin, t.fenc);
     let m = matchdata_new(re, t.into_bytes(), bin, p);
     set_last(m);
     mkfix(md_char_index(m, at) as i64)
@@ -800,15 +855,15 @@ pub fn str_byte_search(s: V, re: V, from: usize, back: bool) -> V {
     }
     let p = region_pos(&region);
     let at = p[0];
-    let bin = t.bin;
+    let bin = (t.bin, t.fenc);
     set_last(matchdata_new(re, t.into_bytes(), bin, p));
     mkfix(at)
 }
 
 pub fn str_aref(s: V, re: V, cap: Option<V>) -> V {
     let m = do_match(re, s, 0, true);
-    if m == QNIL {
-        return QNIL;
+    if m == QNIL || m == UNDEF {
+        return m;
     }
     match cap {
         None => md_group(m, 0),
@@ -833,13 +888,22 @@ pub fn partition(s: V, re: V, last: bool) -> V {
     } else {
         search(re, &t, 0)
     };
+    // ($~ is the match, as in CRuby)
     match found {
         Some(p) => {
             let (b, e) = (p[0] as usize, p[1] as usize);
-            ary_new(vec![t.str(&src[..b]), t.str(&src[b..e]), t.str(&src[e..])])
+            let r = ary_new(vec![t.str(&src[..b]), t.str(&src[b..e]), t.str(&src[e..])]);
+            set_last(matchdata_new(re, src.to_vec(), (t.bin, t.fenc), p));
+            r
         }
-        None if last => ary_new(vec![t.str(&[]), t.str(&[]), t.str(src)]),
-        None => ary_new(vec![t.str(src), t.str(&[]), t.str(&[])]),
+        None if last => {
+            set_last(QNIL);
+            ary_new(vec![t.str(&[]), t.str(&[]), t.str(src)])
+        }
+        None => {
+            set_last(QNIL);
+            ary_new(vec![t.str(src), t.str(&[]), t.str(&[])])
+        }
     }
 }
 
@@ -893,6 +957,45 @@ pub extern "C" fn kn_regexp_new(s: V, opts: u64) -> V {
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_last_match() -> V {
     last_match()
+}
+/// A method with its own `$~` starts: the caller's, which it puts back as it returns
+/// (kn_match_restore); its own starts nil.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_match_save() -> V {
+    let p = pst();
+    std::mem::replace(&mut p.last_match, QNIL)
+}
+/// `__method__` (`callee` 0) or `__callee__` (1) in a define_method body: the running
+/// method's original name, or the one it was called by (an alias is a copy of the method).
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_dm_name(callee: i64) -> V {
+    let Some(&m) = pst().dm_stack.last() else { return QNIL };
+    let name = unsafe { (*m).name };
+    if callee != 0 {
+        let owner = unsafe { (*m).owner };
+        if !owner.is_null() {
+            if let Some((k, _)) = unsafe { (*owner).methods.iter() }.find(|(_, v)| **v as *const Method == m) {
+                return mksym(*k);
+            }
+        }
+    }
+    mksym(name)
+}
+/// `__method__`/`__callee__` in a block not known to be a define_method body: the running
+/// method's name when it is this block (passed on to define_method), else `lexical`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_dm_name_for(proc_: V, callee: i64, lexical: V) -> V {
+    let Some(&m) = pst().dm_stack.last() else { return lexical };
+    if let Body::Proc(p) = unsafe { &(*m).body } {
+        if *p == proc_ || (is_proc(*p) && is_proc(proc_) && rproc(*p).func as usize == rproc(proc_).func as usize && rproc(*p).env == rproc(proc_).env) {
+            return kn_dm_name(callee);
+        }
+    }
+    lexical
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_match_restore(saved: V) {
+    pst().last_match = saved;
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_nth_ref(n: u64) -> V {
@@ -949,11 +1052,67 @@ pub fn init() {
     let re_err = new_class("RegexpError", rt().c.standard_error);
     set_global_const("RegexpError", re_err as V);
     *REGEXP_ERROR.get() = re_err;
+    let te = new_class("Regexp::TimeoutError", re_err);
+    const_set(rc, sym("TimeoutError"), te as V);
     let md = new_class("MatchData", o);
     set_global_const("MatchData", md as V);
     *MATCHDATA.get() = md;
 
     fn new_re(a: &[V]) -> V {
+        // `timeout:` (kept for Regexp#timeout; matches aren't interrupted)
+        let mut timeout = QNIL;
+        let mut av = a.to_vec();
+        if let Some(&h) = av.last().filter(|&&h| av.len() > 1 && is_hash(h) && hdr(h).flags & FL_KWHASH != 0) {
+            if let Some(&t) = rhash(h).m.get(&HKey(mksym(sym("timeout")))) {
+                timeout = match timeout_arg(t) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+            }
+            av.pop();
+        }
+        let a = &av[..];
+        let r = new_re_plain(a);
+        if timeout != QNIL && r != UNDEF && is_regexp(r) {
+            gen_ivar_set(r, sym("@__timeout"), timeout);
+        }
+        r
+    }
+    /// A timeout in seconds: nil, or a positive Float.
+    fn timeout_arg(t: V) -> Result<V, V> {
+        if t == QNIL {
+            return Ok(QNIL);
+        }
+        let f = if is_fix(t) || is_float(t) || is_big(t) {
+            crate::fmt::num_to_f(t).unwrap_or(0.0)
+        } else if is_str(t) || t == QTRUE || t == QFALSE {
+            return Err(type_error("no implicit conversion to float from string"));
+        } else {
+            let x = send(t, sym("to_f"), &[], QNIL);
+            if x == UNDEF {
+                return Err(UNDEF);
+            }
+            crate::fmt::num_to_f(x).unwrap_or(0.0)
+        };
+        if !(f > 0.0) || !f.is_finite() {
+            return Err(arg_error(&format!("invalid timeout: {}", crate::fmt::inspect_lossy(t))));
+        }
+        Ok(float_new(f))
+    }
+    // (kept in a hidden global, so the GC sees it)
+    defs(rc, "timeout", 0, 0, |_, _, _| rt().gvars.get(&sym("$__kenny_regexp_timeout")).copied().unwrap_or(QNIL));
+    defs(rc, "timeout=", 1, 1, |_, a, _| match timeout_arg(a[0]) {
+        Ok(t) => {
+            rt().gvars.insert(sym("$__kenny_regexp_timeout"), t);
+            a[0]
+        }
+        Err(e) => e,
+    });
+    defn(rc, "timeout", 0, 0, |s, _, _| {
+        let t = ivar_get(s, sym("@__timeout"));
+        if t == UNDEF { QNIL } else { t }
+    });
+    fn new_re_plain(a: &[V]) -> V {
         let src = a[0];
         if is_regexp(src) {
             return src;
@@ -984,17 +1143,25 @@ pub fn init() {
     });
     defs(rc, "union", 0, -1, |_, a, _| {
         let items: Vec<V> = if a.len() == 1 && is_ary(a[0]) { rary(a[0]).v.clone() } else { a.to_vec() };
-        let parts: Vec<String> = items
-            .iter()
-            .map(|x| {
-                if is_regexp(*x) {
-                    let r = re_of(*x);
-                    format!("(?{}-mix:{})", opts_str(r.opts), String::from_utf8_lossy(&r.source))
-                } else {
-                    escape(&crate::fmt::to_s(*x).unwrap_or_default())
-                }
-            })
-            .collect();
+        // (no patterns: a regexp that never matches; one Regexp: itself)
+        if items.is_empty() {
+            return regexp_new(b"(?!)", 0);
+        }
+        if items.len() == 1 && is_regexp(items[0]) {
+            return items[0];
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for x in &items {
+            if is_regexp(*x) {
+                let t = tri!(send0(*x, "to_s"));
+                parts.push(String::from_utf8_lossy(&rstr(t).b).into_owned());
+            } else if is_sym(*x) {
+                parts.push(escape(sym_str(sym_id(*x)).as_bytes()));
+            } else {
+                let sv = tri!(crate::regex::to_str_arg(*x));
+                parts.push(escape(&rstr(sv).b));
+            }
+        }
         regexp_new(parts.join("|").as_bytes(), 0)
     });
     defs(rc, "last_match", 0, 1, |_, a, _| {
@@ -1009,11 +1176,11 @@ pub fn init() {
         let r = re_of(s);
         let on = opts_str(r.opts);
         let off: String = "mix".chars().filter(|c| !on.contains(*c)).collect();
-        new_str_v(format!("(?{}{}{}:{})", on, if off.is_empty() { "" } else { "-" }, off, String::from_utf8_lossy(&r.source)))
+        new_str_v(format!("(?{}{}{}:{})", on, if off.is_empty() { "" } else { "-" }, off, slash_escaped(&r.source)))
     });
     defn(rc, "inspect", 0, 0, |s, _, _| {
         let r = re_of(s);
-        new_str_v(format!("/{}/{}", String::from_utf8_lossy(&r.source), opts_str(r.opts)))
+        new_str_v(format!("/{}/{}", slash_escaped(&r.source), opts_str(r.opts)))
     });
     defn(rc, "options", 0, 0, |s, _, _| mkfix(re_of(s).opts as i64));
     defn(rc, "casefold?", 0, 0, |s, _, _| bool_v(re_of(s).opts & OPT_I != 0));
@@ -1038,7 +1205,7 @@ pub fn init() {
         let pos = a.get(1).map(|x| fix(*x).max(0) as usize).unwrap_or(0);
         let target = if is_sym(a[0]) { str_from(&sym_str(sym_id(a[0]))) } else { a[0] };
         let m = do_match(s, target, pos, true);
-        if m != QNIL && is_proc(b) { call_block(b, &[m]) } else { m }
+        if m != QNIL && m != UNDEF && is_proc(b) { call_block(b, &[m]) } else { m }
     });
     defn(rc, "match?", 1, 2, |s, a, _| {
         if a[0] == QNIL {
@@ -1052,6 +1219,9 @@ pub fn init() {
             Some(&p) if is_fix(p) => fix(p),
             _ => 0,
         };
+        if let Some(e) = broken_subject(target) {
+            return e;
+        }
         bool_v(matches(s, target, pos))
     });
     defn(rc, "===", 1, 1, |s, a, _| {
@@ -1059,7 +1229,7 @@ pub fn init() {
         if !is_str(target) {
             return QFALSE;
         }
-        bool_v(do_match(s, target, 0, true) != QNIL)
+        bool_v(tri!(do_match(s, target, 0, true)) != QNIL)
     });
     defn(rc, "==", 1, 1, |s, a, _| bool_v(is_regexp(a[0]) && re_of(s).source == re_of(a[0]).source && re_of(s).opts == re_of(a[0]).opts));
     defn(rc, "eql?", 1, 1, |s, a, _| bool_v(is_regexp(a[0]) && re_of(s).source == re_of(a[0]).source && re_of(s).opts == re_of(a[0]).opts));
@@ -1164,6 +1334,21 @@ pub fn init() {
     let _ = to_re;
 }
 
+/// String#match / match?'s pattern: a String is compiled as a regexp source, not quoted
+/// (CRuby's get_pat; sub, scan, index and the rest take a String literally)
+/// A String argument (or one with to_str), else TypeError: UNDEF on error.
+pub fn to_str_arg(v: V) -> V {
+    if is_str(v) {
+        return v;
+    }
+    if is_heap(v) && respond_to(v, sym("to_str")) {
+        return send0(v, "to_str");
+    }
+    type_error(&format!("no implicit conversion of {} into String", if v == QNIL { "nil".to_string() } else { class_name(real_class(v)) }))
+}
 pub fn pattern_arg(v: V) -> Result<V, V> {
+    if is_str(v) {
+        return tri_r(regexp_new(&rstr(v).b, 0));
+    }
     to_re(v)
 }

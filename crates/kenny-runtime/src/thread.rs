@@ -34,6 +34,10 @@ use std::time::{Duration, Instant};
 
 const THREAD_STACK: usize = 16 << 20;
 const MAIN_STACK: usize = 1 << 30;
+/// How much of it Ruby code may use before SystemStackError: several hundred thousand frames
+/// (CRuby stops near ten thousand), but not so deep that runaway recursion takes minutes to
+/// fail (every GC scans the whole stack).
+const MAIN_USABLE: usize = 64 << 20;
 const FIBER_STACK: usize = 8 << 20;
 const STACK_MARGIN: usize = 1 << 20;
 const P_STACK: usize = 8 << 20;
@@ -80,12 +84,15 @@ struct GThread {
     last_match: V,
     definee: Vec<*mut Class>,
     dm_stack: Vec<*const Method>,
+    super_at: Vec<(V, u32, usize)>,
     current_block: Vec<V>,
     saved_throws: crate::gc::SavedThrows,
     fiber_stack: Vec<usize>,
     // set by other threads (under the lock)
     interrupt: Option<Throw>,
     has_interrupt: AtomicBool,
+    /// killed: running its ensure blocks on the way out (Thread#status "aborting")
+    aborting: bool,
     waiting_on: usize,
 }
 
@@ -292,6 +299,7 @@ fn save_state(t: &mut GThread) {
     t.last_match = p.last_match;
     t.definee = std::mem::take(&mut p.definee);
     t.dm_stack = std::mem::take(&mut p.dm_stack);
+    t.super_at = std::mem::take(&mut p.super_at);
     t.current_block = std::mem::take(&mut p.current_block);
     t.saved_throws = std::mem::take(&mut p.heap.saved_throws);
     t.fiber_stack = std::mem::take(&mut p.thr.fiber_stack);
@@ -303,6 +311,7 @@ fn restore_state(t: &mut GThread) {
     p.last_match = t.last_match;
     p.definee = std::mem::take(&mut t.definee);
     p.dm_stack = std::mem::take(&mut t.dm_stack);
+    p.super_at = std::mem::take(&mut t.super_at);
     p.current_block = std::mem::take(&mut t.current_block);
     p.heap.saved_throws = std::mem::take(&mut t.saved_throws);
     p.thr.fiber_stack = std::mem::take(&mut t.fiber_stack);
@@ -395,6 +404,7 @@ fn thread_obj(tid: usize) -> V {
 fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize>) -> usize {
     let stack = DefaultStack::new(stack_size).expect("thread stack");
     let (base, limit) = (stack.base().get(), stack.limit().get());
+    let limit = if stack_size == MAIN_STACK { limit.max(base.saturating_sub(MAIN_USABLE)) } else { limit };
     // pick the P; starting a second P switches the runtime into multi-threaded mode first
     let p = on.unwrap_or_else(|| locked!(s => {
         let p = s.next_p % s.max_ps;
@@ -431,9 +441,11 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
             last_match: QNIL,
             definee: Vec::new(),
             dm_stack: Vec::new(),
+            super_at: Vec::new(),
             current_block: Vec::new(),
             interrupt: None,
             has_interrupt: AtomicBool::new(false),
+            aborting: false,
             waiting_on: 0,
             pinned: on.is_some(),
             saved_throws: Default::default(),
@@ -663,6 +675,23 @@ fn resume_thread(i: usize) {
                 let obj = t.obj;
                 s.ps[pi].nthreads -= 1;
                 P_NTHREADS[pi].fetch_sub(1, Ordering::Relaxed);
+                // abort_on_exception (the thread's, or Thread.abort_on_exception): the exception
+                // is raised in the main thread, in the same step (a main thread blocked in a
+                // wait would otherwise be found deadlocked)
+                if let Some((_, e)) = report {
+                    let abort = truthy(ivar_get(obj, sym("@__abort"))) || truthy(crate::extra::thread_abort_default());
+                    if abort && class_name(real_class(e)) != "SystemExit" && s.threads[0].state != St::Done {
+                        let m = &mut s.threads[0];
+                        m.interrupt = Some(Throw::Raise(e));
+                        m.has_interrupt.store(true, Ordering::Release);
+                        let mp = m.p;
+                        match s.threads[0].state {
+                            St::Blocked => wake.extend(make_runnable(s, 0)),
+                            _ => wake.push(s.ps[mp].parker.clone()),
+                        }
+                        crate::gc::KN_GC_PENDING.fetch_or(PREEMPT_BIT, Ordering::Relaxed);
+                    }
+                }
                 // wake the joiners in the same step: between "done" and "joiners woken", P 0's
                 // deadlock check would see every thread finished or blocked
                 loop {
@@ -715,6 +744,9 @@ fn prepare_block(s: &mut Sched, on: V, timeout: Option<Duration>) -> Option<Thro
     let t = &mut s.threads[cur];
     if let Some(i) = t.interrupt.take() {
         t.has_interrupt.store(false, Ordering::Release);
+        if matches!(i, Throw::Kill) {
+            t.aborting = true;
+        }
         return Some(i);
     }
     t.state = St::Blocked;
@@ -746,6 +778,9 @@ fn finish_block(on: V) -> Wake {
         t.waiting_on = 0;
         let i = t.interrupt.take();
         t.has_interrupt.store(false, Ordering::Release);
+        if matches!(i, Some(Throw::Kill)) {
+            t.aborting = true;
+        }
         (i, std::mem::replace(&mut t.timed_out, false))
     });
     if let Some(i) = intr {
@@ -1038,10 +1073,20 @@ fn deliver_interrupt() {
     let i = locked!(s => {
         let t = &mut s.threads[cur];
         t.has_interrupt.store(false, Ordering::Release);
-        t.interrupt.take()
+        let i = t.interrupt.take();
+        if matches!(i, Some(Throw::Kill)) {
+            t.aborting = true;
+        }
+        i
     });
     if let Some(i) = i {
         pst().pending = i;
+    }
+}
+/// The current thread is being killed (Thread#kill of itself, Thread.exit).
+fn mark_aborting() {
+    if let Some(cur) = pt().current {
+        locked!(s => s.threads[cur].aborting = true);
     }
 }
 
@@ -1370,7 +1415,8 @@ pub fn init() {
         let obj = locked!(s => s.threads[tid].obj);
         ivar_set(obj, sym("@__blk"), b);
         ivar_set(obj, sym("@__args"), ary_new(a.to_vec()));
-        ivar_set(obj, sym("@__report"), QTRUE);
+        // (Thread.report_on_exception at its start)
+        ivar_set(obj, sym("@__report"), crate::extra::thread_report_default());
         ivar_set(obj, sym("@__inherited_storage"), storage);
         obj
     });
@@ -1451,10 +1497,13 @@ pub fn init() {
     });
     defn(th, "alive?", 0, 0, |s, _, _| bool_v(locked!(st => st.threads[tid_of(s)].state != St::Done)));
     defn(th, "status", 0, 0, |s, _, _| {
-        let (state, exc) = locked!(st => {
+        let (state, exc, aborting) = locked!(st => {
             let t = &st.threads[tid_of(s)];
-            (t.state, t.exc)
+            (t.state, t.exc, t.aborting)
         });
+        if aborting && state != St::Done {
+            return str_from("aborting");
+        }
         match state {
             St::Done => {
                 if exc != QNIL {
@@ -1494,6 +1543,9 @@ pub fn init() {
     fn interrupt(s: V, what: Throw) -> V {
         let tid = tid_of(s);
         if Some(tid) == pt().current {
+            if matches!(what, Throw::Kill) {
+                mark_aborting();
+            }
             pst().pending = what;
             return UNDEF;
         }
@@ -1575,6 +1627,7 @@ pub fn init() {
         s
     });
     defs(th, "exit", 0, 0, |_, _, _| {
+        mark_aborting();
         pst().pending = Throw::Kill;
         UNDEF
     });

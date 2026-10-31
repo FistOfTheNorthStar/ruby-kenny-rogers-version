@@ -59,7 +59,7 @@ pub fn require_ext(name: &str) -> Option<V> {
         return Some(QFALSE);
     }
     LOADED_EXTS.get().push(feature);
-    enter_frame(sym("require"), rt().main_obj);
+    enter_frame(sym("require"), rt().main_obj, std::ptr::null_mut());
     if CFUNC_CALLER.get().is_some() {
         // (through the C shim: an exception the Init function raises longjmps back to it)
         let _ = crate::core::call_native_c(init as *const c_void, 0, QNIL, &[]);
@@ -119,7 +119,7 @@ globals!(
     rb_eArgError, rb_eTypeError, rb_eNameError, rb_eNoMethodError, rb_eIndexError, rb_eKeyError, rb_eRangeError,
     rb_eZeroDivError, rb_eNotImpError, rb_eIOError, rb_eStopIteration, rb_eFrozenError, rb_eNoMemError,
     rb_eScriptError, rb_eFloatDomainError, rb_eEncodingError, rb_eLocalJumpError, rb_eSecurityError,
-    rb_cBinding, rb_cComplex, rb_cData, rb_cDir, rb_cEncoding, rb_cEnumerator, rb_cFile, rb_cMatch, rb_cMethod, rb_cRandom, rb_cRational, rb_cRegexp, rb_cSet, rb_cThread, rb_cUnboundMethod, rb_eEncCompatError, rb_eEOFError, rb_eFatal, rb_eInterrupt, rb_eLoadError, rb_eMathDomainError, rb_eNoMatchingPatternError, rb_eNoMatchingPatternKeyError, rb_eRegexpError, rb_eSignal, rb_eSyntaxError, rb_eSystemCallError, rb_eSystemExit, rb_eThreadError, rb_mErrno, rb_mGC, rb_mMath, rb_mProcess,
+    rb_cBinding, rb_cComplex, rb_cData, rb_cDir, rb_cEncoding, rb_cEnumerator, rb_cFile, rb_cMatch, rb_cMethod, rb_cRandom, rb_cRational, rb_cRegexp, rb_cSet, rb_cThread, rb_cUnboundMethod, rb_eEncCompatError, rb_eEOFError, rb_eFatal, rb_eInterrupt, rb_eLoadError, rb_eMathDomainError, rb_eNoMatchingPatternError, rb_eNoMatchingPatternKeyError, rb_eRegexpError, rb_eSignal, rb_eSyntaxError, rb_eSystemCallError, rb_eSystemExit, rb_eThreadError, rb_mErrno, rb_mGC, rb_mMath, rb_mProcess, rb_eSysStackError,
 );
 
 pub fn init() {
@@ -207,6 +207,7 @@ pub fn init() {
         rb_eRegexpError = path("RegexpError");
         rb_eSignal = path("SignalException");
         rb_eSyntaxError = path("SyntaxError");
+        rb_eSysStackError = path("SystemStackError");
         rb_eSystemCallError = path("SystemCallError");
         rb_eSystemExit = path("SystemExit");
         rb_eThreadError = path("ThreadError");
@@ -317,6 +318,10 @@ pub extern "C" fn rb_define_alloc_func(klass: V, f: unsafe extern "C" fn(V) -> V
     alloc_funcs_change(|m| {
         m.insert(klass as usize, f);
     });
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_get_alloc_func(klass: V) -> Option<unsafe extern "C" fn(V) -> V> {
+    alloc_func(cls(klass))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_undef_alloc_func(klass: V) {
@@ -479,7 +484,18 @@ pub extern "C" fn rb_obj_is_instance_of(v: V, c: V) -> V {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_respond_to(v: V, id: V) -> c_int {
-    respond_to(v, id as u32) as c_int
+    // as `obj.respond_to?(name)`: private methods don't count (ox's SAX handler base class
+    // has every callback as a private no-op)
+    let m = find_method(class_of(v), id as u32);
+    if !m.is_null() && unsafe { (*m).vis } != VIS_PRIVATE && !crate::kernel::is_user_method(v, "respond_to?") {
+        return 1;
+    }
+    let r = send(v, sym("respond_to?"), &[mksym(id as u32)], QNIL);
+    if r == UNDEF {
+        pst().pending = Throw::None;
+        return 0;
+    }
+    truthy(r) as c_int
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_obj_freeze(v: V) -> V {
@@ -705,6 +721,8 @@ pub unsafe extern "C" fn rb_str_new_with_class(obj: V, p: *const c_char, len: c_
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_capacity(s: V) -> usize {
+    // (C code that asks may write up to it: see `filling`)
+    filling(s, true);
     rstr(s).b.capacity()
 }
 /// (CRuby: a byte range of the String, sharing its buffer; here a copy)
@@ -735,9 +753,39 @@ pub extern "C" fn rb_str_hash(s: V) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_capi_str_reserve(s: V, extra: c_long) {
     rstr(s).b.reserve(extra.max(0) as usize);
+    filling(s, true);
+}
+
+/// Strings C code is filling past their length (after rb_str_modify_expand or
+/// rb_str_buf_new, until rb_str_set_len): RSTRING_PTR then leaves the bytes after the length
+/// alone instead of writing the terminator there. (The string, and its buffer: an entry whose
+/// buffer moved is stale.)
+static FILLING: std::sync::Mutex<Option<rustc_hash::FxHashMap<V, usize>>> = std::sync::Mutex::new(None);
+static FILLING_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn filling(s: V, on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !on && FILLING_N.load(Relaxed) == 0 {
+        return;
+    }
+    let mut g = FILLING.lock().unwrap();
+    let m = g.get_or_insert_with(Default::default);
+    if on {
+        m.insert(s, rstr(s).b.as_ptr() as usize);
+    } else {
+        m.remove(&s);
+    }
+    FILLING_N.store(m.len(), Relaxed);
+}
+fn is_filling(s: V) -> bool {
+    if FILLING_N.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let g = FILLING.lock().unwrap();
+    g.as_ref().and_then(|m| m.get(&s)).is_some_and(|&p| p == rstr(s).b.as_ptr() as usize)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_resize(s: V, len: c_long) -> V {
+    filling(s, false);
     rstr(s).b.resize(len.max(0) as usize, 0);
     s
 }
@@ -745,6 +793,7 @@ pub extern "C" fn rb_str_resize(s: V, len: c_long) -> V {
 /// its capacity; growing past it zero-fills).
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_set_len(s: V, len: c_long) {
+    filling(s, false);
     let b = &mut rstr(s).b;
     let len = len.max(0) as usize;
     if len <= b.capacity() {
@@ -752,17 +801,24 @@ pub extern "C" fn rb_str_set_len(s: V, len: c_long) {
     } else {
         b.resize(len, 0);
     }
+    // (the terminator, as CRuby's)
+    b.reserve(1);
+    unsafe { *b.as_mut_ptr().add(b.len()) = 0 };
 }
 /// An empty ASCII-8BIT String with room for `cap` bytes.
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_str_buf_new(cap: c_long) -> V {
     let s = str_new(Vec::with_capacity(cap.max(0) as usize + 1));
     set_enc_index(s, ENC_BINARY);
+    filling(s, true);
     s
 }
 /// RSTRING_PTR: a NUL-terminated view of the bytes (capacity reserved for the terminator).
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_kn_rstring_ptr(s: V) -> *mut c_char {
+    if is_filling(s) && rstr(s).b.len() < rstr(s).b.capacity() {
+        return rstr(s).b.as_mut_ptr() as *mut c_char;
+    }
     let b = &mut rstr(s).b;
     b.reserve(1);
     unsafe { *b.as_mut_ptr().add(b.len()) = 0 };
@@ -1202,11 +1258,12 @@ pub extern "C" fn rb_attr_get(obj: V, id: V) -> V {
 // ---------- the running C method (rb_frame_this_func, rb_current_receiver) ----------
 
 thread_local! {
-    static FRAMES: std::cell::RefCell<Vec<(u32, V)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FRAMES: std::cell::RefCell<Vec<(u32, V, *mut Class)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-/// A C method is called (its name and receiver; the receiver is also on the caller's stack).
-pub fn enter_frame(name: u32, recv: V) {
-    FRAMES.with(|f| f.borrow_mut().push((name, recv)));
+/// A C method is called (its name, receiver and owner; the receiver is also on the caller's
+/// stack, the owner is a class).
+pub fn enter_frame(name: u32, recv: V, owner: *mut Class) {
+    FRAMES.with(|f| f.borrow_mut().push((name, recv, owner)));
 }
 pub fn leave_frame() {
     FRAMES.with(|f| f.borrow_mut().pop());
@@ -1218,6 +1275,21 @@ pub extern "C" fn rb_frame_this_func() -> V {
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_frame_callee() -> V {
     rb_frame_this_func()
+}
+/// `super` from the running C method (with its arguments and block).
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_call_super(argc: c_int, argv: *const V) -> V {
+    let Some((mid, recv, owner)) = FRAMES.with(|f| f.borrow().last().copied()) else {
+        return raise(rt().c.runtime_error, "super called outside of method");
+    };
+    let args: &[V] = if argc <= 0 || argv.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(argv, argc as usize) } };
+    let m = crate::core::find_super_method(recv, owner, mid);
+    if m.is_null() || owner.is_null() {
+        let d = crate::core::describe_recv(recv);
+        return raise(rt().c.no_method_error, &format!("super: no superclass method '{}' for {d}", sym_str(mid)));
+    }
+    let blk = pst().current_block.last().copied().unwrap_or(QNIL);
+    crate::core::invoke(m, recv, args, blk)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_current_receiver() -> V {
@@ -1742,4 +1814,116 @@ pub extern "C" fn kn_capi_restore_throw(h: V) {
             pst().pending = t;
         }
     }
+}
+
+// ---------- Integer <-> words (rb_integer_pack / rb_integer_unpack) ----------
+
+fn int_of(v: V) -> Option<num_bigint::BigInt> {
+    if is_fix(v) {
+        Some(num_bigint::BigInt::from(fix(v)))
+    } else if is_big(v) {
+        Some(rbig(v).n.clone())
+    } else {
+        None
+    }
+}
+const IP_MSWORD_FIRST: c_int = 0x01;
+const IP_MSBYTE_FIRST: c_int = 0x10;
+const IP_NATIVE: c_int = 0x40;
+const IP_2COMP: c_int = 0x80;
+const IP_NEGATIVE: c_int = 0x200;
+/// Index in the buffer of little-endian byte `i` of the whole number.
+fn ip_pos(i: usize, wordsize: usize, numwords: usize, flags: c_int) -> usize {
+    let (w, b) = (i / wordsize, i % wordsize);
+    let w = if flags & IP_MSWORD_FIRST != 0 { numwords - 1 - w } else { w };
+    let msbyte = flags & IP_MSBYTE_FIRST != 0 || (flags & IP_NATIVE != 0 && cfg!(target_endian = "big"));
+    let b = if msbyte { wordsize - 1 - b } else { b };
+    w * wordsize + b
+}
+/// CRuby's validate_integer_pack_format: an ArgumentError (pending) when the flags don't say
+/// the word and byte order the sizes need.
+fn ip_check(numwords: usize, wordsize: usize, flags: c_int) -> bool {
+    let wo = flags & (IP_MSWORD_FIRST | 0x02);
+    let bo = flags & (IP_MSBYTE_FIRST | 0x20 | IP_NATIVE);
+    let msg = if wo == (IP_MSWORD_FIRST | 0x02) {
+        "unexpected word order"
+    } else if wo == 0 && numwords > 1 {
+        "word order not specified"
+    } else if bo.count_ones() > 1 {
+        "unexpected byte order"
+    } else if bo == 0 && wordsize > 1 {
+        "byte order not specified"
+    } else if wordsize == 0 {
+        "too small wordsize"
+    } else {
+        return true;
+    };
+    arg_error(msg);
+    false
+}
+/// rb_integer_pack (kenny_capi.c): *ok = 0 with an exception pending.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_integer_pack(val: V, words: *mut u8, numwords: usize, wordsize: usize, _nails: usize, flags: c_int, ok: *mut c_int) -> c_int {
+    use num_bigint::Sign;
+    unsafe { *ok = 0 };
+    if !ip_check(numwords, wordsize, flags) {
+        return 0;
+    }
+    // (the C side has converted it with rb_to_int)
+    let Some(n) = int_of(val) else { return 0 };
+    unsafe { *ok = 1 };
+    let total = numwords * wordsize;
+    let sign: c_int = match n.sign() {
+        Sign::Minus => -1,
+        Sign::NoSign => 0,
+        Sign::Plus => 1,
+    };
+    let mag = n.magnitude().to_bytes_le();
+    let mut bytes = vec![0u8; total];
+    let mut overflow = mag.len() > total && !(mag.len() == 1 && mag[0] == 0);
+    for (i, &b) in mag.iter().enumerate().take(total) {
+        bytes[i] = b;
+    }
+    if flags & IP_2COMP != 0 && sign < 0 {
+        // two's complement: invert and add one
+        let mut carry = 1u16;
+        for b in bytes.iter_mut() {
+            let x = (!*b) as u16 + carry;
+            *b = x as u8;
+            carry = x >> 8;
+        }
+        // fits when -2**(8*total-1) <= n
+        if !overflow && total > 0 && bytes[total - 1] & 0x80 == 0 && mag.iter().any(|&b| b != 0) {
+            overflow = true;
+        }
+    }
+    let out = unsafe { std::slice::from_raw_parts_mut(words, total) };
+    for (i, &b) in bytes.iter().enumerate() {
+        out[ip_pos(i, wordsize, numwords, flags)] = b;
+    }
+    if overflow { sign * 2 } else { sign }
+}
+/// rb_integer_unpack (kenny_capi.c): UNDEF with an exception pending.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_integer_unpack(words: *const u8, numwords: usize, wordsize: usize, _nails: usize, flags: c_int) -> V {
+    if !ip_check(numwords, wordsize, flags) {
+        return UNDEF;
+    }
+    let total = numwords * wordsize;
+    let src = unsafe { std::slice::from_raw_parts(words, total) };
+    let mut bytes = vec![0u8; total];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = src[ip_pos(i, wordsize, numwords, flags)];
+    }
+    let mut n = num_bigint::BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes);
+    if flags & IP_2COMP != 0 {
+        if total > 0 && bytes[total - 1] & 0x80 != 0 {
+            n -= num_bigint::BigInt::from(1) << (8 * total);
+        } else if flags & IP_NEGATIVE != 0 && n == num_bigint::BigInt::from(0) {
+            n = -(num_bigint::BigInt::from(1) << (8 * total));
+        }
+    } else if flags & IP_NEGATIVE != 0 {
+        n = -n;
+    }
+    int_from_big(n)
 }

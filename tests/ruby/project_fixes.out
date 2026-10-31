@@ -1,0 +1,69 @@
+Fwd(Fwd(Gen#hi))
+true
+[1, 2]
+[5]
+9
+1
+false
+"protected method 'v' called for an instance of PA"
+"protected method 'v' called for an instance of PA"
+"protected method 'cp' called for class PA"
+"protected method 'v' called for an instance of PA"
+"protected method 'secret' called for an instance of PMM"
+true
+nil
+false
+nil
+[3, 4, 4, 1, 2]
+false
+false
+[#<Encoding:BINARY (ASCII-8BIT)>, 7, 7]
+[#<Encoding:BINARY (ASCII-8BIT)>, 10]
+Encoding::CompatibilityError
+nil
+#<ArgumentError: invalid timeout: -1>
+1.0
+nil
+nil
+3.0
+false
+[]
+[Regexp::TimeoutError, RegexpError, StandardError]
+MyRange
+[1, 2, 3]
+false
+"bad value for range"
+[1, 2, 3]
+"wrong number of arguments (given 3, expected 0..2)"
+true
+true
+false
+[NA::NB, NA]
+[NA]
+[#<Class:NA>, NA]
+[NA::NB]
+[NA::NB]
+[NA::NB]
+[]
+{a: 1}
+Hash
+Array
+String
+[1, 1]
+[1, 1]
+[1, 1]
+:stack_error
+true
+:top_level
+:adm
+true
+false
+false
+true
+FrozenError
+FrozenError
+true
+:foo
+:bar
+#<Encoding:BINARY (ASCII-8BIT)>
+7

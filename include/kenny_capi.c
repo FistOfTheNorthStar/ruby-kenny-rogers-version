@@ -732,6 +732,27 @@ VALUE rb_cstr_to_inum(const char *s, int base, int badcheck) {
   if (badcheck) return base ? rb_funcall(rb_cObject, rb_intern("Integer"), 2, str, INT2FIX(base)) : rb_Integer(str);
   return rb_str2inum(str, base);
 }
+VALUE rb_str_to_inum(VALUE str, int base, int badcheck) {
+  StringValue(str);
+  if (badcheck) return rb_funcall(rb_mKernel, rb_intern("Integer"), 2, str, INT2NUM(base == 0 ? 10 : base));
+  return rb_funcall(str, rb_intern("to_i"), 1, INT2NUM(base == 0 ? 10 : base));
+}
+int kn_capi_integer_pack(VALUE val, void *words, size_t numwords, size_t wordsize, size_t nails, int flags, int *ok);
+VALUE kn_capi_integer_unpack(const void *words, size_t numwords, size_t wordsize, size_t nails, int flags);
+int rb_integer_pack(VALUE val, void *words, size_t numwords, size_t wordsize, size_t nails, int flags) {
+  int ok;
+  val = rb_to_int(val);
+  int r = kn_capi_integer_pack(val, words, numwords, wordsize, nails, flags, &ok);
+  if (!ok) kn_unwind();
+  return r;
+}
+VALUE rb_integer_unpack(const void *words, size_t numwords, size_t wordsize, size_t nails, int flags) {
+  VALUE r = kn_capi_integer_unpack(words, numwords, wordsize, nails, flags);
+  KN_CHECK(r);
+  return r;
+}
+VALUE rb_str_encode_ospath(VALUE path) { return path; }
+int rb_reserved_fd_p(int fd) { (void)fd; return 0; }
 VALUE rb_cstr2inum(const char *s, int base) { return rb_cstr_to_inum(s, base, base == 0); }
 double rb_cstr_to_dbl(const char *s, int badcheck) {
   VALUE str = rb_utf8_str_new_cstr(s);
@@ -1040,6 +1061,39 @@ VALUE rb_struct_aset(VALUE st, VALUE idx, VALUE v) { return rb_funcall(st, rb_in
 VALUE rb_struct_getmember(VALUE st, ID id) { return rb_funcall(st, rb_intern("[]"), 1, ID2SYM(id)); }
 VALUE rb_struct_size(VALUE st) { return rb_funcall(st, rb_intern("size"), 0); }
 VALUE rb_range_new(VALUE beg, VALUE end, int excl) { return rb_funcall(rb_cRange, rb_intern("new"), 3, beg, end, excl ? Qtrue : Qfalse); }
+VALUE rb_range_beg_len(VALUE range, long *begp, long *lenp, long len, int err) {
+  VALUE b, e;
+  int excl;
+  if (!rb_range_values(range, &b, &e, &excl)) return Qfalse;
+  long beg = NIL_P(b) ? 0 : NUM2LONG(b);
+  long end = NIL_P(e) ? -1 : NUM2LONG(e);
+  if (NIL_P(e)) excl = 0;
+  long origbeg = beg, origend = end;
+  if (beg < 0) {
+    beg += len;
+    if (beg < 0) goto out_of_range;
+  }
+  if (end < 0) end += len;
+  if (!excl) end++;
+  if (err == 0 || err == 2) {
+    if (beg > len) goto out_of_range;
+    if (end > len) end = len;
+  }
+  len = end - beg;
+  if (len < 0) len = 0;
+  *begp = beg;
+  *lenp = len;
+  return Qtrue;
+out_of_range:
+  if (err) rb_raise(rb_eRangeError, "%ld..%s%ld out of range", origbeg, excl ? "." : "", origend);
+  return Qnil;
+}
+VALUE rb_reg_new_str(VALUE src, int opts) { return rb_funcall(rb_cRegexp, rb_intern("new"), 2, src, INT2NUM(opts)); }
+VALUE rb_reg_new(const char *src, long len, int opts) { return rb_reg_new_str(rb_str_new(src, len), opts); }
+VALUE rb_obj_encoding(VALUE obj) { return rb_funcall(obj, rb_intern("encoding"), 0); }
+VALUE rb_struct_alloc_noinit(VALUE klass) { return rb_obj_alloc(klass); }
+VALUE rb_define_class_id(ID name, VALUE super) { (void)name; return rb_class_new(super ? super : rb_cObject); }
+VALUE rb_define_module_id(ID name) { (void)name; return rb_module_new(); }
 int rb_range_values(VALUE range, VALUE *begp, VALUE *endp, int *exclp) {
   if (!RTEST(rb_obj_is_kind_of(range, rb_cRange))) {
     ID b = rb_intern("begin"), e = rb_intern("end"), x = rb_intern("exclude_end?");
@@ -1180,6 +1234,8 @@ void *rb_thread_call_without_gvl2(void *(*func)(void *), void *data1, void (*ubf
   return rb_thread_call_without_gvl(func, data1, ubf, data2);
 }
 void *rb_thread_call_with_gvl(void *(*func)(void *), void *data1) { return func(data1); }
+/* (the functions given rb_thread_call_without_gvl run as they are: the GVL is never released) */
+int ruby_thread_has_gvl_p(void) { return 1; }
 void *rb_nogvl(void *(*func)(void *), void *data1, void (*ubf)(void *), void *data2, int flags) {
   (void)flags;
   return rb_thread_call_without_gvl(func, data1, ubf, data2);
@@ -1203,6 +1259,60 @@ VALUE rb_mutex_synchronize(VALUE m, VALUE (*func)(VALUE), VALUE arg) {
 VALUE rb_time_new(time_t sec, long usec) { return rb_funcall(rb_cTime, rb_intern("at"), 2, LL2NUM((long long)sec), LONG2NUM(usec)); }
 VALUE rb_time_nano_new(time_t sec, long nsec) {
   return rb_funcall(rb_cTime, rb_intern("at"), 3, LL2NUM((long long)sec), LONG2NUM(nsec), ID2SYM(rb_intern("nsec")));
+}
+VALUE rb_time_timespec_new(const struct timespec *ts, int offset) {
+  VALUE t = rb_time_nano_new(ts->tv_sec, ts->tv_nsec);
+  if (offset == INT_MAX - 1) return rb_funcall(t, rb_intern("utc"), 0);
+  if (offset != INT_MAX) return rb_funcall(t, rb_intern("localtime"), 1, INT2NUM(offset));
+  return t;
+}
+int rb_obj_method_arity(VALUE obj, ID mid) {
+  return NUM2INT(rb_funcall(rb_funcall(obj, rb_intern("method"), 1, ID2SYM(mid)), rb_intern("arity"), 0));
+}
+int rb_mod_method_arity(VALUE mod, ID mid) {
+  return NUM2INT(rb_funcall(rb_funcall(mod, rb_intern("instance_method"), 1, ID2SYM(mid)), rb_intern("arity"), 0));
+}
+VALUE rb_obj_method(VALUE obj, VALUE name) { return rb_funcall(obj, rb_intern("method"), 1, name); }
+VALUE rb_sym_to_s(VALUE sym) { return rb_funcall(sym, rb_intern("to_s"), 0); }
+void rb_copy_generic_ivar(VALUE clone, VALUE obj) {
+  VALUE names = rb_funcall(obj, rb_intern("instance_variables"), 0);
+  for (long i = 0; i < RARRAY_LEN(names); i++) {
+    ID id = SYM2ID(rb_ary_entry(names, i));
+    rb_ivar_set(clone, id, rb_ivar_get(obj, id));
+  }
+}
+VALUE rb_io_wait(VALUE io, VALUE events, VALUE timeout) {
+  int ev = NUM2INT(events);
+  VALUE one = rb_ary_new_from_args(1, io);
+  VALUE r = rb_funcall(rb_cIO, rb_intern("select"), 4, (ev & (RUBY_IO_READABLE | RUBY_IO_PRIORITY)) ? one : rb_ary_new(),
+                       (ev & RUBY_IO_WRITABLE) ? one : rb_ary_new(), Qnil, timeout);
+  if (NIL_P(r)) return Qfalse;
+  int ready = 0;
+  if (RARRAY_LEN(rb_ary_entry(r, 0)) > 0) ready |= ev & (RUBY_IO_READABLE | RUBY_IO_PRIORITY);
+  if (RARRAY_LEN(rb_ary_entry(r, 1)) > 0) ready |= RUBY_IO_WRITABLE;
+  return INT2NUM(ready);
+}
+int rb_method_boundp(VALUE klass, ID mid, int ex) {
+  VALUE name = ID2SYM(mid);
+  if (RTEST(rb_funcall(klass, rb_intern("method_defined?"), 1, name))) return 1;
+  return !ex && RTEST(rb_funcall(klass, rb_intern("private_method_defined?"), 1, name));
+}
+void rb_ivar_foreach(VALUE obj, int (*func)(ID key, VALUE val, st_data_t arg), st_data_t arg) {
+  VALUE names = rb_funcall(obj, rb_intern("instance_variables"), 0);
+  long n = RARRAY_LEN(names);
+  for (long i = 0; i < n; i++) {
+    ID id = SYM2ID(rb_ary_entry(names, i));
+    int r = func(id, rb_ivar_get(obj, id), arg);
+    if (r == ST_STOP) break;
+  }
+}
+st_index_t rb_ivar_count(VALUE obj) {
+  return (st_index_t)RARRAY_LEN(rb_funcall(obj, rb_intern("instance_variables"), 0));
+}
+/* (CRuby returns nil for a name no Symbol has; Kenny interns it) */
+VALUE rb_check_symbol_cstr(const char *ptr, long len, rb_encoding *enc) {
+  (void)enc;
+  return ID2SYM(rb_intern2(ptr, len));
 }
 struct timespec rb_time_timespec(VALUE time) {
   struct timespec t;

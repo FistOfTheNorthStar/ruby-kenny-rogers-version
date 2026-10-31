@@ -235,6 +235,8 @@ class StringIO
       s = o.to_s
       next if s.empty?
       buf = @__buf
+      # (into a binary buffer: the bytes, as CRuby's strio_write)
+      s = s.b if buf.encoding == Encoding::BINARY && s.encoding != Encoding::BINARY && !s.ascii_only?
       size = buf.bytesize
       @__pos = size if @append
       pos = @__pos
