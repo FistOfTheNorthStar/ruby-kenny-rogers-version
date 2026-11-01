@@ -155,7 +155,10 @@ No GVL. No new concurrency API. The existing ones become lightweight:
 
 Like Go's `net/http`, the runtime contains an HTTP/1.1 + HTTP/2 server written in Rust.
 No Puma, no Unicorn, no new API: a standard Rack `config.ru` (`run MyApp`) is the entry point,
-each request runs on its own lightweight `Thread`, and `./app` starts serving.
+each request runs on one of a pool of lightweight `Thread`s (`KENNY_SERVER_THREADS`, default 4
+per core), and `./app` starts serving. A request that waits (on the database, a socket, `sleep`)
+leaves its core to the other requests. Its limits and timeouts are Puma's defaults
+(`KENNY_MAX_BODY`, `KENNY_READ_TIMEOUT`, `KENNY_KEEPALIVE_TIMEOUT`; see the README).
 
 ```
 kenny build config.ru -o app
