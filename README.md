@@ -205,7 +205,17 @@ Working:
   Ripper subclasses work; lexer states of some tokens (spaces, heredoc ends) can differ from
   CRuby's, and `Ripper#state`/`#token` are nil.
 - **Built-in HTTP server** for Rack apps: one process serves requests on every core
-  (`rack.multithread` is true); `WEB_CONCURRENCY=n` forks n processes instead. `rack.hijack`
+  (`rack.multithread` is true); `WEB_CONCURRENCY=n` forks n processes instead. An event loop
+  per core reads and writes the connections, and the requests run on a pool of lightweight
+  threads (`KENNY_SERVER_THREADS`, default 4 per core; `0` runs them on the event loops, one
+  at a time per core), so a request waiting on the database or a socket doesn't hold up others.
+  Request bodies may be chunked; one over 1 MB goes to a temporary file (`rack.input` is then
+  an IO on it), and `Expect: 100-continue` is answered. Limits as in Puma: 112 KB of request
+  line and headers (431 above it), no body limit unless `KENNY_MAX_BODY` sets one (413);
+  headers must arrive within `KENNY_READ_TIMEOUT` seconds (default 30; 408 otherwise), and an
+  upload or a response download that stalls that long is cut off; an idle keep-alive connection
+  is closed after `KENNY_KEEPALIVE_TIMEOUT` seconds (default 20). A running request is not
+  timed. `0` turns a timeout off. `rack.hijack`
   (full and partial) hands the connection's socket to the app.
 
 Not yet:
@@ -276,7 +286,10 @@ several do (it keeps far less memory resident when threads free each other's obj
 mimalloc. `KENNY_EVAL_CACHE` (default 2000) sizes the cache of `eval`'d code. `KENNY_THREADS`
 sets how many OS threads run Ruby threads (default: one per core, or one with
 `RAILS_ENV=development`, whose code reloading counts on a GVL); `WEB_CONCURRENCY=n`
-additionally forks n server processes (default 1). `KENNY_SCHED_STATS=1` prints how often
+additionally forks n server processes (default 1); `KENNY_SERVER_THREADS` sets how many
+threads run requests in each (default 4 per `KENNY_THREADS`); `KENNY_MAX_BODY` (bytes, or with a
+K/M/G suffix), `KENNY_READ_TIMEOUT` and `KENNY_KEEPALIVE_TIMEOUT` (seconds) are the server's
+limits. `KENNY_SCHED_STATS=1` prints how often
 threads moved between cores (`KENNY_NO_STEAL=1` keeps them where they started, to compare); `KENNY_CRASH_TRACE=1` prints a native backtrace on a crash. `KENNY_NO_INLINE=1 kenny build ...` compiles without block inlining (to compare, or
 to rule it out when debugging). Debugging: `KENNY_DEBUG_RAISE=1` logs every exception raised
 (rescued or not) with its location; `KENNY_DEBUG_EVAL=1` logs every string compiled at runtime

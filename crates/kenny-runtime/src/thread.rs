@@ -380,7 +380,7 @@ pub fn run_main(main: Box<dyn FnOnce() -> V>) -> V {
     let x = 0u8;
     pt().idx = 0;
     pt().os_base = std::hint::black_box(&x) as *const u8 as usize + 256;
-    spawn_raw(Box::new(move |_| main()), MAIN_STACK, Some(0));
+    spawn_raw(Box::new(move |_| main()), MAIN_STACK, Some(0), true);
     p_loop(0);
     let main = locked!(s => {
         let m = &mut s.threads[0];
@@ -400,8 +400,9 @@ fn thread_obj(tid: usize) -> V {
     o
 }
 
-/// Create a thread running `f`, on P `on` (or the next P in turn). Returns its id.
-fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize>) -> usize {
+/// Create a thread running `f`, on P `on` (or the next P in turn); a `pinned` thread never
+/// moves to another P. Returns its id.
+fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize>, pinned: bool) -> usize {
     let stack = DefaultStack::new(stack_size).expect("thread stack");
     let (base, limit) = (stack.base().get(), stack.limit().get());
     let limit = if stack_size == MAIN_STACK { limit.max(base.saturating_sub(MAIN_USABLE)) } else { limit };
@@ -447,7 +448,7 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
             has_interrupt: AtomicBool::new(false),
             aborting: false,
             waiting_on: 0,
-            pinned: on.is_some(),
+            pinned,
             saved_throws: Default::default(),
             fiber_stack: Vec::new(),
         }));
@@ -1196,7 +1197,74 @@ fn tid_of(v: V) -> usize {
 /// Run `f` on a new thread of P `p` (used by the HTTP server to put a request loop on
 /// every P). Returns the thread id.
 pub fn spawn_native_on(p: usize, f: Box<dyn FnOnce() -> V>) -> usize {
-    spawn_raw(Box::new(move |_| f()), THREAD_STACK, Some(p))
+    spawn_raw(Box::new(move |_| f()), THREAD_STACK, Some(p), true)
+}
+/// Run `f` on a new thread that starts on P `p` but, like a Ruby `Thread`, may move to an
+/// idle P (the HTTP server's request threads).
+pub fn spawn_native_unpinned_on(p: usize, f: Box<dyn FnOnce() -> V>) -> usize {
+    spawn_raw(Box::new(move |_| f()), THREAD_STACK, Some(p), false)
+}
+
+/// Block the current thread until `notify_one(key)`, unless `ready()` holds. `ready` is
+/// checked with the scheduler's lock held, so a notify that follows a change making it true
+/// is never lost. Returns false when a Thread#raise / kill interrupted the wait (it is then
+/// pending). `key` must not be an object's address in use as another wait's key.
+pub fn wait_until(key: usize, ready: impl Fn() -> bool) -> bool {
+    if !active() {
+        return true;
+    }
+    enum R {
+        Ready,
+        Interrupted(Throw),
+        Blocked,
+    }
+    let r = locked!(s => {
+        if ready() {
+            R::Ready
+        } else {
+            match prepare_block(s, key as V, None) {
+                Some(i) => R::Interrupted(i),
+                None => R::Blocked,
+            }
+        }
+    });
+    match r {
+        R::Ready => true,
+        R::Interrupted(i) => {
+            pst().pending = i;
+            false
+        }
+        R::Blocked => {
+            suspend_current();
+            !matches!(finish_block(key as V), Wake::Interrupted)
+        }
+    }
+}
+
+/// Wake one thread waiting in `wait_until(key)`: the one that started waiting last on P
+/// `prefer` if there is one (it runs without waking another OS thread), else the one that has
+/// waited longest. False if none was waiting.
+pub fn notify_one(key: usize, prefer: Option<usize>) -> bool {
+    let (woken, pk) = locked!(s => {
+        let local = prefer.and_then(|p| {
+            let q = s.waiters.get(&key)?;
+            q.iter().rposition(|&tid| {
+                let t = &s.threads[tid];
+                t.state == St::Blocked && t.waiting_on == key && t.p == p
+            })
+        });
+        match local {
+            Some(i) => {
+                let tid = s.waiters.get_mut(&key).unwrap().remove(i).unwrap();
+                (true, make_runnable(s, tid))
+            }
+            None => wake_one_locked(s, key as V),
+        }
+    });
+    if let Some(pk) = pk {
+        pk.unpark();
+    }
+    woken
 }
 /// Number of Ps available (KENNY_THREADS).
 pub fn max_ps() -> usize {
@@ -1411,6 +1479,7 @@ pub fn init() {
             }),
             THREAD_STACK,
             None,
+            false,
         );
         let obj = locked!(s => s.threads[tid].obj);
         ivar_set(obj, sym("@__blk"), b);
