@@ -1141,6 +1141,64 @@ fn init_encoding(st: *mut Class, enc: *mut Class) {
         }
         bool_v(std::str::from_utf8(&rstr(s).b).is_ok())
     });
+    // scrub(repl = U+FFFD / "?") / scrub { |bytes| ... }: each invalid byte sequence (UTF-8's
+    // maximal invalid subparts, as CRuby splits them) replaced; a BINARY String has none
+    defn(st, "scrub", 0, 1, |s, a, b| {
+        let ascii = hdr(s).flags & FL_ASCII != 0;
+        let bytes = rstr(s).b.to_vec();
+        if is_bin(s) || (if ascii { bytes.is_ascii() } else { std::str::from_utf8(&bytes).is_ok() }) {
+            return new_like(s, bytes);
+        }
+        let repl = match a.first() {
+            Some(&r) if r != QNIL => {
+                if !is_str(r) {
+                    return type_error(&format!("no implicit conversion of {} into String", crate::core::class_name(real_class(r))));
+                }
+                Some(rstr(r).b.to_vec())
+            }
+            _ => None,
+        };
+        let mut out = Vec::with_capacity(bytes.len());
+        let put = |out: &mut Vec<u8>, bad: &[u8]| -> bool {
+            if let Some(r) = &repl {
+                out.extend_from_slice(r);
+            } else if b != QNIL {
+                let v = call_block(b, &[crate::pack::bin_str(bad.to_vec())]);
+                if v == UNDEF {
+                    return false;
+                }
+                if !is_str(v) {
+                    type_error(&format!("no implicit conversion of {} into String", crate::core::class_name(real_class(v))));
+                    return false;
+                }
+                out.extend_from_slice(&rstr(v).b);
+            } else {
+                out.extend_from_slice(if ascii { b"?" } else { "\u{FFFD}".as_bytes() });
+            }
+            true
+        };
+        if ascii {
+            for &c in &bytes {
+                if c.is_ascii() {
+                    out.push(c);
+                } else if !put(&mut out, &[c]) {
+                    return UNDEF;
+                }
+            }
+        } else {
+            for chunk in bytes.utf8_chunks() {
+                out.extend_from_slice(chunk.valid().as_bytes());
+                if !chunk.invalid().is_empty() && !put(&mut out, chunk.invalid()) {
+                    return UNDEF;
+                }
+            }
+        }
+        let r = new_like(s, out);
+        if ascii {
+            hdr(r).flags |= FL_ASCII;
+        }
+        r
+    });
     let us = object_new(enc);
     ivar_set(us, sym("@__name"), str_from("US-ASCII"));
     const_set(enc, sym("US_ASCII"), us);
