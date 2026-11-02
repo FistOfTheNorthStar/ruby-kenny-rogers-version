@@ -962,6 +962,8 @@ fn new_tls(fd: i32, sock: V, conn: Conn, sessions: Option<(Arc<dyn ClientSession
         let one: libc::c_int = 1;
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, &one as *const _ as *const libc::c_void, 4);
     }
+    // (macOS's send(2) ignores MSG_DONTWAIT: a large write would block the OS thread)
+    crate::io::set_nonblock(fd, true);
     wrap(
         *TLS_CLASS.get(),
         Tls {

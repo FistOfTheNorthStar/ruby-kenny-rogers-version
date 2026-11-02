@@ -1,0 +1,7 @@
+1000
+true
+true
+["bye"]
+[[:read, 100], [:timeout, 200]]
+true
+[0, 1, 2]
