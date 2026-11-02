@@ -15,22 +15,6 @@ module Gem
   autoload :Version, "rubygems/version"
   autoload :Requirement, "rubygems/requirement"
   autoload :Dependency, "rubygems/dependency"
-  # (the rest of RubyGems' own autoloads: `require "rubygems"` loads nothing more, as RubyGems
-  # is already there)
-  autoload :ConfigFile, "rubygems/config_file"
-  autoload :CIDetector, "rubygems/ci_detector"
-  autoload :DependencyList, "rubygems/dependency_list"
-  autoload :Installer, "rubygems/installer"
-  autoload :Licenses, "rubygems/util/licenses"
-  autoload :NameTuple, "rubygems/name_tuple"
-  autoload :PathSupport, "rubygems/path_support"
-  autoload :RequestSet, "rubygems/request_set"
-  autoload :Resolver, "rubygems/resolver"
-  autoload :Source, "rubygems/source"
-  autoload :SourceList, "rubygems/source_list"
-  autoload :SpecFetcher, "rubygems/spec_fetcher"
-  autoload :SpecificationPolicy, "rubygems/specification_policy"
-  autoload :Util, "rubygems/util"
 
   # Gem::Specification on first reference (not an autoload: RubyGems' own `class
   # Specification < BasicSpecification` must define it when RubyGems itself is loaded)
@@ -126,13 +110,6 @@ module Gem
     def sources=(list)
       @sources = list && Gem::SourceList.from(list)
     end
-    def load_yaml
-      return if @yaml_loaded
-      require "psych"
-      require "rubygems/psych_tree"
-      require "rubygems/safe_yaml"
-      @yaml_loaded = true
-    end
   end
   DEFAULT_SOURCE_DATE_EPOCH = 315_619_200
 
@@ -140,4 +117,15 @@ module Gem
   # the AWS SDK's user agent), from the stdlib when first used
   autoload :Deprecate, "rubygems/deprecate"
   autoload :Platform, "rubygems/platform"
+
+  # The rest of RubyGems (Gem::ConfigFile, Gem::Installer, Gem::SourceList ..., Gem.load_yaml):
+  # `kenny build` compiles kenny/gem_rubygems.rb in only when the program's code names one of
+  # those classes (see crates/kenny-compiler/src/gem_extras.rs), so it isn't required by a
+  # literal path here: it pulls in about 150 of RubyGems' files and Psych.
+  EXTRAS = "kenny/gem_rubygems"
+  private_constant :EXTRAS
+  begin
+    require EXTRAS
+  rescue ::LoadError # (not Gem::LoadError)
+  end
 end

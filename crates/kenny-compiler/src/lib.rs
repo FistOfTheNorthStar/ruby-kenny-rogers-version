@@ -27,6 +27,7 @@ mod felem;
 mod hoist;
 mod chilled;
 mod ripper;
+mod gem_extras;
 mod gcmap;
 #[cfg(feature = "jit")]
 pub mod jit;
@@ -328,6 +329,10 @@ pub struct Compiler<M: Module> {
     pub(crate) ripper_backend: Option<PathBuf>,
     pub(crate) ripper_used: bool,
     pub(crate) ripper_quiet: bool,
+    /// see `Options::gem_extras`; set once a compiled file names one of its classes
+    pub(crate) gem_extras: Option<PathBuf>,
+    pub(crate) gem_extras_used: bool,
+    pub(crate) gem_extras_quiet: Option<PathBuf>,
     /// Canonical load paths and dependency directories (code compiled with gem semantics).
     pub(crate) dep_roots: Vec<PathBuf>,
     pub warnings: Vec<String>,
@@ -602,6 +607,11 @@ pub struct Options {
     /// Ripper's parsing backend (Kenny's kenny/ripper_prism.rb, which loads Prism): compiled in
     /// only when the program's code names Ripper's parser (see ripper.rs).
     pub ripper_backend: Option<PathBuf>,
+    /// The rest of RubyGems for Kenny's Gem (kenny/gem_rubygems.rb): compiled in only when the
+    /// program's code names one of its classes (see gem_extras.rs).
+    pub gem_extras: Option<PathBuf>,
+    /// The standard library's `rubygems/` directory: its files don't count for `gem_extras`.
+    pub gem_extras_quiet: Option<PathBuf>,
     /// The `-I` directories (absolute): `$LOAD_PATH` starts with them, as in CRuby.
     pub runtime_load_path: Vec<PathBuf>,
 }
@@ -628,7 +638,9 @@ pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, V
     c.ruby = opts.ruby.clone();
     c.runtime_load_path = opts.runtime_load_path.clone();
     c.ripper_backend = opts.ripper_backend.clone();
+    c.gem_extras = opts.gem_extras.clone();
     let canon = |p: &PathBuf| p.canonicalize().unwrap_or(p.clone());
+    c.gem_extras_quiet = opts.gem_extras_quiet.as_ref().map(canon);
     let app: Vec<PathBuf> = opts.app_load_paths.iter().map(canon).collect();
     c.dep_roots = opts.load_paths.iter().map(canon).filter(|p| !app.contains(p)).chain(opts.dep_dirs.iter().map(canon)).collect();
     let top = c.compile_program(src, path);
@@ -639,6 +651,11 @@ pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, V
     if c.ripper_used {
         if let Some(b) = &opts.ripper_backend {
             c.require_file(b.clone(), 0);
+        }
+    }
+    if c.gem_extras_used {
+        if let Some(g) = &opts.gem_extras {
+            c.require_file(g.clone(), 0);
         }
     }
     if !c.errors.is_empty() {
@@ -737,6 +754,9 @@ impl<M: Module> Compiler<M> {
             ripper_backend: None,
             ripper_used: false,
             ripper_quiet: false,
+            gem_extras: None,
+            gem_extras_used: false,
+            gem_extras_quiet: None,
             dep_roots: Vec::new(),
             warnings: Vec::new(),
             refine_scope: None,

@@ -51,6 +51,7 @@ const OVERLAY: &[(&str, &str)] = &[
     ("prism/prism.rb", include_str!("../../../lib/kenny/prism/prism.rb")),
     ("kenny/ripper_prism.rb", include_str!("../../../lib/kenny/kenny/ripper_prism.rb")),
     ("kenny/gem.rb", include_str!("../../../lib/kenny/kenny/gem.rb")),
+    ("kenny/gem_rubygems.rb", include_str!("../../../lib/kenny/kenny/gem_rubygems.rb")),
     ("kenny/gem_specification.rb", include_str!("../../../lib/kenny/kenny/gem_specification.rb")),
     ("kenny/data.rb", include_str!("../../../lib/kenny/kenny/data.rb")),
     ("kenny/argf.rb", include_str!("../../../lib/kenny/kenny/argf.rb")),
@@ -369,9 +370,12 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<(kenny_compiler::Options,
     let ruby = ruby::get().map(|r| r.release_line()).unwrap_or_default();
     // Ripper's Prism backend: compiled in only when the program's code names Ripper's parser
     let ripper_backend = Some(overlay.join("kenny/ripper_prism.rb"));
+    // the rest of RubyGems: compiled in only when the program's code names one of its classes
+    let gem_extras = Some(overlay.join("kenny/gem_rubygems.rb"));
+    let gem_extras_quiet = stdlib.as_ref().map(|d| d.join("rubygems"));
     // (CRuby's $LOAD_PATH starts with the -I directories, expanded)
     let runtime_load_path = o.load_paths.iter().filter_map(|p| std::path::absolute(p).ok()).collect();
-    Ok((kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs, app_load_paths, ruby, coverage: false, ripper_backend, runtime_load_path }, pairing, gem_exts))
+    Ok((kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs, app_load_paths, ruby, coverage: false, ripper_backend, gem_extras, gem_extras_quiet, runtime_load_path }, pairing, gem_exts))
 }
 
 /// Returns whether the asset compilers were linked in (see `needs_assets`).

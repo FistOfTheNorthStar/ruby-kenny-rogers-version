@@ -198,6 +198,9 @@ impl<M: Module> Compiler<M> {
     }
 
     pub(crate) fn call_node(&mut self, fx: &mut Fx, c: &CallNode) -> Value {
+        if c.name().as_slice() == b"load_yaml" && c.receiver().is_some_and(|r| crate::gem_extras::is_gem(&r)) {
+            self.note_gem_extras();
+        }
         // `Module.nesting`: the lexical scopes, innermost first (the cref slots of the
         // enclosing class bodies, without the top level's)
         if c.name().as_slice() == b"nesting"
