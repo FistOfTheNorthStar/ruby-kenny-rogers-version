@@ -1,0 +1,22 @@
+[RuntimeError, "stop read"]
+[ArgumentError, "stop gets"]
+[IOError, "stop select"]
+[RuntimeError, "stop accept"]
+[RuntimeError, "stop write"]
+"after\n"
+[:ensure]
+false
+false
+Timeout::Error
+Timeout::Error
+Timeout::Error
+"ok"
+[IOError, "stream closed in another thread"]
+[IOError, "stream closed in another thread"]
+[IOError, "stream closed in another thread"]
+[Errno::EBADF, "Bad file descriptor"]
+[IOError, "stream closed in another thread"]
+[IOError, "stream closed in another thread"]
+[IOError, "stream closed in another thread"]
+[IOError, "stream closed in another thread"]
+"late"
