@@ -28,7 +28,7 @@ use crate::tri;
 use corosensei::stack::{DefaultStack, Stack};
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,8 @@ struct GThread {
     value: V,
     exc: V,
     ctx: usize,
+    /// The context it suspended in: `ctx`, or a Fiber's when it waits inside one.
+    run_ctx: usize,
     /// Stays on its P (the main thread, the HTTP server's loops).
     pinned: bool,
     // per-thread runtime state, swapped on switch (only touched by the thread's own P)
@@ -94,6 +96,8 @@ struct GThread {
     /// killed: running its ensure blocks on the way out (Thread#status "aborting")
     aborting: bool,
     waiting_on: usize,
+    /// blocked in `wait_io` (for an fd or a child process)
+    io_wait: bool,
 }
 
 struct GFiber {
@@ -115,18 +119,47 @@ struct Parker {
     /// loop): wakes that poller when the P gets work (a new thread, a thread woken up).
     hook: Mutex<Option<WakeHook>>,
     has_hook: AtomicBool,
+    /// the P's index (its event queue in the poller, while it polls)
+    idx: usize,
 }
 type WakeHook = Box<dyn Fn() + Send + Sync>;
 impl Parker {
-    fn new() -> Self {
-        Parker { m: Mutex::new(false), cv: Condvar::new(), hook: Mutex::new(None), has_hook: AtomicBool::new(false) }
+    fn new(idx: usize) -> Self {
+        Parker { m: Mutex::new(false), cv: Condvar::new(), hook: Mutex::new(None), has_hook: AtomicBool::new(false), idx }
     }
     fn unpark(&self) {
-        *self.m.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        self.cv.notify_one();
+        let polling = {
+            let mut g = self.m.lock().unwrap_or_else(|e| e.into_inner());
+            *g = true;
+            crate::poller::is_polling(self.idx)
+        };
+        if polling {
+            crate::poller::kick_p(self.idx);
+        } else {
+            self.cv.notify_one();
+        }
         if let Some(h) = &*self.hook.lock().unwrap_or_else(|e| e.into_inner()) {
             h();
         }
+    }
+    /// `park`, waiting in the poller's event queue (this P holds its token): the keys of the
+    /// waits that became ready go to `keys`.
+    fn park_polling(&self, timeout: Option<Duration>, keys: &mut Vec<usize>) {
+        crate::gc::blocking(|| {
+            {
+                let mut g = self.m.lock().unwrap_or_else(|e| e.into_inner());
+                if *g {
+                    *g = false;
+                    return;
+                }
+                // (under the lock: an unpark from now on kicks the event queue instead)
+                crate::poller::set_polling(self.idx, true);
+            }
+            crate::poller::poll_p(self.idx, timeout, keys);
+            let mut g = self.m.lock().unwrap_or_else(|e| e.into_inner());
+            crate::poller::set_polling(self.idx, false);
+            *g = false;
+        });
     }
     /// Wait until unparked (or the timeout); counts as idle for the GC.
     fn park(&self, timeout: Option<Duration>) {
@@ -147,8 +180,14 @@ struct PSlot {
     parker: Arc<Parker>,
     started: bool,
     runq: VecDeque<usize>,
-    /// Threads of this P blocked with a timeout (checked by its loop).
+    /// Threads of this P blocked with a timeout (checked by its loop). Entries of threads
+    /// woken early or moved to another P stay until the next scan.
     sleepers: Vec<usize>,
+    /// The earliest wake-up time in `sleepers` (perhaps of an entry gone stale meanwhile):
+    /// until then the loop needn't scan them.
+    next_wake: Option<Instant>,
+    /// `sleepers` is tidied up when it grows past this
+    tidy_at: usize,
     nthreads: usize,
     /// Parked in its loop with nothing to run (a candidate to steal work).
     idle: bool,
@@ -324,7 +363,11 @@ fn suspend_current() {
         return;
     }
     let t = unsafe { &mut *p.cur };
-    leave_ctx(t.ctx);
+    // (inside a Fiber the thread runs on the Fiber's stack: that is the one to scan while it
+    // is suspended, and the one to enter again; the thread's own stack was left at resume)
+    let c = p.running_ctx.unwrap_or(t.ctx);
+    t.run_ctx = c;
+    leave_ctx(c);
     save_state(t);
     let y = t.yielder;
     unsafe { (*y).suspend(()) };
@@ -360,7 +403,7 @@ pub fn run_main(main: Box<dyn FnOnce() -> V>) -> V {
         waiters: HashMap::new(),
         fibers: Vec::new(),
         ps: (0..(max_ps * 2).min(256))
-            .map(|i| PSlot { parker: Arc::new(Parker::new()), started: i == 0, runq: VecDeque::new(), sleepers: Vec::new(), nthreads: 0, idle: false })
+            .map(|i| PSlot { parker: Arc::new(Parker::new(i)), started: i == 0, runq: VecDeque::new(), sleepers: Vec::new(), next_wake: None, tidy_at: 64, nthreads: 0, idle: false })
             .collect(),
         max_ps,
         // new threads go to the other Ps first (P 0 runs the main thread)
@@ -437,6 +480,7 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
             value: QNIL,
             exc: QNIL,
             ctx,
+            run_ctx: ctx,
             pending: Throw::None,
             errinfo: QNIL,
             last_match: QNIL,
@@ -448,6 +492,7 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
             has_interrupt: AtomicBool::new(false),
             aborting: false,
             waiting_on: 0,
+            io_wait: false,
             pinned,
             saved_throws: Default::default(),
             fiber_stack: Vec::new(),
@@ -494,6 +539,11 @@ fn start_os_thread(idx: usize) {
 /// Ticks of the 10ms fairness timer.
 static TICK: AtomicU64 = AtomicU64::new(0);
 
+/// Ps running a thread right now; the fairness timer sleeps while there are none.
+static RUNNING: AtomicUsize = AtomicUsize::new(0);
+static TIMER_ASLEEP: AtomicBool = AtomicBool::new(false);
+static TIMER_IDLE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+
 fn start_timer() {
     let first = locked!(s => !std::mem::replace(&mut s.timer_started, true));
     if !first {
@@ -501,6 +551,16 @@ fn start_timer() {
     }
     std::thread::spawn(|| loop {
         std::thread::sleep(Duration::from_millis(10));
+        if RUNNING.load(Ordering::SeqCst) == 0 {
+            // every thread waits (on a socket, say): nothing to preempt, so no ticks
+            let mut g = TIMER_IDLE.0.lock().unwrap_or_else(|e| e.into_inner());
+            TIMER_ASLEEP.store(true, Ordering::SeqCst);
+            while RUNNING.load(Ordering::SeqCst) == 0 {
+                g = TIMER_IDLE.1.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+            TIMER_ASLEEP.store(false, Ordering::SeqCst);
+            continue;
+        }
         TICK.fetch_add(1, Ordering::Relaxed);
         crate::gc::KN_GC_PENDING.fetch_or(PREEMPT_BIT, Ordering::Relaxed);
         if crate::mt::multi() {
@@ -543,7 +603,7 @@ fn p_loop(idx: usize) {
                 match pick {
                     Some(t) => Pick::Run(t),
                     None => {
-                        let earliest = s.ps[idx].sleepers.iter().filter_map(|&t| s.threads[t].wake_at).min();
+                        let earliest = s.ps[idx].next_wake;
                         match earliest {
                             Some(w) => Pick::Wait(Some(w.saturating_duration_since(now))),
                             None if idx == 0 && deadlocked(s) => {
@@ -556,8 +616,12 @@ fn p_loop(idx: usize) {
                                 s.ps[idx].idle = false;
                                 Pick::Run(0)
                             }
-                            // P 0 checks for deadlock now and then
-                            None if idx == 0 => Pick::Wait(Some(Duration::from_millis(50))),
+                            // P 0 checks for deadlock now and then (seldom while threads wait
+                            // for fds: an idle server shouldn't wake up for it)
+                            None if idx == 0 => {
+                                let io = s.threads.iter().any(|t| t.io_wait && t.state == St::Blocked);
+                                Pick::Wait(Some(Duration::from_millis(if io { 1000 } else { 50 })))
+                            }
                             None => Pick::Wait(None),
                         }
                     }
@@ -567,6 +631,9 @@ fn p_loop(idx: usize) {
         match pick {
             Pick::Exit => return,
             Pick::Run(i) => {
+                if crate::poller::needs_poller(idx) {
+                    poll_handoff(idx);
+                }
                 resume_thread(i);
                 if idx >= sraw().map(|s| s.max_ps).unwrap_or(usize::MAX) {
                     give_back(i);
@@ -574,8 +641,23 @@ fn p_loop(idx: usize) {
             }
             Pick::Wait(t) => {
                 crate::kernel::flush_out();
-                let parker = locked!(s => s.ps[idx].parker.clone());
-                parker.park(t);
+                let (parker, regular) = locked!(s => (s.ps[idx].parker.clone(), idx < s.max_ps));
+                if regular && crate::poller::want_poll(idx) {
+                    if !crate::poller::ensure_p(idx) {
+                        // (no event queue for this P: the poller thread polls instead)
+                        crate::poller::give_token(idx, None);
+                        parker.park(t);
+                        continue;
+                    }
+                    // nothing to run: wait in the poller's event queue (see poller.rs)
+                    let mut keys = Vec::new();
+                    parker.park_polling(t, &mut keys);
+                    if !keys.is_empty() {
+                        wake_io_here(idx, &keys);
+                    }
+                } else {
+                    parker.park(t);
+                }
             }
         }
     }
@@ -583,6 +665,10 @@ fn p_loop(idx: usize) {
 
 /// Make this P's sleepers whose time has come runnable (lock held).
 fn wake_due_sleepers(s: &mut Sched, idx: usize, now: Instant) {
+    if s.ps[idx].next_wake.is_none_or(|w| w > now) {
+        return;
+    }
+    let mut next: Option<Instant> = None;
     let mut i = 0;
     while i < s.ps[idx].sleepers.len() {
         let tid = s.ps[idx].sleepers[i];
@@ -600,13 +686,34 @@ fn wake_due_sleepers(s: &mut Sched, idx: usize, now: Instant) {
             P_RUNQ[idx].store(s.ps[idx].runq.len(), Ordering::Relaxed);
             continue;
         }
+        next = next.min(t.wake_at).or(t.wake_at);
         i += 1;
+    }
+    s.ps[idx].next_wake = next;
+    s.ps[idx].tidy_at = (s.ps[idx].sleepers.len() * 2).max(64);
+}
+
+/// Thread `tid` of P `p` waits until `at` (lock held).
+fn add_sleeper(s: &mut Sched, p: usize, tid: usize, at: Instant) {
+    let ps = &mut s.ps[p];
+    ps.sleepers.push(tid);
+    ps.next_wake = Some(ps.next_wake.map_or(at, |w| w.min(at)));
+    if ps.sleepers.len() > ps.tidy_at {
+        // (threads that keep waiting with a timeout and being woken early leave entries)
+        let threads = &s.threads;
+        let ps = &mut s.ps[p];
+        ps.sleepers.retain(|&t| threads[t].state == St::Blocked && threads[t].wake_at.is_some() && threads[t].p == p);
+        ps.sleepers.sort_unstable();
+        ps.sleepers.dedup();
+        ps.next_wake = ps.sleepers.iter().filter_map(|&t| threads[t].wake_at).min();
+        ps.tidy_at = (ps.sleepers.len() * 2).max(64);
     }
 }
 
 /// No thread can ever run again (all blocked without a timeout, none running).
 fn deadlocked(s: &Sched) -> bool {
-    s.threads.iter().all(|t| t.state == St::Done || (t.state == St::Blocked && t.wake_at.is_none() && !t.has_interrupt.load(Ordering::Relaxed)))
+    // (a thread waiting for an fd or a child process isn't stuck: the world may answer)
+    s.threads.iter().all(|t| t.state == St::Done || (t.state == St::Blocked && t.wake_at.is_none() && !t.io_wait && !t.has_interrupt.load(Ordering::Relaxed)))
         && s.threads[0].state == St::Blocked
 }
 
@@ -614,7 +721,7 @@ fn resume_thread(i: usize) {
     let (tp, ctx, co) = locked!(s => {
         let t = &mut s.threads[i];
         t.state = St::Running;
-        (&mut **t as *mut GThread, t.ctx, t.co.take())
+        (&mut **t as *mut GThread, t.run_ctx, t.co.take())
     });
     let Some(mut co) = co else { return };
     let p = pt();
@@ -625,7 +732,12 @@ fn resume_thread(i: usize) {
     // (a pending Thread#raise is picked up where the thread resumes: finish_block, pass, or
     // its next safepoint)
     enter_ctx(ctx);
+    if RUNNING.fetch_add(1, Ordering::SeqCst) == 0 && TIMER_ASLEEP.load(Ordering::SeqCst) {
+        let _g = TIMER_IDLE.0.lock().unwrap_or_else(|e| e.into_inner());
+        TIMER_IDLE.1.notify_one();
+    }
     let res = co.resume(());
+    RUNNING.fetch_sub(1, Ordering::SeqCst);
     // back on the P's own stack
     let p = pt();
     p.running_ctx = None;
@@ -755,8 +867,8 @@ fn prepare_block(s: &mut Sched, on: V, timeout: Option<Duration>) -> Option<Thro
     t.timed_out = false;
     t.waiting_on = on as usize;
     let p = t.p;
-    if timeout.is_some() {
-        s.ps[p].sleepers.push(cur);
+    if let Some(at) = t.wake_at {
+        add_sleeper(s, p, cur, at);
     }
     if on != QNIL {
         s.waiters.entry(on as usize).or_default().push_back(cur);
@@ -777,6 +889,7 @@ fn finish_block(on: V) -> Wake {
         }
         let t = &mut s.threads[cur];
         t.waiting_on = 0;
+        t.io_wait = false;
         let i = t.interrupt.take();
         t.has_interrupt.store(false, Ordering::Release);
         if matches!(i, Some(Throw::Kill)) {
@@ -822,11 +935,19 @@ pub enum IoWake {
 /// arms the poller for `key`; it runs once the thread counts as blocked, so a wake that comes
 /// before the thread is off its stack isn't lost.
 pub fn wait_io(key: usize, timeout: Option<Duration>, register: impl FnOnce() -> bool) -> IoWake {
-    if !active() || !pt().fiber_stack.is_empty() {
+    if !active() {
         return IoWake::Unsupported;
     }
     let on = key as V;
-    if let Some(i) = locked!(s => prepare_block(s, on, timeout)) {
+    let cur = pt().current.unwrap();
+    let r = locked!(s => {
+        let r = prepare_block(s, on, timeout);
+        if r.is_none() {
+            s.threads[cur].io_wait = true;
+        }
+        r
+    });
+    if let Some(i) = r {
         pst().pending = i;
         return IoWake::Interrupted;
     }
@@ -847,6 +968,67 @@ pub fn wait_io(key: usize, timeout: Option<Duration>, register: impl FnOnce() ->
 /// Wake the thread parked in `wait_io(key)` (any OS thread may call it).
 pub fn wake_io(key: usize) {
     wake_all(key as V);
+}
+
+/// P `idx` polled and found `keys` ready: their threads run here (it is idle, so that costs
+/// no other OS thread a wake-up), except those that must stay on their own P. Idle Ps are
+/// woken to take over the rest when several became ready.
+fn wake_io_here(idx: usize, keys: &[usize]) {
+    let mut wake: Vec<Arc<Parker>> = Vec::new();
+    locked!(s => {
+        let mut here = 0;
+        for &k in keys {
+            let Some(mut q) = s.waiters.remove(&k) else { continue };
+            while let Some(tid) = q.pop_front() {
+                let t = &s.threads[tid];
+                if t.state != St::Blocked || t.waiting_on != k {
+                    continue;
+                }
+                if !t.pinned && t.co.is_some() && t.fiber_stack.is_empty() && t.p != idx {
+                    move_thread(s, tid, idx);
+                }
+                if s.threads[tid].p == idx {
+                    let t = &mut s.threads[tid];
+                    t.state = St::Runnable;
+                    t.wake_at = None;
+                    s.ps[idx].runq.push_back(tid);
+                    P_RUNQ[idx].store(s.ps[idx].runq.len(), Ordering::Relaxed);
+                    here += 1;
+                } else {
+                    wake.extend(make_runnable(s, tid));
+                }
+            }
+        }
+        for _ in 1..here {
+            match kick_idle(s, idx) {
+                Some(pk) => wake.push(pk),
+                None => break,
+            }
+        }
+    });
+    for pk in wake {
+        pk.unpark();
+    }
+}
+
+/// P `idx` is about to run a thread while it holds the poller's token (or nobody does while
+/// threads wait for fds): pass the token to an idle P, else to the poller thread.
+#[cold]
+fn poll_handoff(idx: usize) {
+    let to = locked!(s => {
+        let n = s.max_ps;
+        (0..n).map(|k| (idx + 1 + k) % n).find(|&v| v != idx && s.ps[v].started && s.ps[v].idle).map(|v| {
+            s.ps[v].idle = false;
+            (v, s.ps[v].parker.clone())
+        })
+    });
+    match to {
+        Some((v, pk)) => {
+            crate::poller::give_token(idx, Some(v));
+            pk.unpark();
+        }
+        None => crate::poller::give_token(idx, None),
+    }
 }
 
 /// Make thread `tid` runnable (lock held); returns the parker to poke if it is on another P.
@@ -915,9 +1097,9 @@ fn move_thread(s: &mut Sched, tid: usize, to: usize) {
     P_NTHREADS[from].fetch_sub(1, Ordering::Relaxed);
     s.ps[to].nthreads += 1;
     P_NTHREADS[to].fetch_add(1, Ordering::Relaxed);
-    if let Some(i) = s.ps[from].sleepers.iter().position(|&t| t == tid) {
-        s.ps[from].sleepers.swap_remove(i);
-        s.ps[to].sleepers.push(tid);
+    // (its entry in `from`'s sleepers goes stale)
+    if let (St::Blocked, Some(at)) = (s.threads[tid].state, s.threads[tid].wake_at) {
+        add_sleeper(s, to, tid, at);
     }
 }
 /// Take a waiting thread from another P's queue for idle P `idx` (lock held): the one that
@@ -1186,7 +1368,7 @@ pub fn idle_timeout() -> Option<Duration> {
             return Some(Duration::ZERO);
         }
         let now = Instant::now();
-        ps.sleepers.iter().filter_map(|&t| s.threads[t].wake_at).min().map(|w| w.saturating_duration_since(now)).or(Some(Duration::from_millis(50)))
+        ps.next_wake.map(|w| w.saturating_duration_since(now)).or(Some(Duration::from_millis(50)))
     })
 }
 

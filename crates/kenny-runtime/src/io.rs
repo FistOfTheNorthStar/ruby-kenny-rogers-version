@@ -61,6 +61,14 @@ const FNM_EXTGLOB: i64 = 16;
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
 }
+/// A read or write as a blocking call (gc::blocking): its result and errno, taken before
+/// the collection it may stop for on the way out changes errno.
+fn blocking_rw(f: impl FnOnce() -> isize) -> (isize, i32) {
+    crate::gc::blocking(move || {
+        let n = f();
+        (n, if n < 0 { errno() } else { 0 })
+    })
+}
 fn bstr(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
@@ -355,6 +363,88 @@ pub struct IoState {
     /// mixes up data at worst and never touches freed memory.
     wbusy: std::sync::atomic::AtomicBool,
     rbusy: std::sync::atomic::AtomicBool,
+    /// (fd, what it is), see `kind_of`
+    kind: (i32, FdKind),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FdKind {
+    /// a regular file (or a directory): reads and writes don't wait for anyone
+    File,
+    /// a socket, or a pipe or FIFO other than the inherited stdin/out/err: made non-blocking
+    /// (as CRuby makes them), so reads and writes never block, they wait parked
+    Stream,
+    /// a terminal, device, or an inherited stdio pipe (other processes may share it: its
+    /// flags stay as they are): wait until ready, then read or write
+    Other,
+}
+pub(crate) fn set_nonblock(fd: i32, on: bool) {
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if fl >= 0 && (fl & libc::O_NONBLOCK != 0) != on {
+        unsafe { libc::fcntl(fd, libc::F_SETFL, if on { fl | libc::O_NONBLOCK } else { fl & !libc::O_NONBLOCK }) };
+    }
+}
+fn fd_kind(fd: i32) -> FdKind {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return FdKind::Other;
+    }
+    match st.st_mode & libc::S_IFMT {
+        libc::S_IFREG | libc::S_IFDIR => FdKind::File,
+        libc::S_IFSOCK => FdKind::Stream,
+        libc::S_IFIFO if fd > 2 => FdKind::Stream,
+        _ => FdKind::Other,
+    }
+}
+
+/// flush_raw's errors that aren't an errno: a Thread#raise / kill came while the write
+/// waited, or another thread closed the IO.
+const EWAIT_INTERRUPTED: i32 = -1;
+const EWAIT_CLOSED: i32 = -2;
+fn write_error(e: i32, detail: &[u8]) -> V {
+    match e {
+        EWAIT_INTERRUPTED => UNDEF,
+        EWAIT_CLOSED => closed_in_another_thread(),
+        e => raise_errno(e, None, detail),
+    }
+}
+
+/// Write all of `b` to a socket, pipe or terminal; while it can't take more, the thread waits
+/// parked. A `stream` (non-blocking) takes what fits and the thread waits for room for the
+/// rest; otherwise the write starts once there is room and may block for the rest, as a
+/// blocking call that holds up nobody else.
+fn write_waiting(fd: i32, mut b: &[u8], stream: bool) -> Result<(), i32> {
+    while !b.is_empty() {
+        let n = if stream {
+            // (in a blocking call should a child process have been handed it, which makes it
+            // blocking again)
+            let (ptr, len) = (b.as_ptr() as usize, b.len());
+            blocking_rw(move || unsafe { libc::write(fd, ptr as *const c_void, len) })
+        } else {
+            let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+            if unsafe { libc::poll(&mut p, 1, 0) } == 0 {
+                (-1, libc::EAGAIN) // full: wait below
+            } else {
+                let (ptr, len) = (b.as_ptr() as usize, b.len());
+                blocking_rw(move || unsafe { libc::write(fd, ptr as *const c_void, len) })
+            }
+        };
+        let (n, e) = n;
+        if n >= 0 {
+            b = &b[n as usize..];
+            continue;
+        }
+        match e {
+            libc::EINTR => {}
+            libc::EAGAIN => match poll_wait_raw(&mut [libc::pollfd { fd, events: libc::POLLOUT, revents: 0 }], None) {
+                Ok(_) => {}
+                Err(WaitErr::Interrupted) => return Err(EWAIT_INTERRUPTED),
+                Err(WaitErr::Closed) => return Err(EWAIT_CLOSED),
+            },
+            e => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Holds an IO buffer flag (see IoState::wbusy) until dropped. Waiting yields to other
@@ -417,13 +507,31 @@ pub(crate) fn wait_fd(fd: i32, events: i16) -> Result<(), V> {
     poll_wait(&mut [libc::pollfd { fd, events, revents: 0 }], None).map(|_| ())
 }
 
+/// The IOError of a wait whose IO another thread closed.
+pub(crate) fn closed_in_another_thread() -> V {
+    io_error("stream closed in another thread")
+}
+
+/// Why a wait ended early.
+pub(crate) enum WaitErr {
+    /// a Thread#raise / kill is pending (the exception is in `pending`)
+    Interrupted,
+    /// another thread closed one of the fds
+    Closed,
+}
+
+/// `poll_wait_raw`, with a close by another thread raised as IOError.
+fn poll_wait(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32, V> {
+    poll_wait_raw(pfds, timeout).map_err(|e| match e {
+        WaitErr::Interrupted => UNDEF,
+        WaitErr::Closed => closed_in_another_thread(),
+    })
+}
+
 /// Wait until one of `pfds` is ready (returns poll(2)'s count, revents set) or `timeout`
 /// passes (Ok(0)), without holding up this P's other threads or a collection: the thread
 /// parks in the scheduler and the poller (kqueue / epoll) wakes it.
-fn poll_wait(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32, V> {
-    // (a parked wait wakes now and then to look again, should an fd never report: closed
-    // under it, or a kind the poller accepts but never signals)
-    const RECHECK: Duration = Duration::from_secs(5);
+pub(crate) fn poll_wait_raw(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32, WaitErr> {
     let start = std::time::Instant::now();
     let fds: Vec<(i32, bool)> = pfds.iter().filter(|p| p.fd >= 0).map(|p| (p.fd, p.events & libc::POLLOUT != 0)).collect();
     loop {
@@ -437,17 +545,64 @@ fn poll_wait(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32
         }
         let key = crate::poller::next_key();
         let mut registered = false;
-        let w = crate::thread::wait_io(key, Some(remaining.map_or(RECHECK, |r| r.min(RECHECK))), || {
+        // (without a timeout the wait is no sleeper the scheduler has to look at)
+        let w = crate::thread::wait_io(key, remaining, || {
             registered = crate::poller::register(&fds, key);
             registered
         });
-        if registered {
-            crate::poller::deregister(&fds, key);
+        if registered && crate::poller::deregister(&fds, key) && !matches!(w, crate::thread::IoWake::Interrupted) {
+            return Err(WaitErr::Closed);
         }
         match w {
             crate::thread::IoWake::Ready | crate::thread::IoWake::Timeout => {}
-            crate::thread::IoWake::Interrupted => return Err(UNDEF),
+            crate::thread::IoWake::Interrupted => return Err(WaitErr::Interrupted),
             crate::thread::IoWake::Unsupported => return poll_slices(pfds, remaining),
+        }
+    }
+}
+
+/// Wait for child `pid` to exit, parked (kqueue's process events, a pidfd on Linux).
+/// Ok(false): can't wait for it that way (the caller polls).
+fn wait_child(pid: i32) -> Result<bool, V> {
+    if pid <= 0 || !crate::thread::active() || crate::poller::off() {
+        return Ok(false);
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let pfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        if pfd < 0 {
+            return Ok(false);
+        }
+        let r = poll_wait_raw(&mut [libc::pollfd { fd: pfd, events: libc::POLLIN, revents: 0 }], Some(Duration::from_secs(5)));
+        unsafe { libc::close(pfd) };
+        return match r {
+            Ok(_) => Ok(true),
+            Err(_) => Err(UNDEF),
+        };
+    }
+    #[allow(unreachable_code)]
+    {
+        let key = crate::poller::next_key();
+        let mut registered = false;
+        let w = crate::thread::wait_io(key, Some(Duration::from_secs(5)), || {
+            registered = crate::poller::register_proc(pid, key);
+            if registered {
+                // (it may have exited before it was watched)
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let r = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+                if r != 0 || unsafe { info.si_pid() } != 0 {
+                    crate::thread::wake_io(key);
+                }
+            }
+            registered
+        });
+        if registered {
+            crate::poller::deregister_proc(pid, key);
+        }
+        match w {
+            crate::thread::IoWake::Interrupted => Err(UNDEF),
+            crate::thread::IoWake::Unsupported => Ok(false),
+            _ => Ok(true),
         }
     }
 }
@@ -456,7 +611,7 @@ fn poll_wait(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32
 /// yield to them; alone, block in short slices (counted as stopped for the GC), so a thread
 /// that comes to this P meanwhile (woken up, or a sleeper whose time came) waits at most a
 /// slice.
-fn poll_slices(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32, V> {
+fn poll_slices(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32, WaitErr> {
     const SLICE_MS: i32 = 20;
     let start = std::time::Instant::now();
     loop {
@@ -464,12 +619,18 @@ fn poll_slices(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i
         let shared = crate::thread::idle_timeout().is_some();
         let ms = if shared { 0 } else { remaining.map_or(SLICE_MS, |r| (r.as_millis() as i32).min(SLICE_MS)) };
         let (ptr, len) = (pfds.as_mut_ptr() as usize, pfds.len() as libc::nfds_t);
-        let n = if ms == 0 {
-            unsafe { libc::poll(ptr as *mut libc::pollfd, len, 0) }
+        let (n, e) = if ms == 0 {
+            let n = unsafe { libc::poll(ptr as *mut libc::pollfd, len, 0) };
+            (n, if n < 0 { errno() } else { 0 })
         } else {
-            crate::gc::blocking(|| unsafe { libc::poll(ptr as *mut libc::pollfd, len, ms) })
+            let (n, e) = blocking_rw(|| unsafe { libc::poll(ptr as *mut libc::pollfd, len, ms) } as isize);
+            (n as i32, e)
         };
-        if n > 0 || (n < 0 && errno() != libc::EINTR) {
+        if n > 0 && pfds.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
+            // (the fds were open when the wait began: another thread closed one)
+            return Err(WaitErr::Closed);
+        }
+        if n > 0 || (n < 0 && e != libc::EINTR) {
             return Ok(n);
         }
         if remaining.is_some_and(|r| r.is_zero()) || timeout.is_some_and(|t| start.elapsed() >= t) {
@@ -477,12 +638,12 @@ fn poll_slices(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i
         }
         if shared {
             if crate::thread::sleep(Some(Duration::from_millis(2))) == UNDEF {
-                return Err(UNDEF);
+                return Err(WaitErr::Interrupted);
             }
         } else {
             crate::thread::pass();
             if pst().pending_is_set() {
-                return Err(UNDEF);
+                return Err(WaitErr::Interrupted);
             }
         }
     }
@@ -512,6 +673,7 @@ impl IoState {
             bom_enc: None,
             wbusy: std::sync::atomic::AtomicBool::new(false),
             rbusy: std::sync::atomic::AtomicBool::new(false),
+            kind: (-1, FdKind::Other),
         })
     }
     fn detail(&self) -> Vec<u8> {
@@ -575,9 +737,19 @@ impl IoState {
                     flush_out(); // keep ordering with Kenny's stdout buffer
                 }
                 let fd = self.wfd;
-                // (a socket or pipe may block until the other end reads, a disk write may be
-                // slow: neither holds up a collection or this P's other threads)
-                crate::gc::blocking(|| sys_write_all(fd, &b))
+                match self.kind_of(fd) {
+                    // (a disk write may be slow: it holds up neither a collection nor this
+                    // P's other threads)
+                    FdKind::File => crate::gc::blocking(|| sys_write_all(fd, &b)),
+                    // (a socket or pipe waits for the other end to read: parked)
+                    k => {
+                        let r = write_waiting(fd, &b, k == FdKind::Stream);
+                        if r == Err(EWAIT_CLOSED) || (r.is_err() && self.closed) {
+                            return Err(EWAIT_CLOSED);
+                        }
+                        r
+                    }
+                }
             }
         }
     }
@@ -585,7 +757,7 @@ impl IoState {
         if self.std == 1 {
             flush_out();
         }
-        self.flush_raw().map_err(|e| raise_errno(e, None, &self.detail()))
+        self.flush_raw().map_err(|e| write_error(e, &self.detail()))
     }
     pub fn write(&mut self, b: &[u8]) -> Result<(), V> {
         self.check_writable()?;
@@ -634,18 +806,27 @@ impl IoState {
         if self.std == 0 && self.fd == 0 {
             flush_out();
         }
-        wait_fd(self.fd, libc::POLLIN)?;
+        let fd = self.fd;
+        let kind = self.kind_of(fd);
+        if kind == FdKind::Stream {
+            return self.read_stream();
+        }
+        if kind == FdKind::Other {
+            wait_fd(fd, libc::POLLIN)?;
+            if self.closed {
+                return Err(closed_in_another_thread());
+            }
+        }
         let rbusy = unsafe { &*(&self.rbusy as *const std::sync::atomic::AtomicBool) };
         let _g = BufLock::take(rbusy);
         let old = self.rbuf.len();
         self.rbuf.resize(old + (1 << 16), 0);
         loop {
-            // (wait_fd waited until a pipe, socket or terminal has data; regular files don't block)
+            // (wait_fd waited until a terminal or device has data; regular files don't block)
             // (a disk read may be slow: it holds up neither a collection nor this P's threads)
             let (fd, buf) = (self.fd, self.rbuf[old..].as_mut_ptr() as usize);
-            let n = crate::gc::blocking(move || unsafe { libc::read(fd, buf as *mut c_void, 1 << 16) });
+            let (n, e) = blocking_rw(move || unsafe { libc::read(fd, buf as *mut c_void, 1 << 16) });
             if n < 0 {
-                let e = errno();
                 if e == libc::EINTR {
                     continue;
                 }
@@ -660,6 +841,48 @@ impl IoState {
             self.rbuf.truncate(old + n as usize);
             return Ok(n as usize);
         }
+    }
+    /// `fill_more` from a socket or pipe (non-blocking): read what is there, else wait parked
+    /// until there is something (another thread reading the same fd can't leave this one
+    /// stuck in read(2)).
+    fn read_stream(&mut self) -> Result<usize, V> {
+        let fd = self.fd;
+        let rbusy = unsafe { &*(&self.rbusy as *const std::sync::atomic::AtomicBool) };
+        loop {
+            if self.closed {
+                return Err(closed_in_another_thread());
+            }
+            let g = BufLock::take(rbusy);
+            let old = self.rbuf.len();
+            self.rbuf.resize(old + (1 << 16), 0);
+            // (in a blocking call should a child process have been handed the fd, which makes
+            // it blocking again)
+            let buf = self.rbuf[old..].as_mut_ptr() as usize;
+            let (n, e) = blocking_rw(move || unsafe { libc::read(fd, buf as *mut c_void, 1 << 16) });
+            if n >= 0 {
+                self.rbuf.truncate(old + n as usize);
+                return Ok(n as usize);
+            }
+            self.rbuf.truncate(old);
+            drop(g);
+            match e {
+                libc::EINTR => {}
+                libc::EAGAIN => poll_wait(&mut [libc::pollfd { fd, events: libc::POLLIN, revents: 0 }], None).map(|_| ())?,
+                e => return Err(raise_errno(e, Some("io_fread"), &self.detail())),
+            }
+        }
+    }
+    /// What `fd` is (cached while the IO keeps that fd). Sockets and pipes are made
+    /// non-blocking, as CRuby makes them (and macOS's send(2) ignores MSG_DONTWAIT).
+    fn kind_of(&mut self, fd: i32) -> FdKind {
+        if self.kind.0 != fd {
+            let k = fd_kind(fd);
+            if k == FdKind::Stream {
+                set_nonblock(fd, true);
+            }
+            self.kind = (fd, k);
+        }
+        self.kind.1
     }
     fn take(&mut self, n: usize) -> Vec<u8> {
         let n = n.min(self.avail());
@@ -866,7 +1089,9 @@ impl IoState {
         if self.closed {
             return Ok(());
         }
-        let r = self.flush_raw();
+        // (another thread in the middle of a write, perhaps waiting for the other end to
+        // read: don't wait for it, it gets "stream closed in another thread")
+        let r = if self.wbusy.load(std::sync::atomic::Ordering::Acquire) { Ok(()) } else { self.flush_raw() };
         self.close_fds();
         unregister(self);
         if self.pid > 0 {
@@ -876,7 +1101,7 @@ impl IoState {
                 set_last_status(p, st);
             }
         }
-        r.map_err(|e| raise_errno(e, None, &self.detail()))
+        r.map_err(|e| write_error(e, &self.detail()))
     }
     /// An embedded file that something needs a real descriptor for (`fileno`, `dup`, a
     /// child's redirection...): continue reading it from a temporary copy.
@@ -901,10 +1126,13 @@ impl IoState {
         self.readable = false;
         self.writable = false;
         if self.std == 0 && self.autoclose {
+            // (threads waiting on it wake up: "stream closed in another thread")
             if self.fd > 2 {
+                crate::poller::closing(self.fd);
                 unsafe { libc::close(self.fd) };
             }
             if self.wfd != self.fd && self.wfd > 2 {
+                crate::poller::closing(self.wfd);
                 unsafe { libc::close(self.wfd) };
             }
         }
@@ -2005,16 +2233,24 @@ fn set_last_status(pid: i32, raw: i32) -> V {
 }
 /// waitpid that lets green threads run; Ok(None) = WNOHANG and nothing exited.
 fn waitpid_v(pid: i32, flags: i32) -> Result<Option<(i32, i32)>, V> {
+    // (waiting for any child, or a process group, polls: no event says one of them exited)
+    let mut nap = Duration::from_millis(1);
     loop {
-        let threads = crate::thread::idle_timeout().is_some();
+        let threads = crate::thread::idle_timeout().is_some() || (pid > 0 && crate::thread::active() && !crate::poller::off());
         let f = if threads { flags | libc::WNOHANG } else { flags };
         let mut status = 0;
-        let r = unsafe { libc::waitpid(pid, &mut status, f) };
+        let (r, e) = if f & libc::WNOHANG != 0 {
+            let r = unsafe { libc::waitpid(pid, &mut status, f) };
+            (r, if r < 0 { errno() } else { 0 })
+        } else {
+            let sp = &mut status as *mut i32 as usize;
+            let (r, e) = blocking_rw(move || unsafe { libc::waitpid(pid, sp as *mut i32, f) } as isize);
+            (r as i32, e)
+        };
         if r > 0 {
             return Ok(Some((r, status)));
         }
         if r < 0 {
-            let e = errno();
             if e == libc::EINTR {
                 continue;
             }
@@ -2023,9 +2259,13 @@ fn waitpid_v(pid: i32, flags: i32) -> Result<Option<(i32, i32)>, V> {
         if flags & libc::WNOHANG != 0 {
             return Ok(None);
         }
-        if crate::thread::sleep(Some(Duration::from_millis(2))) == UNDEF {
+        if wait_child(pid)? {
+            continue;
+        }
+        if crate::thread::sleep(Some(nap)) == UNDEF {
             return Err(UNDEF);
         }
+        nap = (nap * 2).min(Duration::from_millis(20));
     }
 }
 fn mkpipe() -> Result<(i32, i32), V> {
@@ -2295,6 +2535,8 @@ fn spawn_child(spec: SpawnSpec, capture_in: bool, capture_out: bool) -> Result<R
     }
     for (i, fd) in fds.iter().enumerate() {
         if let Some(fd) = *fd {
+            // (a child expects blocking stdio, as CRuby gives it: a socket of ours is non-blocking)
+            set_nonblock(fd, false);
             let s = Stdio::from(unsafe { OwnedFd::from_raw_fd(fd) });
             match i {
                 0 => cmd.stdin(s),
@@ -2378,6 +2620,7 @@ fn k_exec(a: &[V]) -> V {
             Some(Redir::Path(p, f, perm)) => ok!(open_fd(p, *f, *perm)),
             _ => continue,
         };
+        set_nonblock(fd, false);
         let s = Stdio::from(unsafe { OwnedFd::from_raw_fd(fd) });
         match i {
             0 => spec.cmd.stdin(s),
@@ -3572,9 +3815,11 @@ pub fn init() {
             pfds.push(libc::pollfd { fd: if s.std != 0 { s.std as i32 } else { s.wfd }, events: libc::POLLOUT, revents: 0 });
         }
         let n = if ready_r.is_empty() {
-            match poll_wait(&mut pfds, timeout) {
+            match poll_wait_raw(&mut pfds, timeout) {
                 Ok(n) => n,
-                Err(e) => return e,
+                Err(WaitErr::Interrupted) => return UNDEF,
+                // (as in CRuby: select(2) on the closed fd fails)
+                Err(WaitErr::Closed) => return raise_errno(libc::EBADF, None, b""),
             }
         } else {
             unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) }
