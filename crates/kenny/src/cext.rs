@@ -12,6 +12,11 @@
 //! left out (Kenny's `ruby.h` replaces them); the extconf checks ran against CRuby's
 //! headers, so a check can find a function Kenny's API lacks — then the extension doesn't
 //! compile or link, and is left out with a warning (requiring it raises LoadError, as before).
+//!
+//! Each extension was a shared library of its own under CRuby, so two can define the same C
+//! symbol (rinku and redcarpet both vendor Sundown's `buffer.c`). Linked into one binary,
+//! they would clash: each extension's objects are combined into one relocatable object in
+//! which only its `Init_` functions stay global, the rest becoming local to it (`ld -r`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -478,12 +483,41 @@ pub fn compile(exts: Vec<Ext>, work: &Path, ruby_h: &str, shim: &str) -> Result<
             warn_left_out(&e, &first_error(why));
             continue;
         }
-        let objs = jobs.iter().filter(|j| j.ext == Some(i)).map(|j| j.obj.clone()).collect();
+        let objs: Vec<PathBuf> = jobs.iter().filter(|j| j.ext == Some(i)).map(|j| j.obj.clone()).collect();
+        let objs = match localize(&objs, &work.join(format!("ext{i}.o"))) {
+            Ok(o) => vec![o],
+            Err(why) if e.optional => {
+                warn_left_out(&e, &why);
+                continue;
+            }
+            Err(why) => return Err(format!("{}: {why}", e.label)),
+        };
         built.push((e, objs));
     }
     let mut b = Built { shim: vec![work.join("kenny_capi.o")], exts: built, reg: work.join("kenny_exts.o"), work: work.to_path_buf() };
     b.register()?;
     Ok(b)
+}
+
+/// One extension's objects as one object `out` whose only global definitions are its `Init_`
+/// functions (see the module docs); what it uses from elsewhere stays undefined.
+fn localize(objs: &[PathBuf], out: &Path) -> Result<PathBuf, String> {
+    let run = |c: &mut Command, what: &str| -> Result<(), String> {
+        match c.output() {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(format!("{what} failed: {}", tail(&String::from_utf8_lossy(&o.stderr), 5))),
+            Err(e) => Err(format!("failed to run {what}: {e}")),
+        }
+    };
+    if cfg!(target_os = "macos") {
+        // (`ld -r` turns the symbols it doesn't export into local ones)
+        run(Command::new("ld").arg("-r").args(["-exported_symbol", "_Init_*"]).arg("-o").arg(out).args(objs), "ld -r")?;
+    } else {
+        run(Command::new("ld").arg("-r").arg("-o").arg(out).args(objs), "ld -r")?;
+        let objcopy = std::env::var("OBJCOPY").unwrap_or_else(|_| "objcopy".into());
+        run(Command::new(&objcopy).args(["--wildcard", "--keep-global-symbol=Init_*"]).arg(out), "objcopy")?;
+    }
+    Ok(out.to_path_buf())
 }
 
 /// The first compiler error of a failed compile (for a one-line warning).
