@@ -1,0 +1,31 @@
+true
+rel_feat loaded
+["<dir>/require_runtime/inc_lit.rb", "<dir>/require_runtime/inc_comp.rb", "<dir>/require_runtime/rel_feat.rb"]
+lib/rt_lib.rb loaded
+false
+lib/rt_nested/conf.rb loaded
+true
+false
+disk_feat.rb loaded
+true
+false
+["<dir>/require_runtime/lib/rt_lib.rb", "<dir>/require_runtime/lib/rt_nested/conf.rb", "<dir>/require_runtime_disk/disk_feat.rb"]
+require 'inc_late' (compiled in, not loaded yet):
+  zeitwerk-style wrapper: inc_late
+  first wrapper: inc_late
+inc_late loaded
+true
+require 'inc_lit' (loaded):
+  zeitwerk-style wrapper: inc_lit
+  first wrapper: inc_lit
+false
+Kernel.require 'inc_comp':
+  zeitwerk-style wrapper: inc_comp
+  first wrapper: inc_comp
+false
+require_relative (not a require call):
+false
+  zeitwerk-style wrapper: kenny_not_there
+  first wrapper: kenny_not_there
+LoadError
+["<dir>/require_runtime/inc_late.rb"]

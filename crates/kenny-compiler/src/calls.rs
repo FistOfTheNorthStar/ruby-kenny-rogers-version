@@ -398,7 +398,7 @@ impl<M: Module> Compiler<M> {
                         ).find(|p| p.is_file())
                     };
                     if let Some(p) = found {
-                        return self.require_path(fx, p, at);
+                        return self.require_path_as(fx, p, at, Some(name.as_bytes()));
                     }
                 }
                 b"binding" if arg_nodes.is_empty() && block.is_none() => {
@@ -528,7 +528,11 @@ impl<M: Module> Compiler<M> {
             let plain = move |c: &mut Self, fx: &mut Fx, rt: &'static str, args: &[Value]| -> Value {
                 if inline && rt == "kn_vcall" {
                     c.direct_call(fx, cache, recv, &[], false, |c, fx| c.call(fx, rt, args))
-                } else if (inline || stub) && rt == "kn_attr_get" {
+                } else if inline && rt == "kn_attr_get" {
+                    // (in a loop, `attr_fast` tried the attribute first) a compiled method
+                    // called here, anything else through the runtime
+                    c.direct_call(fx, cache, recv, &[], false, |c, fx| c.call(fx, rt, args))
+                } else if stub && rt == "kn_attr_get" {
                     c.call_stub(fx, crate::fastpath::STUB_ATTR_GET, args)
                 } else if stub && rt == "kn_vcall" {
                     c.call_stub(fx, crate::fastpath::STUB_VCALL, args)
@@ -536,11 +540,11 @@ impl<M: Module> Compiler<M> {
                     c.call(fx, rt, args)
                 }
             };
-            let attr = !fx.loops.is_empty() && crate::fastpath::attr_name(&name);
+            let attr = crate::fastpath::attr_name(&name) && (!fx.loops.is_empty() || (!self.in_dependency() && self.attr_names.contains(&name)));
             let dynamic = |c: &mut Self, fx: &mut Fx| -> Value {
                 if attr {
                     let mode = c.iconst(fx, 2);
-                    c.attr_fast(fx, cache, recv, None, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, mode]))
+                    c.attr_fast(fx, cache, recv, None, false, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, mode]))
                 } else {
                     plain(c, fx, "kn_vcall", &[cache, recv, mid])
                 }
@@ -827,10 +831,19 @@ impl<M: Module> Compiler<M> {
             let p = self.str_lit(fx, abs.display().to_string().as_bytes());
             return self.send(fx, s, b"require", &[p], None);
         }
-        self.require_path(fx, full, at)
+        self.require_path_as(fx, full, at, Some(b""))
     }
 
+    /// `load "x"` of a file found at build time: runs the compiled file.
     fn require_path(&mut self, fx: &mut Fx, full: PathBuf, at: usize) -> Value {
+        self.require_path_as(fx, full, at, None)
+    }
+
+    /// Run the compiled file `full` once. `req`: for `require "name"` (Some(name)) and
+    /// `require_relative` (Some("")), which list it in `$LOADED_FEATURES`; a `require "name"`
+    /// calls a Ruby definition of `require` instead once there is one (Zeitwerk's,
+    /// bootsnap's), as CRuby does.
+    fn require_path_as(&mut self, fx: &mut Fx, full: PathBuf, at: usize, req: Option<&[u8]>) -> Value {
         let Some((fid, flag)) = self.require_file(full, at) else {
             return self.iconst(fx, QFALSE);
         };
@@ -838,15 +851,31 @@ impl<M: Module> Compiler<M> {
         // (kn_require_file waits for that thread, like CRuby's require)
         let flagp = self.slot_ptr(fx, flag);
         let st = fx.b.ins().load(I64, mem(), flagp, 0);
-        let loaded = fx.b.ins().icmp_imm_s(IntCC::Equal, st, 1);
+        let mut loaded = fx.b.ins().icmp_imm_s(IntCC::Equal, st, 1);
+        if req.is_some_and(|n| !n.is_empty()) {
+            // (`KnDirect::require_hook`: `require` redefined in Ruby)
+            let dg = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+            let dir = fx.b.ins().symbol_value(I64, dg);
+            let hook = fx.b.ins().load(I64, mem(), dir, crate::KN_DIRECT_REQUIRE_HOOK);
+            let nohook = fx.b.ins().icmp_imm_s(IntCC::Equal, hook, 0);
+            loaded = fx.b.ins().band(loaded, nohook);
+        }
         let run = fx.b.create_block();
         let done = fx.b.create_block();
         fx.b.append_block_param(done, I64);
         let f = self.iconst(fx, QFALSE);
         fx.b.ins().brif(loaded, done, &[f.into()], run, &[]);
         fx.b.switch_to_block(run);
+        fx.b.set_cold_block(run);
         let fa = self.fn_addr(fx, fid);
-        let r = self.call(fx, "kn_require_file", &[flagp, fa]);
+        let r = match req {
+            None => self.call(fx, "kn_require_file", &[flagp, fa]),
+            Some(n) => {
+                let s = self.self_val(fx);
+                let name = if n.is_empty() { self.nil(fx) } else { self.sym_val(fx, n) };
+                self.call(fx, "kn_require_lit", &[flagp, fa, s, name])
+            }
+        };
         self.check(fx, r);
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(done);

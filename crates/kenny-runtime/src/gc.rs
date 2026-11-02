@@ -772,8 +772,8 @@ pub fn wb_obj(v: V) {
         }
     }
 }
-/// C-extension data objects (their mark functions see values the barrier can't): scanned by
-/// every minor collection.
+/// C-extension data objects (their mark functions see values the barrier can't): the old ones
+/// are traced by every minor collection. Every collection drops the ones that died.
 static DATA_MARKED: crate::mt::L<Vec<V>> = crate::mt::L::new(Vec::new());
 pub fn register_marked_data(v: V) {
     DATA_MARKED.get().push(v);
@@ -2148,8 +2148,11 @@ fn collect_locked() {
         }
         phase("old_envs", &mut lap);
         DBG_NDATA.store(DATA_MARKED.raw().len(), std::sync::atomic::Ordering::Relaxed);
+        // (only the old ones: a young one is traced if something reaches it)
         for &d in DATA_MARKED.raw().iter() {
-            m.trace(d);
+            if hdr(d).flags & FL_MARK != 0 {
+                m.trace(d);
+            }
         }
     } else {
         for &(kind, p) in &remembered {
@@ -2180,10 +2183,9 @@ fn collect_locked() {
     if !major && verify_mode() {
         verify_minor(h);
     }
-    if major {
-        // C-extension data that died
-        DATA_MARKED.raw().retain(|&d| hdr(d).flags & FL_MARK != 0);
-    }
+    // C-extension data that died (also young data in a minor collection: its page is swept
+    // later, and the list must not keep its address once its free function ran)
+    DATA_MARKED.raw().retain(|&d| hdr(d).flags & FL_MARK != 0);
     free_retired(std::mem::take(&mut m.retired), std::mem::take(&mut m.keep));
 
     // sweep: pages are split among this thread and the stopped ones (`sweep_help`); objects
@@ -3007,7 +3009,7 @@ pub fn definee_values(definee: &[*mut Class], dm_stack: &[*const Method], out: &
 /// can call it after the method is removed from its class).
 static METHOD_OBJECT_CODE: crate::mt::L<Option<FxHashSet<usize>>> = crate::mt::L::new(None);
 pub fn note_method_object(m: *const Method) {
-    if let Body::Compiled(f) = unsafe { &(*m).body } {
+    if let Body::Compiled(f) | Body::Aliased(f, _) = unsafe { &(*m).body } {
         METHOD_OBJECT_CODE.get().get_or_insert_with(FxHashSet::default).insert(*f as usize);
     }
 }
@@ -3023,7 +3025,7 @@ fn free_dead_units(h: &mut Heap, m: &mut Marker, orphans: Vec<OrphanUnit>) {
             if meth.is_null() {
                 continue;
             }
-            if let Body::Compiled(f) = unsafe { &(*meth).body } {
+            if let Body::Compiled(f) | Body::Aliased(f, _) = unsafe { &(*meth).body } {
                 let f = *f as usize;
                 if f >= m.code_lo && f < m.code_hi {
                     m.code_word(f);

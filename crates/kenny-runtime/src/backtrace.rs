@@ -29,7 +29,11 @@ struct Func {
     strs: *const u8,
     /// The line of its `def` or block, 0 if none (Method/Proc#source_location).
     def_line: u32,
+    /// An eval unit's top level (`EVAL_TOP`) or a block in it (its nesting depth): their
+    /// label is the eval's context's (`relabel_evals`).
+    eval: u32,
 }
+const EVAL_TOP: u32 = u32::MAX;
 /// A call location that is an inline record (see the module docs).
 const INLINE: u32 = 1 << 31;
 /// Frame index of a captured address (frames of inlined methods at one return address).
@@ -79,6 +83,7 @@ pub unsafe extern "C" fn kn_register_debug(fns: *const u8, n: u64, calls: *const
             exact: f.size & EXACT != 0,
             strs,
             def_line: f.def_line,
+            eval: 0,
         });
     }
     t.sorted = false;
@@ -101,6 +106,7 @@ pub fn register_jit(funcs: &[(usize, u32, u32, u32, Vec<(u32, u32)>, u32)], strs
             exact: *size & EXACT != 0,
             strs,
             def_line: *def_line,
+            eval: eval_kind(&cstr(unsafe { strs.add(*label as usize) })),
         });
     }
     t.sorted = false;
@@ -162,6 +168,9 @@ pub fn capture() -> Vec<usize> {
     }
     let mut fp = frame_pointer();
     let mut n = 0;
+    // (each entry's frame pointer, and whether one is an eval unit's)
+    let mut fps = Vec::new();
+    let mut evals = false;
     while fp >= lo && fp + 16 <= hi && fp % 8 == 0 && n < 100_000 {
         let next = unsafe { *(fp as *const usize) };
         let ret = unsafe { *((fp + 8) as *const usize) };
@@ -173,7 +182,9 @@ pub fn capture() -> Vec<usize> {
                 let n = call_loc(f, ret).map(|l| frames(f, l).len()).unwrap_or(1).min(255);
                 for j in 0..n {
                     out.push(ret | (j << FRAME_SHIFT));
+                    fps.push(fp);
                 }
+                evals |= f.eval != 0;
             }
         }
         if next <= fp {
@@ -182,7 +193,126 @@ pub fn capture() -> Vec<usize> {
         fp = next;
         n += 1;
     }
+    if evals {
+        relabel_evals(&t, &mut out, &fps);
+    }
     out
+}
+
+/// The kind of frame a label names: `EVAL_TOP` for an eval unit's top level, the nesting
+/// depth for a block in it, 0 otherwise.
+fn eval_kind(label: &str) -> u32 {
+    if label == "<eval>" {
+        return EVAL_TOP;
+    }
+    let Some(rest) = label.strip_suffix(" in <eval>") else { return 0 };
+    block_levels(rest)
+}
+
+/// "block" -> 1, "block (3 levels)" -> 3, else 0.
+fn block_levels(s: &str) -> u32 {
+    if s == "block" {
+        return 1;
+    }
+    s.strip_prefix("block (").and_then(|r| r.strip_suffix(" levels)")).and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
+/// The label of a block `levels` deep in a frame labelled `base` (CRuby's "block in X",
+/// "block (2 levels) in X").
+fn block_label(base: &str, levels: u32) -> String {
+    let (more, inner) = match base.split_once(" in ") {
+        Some((b, rest)) if block_levels(b) > 0 => (block_levels(b), rest),
+        _ => (0, base),
+    };
+    match levels + more {
+        1 => format!("block in {inner}"),
+        n => format!("block ({n} levels) in {inner}"),
+    }
+}
+
+/// Frames relabelled for one backtrace: an entry `RELABEL | i` is `RELABELS[i]` (the
+/// captured entry and its label). Kept once per pair, so the table stays as small as the
+/// set of eval call sites and contexts.
+const RELABEL: usize = 1 << 55;
+static RELABELS: std::sync::Mutex<(Vec<(usize, String)>, Option<std::collections::HashMap<(usize, String), usize>>)> = std::sync::Mutex::new((Vec::new(), None));
+
+/// Code `eval`'d from a string is labelled as in CRuby: with the label of the frame it was
+/// evaluated in (the caller of `eval`, or where the Binding it went through was made), and
+/// "block in ..." of that for its blocks. Eval units are shared by every call site of the
+/// same source, so this is worked out per backtrace, from the frames around each eval.
+fn relabel_evals(t: &Table, out: &mut [usize], fps: &[usize]) {
+    let label_of = |e: usize| -> Option<(String, u32)> {
+        let j = e >> FRAME_SHIFT;
+        let ret = e & ADDR_MASK;
+        let f = find(&t.funcs, ret)?;
+        let fr = frames(f, call_loc(f, ret)?);
+        let label = cstr(fr.get(j).or(fr.last())?.2);
+        // (an eval unit's function: its own frame, or a block inlined into it)
+        let kind = if f.eval != 0 { eval_kind(&label) } else { 0 };
+        Some((label, kind))
+    };
+    let ctxs: Vec<(usize, String)> = pst().eval_ctx.clone();
+    let mut resolved: Vec<Option<String>> = vec![None; out.len()];
+    // (outermost first: an eval's context is resolved before the frames run inside it)
+    let mut cur: Option<String> = None;
+    for i in (0..out.len()).rev() {
+        let Some((label, kind)) = label_of(out[i]) else { continue };
+        if kind == EVAL_TOP {
+            // run through a Binding: the binding's label (its eval was called between this
+            // frame and the next one out); else the next frame's, the caller of `eval`
+            let hi = fps.get(i + 1).copied().unwrap_or(usize::MAX);
+            let lbl = ctxs.iter().rev().find(|(sp, _)| *sp > fps[i] && *sp < hi).map(|c| c.1.clone()).or_else(|| {
+                let k = i + 1;
+                if k < out.len() { resolved[k].clone().or_else(|| label_of(out[k]).map(|l| l.0)) } else { None }
+            });
+            let lbl = lbl.unwrap_or_else(|| "<main>".to_string());
+            cur = Some(lbl.clone());
+            resolved[i] = Some(lbl);
+        } else if kind != 0 {
+            if let Some(c) = &cur {
+                resolved[i] = Some(block_label(c, kind));
+            }
+        }
+        let _ = label;
+    }
+    let mut tab = RELABELS.lock().unwrap_or_else(|e| e.into_inner());
+    let (list, index) = &mut *tab;
+    let index = index.get_or_insert_with(Default::default);
+    for (e, r) in out.iter_mut().zip(resolved) {
+        if let Some(l) = r {
+            let key = (*e, l);
+            let i = match index.get(&key) {
+                Some(&i) => i,
+                None => {
+                    list.push(key.clone());
+                    index.insert(key, list.len() - 1);
+                    list.len() - 1
+                }
+            };
+            *e = RELABEL | i;
+        }
+    }
+}
+
+/// Run `f`, an eval through binding `b`: its code is labelled as where `b` was made.
+pub fn with_binding_label(b: V, f: impl FnOnce() -> V) -> V {
+    let pc = ivar_get(b, sym("@__pc"));
+    let label = if is_fix(pc) {
+        symbolize(fix(pc) as usize).map(|x| x.2)
+    } else if ivar_get(b, sym("@__self")) == rt().main_obj {
+        Some("<main>".to_string())
+    } else {
+        None
+    };
+    let Some(label) = label else { return f() };
+    let sp = crate::core::approx_sp();
+    pst().eval_ctx.push((sp, label));
+    let r = f();
+    let ctx = &mut pst().eval_ctx;
+    if let Some(i) = ctx.iter().rposition(|c| c.0 == sp) {
+        ctx.remove(i);
+    }
+    r
 }
 
 /// The label of the innermost compiled-code frame on the stack ("A#foo", "block in A#foo",
@@ -277,6 +407,11 @@ pub fn def_location(addr: usize) -> Option<(String, i64)> {
 
 /// (path, line, label) of one captured return address.
 pub fn symbolize(ret: usize) -> Option<(String, i64, String)> {
+    if ret & RELABEL != 0 && ret >> FRAME_SHIFT == 0 {
+        let (e, label) = RELABELS.lock().unwrap_or_else(|e| e.into_inner()).0.get(ret & !RELABEL)?.clone();
+        let (file, line, _) = symbolize(e)?;
+        return Some((file, line, label));
+    }
     let t = TABLE.read().unwrap();
     let j = ret >> FRAME_SHIFT;
     let ret = ret & ADDR_MASK;

@@ -1,0 +1,6 @@
+cyc_b: require cyc_a -> true, CYC_A defined
+false
+cyc_c: start
+cyc_d: require cyc_c -> false
+cyc_c: require cyc_d -> true
+true

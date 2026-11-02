@@ -826,6 +826,10 @@ pub enum Body {
     /// C extension function and its arity (-1 = argc/argv, 0..15 = fixed).
     CFunc(*const std::ffi::c_void, i32),
     Undefined,
+    /// An alias of a compiled method whose body uses `__callee__` (and that method's name):
+    /// it runs the same function, telling it the name it was called by (`kn_callee`).
+    /// Never called directly by compiled code, so it always goes through `invoke`.
+    Aliased(CompiledFn, u32),
 }
 #[repr(C)]
 pub struct Method {
@@ -1027,6 +1031,12 @@ pub struct PState {
     pub definee: Vec<*mut Class>,
     /// Methods defined with define_method that are running (for `super` inside them).
     pub dm_stack: Vec<*const Method>,
+    /// Evals through a Binding that are running: (stack pointer at the call, the label of
+    /// where the Binding was made), for backtraces (backtrace.rs `relabel_evals`).
+    pub eval_ctx: Vec<(usize, String)>,
+    /// Methods running through an alias that `Body::Aliased` stands for: (the method's own
+    /// name, the alias, the receiver, the stack pointer at the call), innermost last (`kn_callee`).
+    pub callee: Vec<(u32, u32, V, usize)>,
     /// Methods running through `super` from a module that appears more than once in the
     /// receiver's ancestors: (receiver, name, ancestor index it was found at), so a further
     /// `super` goes on from that copy (`find_super_method_at`)
@@ -1132,6 +1142,8 @@ pub fn new_pstate() -> *mut PState {
         stack_limit: 0,
         definee: Vec::new(),
         dm_stack: Vec::new(),
+        eval_ctx: Vec::new(),
+        callee: Vec::new(),
         super_at: Vec::new(),
         current_block: Vec::new(),
         mcache: HashMap::default(),
@@ -1178,6 +1190,10 @@ pub struct KnDirect {
     /// The String class (compiled code runs getbyte/setbyte of plain Strings inline while
     /// `DIRECT_STR_BYTE` is set).
     pub string_class: std::sync::atomic::AtomicUsize,
+    /// Nonzero once Ruby code redefines `require` where a receiverless `require` finds it
+    /// (Kernel, Object, ...: Zeitwerk's and bootsnap's wrappers): compiled `require "x"`
+    /// then calls it as a method instead of running the compiled file itself.
+    pub require_hook: std::sync::atomic::AtomicU64,
 }
 #[unsafe(no_mangle)]
 pub static KN_DIRECT: KnDirect = KnDirect {
@@ -1190,7 +1206,9 @@ pub static KN_DIRECT: KnDirect = KnDirect {
     array_class: std::sync::atomic::AtomicUsize::new(0),
     entry_limit: std::sync::atomic::AtomicUsize::new(0),
     string_class: std::sync::atomic::AtomicUsize::new(0),
+    require_hook: std::sync::atomic::AtomicU64::new(0),
 };
+const _: () = assert!(std::mem::offset_of!(KnDirect, require_hook) == 72);
 const _: () = assert!(std::mem::offset_of!(KnDirect, array_class) == 48 && std::mem::offset_of!(KnDirect, math_module) == 40);
 const _: () = assert!(std::mem::offset_of!(KnDirect, entry_limit) == 56 && std::mem::offset_of!(KnDirect, string_class) == 64);
 /// What compiled code reads of a String (fastpath.rs `STR_*`): the buffer's ptr, len, cap.
@@ -1591,6 +1609,9 @@ pub static EQQ_TOUCHED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// Class `c`'s method table entry of name `mid` changed (see `IS_A_TOUCHED`, `EQQ_TOUCHED`).
 pub fn touch_method_name(c: *mut Class, mid: u32) {
     use std::sync::atomic::Ordering::SeqCst;
+    if mid == require_id() && !c.is_null() {
+        note_require_override(c, c);
+    }
     if !DIRECT_READY.load(SeqCst) {
         return;
     }
@@ -1608,9 +1629,34 @@ pub fn touch_method_name(c: *mut Class, mid: u32) {
         }
     }
 }
+fn require_id() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| sym("require"))
+}
+/// `target` got the methods of `m` (itself, or a module mixed in): if that gives a
+/// receiverless `require` a Ruby definition, compiled `require "x"` calls it from now on
+/// (`KnDirect::require_hook`).
+fn note_require_override(target: *mut Class, m: *mut Class) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if KN_DIRECT.require_hook.load(SeqCst) != 0 || target.is_null() || m.is_null() {
+        return;
+    }
+    let r = rt();
+    let t = unsafe { &*target };
+    let reached = [r.c.kernel, r.c.object, r.c.basic_object, r.c.module, r.c.class].contains(&target) || (t.is_singleton && t.attached == r.main_obj);
+    if !reached {
+        return;
+    }
+    if let Some(&meth) = unsafe { (*m).methods.get(&require_id()) } {
+        if !meth.is_null() && !matches!(unsafe { &(*meth).body }, Body::Native(..) | Body::Undefined) {
+            KN_DIRECT.require_hook.store(1, SeqCst);
+        }
+    }
+}
 /// Module `m` was included in or prepended to `target`: its methods named === count as
 /// defined in `target` (`EQQ_TOUCHED`).
 pub fn touch_mixin(target: *mut Class, m: *mut Class) {
+    note_require_override(target, m);
     if DIRECT_READY.load(std::sync::atomic::Ordering::SeqCst) && !find_method(m, sym("===")).is_null() {
         touch_method_name(target, sym("==="));
     }
@@ -2104,6 +2150,34 @@ fn invoke_body(m: *const Method, recv: V, args: &[V], blk: V) -> V {
             r
         }
         Body::Undefined => QNIL,
+        Body::Aliased(f, orig) => {
+            if approx_sp() < pst().stack_limit {
+                return raise(rt().c.system_stack_error, "stack level too deep");
+            }
+            let sp = approx_sp();
+            pst().callee.push((*orig, m.name, recv, sp));
+            let r = unsafe { f(recv, args.len() as u64, args.as_ptr(), blk) };
+            let c = &mut pst().callee;
+            if let Some(i) = c.iter().rposition(|e| e.3 == sp) {
+                c.remove(i);
+            }
+            r
+        }
+    }
+}
+
+/// Compiled methods whose body uses `__callee__` (their aliases are `Body::Aliased`).
+pub static CALLEE_FNS: crate::mt::L<Option<std::collections::HashSet<usize>>> = crate::mt::L::new(None);
+
+/// `__callee__` in a method `def`'d as `name` running on `recv`: the alias it was called by
+/// (`Body::Aliased`), else `name`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_callee(name: V, recv: V) -> V {
+    // (the innermost entry on this stack: a Fiber suspended inside an alias left its own)
+    let Some((lo, hi)) = crate::thread::current_stack() else { return name };
+    match pst().callee.iter().rev().find(|e| e.3 > lo && e.3 < hi) {
+        Some(&(orig, alias, r, _)) if is_sym(name) && orig == sym_id(name) && r == recv => mksym(alias),
+        _ => name,
     }
 }
 

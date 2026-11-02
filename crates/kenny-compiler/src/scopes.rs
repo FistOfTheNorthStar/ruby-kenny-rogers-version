@@ -162,7 +162,7 @@ impl<M: Module> Compiler<M> {
             cref_slot: slot,
             method: None,
             fast_arity: None,
-            predeclared: None,
+            predeclared: if kind == ScopeKind::Top { self.top_predeclared.take() } else { None },
             bt_label: None,
             bmethod: false,
             ret_hops: None,
@@ -194,8 +194,11 @@ impl<M: Module> Compiler<M> {
         if let Some(&f) = self.loaded.get(&path) {
             return Some(f);
         }
-        if self.loading.contains(&path) {
-            return None;
+        // a `require` cycle (a file that requires the one requiring it, reached while it is
+        // compiled): the same function and flag, so it runs as in CRuby when the cycle is
+        // entered elsewhere at runtime
+        if let Some(&f) = self.loading.get(&path) {
+            return Some(f);
         }
         let src = match std::fs::read(&path) {
             Ok(s) => s,
@@ -204,7 +207,13 @@ impl<M: Module> Compiler<M> {
                 return None;
             }
         };
-        self.loading.insert(path.clone());
+        let sig = self.method_sig();
+        self.fn_counter += 1;
+        let stem: String = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        let pre = self.module.declare_function(&format!("__kn_{}_file_{stem}", self.fn_counter), Linkage::Local, &sig).expect("declare fn");
+        let flag = self.cache_alloc(1);
+        self.loading.insert(path.clone(), (pre, flag));
+        let saved_pre = self.top_predeclared.replace(pre);
         let saved_file = std::mem::replace(&mut self.file, path.clone());
         let saved_src = std::mem::replace(&mut self.src, src.clone());
         let saved_scopes = std::mem::take(&mut self.scopes);
@@ -218,8 +227,9 @@ impl<M: Module> Compiler<M> {
         self.file = saved_file;
         self.src = saved_src;
         self.loading.remove(&path);
+        self.top_predeclared = saved_pre;
         let fid = r.ok()?;
-        let flag = self.cache_alloc(1);
+        debug_assert!(fid == pre);
         self.src_hashes.insert(path.clone(), src_hash(&src));
         self.loaded.insert(path, (fid, flag));
         Some((fid, flag))
@@ -1572,6 +1582,7 @@ impl<M: Module> Compiler<M> {
         let saved_ctx = std::mem::take(&mut self.inline_ctx);
         self.def_stack.push((self.file.clone(), offset));
         self.def_cref.insert((self.file.clone(), offset), fx.cref_slot);
+        let saved_callee = std::mem::replace(&mut self.callee_used, false);
         let fid = self.build_fn(spec, |c, fx| {
             c.bind_method_params(fx, params);
             c.cov_method(fx, cov_key);
@@ -1586,6 +1597,8 @@ impl<M: Module> Compiler<M> {
         });
         self.def_stack.pop();
         self.inline_ctx = saved_ctx;
+        let uses_callee = std::mem::replace(&mut self.callee_used, saved_callee);
+        let kind = if uses_callee { kind | 8 } else { kind };
         let (fid, fast) = match fast_n {
             Some(n) => {
                 let w = self.fast_wrapper(fid, n, &wrapper_label, def_line);
