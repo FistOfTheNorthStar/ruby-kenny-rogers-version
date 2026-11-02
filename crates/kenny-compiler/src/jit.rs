@@ -249,6 +249,8 @@ pub struct JitUnit {
     /// (address, size, label, file, calls, definition line)
     pub debug: Vec<(usize, u32, u32, u32, Vec<(u32, u32)>, u32)>,
     pub strs: *const u8,
+    /// stack maps (gcmap.rs): (function address, code size, table)
+    pub maps: Vec<(usize, u32, Vec<u32>)>,
     /// The unit's memory: (start, len, is_code); see `free_unit`.
     pub memory: Vec<(usize, usize, bool)>,
     /// Cache slots holding runtime-allocated entries: (word offset into `caches`, kind).
@@ -320,11 +322,13 @@ pub fn compile(src: &[u8], mode: EvalMode, file: &str, symbols: &[(&'static str,
         .into_iter()
         .map(|f| (c.module.get_finalized_function(f.id) as usize, f.size | if f.exact { crate::DEBUG_EXACT } else { 0 }, f.label, f.file, f.calls, f.def_line))
         .collect();
+    let maps = std::mem::take(&mut c.stack_maps).into_iter().map(|(id, size, t)| (c.module.get_finalized_function(id) as usize, size, t)).collect();
     let memory = SHARED.lock().unwrap().as_mut().map(|s| std::mem::take(&mut s.unit)).unwrap_or_default();
     let unit = JitUnit {
         owned_caches: std::mem::take(&mut c.owned_caches),
         memory,
         debug,
+        maps,
         strs: strs_ptr,
         entry,
         caches: caches as *mut u8,

@@ -45,6 +45,7 @@ pub mod rational;
 pub mod regex;
 pub mod server;
 pub mod socket;
+pub mod stackmap;
 pub mod sqlite;
 pub mod string;
 pub mod strscan;

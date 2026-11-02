@@ -27,6 +27,7 @@ mod felem;
 mod hoist;
 mod chilled;
 mod ripper;
+mod gcmap;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -328,6 +329,8 @@ pub struct Compiler<M: Module> {
     pub(crate) block_parent: Option<String>,
     /// Per compiled function: return-address offsets of its calls and their source locations.
     pub(crate) debug_fns: Vec<DebugFn>,
+    /// Stack maps of the compiled functions (gcmap.rs): (function, code size, table).
+    pub(crate) stack_maps: Vec<(FuncId, u32, Vec<u32>)>,
     /// The definition line of the next function `build_fn` compiles (see `DebugFn::def_line`).
     pub(crate) def_line_next: u32,
     /// Proc#parameters descriptors of the blocks compiled (`scopes::params_desc` form).
@@ -504,6 +507,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_eval_locals", &[I64, I64], &[I64]),
     ("kn_register_file", &[I64, I64, I64, I64, I64], &[]),
     ("kn_register_debug", &[I64, I64, I64, I64], &[]),
+    ("kn_register_stackmaps", &[I64, I64, I64], &[]),
     ("kn_register_ruby", &[I64, I64], &[]),
     ("kn_send_refined", &[I64, I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_send0", &[I64, I64, I64, I64], &[I64]),
@@ -702,6 +706,7 @@ impl<M: Module> Compiler<M> {
             block_parent: None,
             cref_parents: HashMap::new(),
             debug_fns: Vec::new(),
+            stack_maps: Vec::new(),
             def_line_next: 0,
             block_params: Vec::new(),
             line_index: (PathBuf::new(), 0, 0, Vec::new()),
@@ -791,6 +796,8 @@ impl Compiler<ObjectModule> {
                 let n = b.ins().iconst(I64, bp.len() as i64);
                 b.ins().call(reg, &[tp, n, strs_base]);
             }
+            // stack maps (gcmap.rs)
+            self.emit_stack_maps(&mut b)?;
             // backtrace tables: functions (address, size, label, calls) and their call sites
             {
                 let fns_id = self.module.declare_data("__kn_dbg_fns", Linkage::Local, false, false).map_err(e)?;

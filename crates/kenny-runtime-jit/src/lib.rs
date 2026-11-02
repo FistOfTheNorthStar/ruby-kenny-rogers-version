@@ -151,6 +151,7 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_eval_locals", kenny_runtime::compat::kn_eval_locals as *const u8),
         ("kn_register_file", kenny_runtime::compat::kn_register_file as *const u8),
         ("kn_register_debug", kenny_runtime::backtrace::kn_register_debug as *const u8),
+        ("kn_register_stackmaps", kenny_runtime::stackmap::kn_register_stackmaps as *const u8),
         ("kn_register_ruby", kenny_runtime::misc::kn_register_ruby as *const u8),
         ("kn_send_refined", kenny_runtime::abi::kn_send_refined as *const u8),
         ("kn_send0", kenny_runtime::opt::kn_send0 as *const u8),
@@ -212,6 +213,7 @@ fn cache_limit() -> usize {
 
 fn install(unit: &JitUnit) {
     kenny_runtime::backtrace::register_jit(&unit.debug, unit.strs);
+    kenny_runtime::stackmap::register_jit(&unit.maps);
     for (i, name) in unit.syms.iter().enumerate() {
         unsafe { *(unit.syms_ptr as *mut V).add(i) = mksym(intern(name)) };
     }
@@ -250,6 +252,11 @@ fn free_dead_units() {
     for id in dead {
         if let Some(u) = units.remove(&id) {
             kenny_runtime::backtrace::unregister_jit(&u.funcs);
+            for &(start, len, code) in &u.memory {
+                if code {
+                    kenny_runtime::stackmap::unregister_range(start, start + len);
+                }
+            }
             kenny_runtime::abi::forget_defs(&u.funcs);
             kenny_runtime::gc::unpin_region(u.caches, u.cache_words);
             kenny_runtime::abi::free_owned_caches(u.caches, &u.owned_caches);

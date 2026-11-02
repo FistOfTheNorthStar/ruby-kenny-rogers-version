@@ -183,6 +183,17 @@ pub(crate) unsafe fn call_found(m: *const Method, recv: V, mid: V, args: &[V], e
     if m.is_null() {
         return method_missing(recv, sym_id(mid), args, QNIL, false);
     }
+    if !crate::core::args_on_stack(args) {
+        return crate::core::with_stack_args(args, |a| unsafe { call_found_copied(m, recv, mid, a, explicit) });
+    }
+    unsafe { call_found_body(m, recv, mid, args, explicit) }
+}
+#[inline(never)]
+unsafe fn call_found_copied(m: *const Method, recv: V, mid: V, args: &[V], explicit: u64) -> V {
+    unsafe { call_found_body(m, recv, mid, args, explicit) }
+}
+#[inline(always)]
+unsafe fn call_found_body(m: *const Method, recv: V, mid: V, args: &[V], explicit: u64) -> V {
     let mm = unsafe { &*m };
     if explicit != 0 && mm.vis == VIS_PRIVATE {
         return crate::visibility::private_call_error(recv, sym_id(mid), args, QNIL);

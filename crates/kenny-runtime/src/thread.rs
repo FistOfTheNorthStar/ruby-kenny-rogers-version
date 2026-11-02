@@ -59,6 +59,8 @@ struct Ctx {
     base: usize,
     limit: usize,
     saved_sp: usize,
+    /// The frame pointer where it was suspended (the GC walks its frames from there).
+    saved_fp: usize,
     live: bool,
     /// Executing on some P right now (the GC scans it through that P instead).
     running: bool,
@@ -247,12 +249,16 @@ fn enter_ctx(c: usize) {
     pst().heap.stack_base = base;
     crate::core::set_stack_limit(limit + STACK_MARGIN);
 }
-/// Mark ctx `c` as suspended at the current stack position.
+/// Mark ctx `c` as suspended at the current stack position (inlined: the frame pointer
+/// read is the caller's, whose frame stays while the context is suspended).
+#[inline(always)]
 fn leave_ctx(c: usize) {
     let sp = approx_sp();
+    let fp = crate::stackmap::frame_pointer();
     locked!(s => {
         let ctx = &mut s.ctxs[c];
         ctx.saved_sp = sp;
+        ctx.saved_fp = fp;
         ctx.running = false;
     });
 }
@@ -262,6 +268,11 @@ fn suspended_stacks() -> Vec<(usize, usize)> {
     let Some(s) = sraw() else { return vec![] };
     s.ctxs.iter().filter(|c| c.live && !c.running && c.saved_sp != 0).map(|c| (c.saved_sp, c.base)).collect()
 }
+/// The same stacks with the frame pointer each was suspended at: (sp, base, fp).
+pub fn suspended_frames() -> Vec<(usize, usize, usize)> {
+    let Some(s) = sraw() else { return vec![] };
+    s.ctxs.iter().filter(|c| c.live && !c.running && c.saved_sp != 0).map(|c| (c.saved_sp, c.base, c.saved_fp)).collect()
+}
 
 pub fn static_roots(out: &mut Vec<V>) {
     let Some(s) = sraw() else { return };
@@ -269,6 +280,7 @@ pub fn static_roots(out: &mut Vec<V>) {
     for t in &s.threads {
         out.extend([t.obj, t.value, t.exc, t.errinfo, t.last_match]);
         out.extend(t.current_block.iter().copied());
+        out.extend(t.super_at.iter().map(|x| x.0));
         crate::gc::definee_values(&t.definee, &t.dm_stack, out);
         for th in [Some(t.pending), t.interrupt].into_iter().flatten() {
             crate::gc::throw_values(th, out);
@@ -286,7 +298,7 @@ pub fn current_stack() -> Option<(usize, usize)> {
 }
 
 fn new_ctx(s: &mut Sched, base: usize, limit: usize) -> usize {
-    s.ctxs.push(Ctx { base, limit, saved_sp: 0, live: true, running: false });
+    s.ctxs.push(Ctx { base, limit, saved_sp: 0, saved_fp: 0, live: true, running: false });
     s.ctxs.len() - 1
 }
 
