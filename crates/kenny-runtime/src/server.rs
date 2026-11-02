@@ -731,7 +731,8 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
         }
         // the requests the request threads finished meanwhile; then let this P's threads
         // (request threads among them) run before polling again; a few rounds while they
-        // keep finishing this loop's requests, then back to the network
+        // keep finishing this loop's requests, then back to the network. (Without request
+        // threads too: the app's own threads on this P run only here.)
         for _ in 0..4 {
             for d in mailbox.take() {
                 if let Some(c) = conns.get_mut(&d.token) {
@@ -744,12 +745,12 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
                 }
             }
             flush_out();
-            if !pooled || !crate::thread::active() {
+            if !crate::thread::active() {
                 break;
             }
             crate::thread::pass();
             pst().pending = Throw::None;
-            if mailbox.is_empty() {
+            if !pooled || mailbox.is_empty() {
                 break;
             }
         }

@@ -265,7 +265,9 @@ Web (the machine was also running other work, so treat these as rough; `ab -c 10
 | Whole Rails 8.1 app (`examples/blog8`, SQLite, Solid Cache/Queue), scaffold index | 2.2k req/s, 119 MB | 6.7k req/s, 195 MB | 1.3k req/s, 71 MB (1 thread, Ruby 3.3); 4.8k req/s, 1,040 MB (12 workers) |
 
 Run them yourself: `bench/run.sh` (`RUBY=/path/to/ruby`, `RUBY_OPTS=--yjit`). Tests: `tests/run.sh` (against Ruby 3.4), `tests/run.sh 4.0`
-(against an installed Ruby 4.0; a test's `.4.0.out` holds what 4.0 prints differently). Compile-check a file without linking: `kenny check file.rb`.
+(against an installed Ruby 4.0; a test's `.4.0.out` holds what 4.0 prints differently); `tests/gems/run.sh [gem ...]`
+(gems, under CRuby and Kenny); `tests/server/run.sh [pattern]` (the HTTP server: a test app's
+binary started with different settings, driven over raw sockets by a CRuby script; ~20 s). Compile-check a file without linking: `kenny check file.rb`.
 
 GC tuning and diagnostics (environment variables read by compiled programs):
 `KENNY_GC_STATS=1` prints collections, GC time and heap size at exit (`=2` after every
