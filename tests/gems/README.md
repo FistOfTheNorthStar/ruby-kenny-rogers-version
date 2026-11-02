@@ -43,17 +43,17 @@ Pass (the top 100): actioncable, actionmailer, actionpack, actionview, activejob
 ## Large applications
 
 Run by hand (their setups need databases, Redis and local edits), before the fixes on
-`gem-fixes-3` that they led to:
+`gem-fixes-3` that they led to (Mastodon: after them, and after the GC fixes listed below):
 
 | Application | Under Kenny |
 |---|---|
 | Rails' own tests (activesupport, activemodel, actionview, activerecord on SQLite) | 9,242 tests pass, against CRuby's 9,896 |
 | Jekyll | its Minitest suite runs, and its docs site builds about 30% faster than under CRuby |
-| Mastodon | Rails and RSpec boot; the validator specs pass one file at a time (103 of 103); a run of several files crashes in the GC |
+| Mastodon | Rails and RSpec boot; one run of the validator, policy and presenter specs passes (387 of 387, as under CRuby); validators, policies, presenters, serializers, helpers and models together: 2,527 examples, 57 failures, 44 of which fail under CRuby too on the same machine (libvips, Vite manifest) |
 | Discourse | doesn't boot yet |
 
-Still open from them: the GC crash in long multi-file runs (Mastodon); C extensions that
-define the same C symbol (rinku and redcarpet both vendor Sundown's `buffer.c`); Gemfile
+Still open from them: Mastodon's 13 other failures (`Time` given an `ActiveSupport::TimeZone`,
+`be "a"` on frozen string literals, a few others); C extensions that define the same C symbol (rinku and redcarpet both vendor Sundown's `buffer.c`); Gemfile
 `if ENV[...]` branches and `optional: true` groups, which the build takes as always on; a
 compile-time `require` cycle that bakes a `require` as `false`; `require` of a project file
 through a `$LOAD_PATH` entry added at runtime; literal `require`s skip `Kernel#require`
@@ -168,6 +168,10 @@ suites, Jekyll, Mastodon, Discourse) under Kenny:
   subclasses, `Time` with zones and Rationals.
 - Runaway recursion raises SystemStackError in under a second (the main thread's stack had
   1 GB usable, so it took minutes).
+- Mastodon's multi-file RSpec runs: a minor collection ran C mark functions on freed data
+  (pg's type maps), Method objects let a removed `define_method` method's block be freed
+  (rspec-mocks keeps them), and `clone` dropped the singleton class (rspec's composed DSL
+  matchers).
 - Also: `Hash#merge` keeps the subclass, an overridden `Hash#default`, `Integer#[]`'s forms,
   `const_source_location`, `Binding#source_location`, `Proc#binding` locals,
   `Module#set_temporary_name`, `IO#wait`, `fcntl`, `ruby2_keywords`, `$LOADED_FEATURES` order
