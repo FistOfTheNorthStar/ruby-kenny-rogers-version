@@ -772,8 +772,8 @@ pub fn wb_obj(v: V) {
         }
     }
 }
-/// C-extension data objects (their mark functions see values the barrier can't): scanned by
-/// every minor collection.
+/// C-extension data objects (their mark functions see values the barrier can't): the old ones
+/// are traced by every minor collection. Every collection drops the ones that died.
 static DATA_MARKED: crate::mt::L<Vec<V>> = crate::mt::L::new(Vec::new());
 pub fn register_marked_data(v: V) {
     DATA_MARKED.get().push(v);
@@ -2148,8 +2148,11 @@ fn collect_locked() {
         }
         phase("old_envs", &mut lap);
         DBG_NDATA.store(DATA_MARKED.raw().len(), std::sync::atomic::Ordering::Relaxed);
+        // (only the old ones: a young one is traced if something reaches it)
         for &d in DATA_MARKED.raw().iter() {
-            m.trace(d);
+            if hdr(d).flags & FL_MARK != 0 {
+                m.trace(d);
+            }
         }
     } else {
         for &(kind, p) in &remembered {
@@ -2171,10 +2174,9 @@ fn collect_locked() {
     if !major && verify_mode() {
         verify_minor(h);
     }
-    if major {
-        // C-extension data that died
-        DATA_MARKED.raw().retain(|&d| hdr(d).flags & FL_MARK != 0);
-    }
+    // C-extension data that died (also young data in a minor collection: its page is swept
+    // later, and the list must not keep its address once its free function ran)
+    DATA_MARKED.raw().retain(|&d| hdr(d).flags & FL_MARK != 0);
     free_retired(std::mem::take(&mut m.retired), std::mem::take(&mut m.keep));
 
     // sweep: pages are split among this thread and the stopped ones (`sweep_help`); objects
