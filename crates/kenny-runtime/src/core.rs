@@ -158,6 +158,10 @@ pub const FL_STR_ASCII: u32 = 1 << 12;
 /// comment, as in CRuby 3.4 and 4.0): not frozen, but its first change clears the flag and,
 /// with `Warning[:deprecated]` on, warns that literals will be frozen (`unchill`).
 pub const FL_CHILLED: u32 = 1 << 13;
+/// The object has (or had) an entry in `GENERIC_IVARS` (as CRuby's FL_EXIVAR): objects
+/// without it skip that table's lock, which the sweep would otherwise take for every dead
+/// Proc, Range or Float.
+pub const FL_EXIVAR: u32 = 1 << 22;
 
 #[repr(C)]
 pub struct Header {
@@ -2413,8 +2417,14 @@ fn gen_slot(v: V) -> Option<&'static GenIv> {
 pub fn gen_ivar_get(v: V, id: u32) -> Option<V> {
     match gen_slot(v) {
         Some(g) => g.map().and_then(|m| m.get(&id).copied()),
+        None if !has_exivar(v) => None,
         None => GENERIC_IVARS.get().as_ref().and_then(|t| t.get(&(v as usize))).and_then(|m| m.get(&id).copied()),
     }
+}
+/// Can `v` have an entry in `GENERIC_IVARS`? (Immediates are looked up as before.)
+#[inline]
+fn has_exivar(v: V) -> bool {
+    !is_heap(v) || hdr(v).flags & FL_EXIVAR != 0
 }
 pub fn gen_ivar_set(v: V, id: u32, val: V) {
     crate::gc::wb_obj(v);
@@ -2425,18 +2435,23 @@ pub fn gen_ivar_set(v: V, id: u32, val: V) {
         }
         None => {
             GENERIC_IVARS.get().get_or_insert_with(HashMap::default).entry(v as usize).or_default().insert_untracked(id, val);
+            if is_heap(v) {
+                hdr(v).flags |= FL_EXIVAR;
+            }
         }
     }
 }
 pub fn gen_ivar_remove(v: V, id: u32) -> Option<V> {
     match gen_slot(v) {
         Some(g) => g.map().and_then(|m| m.remove(&id)),
+        None if !has_exivar(v) => None,
         None => GENERIC_IVARS.get().as_mut().and_then(|t| t.get_mut(&(v as usize))).and_then(|m| m.remove(&id)),
     }
 }
 pub fn gen_ivar_list(v: V) -> Vec<(u32, V)> {
     match gen_slot(v) {
         Some(g) => g.map().map(|m| m.iter().map(|(&k, &v)| (k, v)).collect()).unwrap_or_default(),
+        None if !has_exivar(v) => Vec::new(),
         None => GENERIC_IVARS.get().as_ref().and_then(|t| t.get(&(v as usize))).map(|m| m.iter().map(|(&k, &v)| (k, v)).collect()).unwrap_or_default(),
     }
 }
@@ -2454,6 +2469,7 @@ pub fn gen_ivar_values(v: V, out: &mut Vec<V>) {
                 out.extend(m.values().copied());
             }
         }
+        None if !has_exivar(v) => {}
         None => {
             if let Some(m) = GENERIC_IVARS.raw().as_ref().and_then(|t| t.get(&(v as usize))) {
                 out.extend(m.values().copied());

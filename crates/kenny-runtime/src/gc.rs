@@ -441,8 +441,8 @@ fn lazy_sweep(pg: &mut Page) {
             if hd.flags & FL_MARK == 0 {
                 pg.alloc[wi] &= !(1u64 << b);
                 freed += 1;
-                if !matches!(hd.kind, Kind::String | Kind::Array | Kind::Hash | Kind::Object | Kind::Env) {
-                    // these keep instance variables in the shared table (its lock without
+                if hd.flags & crate::core::FL_EXIVAR != 0 {
+                    // instance variables in the shared table (its lock without
                     // stopping: a collection must not find this page half swept; its holders
                     // never stop while holding it, see core.rs)
                     if let Some(t) = crate::core::GENERIC_IVARS.get_unstoppable().as_mut() {
@@ -1221,7 +1221,7 @@ fn sweep_help() -> bool {
                             Kind::String | Kind::Array | Kind::Hash | Kind::Object | Kind::Env => unsafe { free_obj(p) },
                             // these keep instance variables in the shared table (read-only
                             // during the sweep); with an entry, the collector removes it
-                            Kind::Float | Kind::Bignum | Kind::Range | Kind::Proc if !gen_tbl.is_some_and(|t| t.contains_key(&p)) => unsafe { free_obj(p) },
+                            Kind::Float | Kind::Bignum | Kind::Range | Kind::Proc if hd.flags & crate::core::FL_EXIVAR == 0 || !gen_tbl.is_some_and(|t| t.contains_key(&p)) => unsafe { free_obj(p) },
                             _ => deferred.push(p),
                         }
                     }
