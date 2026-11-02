@@ -153,3 +153,8 @@ class Boom < Nokogiri::XML::SAX::Document
   def end_document = p(:never)
 end
 p((Nokogiri::XML::SAX::Parser.new(Boom.new).parse("<a><b/></a>") rescue [$!.class, $!.message]))
+# an Encoding object (Discourse's ExcerptParser) or nil
+d = Log.new
+Nokogiri::HTML4::SAX::Parser.new(d, Encoding::UTF_8).parse("<p>é</p>")
+p d.ev.select { |e| e[0] == :characters }
+p Nokogiri::XML::SAX::Parser.new(Log.new, nil).document.class

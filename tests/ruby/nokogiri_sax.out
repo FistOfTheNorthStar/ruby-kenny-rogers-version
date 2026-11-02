@@ -469,3 +469,5 @@ nil
 [TypeError, "wrong argument type nil (expected String)"]
 [NoMethodError]
 [RuntimeError, "boom b"]
+[[:characters, "é"]]
+Log

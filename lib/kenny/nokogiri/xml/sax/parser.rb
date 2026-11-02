@@ -114,7 +114,10 @@ module Nokogiri
 
         private
 
+        # (an Encoding or nil as nokogiri 1.19 takes them: nil is the document's own, UTF-8 here)
         def check_encoding(encoding)
+          encoding = "UTF-8" if encoding.nil?
+          encoding = encoding.name if encoding.is_a?(Encoding)
           encoding.upcase.tap do |enc|
             raise ArgumentError, "'#{enc}' is not a valid encoding" unless ENCODINGS[enc]
           end
