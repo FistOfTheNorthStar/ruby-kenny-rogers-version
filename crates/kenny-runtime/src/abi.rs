@@ -724,11 +724,26 @@ pub unsafe extern "C" fn kn_is_a_fill(cache: *mut CallCache, v: V, c: V) -> V {
     }
     bool_v(r)
 }
-/// A static call site's slot ([class, serial], kenny-compiler statics.rs): filled when the
-/// receiver's class has the method whose `Method::fast` is `expect` (one OS thread only).
+/// Classes in a static call site's slot (kenny-compiler statics.rs `POLY_WAYS`).
+pub const STATIC_WAYS: usize = 4;
+/// A static or inlined call site's slot ([serial, class 0 .. class 3], kenny-compiler
+/// statics.rs `poly_guard`): the receiver's class is added (newest first) when it has the
+/// method whose `Method::fast` is `expect`; a class that has another method is added as
+/// `class | 1`, which compiled code never takes for a class, so it isn't looked up again.
+/// A slot of an older serial starts over. (One OS thread only: the words are written one
+/// by one.)
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn kn_static_fill(slot: *mut [u64; 2], recv: V, mid: V, expect: usize) -> V {
+pub unsafe extern "C" fn kn_static_fill(slot: *mut [u64; 1 + STATIC_WAYS], recv: V, mid: V, expect: usize) -> V {
     if !is_heap(recv) || crate::mt::multi() {
+        return QNIL;
+    }
+    let s = unsafe { &mut *slot };
+    let k = hdr(recv).klass;
+    let serial = KN_DIRECT.serial.load(std::sync::atomic::Ordering::Acquire);
+    if s[0] != serial {
+        *s = [0; 1 + STATIC_WAYS];
+        s[0] = serial;
+    } else if s[1..].iter().any(|&w| w == k as u64 | 1 || w == k as u64) {
         return QNIL;
     }
     // top bit: a call with a receiver (only a public method will do); bit 62: `expect` is
@@ -736,16 +751,13 @@ pub unsafe extern "C" fn kn_static_fill(slot: *mut [u64; 2], recv: V, mid: V, ex
     let public = expect >> 63 != 0;
     let by_params = (expect >> 62) & 1 != 0;
     let expect = expect & !(3 << 62);
-    let k = hdr(recv).klass;
     let m = find_method(k, sym_id(mid));
     let have = if m.is_null() { 0 } else if by_params { unsafe { (*m).params as usize } } else { unsafe { (*m).fast } };
     let same = have != 0 && have == expect;
-    if same && (!public || unsafe { (*m).vis } == VIS_PUBLIC) {
-        unsafe {
-            (*slot)[0] = k as u64;
-            (*slot)[1] = KN_DIRECT.serial.load(std::sync::atomic::Ordering::Acquire);
-        }
-    }
+    let word = if same && (!public || unsafe { (*m).vis } == VIS_PUBLIC) { k as u64 } else { k as u64 | 1 };
+    // newest first: the oldest class drops out
+    s.copy_within(1..STATIC_WAYS, 2);
+    s[1] = word;
     QNIL
 }
 /// On entry to a compiled method that calls itself (kenny-compiler statics.rs
