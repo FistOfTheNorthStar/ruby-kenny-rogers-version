@@ -48,5 +48,14 @@ for f in tests/ruby/*.rb; do
   got=$(./target/release/kenny run "$f" "$@" 2>&1)
   if [ "$got" = "$(cat "$exp")" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL $f"; printf '%s\n' "$got" | diff "$exp" - | head -20; fi
 done
+# Bundler projects (a Gemfile and Gemfile.lock next to test.rb): built from inside the directory
+for d in tests/bundle/*/; do
+  f="${d}test.rb"
+  [ -f "$f" ] || continue
+  exp="${d}test.$ver.out"
+  [ -f "$exp" ] || exp="${d}test.out"
+  got=$(cd "$d" && KENNY_QUIET=1 ../../../target/release/kenny run test.rb 2>&1)
+  if [ "$got" = "$(cat "$exp")" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL $f"; printf '%s\n' "$got" | diff "$exp" - | head -20; fi
+done
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

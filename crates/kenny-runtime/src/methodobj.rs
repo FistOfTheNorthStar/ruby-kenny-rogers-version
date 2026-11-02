@@ -35,7 +35,7 @@ pub fn method_location(m: *const Method) -> V {
     }
     let m = unsafe { &*m };
     match &m.body {
-        Body::Compiled(f) => {
+        Body::Compiled(f) | Body::Aliased(f, _) => {
             let r = code_location(*f as usize);
             if r != QNIL || m.fast == 0 {
                 return r;
@@ -223,7 +223,7 @@ pub fn arity(m: *const Method) -> i64 {
             let pr = rproc(*p);
             if pr.max < 0 || pr.min != pr.max { -(pr.min as i64) - 1 } else { pr.min as i64 }
         }
-        Body::Compiled(_) => {
+        Body::Compiled(_) | Body::Aliased(..) => {
             if mm.params.is_null() {
                 return -1;
             }

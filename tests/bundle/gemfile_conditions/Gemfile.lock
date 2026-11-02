@@ -1,0 +1,20 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    kenny-not-installed-a (1.0.0)
+    kenny-not-installed-b (1.0.0)
+    kenny-not-installed-c (1.0.0)
+    kenny-not-installed-d (1.0.0)
+
+PLATFORMS
+  arm64-darwin
+  ruby
+
+DEPENDENCIES
+  kenny-not-installed-a
+  kenny-not-installed-b
+  kenny-not-installed-c
+  kenny-not-installed-d
+
+BUNDLED WITH
+  2.6.9

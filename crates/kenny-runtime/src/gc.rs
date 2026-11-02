@@ -2834,7 +2834,7 @@ pub fn definee_values(definee: &[*mut Class], dm_stack: &[*const Method], out: &
 /// can call it after the method is removed from its class).
 static METHOD_OBJECT_CODE: crate::mt::L<Option<FxHashSet<usize>>> = crate::mt::L::new(None);
 pub fn note_method_object(m: *const Method) {
-    if let Body::Compiled(f) = unsafe { &(*m).body } {
+    if let Body::Compiled(f) | Body::Aliased(f, _) = unsafe { &(*m).body } {
         METHOD_OBJECT_CODE.get().get_or_insert_with(FxHashSet::default).insert(*f as usize);
     }
 }
@@ -2850,7 +2850,7 @@ fn free_dead_units(h: &mut Heap, m: &mut Marker, orphans: Vec<OrphanUnit>) {
             if meth.is_null() {
                 continue;
             }
-            if let Body::Compiled(f) = unsafe { &(*meth).body } {
+            if let Body::Compiled(f) | Body::Aliased(f, _) = unsafe { &(*meth).body } {
                 let f = *f as usize;
                 if f >= m.code_lo && f < m.code_hi {
                     m.code_word(f);

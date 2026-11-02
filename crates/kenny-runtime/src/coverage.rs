@@ -407,7 +407,7 @@ fn defined_methods(c: &Cov) -> HashMap<usize, Vec<(V, u32, usize)>> {
                 continue;
             }
             let addr = match unsafe { &(*m).body } {
-                Body::Compiled(f) => *f as usize,
+                Body::Compiled(f) | Body::Aliased(f, _) => *f as usize,
                 Body::Proc(p) if is_proc(*p) => rproc(*p).func as usize,
                 _ => continue,
             };
