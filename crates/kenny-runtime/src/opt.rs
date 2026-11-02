@@ -183,6 +183,7 @@ pub(crate) unsafe fn call_found(m: *const Method, recv: V, mid: V, args: &[V], e
     if m.is_null() {
         return method_missing(recv, sym_id(mid), args, QNIL, false);
     }
+    // (every caller passes arguments from its own frame: see core::args_on_stack)
     let mm = unsafe { &*m };
     if explicit != 0 && mm.vis == VIS_PRIVATE {
         return crate::visibility::private_call_error(recv, sym_id(mid), args, QNIL);

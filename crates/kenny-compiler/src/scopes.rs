@@ -591,6 +591,8 @@ impl<M: Module> Compiler<M> {
                 fx.b.ins().return_(&[u]);
             }
             fx.b.seal_all_blocks();
+            let entry = if spec.fast_arity.is_some() { crate::gcmap::Entry::Fast } else if is_block { crate::gcmap::Entry::Block } else { crate::gcmap::Entry::Method };
+            self.declare_gc_values(&mut fx.b, entry);
             let cfg = self.module.isa().frontend_config();
             fx.b.finalize(cfg);
             self.scopes.pop();
@@ -604,6 +606,7 @@ impl<M: Module> Compiler<M> {
             self.errors.push(format!("internal codegen error in {name}: {e:?}"));
         } else if let Some(code) = ctx.compiled_code() {
             self.record_debug_info(id, &bt_label, code, def_line);
+            self.record_stack_maps(id, code);
         }
         id
     }

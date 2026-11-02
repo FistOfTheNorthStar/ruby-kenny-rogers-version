@@ -299,6 +299,8 @@ pub fn method_body(v: V) -> V {
         pr.lambda = true;
         pr.min = if ar < 0 { (-ar - 1) as i32 } else { ar as i32 };
         pr.max = if ar < 0 { -1 } else { ar as i32 };
+        // (audited: the method's object is a root of the proc; the call takes the arguments)
+        pr.func = crate::core::native_block_tramp_transparent;
         return p;
     }
     v
@@ -352,6 +354,8 @@ pub fn init() {
         let p = proc_new_native_rooted(Box::new(move |_, a, b| call(me, a, b)), 0, -1, vec![s]);
         let pr = rproc(p);
         pr.lambda = true;
+        // (audited: `me` is a root of the proc; `call` takes the arguments)
+        pr.func = crate::core::native_block_tramp_transparent;
         let ar = arity(mptr(s));
         pr.min = if ar < 0 { (-ar - 1) as i32 } else { ar as i32 };
         pr.max = if ar < 0 { -1 } else { ar as i32 };

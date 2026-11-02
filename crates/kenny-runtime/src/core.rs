@@ -536,6 +536,12 @@ unsafe extern "C" fn native_block_tramp(p: *mut RProc, self_: V, argc: u64, argv
     let args = unsafe { args_slice(argc, argv) };
     call_native_block(unsafe { &**(*p).native }, self_, args, blk)
 }
+/// The entry of a native block audited like a `gc_transparent` method (its closure keeps
+/// object references only on the stack): called directly, not through `call_native_block`.
+pub unsafe extern "C" fn native_block_tramp_transparent(p: *mut RProc, self_: V, argc: u64, argv: *const V, blk: V) -> V {
+    let args = unsafe { args_slice(argc, argv) };
+    (unsafe { &**(*p).native })(self_, args, blk)
+}
 
 // Native (Rust) methods and blocks may keep object references where the GC can't see or
 // update them (in Rust collections), so the GC moves objects only when no stack has such a
@@ -2014,6 +2020,9 @@ fn find_super_method_uncached(klass: *mut Class, owner: *mut Class, mid: u32) ->
 }
 
 pub fn add_method(c: *mut Class, mid: u32, body: Body) -> *const Method {
+    if let Body::Native(f, _, _) = &body {
+        crate::stackmap::note_native(*f as usize, c, mid);
+    }
     let m = Box::into_raw(Box::new(Method { fast: 0, body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: false, attr_slot: Default::default() })) as *const Method;
     if unsafe { (*c).methods.insert(mid, m) }.is_none() {
         method_name_count(mid, true);
@@ -2058,7 +2067,47 @@ pub(crate) fn approx_sp() -> usize {
     &x as *const u8 as usize
 }
 
+/// Arguments are handed to a method or block only from a stack: a callee may run while the
+/// collector moves objects, and reads its arguments whenever it likes, so they must be where
+/// the collector sees them (and pins them). A slice in a Rust heap buffer (the copy of a
+/// splatted array, say) is copied to the caller's frame first (`with_stack_args`).
+#[inline(always)]
+pub fn args_on_stack(args: &[V]) -> bool {
+    // (above this frame: in a caller's; the frame pointer, as a local's address would cost
+    // every caller a stack slot)
+    let p = args.as_ptr() as usize;
+    args.is_empty() || (p >= crate::stackmap::frame_pointer() && p < pst().heap.stack_base)
+}
+/// `f` with a copy of `args` on this frame (a rooted buffer if there are many).
+#[inline(never)]
+pub fn with_stack_args(args: &[V], f: impl FnOnce(&[V]) -> V) -> V {
+    const N: usize = 16;
+    if args.len() <= N {
+        let mut buf = [QNIL; N];
+        buf[..args.len()].copy_from_slice(args);
+        let r = f(&buf[..args.len()]);
+        std::hint::black_box(&buf);
+        r
+    } else {
+        let r = crate::gc::RVec::from(args.to_vec());
+        f(&r)
+    }
+}
+
 pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
+    if !args_on_stack(args) {
+        return invoke_copied(m, recv, args, blk);
+    }
+    invoke_body(m, recv, args, blk)
+}
+#[cold]
+#[inline(never)]
+fn invoke_copied(m: *const Method, recv: V, args: &[V], blk: V) -> V {
+    // (not `invoke` again: many arguments are copied to a rooted, pinning heap buffer)
+    with_stack_args(args, |a| invoke_body(m, recv, a, blk))
+}
+#[inline(always)]
+fn invoke_body(m: *const Method, recv: V, args: &[V], blk: V) -> V {
     if crate::gc::safepoint() {
         return UNDEF;
     }
@@ -2223,6 +2272,17 @@ pub fn call_block_with_blk(blk: V, args: &[V], blkarg: V) -> V {
     call_proc_with_self(blk, p.self_, args, blkarg, false)
 }
 pub fn call_proc_with_self(pv: V, self_: V, args: &[V], blk: V, as_method: bool) -> V {
+    if !args_on_stack(args) {
+        return call_proc_copied(pv, self_, args, blk, as_method);
+    }
+    call_proc_body(pv, self_, args, blk, as_method)
+}
+#[cold]
+#[inline(never)]
+fn call_proc_copied(pv: V, self_: V, args: &[V], blk: V, as_method: bool) -> V {
+    with_stack_args(args, |a| call_proc_body(pv, self_, a, blk, as_method))
+}
+fn call_proc_body(pv: V, self_: V, args: &[V], blk: V, as_method: bool) -> V {
     if crate::gc::safepoint() {
         return UNDEF;
     }
@@ -2237,7 +2297,7 @@ pub fn call_proc_with_self(pv: V, self_: V, args: &[V], blk: V, as_method: bool)
         }
     } else if p.autosplat && args.len() == 1 && is_ary(args[0]) {
         let v = rary(args[0]).v.clone();
-        return unsafe { (p.func)(pv as *mut RProc, self_, v.len() as u64, v.as_ptr(), blk) };
+        return with_stack_args(&v, |a| unsafe { (p.func)(pv as *mut RProc, self_, a.len() as u64, a.as_ptr(), blk) });
     }
     unsafe { (p.func)(pv as *mut RProc, self_, args.len() as u64, args.as_ptr(), blk) }
 }

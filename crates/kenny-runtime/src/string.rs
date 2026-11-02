@@ -544,6 +544,8 @@ pub fn sym_to_proc(id: u32) -> V {
     );
     rproc(p).lambda = true;
     rproc(p).autosplat = false;
+    // (audited: `send` with the arguments it was given)
+    rproc(p).func = crate::core::native_block_tramp_transparent;
     SYM_PROCS.get().get_or_insert_with(HashMap::new).insert(id, p);
     p
 }

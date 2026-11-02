@@ -1985,6 +1985,8 @@ pub fn blockless_enumerators() {
                 0,
                 -1,
             );
+            // (audited: hands its arguments on; the method it wraps is called as usual)
+            rproc(p).func = crate::core::native_block_tramp_transparent;
             let m = add_method(cls, id, Body::Proc(p));
             unsafe { (*(m as *mut Method)).vis = vis };
         }
