@@ -823,9 +823,14 @@ impl<M: Module> Compiler<M> {
         let rel = String::from_utf8_lossy(arg.as_string_node().unwrap().unescaped()).into_owned();
         let base = self.file.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let full = rb_file(base.join(&rel));
-        if self.file_unit {
+        // no Ruby file there (a C extension: landlock's `require_relative "landlock"` next to its
+        // landlock.bundle): the runtime's require, which finds a linked-in extension by its
+        // feature name, or raises LoadError
+        let bare = base.join(&rel);
+        if self.file_unit || !full.is_file() {
             // a file compiled at runtime: the program's own copy of the file (compiled in, or
             // loaded from disk by the runtime), not a second one inside this unit
+            let full = if full.is_file() { full } else { bare };
             let abs = full.canonicalize().unwrap_or(full);
             let s = self.self_val(fx);
             let p = self.str_lit(fx, abs.display().to_string().as_bytes());
