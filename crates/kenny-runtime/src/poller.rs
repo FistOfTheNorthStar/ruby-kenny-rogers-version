@@ -52,6 +52,8 @@ static INIT: AtomicBool = AtomicBool::new(false);
 static OFF: AtomicBool = AtomicBool::new(false);
 /// Registered (fd or process, key) waits: when 0, nobody needs to poll.
 static NWAITS: AtomicUsize = AtomicUsize::new(0);
+/// Keys in `State::closed`.
+static NCLOSED: AtomicUsize = AtomicUsize::new(0);
 /// Who polls: FREE, P `p` as p + 1, or THREAD (the poller thread).
 static TOKEN: AtomicUsize = AtomicUsize::new(FREE);
 const FREE: usize = 0;
@@ -151,6 +153,7 @@ extern "C" fn after_fork_child() {
     }
     INIT.store(false, Ordering::Relaxed);
     NWAITS.store(0, Ordering::Relaxed);
+    NCLOSED.store(0, Ordering::Relaxed);
     TOKEN.store(FREE, Ordering::Relaxed);
     GEN.fetch_add(1, Ordering::Relaxed);
 }
@@ -188,13 +191,21 @@ pub fn register(fds: &[(i32, bool)], key: usize) -> bool {
     true
 }
 
-/// The wait `key` is over (woken, timed out or interrupted). True: one of its fds was
-/// closed by another thread meanwhile.
-pub fn deregister(fds: &[(i32, bool)], key: usize) -> bool {
+/// The wait `key` is over (woken by its event: `woken`, timed out or interrupted). True: one
+/// of its fds was closed by another thread meanwhile.
+pub fn deregister(fds: &[(i32, bool)], key: usize, woken: bool) -> bool {
     let Some(p) = get() else { return false };
+    // (the event of a wait on one fd took its key off already)
+    if woken && fds.len() == 1 && NCLOSED.load(Ordering::SeqCst) == 0 {
+        return false;
+    }
     let mut w = lock(p);
     drop_key(&mut w, fds, key);
-    w.closed.remove(&key)
+    let closed = w.closed.remove(&key);
+    if closed {
+        NCLOSED.fetch_sub(1, Ordering::SeqCst);
+    }
+    closed
 }
 
 fn drop_key(w: &mut State, fds: &[(i32, bool)], key: usize) {
@@ -223,7 +234,11 @@ pub fn closing(fd: i32) {
         let Some(e) = w.fds.remove(&fd) else { return };
         let keys: Vec<usize> = e.read.into_iter().chain(e.write).collect();
         NWAITS.fetch_sub(keys.len(), Ordering::SeqCst);
-        w.closed.extend(keys.iter().copied());
+        for &k in &keys {
+            if w.closed.insert(k) {
+                NCLOSED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         sys::forget(p.fd, fd);
         keys
     };
@@ -332,12 +347,23 @@ pub fn want_poll(idx: usize) -> bool {
 }
 
 /// P `idx` is about to run a thread: if it holds the token, or nobody does while threads
-/// wait, someone else must poll. Some(()) when the caller should find that someone
-/// (`give_token`).
+/// wait, someone else must poll: true when the caller should find that someone
+/// (`give_token`). (With nobody waiting the token is just dropped: whoever waits next goes
+/// through here or polls itself.)
 #[inline]
 pub fn needs_poller(idx: usize) -> bool {
     let t = TOKEN.load(Ordering::Relaxed);
-    t == idx + 1 || (t == FREE && NWAITS.load(Ordering::Relaxed) > 0)
+    if t == idx + 1 {
+        if NWAITS.load(Ordering::SeqCst) > 0 {
+            return true;
+        }
+        if TOKEN.compare_exchange(t, FREE, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+            return false;
+        }
+        // (a wait registered meanwhile may have seen the token taken)
+        return NWAITS.load(Ordering::SeqCst) > 0;
+    }
+    t == FREE && NWAITS.load(Ordering::Relaxed) > 0
 }
 
 /// Hand the token from P `idx` (or from nobody) to idle P `to`, or to the poller thread

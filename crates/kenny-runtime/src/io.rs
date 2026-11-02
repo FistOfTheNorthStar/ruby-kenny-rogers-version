@@ -436,7 +436,7 @@ fn write_waiting(fd: i32, mut b: &[u8], stream: bool) -> Result<(), i32> {
         }
         match e {
             libc::EINTR => {}
-            libc::EAGAIN => match poll_wait_raw(&mut [libc::pollfd { fd, events: libc::POLLOUT, revents: 0 }], None) {
+            libc::EAGAIN => match poll_wait_ex(&mut [libc::pollfd { fd, events: libc::POLLOUT, revents: 0 }], None, true) {
                 Ok(_) => {}
                 Err(WaitErr::Interrupted) => return Err(EWAIT_INTERRUPTED),
                 Err(WaitErr::Closed) => return Err(EWAIT_CLOSED),
@@ -532,13 +532,25 @@ fn poll_wait(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32
 /// passes (Ok(0)), without holding up this P's other threads or a collection: the thread
 /// parks in the scheduler and the poller (kqueue / epoll) wakes it.
 pub(crate) fn poll_wait_raw(pfds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<i32, WaitErr> {
+    poll_wait_ex(pfds, timeout, true)
+}
+
+/// `poll_wait_raw`; `look_first` false: the caller just found the fd not ready (a read or
+/// write said EAGAIN), so it waits right away.
+fn poll_wait_ex(pfds: &mut [libc::pollfd], timeout: Option<Duration>, mut look_first: bool) -> Result<i32, WaitErr> {
     let start = std::time::Instant::now();
     let fds: Vec<(i32, bool)> = pfds.iter().filter(|p| p.fd >= 0).map(|p| (p.fd, p.events & libc::POLLOUT != 0)).collect();
+    if fds.is_empty() {
+        look_first = true;
+    }
     loop {
-        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
-        if n > 0 || (n < 0 && errno() != libc::EINTR) {
-            return Ok(n);
+        if look_first {
+            let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+            if n > 0 || (n < 0 && errno() != libc::EINTR) {
+                return Ok(n);
+            }
         }
+        look_first = true;
         let remaining = timeout.map(|t| t.saturating_sub(start.elapsed()));
         if remaining.is_some_and(|r| r.is_zero()) {
             return Ok(0);
@@ -550,10 +562,16 @@ pub(crate) fn poll_wait_raw(pfds: &mut [libc::pollfd], timeout: Option<Duration>
             registered = crate::poller::register(&fds, key);
             registered
         });
-        if registered && crate::poller::deregister(&fds, key) && !matches!(w, crate::thread::IoWake::Interrupted) {
+        let ready = matches!(w, crate::thread::IoWake::Ready);
+        if registered && crate::poller::deregister(&fds, key, ready) && !matches!(w, crate::thread::IoWake::Interrupted) {
             return Err(WaitErr::Closed);
         }
         match w {
+            // (one fd: the event said it is ready, no need to ask poll(2))
+            crate::thread::IoWake::Ready if pfds.len() == 1 && fds.len() == 1 => {
+                pfds[0].revents = pfds[0].events;
+                return Ok(1);
+            }
             crate::thread::IoWake::Ready | crate::thread::IoWake::Timeout => {}
             crate::thread::IoWake::Interrupted => return Err(WaitErr::Interrupted),
             crate::thread::IoWake::Unsupported => return poll_slices(pfds, remaining),
@@ -867,7 +885,11 @@ impl IoState {
             drop(g);
             match e {
                 libc::EINTR => {}
-                libc::EAGAIN => poll_wait(&mut [libc::pollfd { fd, events: libc::POLLIN, revents: 0 }], None).map(|_| ())?,
+                libc::EAGAIN => match poll_wait_ex(&mut [libc::pollfd { fd, events: libc::POLLIN, revents: 0 }], None, true) {
+                    Ok(_) => {}
+                    Err(WaitErr::Interrupted) => return Err(UNDEF),
+                    Err(WaitErr::Closed) => return Err(closed_in_another_thread()),
+                },
                 e => return Err(raise_errno(e, Some("io_fread"), &self.detail())),
             }
         }

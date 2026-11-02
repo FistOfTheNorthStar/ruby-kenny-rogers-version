@@ -204,6 +204,9 @@ struct Sched {
     max_ps: usize,
     next_p: usize,
     timer_started: bool,
+    /// P 0 has had nothing to run since (see its deadlock check), and how often it checks
+    p0_idle_since: Option<Instant>,
+    p0_check_every: Duration,
     thread_class: *mut Class,
     fiber_class: *mut Class,
     fatal: *mut Class,
@@ -409,6 +412,8 @@ pub fn run_main(main: Box<dyn FnOnce() -> V>) -> V {
         // new threads go to the other Ps first (P 0 runs the main thread)
         next_p: 1,
         timer_started: false,
+        p0_idle_since: None,
+        p0_check_every: Duration::from_millis(50),
         thread_class,
         fiber_class,
         fatal,
@@ -599,6 +604,8 @@ fn p_loop(idx: usize) {
                 }
                 if pick.is_none() {
                     s.ps[idx].idle = true;
+                } else if idx == 0 {
+                    s.p0_idle_since = None;
                 }
                 match pick {
                     Some(t) => Pick::Run(t),
@@ -606,21 +613,30 @@ fn p_loop(idx: usize) {
                         let earliest = s.ps[idx].next_wake;
                         match earliest {
                             Some(w) => Pick::Wait(Some(w.saturating_duration_since(now))),
-                            None if idx == 0 && deadlocked(s) => {
-                                // every thread is blocked forever: deadlock
-                                let e = exc_new(s.fatal, "No live threads left. Deadlock?");
-                                let main = &mut s.threads[0];
-                                main.interrupt = Some(Throw::Raise(e));
-                                main.has_interrupt.store(true, Ordering::Release);
-                                main.state = St::Runnable;
-                                s.ps[idx].idle = false;
-                                Pick::Run(0)
-                            }
-                            // P 0 checks for deadlock now and then (seldom while threads wait
-                            // for fds: an idle server shouldn't wake up for it)
+                            // P 0 checks for deadlock once it has been idle a while (the check
+                            // looks at every thread; seldom while threads wait for fds: an idle
+                            // server shouldn't wake up for it)
                             None if idx == 0 => {
-                                let io = s.threads.iter().any(|t| t.io_wait && t.state == St::Blocked);
-                                Pick::Wait(Some(Duration::from_millis(if io { 1000 } else { 50 })))
+                                let since = *s.p0_idle_since.get_or_insert(now);
+                                let every = s.p0_check_every;
+                                if now.saturating_duration_since(since) < every {
+                                    Pick::Wait(Some(every - now.saturating_duration_since(since)))
+                                } else if deadlocked(s) {
+                                    // every thread is blocked forever: deadlock
+                                    s.p0_idle_since = None;
+                                    let e = exc_new(s.fatal, "No live threads left. Deadlock?");
+                                    let main = &mut s.threads[0];
+                                    main.interrupt = Some(Throw::Raise(e));
+                                    main.has_interrupt.store(true, Ordering::Release);
+                                    main.state = St::Runnable;
+                                    s.ps[idx].idle = false;
+                                    Pick::Run(0)
+                                } else {
+                                    let io = s.threads.iter().any(|t| t.io_wait && t.state == St::Blocked);
+                                    s.p0_check_every = Duration::from_millis(if io { 1000 } else { 50 });
+                                    s.p0_idle_since = Some(now);
+                                    Pick::Wait(Some(s.p0_check_every))
+                                }
                             }
                             None => Pick::Wait(None),
                         }
