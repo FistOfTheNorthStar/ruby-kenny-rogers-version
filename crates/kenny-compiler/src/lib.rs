@@ -555,6 +555,10 @@ pub struct Options {
     /// Further directories of dependency code that are not load paths (a Rails engine's
     /// `app/` and `config/`): compiled like gem code (see `in_dependency`).
     pub dep_dirs: Vec<PathBuf>,
+    /// Load paths that hold the app's own code (a `-I lib` or `-I spec` inside the Bundler
+    /// project): searched by `require` like the others, but compiled as the app, not as a
+    /// dependency.
+    pub app_load_paths: Vec<PathBuf>,
     /// The Ruby the program is built against, "VERSION PATCHLEVEL RELEASE_DATE" (empty: the
     /// runtime's default, Ruby 3.4). The program reports it (RUBY_VERSION ...) and gets that
     /// version's behavior where 3.4 and 4.0 differ.
@@ -588,7 +592,9 @@ pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, V
     c.load_paths = opts.load_paths.clone();
     c.ruby = opts.ruby.clone();
     c.ripper_backend = opts.ripper_backend.clone();
-    c.dep_roots = opts.load_paths.iter().chain(opts.dep_dirs.iter()).map(|p| p.canonicalize().unwrap_or(p.clone())).collect();
+    let canon = |p: &PathBuf| p.canonicalize().unwrap_or(p.clone());
+    let app: Vec<PathBuf> = opts.app_load_paths.iter().map(canon).collect();
+    c.dep_roots = opts.load_paths.iter().map(canon).filter(|p| !app.contains(p)).chain(opts.dep_dirs.iter().map(canon)).collect();
     let top = c.compile_program(src, path);
     c.embed(&opts.embed_dirs);
     for f in &opts.embed_files {
