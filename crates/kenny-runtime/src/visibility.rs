@@ -200,7 +200,7 @@ pub fn finish_boot() {
                 "Rational", "Complex", "gem_original_require", "test", "ruby2_keywords", "using", "syscall", "trace_var",
                 "untrace_var", "autoload?", "__callee__", "__kenny_openssl_init",
                 // config.ru's Rack::Builder DSL (`run App` at the top level)
-                "run", "use",
+                "run", "use", "map",
             ],
         ),
         (c.object, &["ruby2_keywords", "using"]),
