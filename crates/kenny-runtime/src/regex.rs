@@ -10,7 +10,8 @@ use crate::tri;
 use onig::{Regex, RegexOptions, Region, SearchOptions, Syntax};
 
 pub struct Re {
-    pub re: Regex,
+    /// (shared by the Regexps of one pattern this thread compiled: `compile_cached`)
+    pub re: std::sync::Arc<Regex>,
     pub source: Vec<u8>,
     pub opts: u32,
     pub names: Vec<(String, Vec<u32>)>,
@@ -26,7 +27,7 @@ pub struct Re {
 impl Re {
     pub(crate) fn twin(&self) -> Option<&Regex> {
         if self.binary {
-            return Some(&self.re);
+            return Some(&*self.re);
         }
         self.bin_twin
             .get_or_init(|| {
@@ -176,7 +177,54 @@ fn optional_groups_as_alternation(pat: &str) -> String {
     out
 }
 
+/// A pattern compiled by `compile`, kept for the next Regexp of the same source.
+#[derive(Clone)]
+struct Compiled {
+    re: std::sync::Arc<Regex>,
+    binary: bool,
+    names: Vec<(String, Vec<u32>)>,
+}
+thread_local! {
+    /// Patterns compiled at run time (`Regexp.new`, interpolated literals such as
+    /// Pathname's `chop_basename`), per OS thread: the same pattern is usually built again
+    /// and again, and the onig crate compiles one pattern at a time process-wide (a global
+    /// mutex around `onig_new`), which serialised every core on it under load.
+    static COMPILED: std::cell::RefCell<rustc_hash::FxHashMap<(Vec<u8>, u32), Compiled>> = Default::default();
+}
+/// Most patterns kept per thread (the cache starts over when full).
+const COMPILED_MAX: usize = 1024;
+
 pub fn regexp_new(src: &[u8], opts: u32) -> V {
+    let hit = COMPILED.try_with(|c| c.borrow().get(&(src.to_vec(), opts)).cloned()).ok().flatten();
+    let c = match hit {
+        Some(c) => c,
+        None => match compile(src, opts) {
+            Ok(c) => {
+                let _ = COMPILED.try_with(|m| {
+                    let mut m = m.borrow_mut();
+                    if m.len() >= COMPILED_MAX {
+                        m.clear();
+                    }
+                    m.insert((src.to_vec(), opts), c.clone());
+                });
+                c
+            }
+            Err(msg) => return raise(*REGEXP_ERROR.get(), &msg),
+        },
+    };
+    let all_space = !c.binary && opts & (OPT_I | OPT_X | OPT_M) == 0 && src == br"\A[[:space:]]*\z";
+    let data = Box::into_raw(Box::new(Re { re: c.re, source: src.to_vec(), opts, names: c.names, binary: c.binary, all_space, bin_twin: std::sync::OnceLock::new() }));
+    alloc(RData {
+        h: Header { klass: *REGEXP.get(), kind: Kind::Data, flags: FL_FROZEN },
+        data: data as *mut std::ffi::c_void,
+        dmark: None,
+        dfree: Some(free_re),
+        roots: Vec::new(),
+    })
+}
+
+/// Compile a pattern (Err: the RegexpError message).
+fn compile(src: &[u8], opts: u32) -> Result<Compiled, String> {
     let raw = String::from_utf8_lossy(src);
     let pat = unescape_unicode(&raw).into_owned();
     let o = onig_options(opts);
@@ -209,18 +257,9 @@ pub fn regexp_new(src: &[u8], opts: u32) -> V {
                 true
             });
             names.sort_by_key(|(_, g)| g.iter().min().copied().unwrap_or(0));
-            let all_space = !binary && opts & (OPT_I | OPT_X | OPT_M) == 0 && src == br"\A[[:space:]]*\z";
-            let data = Box::into_raw(Box::new(Re { re, source: src.to_vec(), opts, names, binary, all_space, bin_twin: std::sync::OnceLock::new() }));
-            let v = alloc(RData {
-                h: Header { klass: *REGEXP.get(), kind: Kind::Data, flags: FL_FROZEN },
-                data: data as *mut std::ffi::c_void,
-                dmark: None,
-                dfree: Some(free_re),
-                roots: Vec::new(),
-            });
-            v
+            Ok(Compiled { re: std::sync::Arc::new(re), binary, names })
         }
-        Err(e) => raise(*REGEXP_ERROR.get(), &format!("{}: /{}/", e.description(), pat)),
+        Err(e) => Err(format!("{}: /{}/", e.description(), pat)),
     }
 }
 
@@ -293,7 +332,7 @@ fn text(s: V) -> Subj {
 /// Search `t` from `start` towards `range` (before `start`: backwards).
 fn search_range(r: &Re, t: &Subj, start: usize, range: usize, region: Option<&mut Region>) -> bool {
     if t.raw || r.binary {
-        let Some(re) = (if t.raw { r.twin() } else { Some(&r.re) }) else { return false };
+        let Some(re) = (if t.raw { r.twin() } else { Some(&*r.re) }) else { return false };
         re.search_with_encoding(onig::EncodedBytes::ascii(&t.b), start, range, SearchOptions::SEARCH_OPTION_NONE, region).is_some()
     } else {
         let s = unsafe { std::str::from_utf8_unchecked(&t.b) };
