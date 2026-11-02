@@ -1471,6 +1471,7 @@ impl<M: Module> Compiler<M> {
                 let k = match fx.kind {
                     ScopeKind::Class => 0,
                     ScopeKind::Top if !self.eval_unit || self.file_unit => 1,
+                    ScopeKind::Block if self.fn_labels.last().is_some_and(|l| l.ends_with(" in <main>") || l.ends_with(" in <top (required)>")) => 5,
                     _ => 2,
                 };
                 (s, k)

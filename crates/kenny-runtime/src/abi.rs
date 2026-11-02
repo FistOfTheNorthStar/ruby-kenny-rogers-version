@@ -1674,7 +1674,8 @@ pub extern "C" fn kn_singleton_class_for(v: V) -> V {
 const PROTECTED_OPS: &[&str] = &["+", "-", "*", "/", "%", "<", "<=", ">", ">=", "==", "!=", "&", "|", "^"];
 
 /// kind: 0 = def in class body (target = self), 1 = top level, 2 = def inside a method/block,
-/// 3 = singleton def (`def obj.name`).
+/// 3 = singleton def (`def obj.name`), 4 = `define_method` compiled as a def, 5 = def in a
+/// block of a file's top level (as 2, but private when it lands in Object).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owner_slot: *mut V, params: *const u8, fast: usize) -> V {
     unsafe { kn_def_claim(target, kind, id, f, owner_slot, params, fast, std::ptr::null_mut()) }
@@ -1703,7 +1704,7 @@ pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn
             }
             singleton_class(target)
         }
-        _ => match crate::kernel::definee_top() {
+        _ => match crate::kernel::definee_for(target) {
             Some(c) => c,
             None => {
                 if is_class(target) {
@@ -1713,6 +1714,12 @@ pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn
                 }
             }
         },
+    };
+    // a def in a block of a file's top level, run as a plain block: private, as at top level
+    let kind = match kind {
+        5 if target == r.main_obj && cls == r.c.object => 1,
+        5 => 2,
+        k => k,
     };
     if check_frozen_definee(cls) == UNDEF {
         return UNDEF;
@@ -1825,7 +1832,7 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_alias(target: V, new: V, old: V) -> V {
-    let c = match crate::kernel::definee_top() {
+    let c = match crate::kernel::definee_for(target) {
         Some(c) => c,
         None => {
             if is_class(target) {

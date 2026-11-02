@@ -260,6 +260,28 @@ pub fn definee_top() -> Option<*mut Class> {
     Some(sc)
 }
 
+/// `definee_top`, when that class/module body, `class_eval` or `instance_eval` is the one whose
+/// `self` is `slf`: a block from elsewhere called inside it (a hook run from an
+/// `instance_exec`'d block) defines into its own scope, as CRuby's cref does.
+pub fn definee_for(slf: V) -> Option<*mut Class> {
+    let &c = pst().definee.last()?;
+    let owner = if c as usize & 1 == 1 {
+        (c as usize & !1) as V
+    } else if unsafe { (*c).is_singleton } && !is_heap(slf) {
+        return (class_of(slf) == c).then_some(c);
+    } else if unsafe { (*c).is_singleton } {
+        unsafe { (*c).attached }
+    } else if !is_heap(slf) {
+        return (c as V == slf || class_of(slf) == c).then_some(c);
+    } else {
+        c as V
+    };
+    if owner != slf {
+        return None;
+    }
+    definee_top()
+}
+
 /// instance_eval / instance_exec: `def` inside defines singleton methods of `obj`, but most
 /// blocks never do, so its singleton class is made only on demand (Rails runs proc
 /// callbacks through instance_exec on every request).
