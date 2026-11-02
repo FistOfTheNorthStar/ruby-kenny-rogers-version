@@ -104,6 +104,12 @@ pub fn spin_pause(spins: &mut u32) {
 /// A global runtime table that can change after boot (features, autoloads, caches...).
 /// `get()` locks it for the current statement (or as long as the guard lives); the lock is
 /// reentrant per OS thread and free while only one OS thread runs Ruby code.
+///
+/// Aligned to (and so a multiple of) 128 bytes, Apple Silicon's cache line: a lock word
+/// sharing a line with a hot read-mostly static (`RT`, `PST_KEY`) makes every waiter's
+/// attempt, and every lock and unlock, take that line from all the other cores (the blog on
+/// 12 cores lost 15% to `GENERIC_IVARS` landing next to `RT` when unrelated statics moved).
+#[repr(align(128))]
 pub struct L<T> {
     owner: AtomicUsize,
     depth: AtomicU32,
@@ -131,7 +137,8 @@ impl<T> L<T> {
             return LGuard { l: self, locked: true };
         }
         let mut spins = 0;
-        while self.owner.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        // (waiters read until it looks free: a failed compare-exchange takes the line too)
+        while self.owner.load(Ordering::Relaxed) != 0 || self.owner.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
             spin_pause(&mut spins);
         }
         self.depth.store(1, Ordering::Relaxed);
@@ -150,7 +157,7 @@ impl<T> L<T> {
             return LGuard { l: self, locked: true };
         }
         let mut spins = 0u32;
-        while self.owner.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while self.owner.load(Ordering::Relaxed) != 0 || self.owner.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
             spins += 1;
             if spins < 64 {
                 std::hint::spin_loop();
