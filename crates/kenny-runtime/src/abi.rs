@@ -1331,7 +1331,7 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
         match a.loader {
             Some(f) => {
                 LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let r = crate::compat::run_file_once(f, a.flag);
+                let r = crate::compat::run_feature(f, a.flag);
                 LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 autoloads().remove(&(owner as usize, id));
                 if r == UNDEF {
@@ -1579,7 +1579,7 @@ fn autoload_before_define(outer: *mut Class, id: u32) -> bool {
     let done = |flag: *mut V| unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire) == 1;
     match a.loader {
         Some(f) => {
-            let r = crate::compat::run_file_once(f, a.flag);
+            let r = crate::compat::run_feature(f, a.flag);
             if done(a.flag) {
                 autoloads().remove(&(outer as usize, id));
             }

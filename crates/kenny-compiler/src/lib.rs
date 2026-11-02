@@ -55,6 +55,8 @@ pub const PROC_ENV_OFFSET: i32 = 24;
 pub const ENV_PARENT: i32 = 0;
 /// kenny-runtime core.rs `KnDirect::entry_limit`
 pub const KN_DIRECT_ENTRY_LIMIT: i32 = 56;
+/// kenny-runtime core.rs `KnDirect::require_hook`
+pub const KN_DIRECT_REQUIRE_HOOK: i32 = 72;
 pub const ENV_BLK: i32 = 8;
 pub const ENV_SLOTS: i32 = 16;
 
@@ -304,6 +306,8 @@ pub struct Compiler<M: Module> {
     pub(crate) load_paths: Vec<PathBuf>,
     /// see `Options::ruby`
     pub(crate) ruby: String,
+    /// `Options::runtime_load_path`
+    pub(crate) runtime_load_path: Vec<PathBuf>,
     /// see `Options::ripper_backend`; set once a compiled file names Ripper's parser
     pub(crate) ripper_backend: Option<PathBuf>,
     pub(crate) ripper_used: bool,
@@ -496,6 +500,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_pm_nomatch", &[I64], &[I64]),
     ("kn_autoload", &[I64, I64, I64, I64], &[I64]),
     ("kn_require_file", &[I64, I64], &[I64]),
+    ("kn_require_lit", &[I64, I64, I64, I64], &[I64]),
     ("kn_wb_env", &[I64], &[I64]),
     ("kn_using", &[I64, I64, I64], &[I64]),
     ("kn_refine_scope", &[I64, I64, I64], &[I64]),
@@ -512,6 +517,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_register_file", &[I64, I64, I64, I64, I64], &[]),
     ("kn_register_debug", &[I64, I64, I64, I64], &[]),
     ("kn_register_ruby", &[I64, I64], &[]),
+    ("kn_register_load_path", &[I64, I64], &[]),
     ("kn_send_refined", &[I64, I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_send0", &[I64, I64, I64, I64], &[I64]),
     ("kn_send1", &[I64, I64, I64, I64, I64], &[I64]),
@@ -571,6 +577,8 @@ pub struct Options {
     /// Ripper's parsing backend (Kenny's kenny/ripper_prism.rb, which loads Prism): compiled in
     /// only when the program's code names Ripper's parser (see ripper.rs).
     pub ripper_backend: Option<PathBuf>,
+    /// The `-I` directories (absolute): `$LOAD_PATH` starts with them, as in CRuby.
+    pub runtime_load_path: Vec<PathBuf>,
 }
 
 pub fn compile_file(path: &Path) -> Result<Output, Vec<String>> {
@@ -593,6 +601,7 @@ pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, V
     }
     c.load_paths = opts.load_paths.clone();
     c.ruby = opts.ruby.clone();
+    c.runtime_load_path = opts.runtime_load_path.clone();
     c.ripper_backend = opts.ripper_backend.clone();
     c.dep_roots = opts.load_paths.iter().chain(opts.dep_dirs.iter()).map(|p| p.canonicalize().unwrap_or(p.clone())).collect();
     let top = c.compile_program(src, path);
@@ -696,6 +705,7 @@ impl<M: Module> Compiler<M> {
             src_hashes: HashMap::new(),
             load_paths: Vec::new(),
             ruby: String::new(),
+            runtime_load_path: Vec::new(),
             ripper_backend: None,
             ripper_used: false,
             ripper_quiet: false,
@@ -758,6 +768,17 @@ impl Compiler<ObjectModule> {
                 let p = b.ins().iadd_imm_s(strs, off as i64);
                 let n = b.ins().iconst(I64, line.len() as i64);
                 let f = self.rt_id("kn_register_ruby");
+                let f = self.module.declare_func_in_func(f, b.func);
+                b.ins().call(f, &[p, n]);
+            }
+            // the -I directories: $LOAD_PATH's first entries
+            for dir in std::mem::take(&mut self.runtime_load_path) {
+                let d = dir.display().to_string().into_bytes();
+                let off = self.str_offset(&d);
+                let strs = gv(&mut self.module, &mut b, self.strs_id);
+                let p = b.ins().iadd_imm_s(strs, off as i64);
+                let n = b.ins().iconst(I64, d.len() as i64);
+                let f = self.rt_id("kn_register_load_path");
                 let f = self.module.declare_func_in_func(f, b.func);
                 b.ins().call(f, &[p, n]);
             }
@@ -1251,7 +1272,8 @@ impl<M: Module> Compiler<M> {
         for (path, (fid, flag)) in &self.loaded {
             let hash = self.src_hashes.get(path).copied().unwrap_or(0);
             let abs = path.display().to_string();
-            keyed.push((0, abs.clone(), abs.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
+            // (the absolute path whole: `$LOADED_FEATURES` lists it; the runtime drops `.rb`)
+            keyed.push((0, abs.clone(), abs.clone(), *fid, *flag, hash));
             for (i, lp) in lps.iter().enumerate() {
                 if let Ok(rel) = path.strip_prefix(lp) {
                     let r = rel.display().to_string();

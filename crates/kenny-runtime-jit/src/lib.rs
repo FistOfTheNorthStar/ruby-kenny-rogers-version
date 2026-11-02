@@ -139,6 +139,8 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_pm_nomatch", kenny_runtime::abi::kn_pm_nomatch as *const u8),
         ("kn_autoload", kenny_runtime::abi::kn_autoload as *const u8),
         ("kn_require_file", kenny_runtime::compat::kn_require_file as *const u8),
+        ("kn_require_lit", kenny_runtime::compat::kn_require_lit as *const u8),
+        ("kn_register_load_path", kenny_runtime::compat::kn_register_load_path as *const u8),
         ("kn_wb_env", kenny_runtime::abi::kn_wb_env as *const u8),
         ("kn_using", kenny_runtime::abi::kn_using as *const u8),
         ("kn_refine_scope", kenny_runtime::abi::kn_refine_scope as *const u8),

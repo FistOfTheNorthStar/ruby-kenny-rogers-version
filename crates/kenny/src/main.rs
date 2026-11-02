@@ -360,7 +360,9 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<(kenny_compiler::Options,
     let ruby = ruby::get().map(|r| r.release_line()).unwrap_or_default();
     // Ripper's Prism backend: compiled in only when the program's code names Ripper's parser
     let ripper_backend = Some(overlay.join("kenny/ripper_prism.rb"));
-    Ok((kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs, ruby, coverage: false, ripper_backend }, pairing, gem_exts))
+    // (CRuby's $LOAD_PATH starts with the -I directories, expanded)
+    let runtime_load_path = o.load_paths.iter().filter_map(|p| std::path::absolute(p).ok()).collect();
+    Ok((kenny_compiler::Options { load_paths, embed_dirs, embed_files, dep_dirs, ruby, coverage: false, ripper_backend, runtime_load_path }, pairing, gem_exts))
 }
 
 /// Returns whether the asset compilers were linked in (see `needs_assets`).

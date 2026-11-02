@@ -630,6 +630,10 @@ pub fn init() {
         if feature_listed(base) {
             return QFALSE;
         }
+        // a directory the program put on $LOAD_PATH itself
+        if let Some(r) = crate::compat::require_via_load_path(&name) {
+            return r;
+        }
         let le = const_lookup(rt().c.object, sym("LoadError")).unwrap() as *mut Class;
         let e = exc_new(le, &format!("cannot load such file -- {name}"));
         ivar_set(e, sym("@path"), str_from(&name));

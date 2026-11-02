@@ -1187,6 +1187,10 @@ pub struct KnDirect {
     /// The String class (compiled code runs getbyte/setbyte of plain Strings inline while
     /// `DIRECT_STR_BYTE` is set).
     pub string_class: std::sync::atomic::AtomicUsize,
+    /// Nonzero once Ruby code redefines `require` where a receiverless `require` finds it
+    /// (Kernel, Object, ...: Zeitwerk's and bootsnap's wrappers): compiled `require "x"`
+    /// then calls it as a method instead of running the compiled file itself.
+    pub require_hook: std::sync::atomic::AtomicU64,
 }
 #[unsafe(no_mangle)]
 pub static KN_DIRECT: KnDirect = KnDirect {
@@ -1199,7 +1203,9 @@ pub static KN_DIRECT: KnDirect = KnDirect {
     array_class: std::sync::atomic::AtomicUsize::new(0),
     entry_limit: std::sync::atomic::AtomicUsize::new(0),
     string_class: std::sync::atomic::AtomicUsize::new(0),
+    require_hook: std::sync::atomic::AtomicU64::new(0),
 };
+const _: () = assert!(std::mem::offset_of!(KnDirect, require_hook) == 72);
 const _: () = assert!(std::mem::offset_of!(KnDirect, array_class) == 48 && std::mem::offset_of!(KnDirect, math_module) == 40);
 const _: () = assert!(std::mem::offset_of!(KnDirect, entry_limit) == 56 && std::mem::offset_of!(KnDirect, string_class) == 64);
 /// What compiled code reads of a String (fastpath.rs `STR_*`): the buffer's ptr, len, cap.
@@ -1600,6 +1606,9 @@ pub static EQQ_TOUCHED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// Class `c`'s method table entry of name `mid` changed (see `IS_A_TOUCHED`, `EQQ_TOUCHED`).
 pub fn touch_method_name(c: *mut Class, mid: u32) {
     use std::sync::atomic::Ordering::SeqCst;
+    if mid == require_id() && !c.is_null() {
+        note_require_override(c, c);
+    }
     if !DIRECT_READY.load(SeqCst) {
         return;
     }
@@ -1617,9 +1626,34 @@ pub fn touch_method_name(c: *mut Class, mid: u32) {
         }
     }
 }
+fn require_id() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| sym("require"))
+}
+/// `target` got the methods of `m` (itself, or a module mixed in): if that gives a
+/// receiverless `require` a Ruby definition, compiled `require "x"` calls it from now on
+/// (`KnDirect::require_hook`).
+fn note_require_override(target: *mut Class, m: *mut Class) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if KN_DIRECT.require_hook.load(SeqCst) != 0 || target.is_null() || m.is_null() {
+        return;
+    }
+    let r = rt();
+    let t = unsafe { &*target };
+    let reached = [r.c.kernel, r.c.object, r.c.basic_object, r.c.module, r.c.class].contains(&target) || (t.is_singleton && t.attached == r.main_obj);
+    if !reached {
+        return;
+    }
+    if let Some(&meth) = unsafe { (*m).methods.get(&require_id()) } {
+        if !meth.is_null() && !matches!(unsafe { &(*meth).body }, Body::Native(..) | Body::Undefined) {
+            KN_DIRECT.require_hook.store(1, SeqCst);
+        }
+    }
+}
 /// Module `m` was included in or prepended to `target`: its methods named === count as
 /// defined in `target` (`EQQ_TOUCHED`).
 pub fn touch_mixin(target: *mut Class, m: *mut Class) {
+    note_require_override(target, m);
     if DIRECT_READY.load(std::sync::atomic::Ordering::SeqCst) && !find_method(m, sym("===")).is_null() {
         touch_method_name(target, sym("==="));
     }
