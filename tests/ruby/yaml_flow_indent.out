@@ -1,0 +1,5 @@
+{"en" => {"faker" => {"quotes" => ["a", "b, c"], "dates" => ["x", "y"]}, "other" => {"k" => 1, "k2" => [1, 2]}, "after" => "done"}}
+{"a" => {"b" => [1, 2]}}
+[[1, 2], "x"]
+{"k" => [1]}
+SyntaxError

@@ -30,7 +30,7 @@ impl Re {
         }
         self.bin_twin
             .get_or_init(|| {
-                let pat = unescape_unicode(&String::from_utf8_lossy(&self.source)).into_owned();
+                let pat = ascii_classes(&unescape_unicode(&String::from_utf8_lossy(&self.source)));
                 Regex::with_options_and_encoding(onig::EncodedBytes::ascii(pat.as_bytes()), onig_options(self.opts), Syntax::ruby()).ok()
             })
             .as_ref()
@@ -72,6 +72,73 @@ pub fn re_of(v: V) -> &'static Re {
 
 /// Ruby's `\u{HHHH ...}` / `\uHHHH` escapes, which Oniguruma doesn't parse: like CRuby,
 /// ASCII code points become `\xHH` and others the literal UTF-8 character.
+/// Ruby's `\w \W \d \D \s \S` are ASCII-only (`/\w/` doesn't match "é"); Oniguruma's are
+/// Unicode, and its WORD_IS_ASCII option would also make `\b` and `\p{Word}` ASCII, which
+/// Ruby's aren't. So they are spelled out as ASCII classes (nested inside a class).
+fn ascii_classes(pat: &str) -> String {
+    if !pat.contains('\\') {
+        return pat.to_string();
+    }
+    let cs: Vec<char> = pat.chars().collect();
+    let mut out = String::with_capacity(pat.len() + 16);
+    // nesting of character classes; just after `[` / `[^` a `]` is literal
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        match c {
+            '\\' if i + 1 < cs.len() => {
+                let n = cs[i + 1];
+                let (set, neg) = match n {
+                    'w' => ("a-zA-Z0-9_", false),
+                    'W' => ("a-zA-Z0-9_", true),
+                    'd' => ("0-9", false),
+                    'D' => ("0-9", true),
+                    's' => ("\\t\\n\\v\\f\\r ", false),
+                    'S' => ("\\t\\n\\v\\f\\r ", true),
+                    _ => {
+                        out.push(c);
+                        out.push(n);
+                        i += 2;
+                        continue;
+                    }
+                };
+                if depth > 0 && !neg {
+                    out.push_str(set);
+                } else {
+                    out.push('[');
+                    if neg {
+                        out.push('^');
+                    }
+                    out.push_str(set);
+                    out.push(']');
+                }
+                i += 2;
+                continue;
+            }
+            '[' => {
+                depth += 1;
+                out.push(c);
+                i += 1;
+                if cs.get(i) == Some(&'^') {
+                    out.push('^');
+                    i += 1;
+                }
+                if depth == 1 && cs.get(i) == Some(&']') {
+                    out.push(']');
+                    i += 1;
+                }
+                continue;
+            }
+            ']' if depth > 0 => depth -= 1,
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 fn unescape_unicode(pat: &str) -> std::borrow::Cow<'_, str> {
     if !pat.contains("\\u") {
         return std::borrow::Cow::Borrowed(pat);
@@ -178,7 +245,7 @@ fn optional_groups_as_alternation(pat: &str) -> String {
 
 pub fn regexp_new(src: &[u8], opts: u32) -> V {
     let raw = String::from_utf8_lossy(src);
-    let pat = unescape_unicode(&raw).into_owned();
+    let pat = ascii_classes(&unescape_unicode(&raw));
     let o = onig_options(opts);
     // `/n` with `\x80`-`\xff` escapes: a byte regexp (CRuby makes it ASCII-8BIT); UTF-8
     // Oniguruma would reject the lone bytes as broken multibyte characters

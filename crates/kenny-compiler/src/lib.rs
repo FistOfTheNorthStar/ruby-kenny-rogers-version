@@ -91,6 +91,14 @@ pub(crate) struct LoopCtx {
     pub rescue_depth: usize,
 }
 
+pub(crate) struct EnsureCtx {
+    pub stmts: Option<ruby_prism::StatementsNode<'static>>,
+    /// `fx.unwind`, `fx.rescue_prev` and `fx.loops` lengths outside the `begin`
+    pub unwind_len: usize,
+    pub rescue_len: usize,
+    pub loops_len: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct MethodCtx {
     pub name: Vec<u8>,
@@ -134,6 +142,9 @@ pub(crate) struct Fx<'a> {
     pub locals: HashMap<Vec<u8>, Local>,
     pub unwind: Vec<Block>,
     pub ensure_depth: usize,
+    /// The `ensure` clauses whose bodies are being compiled (outermost first): `next` and
+    /// `break` jumping out of them run them on the way (CRuby inlines them there too).
+    pub ensures: Vec<EnsureCtx>,
     /// `$!` from before each rescue body being compiled (outermost first): jumping out of
     /// one (`return`, `next`, `break`, `retry`) restores it, as leaving it normally does.
     pub rescue_prev: Vec<Value>,
@@ -386,6 +397,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_cvar_defined", &[I64, I64], &[I64]),
     ("kn_vcall", &[I64, I64, I64], &[I64]),
     ("kn_send_splat", &[I64, I64, I64, I64, I64], &[I64]),
+    ("kn_send_splat_pub", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_super", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_super_splat", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_super_defined", &[I64, I64, I64], &[I64]),
@@ -457,6 +469,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_ary_push_kw", &[I64, I64], &[I64]),
     ("kn_take_kwhash", &[I64, I64, I64], &[I64]),
     ("kn_take_kwhash2", &[I64, I64, I64], &[I64]),
+    ("kn_take_kwhash3", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_kw_dup", &[I64], &[I64]),
     ("kn_kw_take", &[I64, I64], &[I64]),
     ("kn_kw_get", &[I64, I64], &[I64]),
@@ -575,6 +588,10 @@ pub struct Options {
     /// Further directories of dependency code that are not load paths (a Rails engine's
     /// `app/` and `config/`): compiled like gem code (see `in_dependency`).
     pub dep_dirs: Vec<PathBuf>,
+    /// Load paths that hold the app's own code (a `-I lib` or `-I spec` inside the Bundler
+    /// project): searched by `require` like the others, but compiled as the app, not as a
+    /// dependency.
+    pub app_load_paths: Vec<PathBuf>,
     /// The Ruby the program is built against, "VERSION PATCHLEVEL RELEASE_DATE" (empty: the
     /// runtime's default, Ruby 3.4). The program reports it (RUBY_VERSION ...) and gets that
     /// version's behavior where 3.4 and 4.0 differ.
@@ -611,7 +628,9 @@ pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, V
     c.ruby = opts.ruby.clone();
     c.runtime_load_path = opts.runtime_load_path.clone();
     c.ripper_backend = opts.ripper_backend.clone();
-    c.dep_roots = opts.load_paths.iter().chain(opts.dep_dirs.iter()).map(|p| p.canonicalize().unwrap_or(p.clone())).collect();
+    let canon = |p: &PathBuf| p.canonicalize().unwrap_or(p.clone());
+    let app: Vec<PathBuf> = opts.app_load_paths.iter().map(canon).collect();
+    c.dep_roots = opts.load_paths.iter().map(canon).filter(|p| !app.contains(p)).chain(opts.dep_dirs.iter().map(canon)).collect();
     let top = c.compile_program(src, path);
     c.embed(&opts.embed_dirs);
     for f in &opts.embed_files {

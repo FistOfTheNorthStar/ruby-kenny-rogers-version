@@ -327,6 +327,13 @@ pub unsafe extern "C" fn kn_send_splat(cache: *mut CallCache, recv: V, mid: V, a
     unsafe { kn_send(cache, recv, mid, a.len() as u64, a.as_ptr(), blk) }
 }
 
+/// `obj.foo(*args)`: an explicit receiver, so not a private method (kn_send_pub).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_send_splat_pub(cache: *mut CallCache, recv: V, mid: V, args: V, blk: V) -> V {
+    let a = rary(args).v.clone();
+    unsafe { kn_send_pub(cache, recv, mid, a.len() as u64, a.as_ptr(), blk) }
+}
+
 /// A `def`'s owner slot (where `super` starts looking) once one definition site has defined
 /// methods in more than one class (a `def` run in a loop or a `Module.new` block, or a method
 /// copied by `Module#dup`): the owner is then found from the running method's code.
@@ -1686,7 +1693,8 @@ pub extern "C" fn kn_singleton_class_for(v: V) -> V {
 const PROTECTED_OPS: &[&str] = &["+", "-", "*", "/", "%", "<", "<=", ">", ">=", "==", "!=", "&", "|", "^"];
 
 /// kind: 0 = def in class body (target = self), 1 = top level, 2 = def inside a method/block,
-/// 3 = singleton def (`def obj.name`).
+/// 3 = singleton def (`def obj.name`), 4 = `define_method` compiled as a def, 5 = def in a
+/// block of a file's top level (as 2, but private when it lands in Object).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owner_slot: *mut V, params: *const u8, fast: usize) -> V {
     unsafe { kn_def_claim(target, kind, id, f, owner_slot, params, fast, std::ptr::null_mut()) }
@@ -1720,7 +1728,7 @@ pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn
             }
             singleton_class(target)
         }
-        _ => match crate::kernel::definee_top() {
+        _ => match crate::kernel::definee_for(target) {
             Some(c) => c,
             None => {
                 if is_class(target) {
@@ -1730,6 +1738,12 @@ pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn
                 }
             }
         },
+    };
+    // a def in a block of a file's top level, run as a plain block: private, as at top level
+    let kind = match kind {
+        5 if target == r.main_obj && cls == r.c.object => 1,
+        5 => 2,
+        k => k,
     };
     if check_frozen_definee(cls) == UNDEF {
         return UNDEF;
@@ -1856,7 +1870,7 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_alias(target: V, new: V, old: V) -> V {
-    let c = match crate::kernel::definee_top() {
+    let c = match crate::kernel::definee_for(target) {
         Some(c) => c,
         None => {
             if is_class(target) {
@@ -1928,6 +1942,21 @@ pub extern "C" fn kn_take_kwhash2(v: V, argc: u64, nreq: u64) -> u64 {
         return 1;
     }
     (argc > nreq && rhash(v).m.keys().all(|k| is_sym(k.0))) as u64
+}
+/// `kn_take_kwhash2` for a method or block that takes only the `n` keywords at `keys` (no
+/// `**rest`): a trailing Hash (not passed as keywords) with a key it doesn't take stays a
+/// positional argument when there is room for one (`maxpos` < 0: a rest parameter), as in
+/// Ruby 3 (`def schema(props = {}, required: [])` called as `schema({type: ...})`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_take_kwhash3(v: V, argc: u64, nreq: u64, maxpos: i64, keys: *const V, n: u64) -> u64 {
+    if kn_take_kwhash2(v, argc, nreq) == 0 {
+        return 0;
+    }
+    if hdr(v).flags & FL_KWHASH != 0 || (maxpos >= 0 && argc as i64 > maxpos) {
+        return 1;
+    }
+    let known = if n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(keys, n as usize) } };
+    rhash(v).m.keys().all(|k| known.contains(&k.0)) as u64
 }
 /// Copy of the keyword hash so keys can be consumed.
 #[unsafe(no_mangle)]

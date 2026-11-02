@@ -785,6 +785,9 @@ fn feature_path(flag: *mut V) -> Option<String> {
 /// A compiled file just ran for a `require`: list it in `$LOADED_FEATURES` (by its
 /// absolute path, as CRuby does).
 pub fn run_feature(f: CompiledFn, flag: *mut V) -> V {
+    if listed_by_hand(flag) {
+        return QFALSE;
+    }
     let r = run_file_once(f, flag);
     if r == QTRUE {
         provide_compiled(flag);
@@ -1014,6 +1017,43 @@ pub fn compiled_entry(name: &str) -> Option<(CompiledFn, *mut V)> {
     FILE_TABLE.get().as_ref()?.get(key).map(|e| (e.0, e.1))
 }
 
+/// A compiled file that hasn't run, whose path the program put in `$LOADED_FEATURES` itself
+/// (a stand-in loaded in its place; rails_helper's skipped capybara files): loaded, as in
+/// CRuby. The entries seen so far are kept in a set, so this is cheap for the thousands of
+/// files a Rails app requires.
+fn listed_by_hand(flag: *mut V) -> bool {
+    let fl = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) };
+    if fl.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return false;
+    }
+    let Some(feature) = feature_path(flag) else { return false };
+    let Some(lf) = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf)) else { return false };
+    let mut g = LF_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (arr, seen, set) = g.get_or_insert_with(|| (0, 0, std::collections::HashSet::new()));
+    let v = &rary(lf).v;
+    if *arr != lf as usize || v.len() < *seen {
+        (*arr, *seen) = (lf as usize, 0);
+        set.clear();
+    }
+    for x in v.iter().skip(*seen) {
+        if is_str(*x) {
+            set.insert(rstr(*x).b.to_vec());
+        }
+    }
+    *seen = v.len();
+    if !set.contains(feature.as_bytes()) {
+        return false;
+    }
+    drop(g);
+    // (the set may still hold an entry deleted since; and one this runtime added is a file
+    // that ran and was unloaded)
+    let by_hand = lf_contains(lf, &feature) && !PUSHED_FEATURES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&feature));
+    // (the flag stays: taken out of $LOADED_FEATURES again, the file loads)
+    by_hand
+}
+/// `listed_by_hand`'s view of `$LOADED_FEATURES`: (the Array, entries seen, their strings)
+static LF_SEEN: std::sync::Mutex<Option<(usize, usize, std::collections::HashSet<Vec<u8>>)>> = std::sync::Mutex::new(None);
+
 /// Whether `$LOADED_FEATURES` lists `feature`.
 fn lf_contains(lf: V, feature: &str) -> bool {
     rary(lf).v.iter().any(|x| is_str(*x) && rstr(*x).b[..] == *feature.as_bytes())
@@ -1049,6 +1089,9 @@ pub fn require_compiled(name: &str) -> Option<V> {
     let fl = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) };
     if fl.load(std::sync::atomic::Ordering::Acquire) == 1 && was_unloaded(lf, &feature) {
         let _ = fl.compare_exchange(1, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
+    }
+    if listed_by_hand(flag) {
+        return Some(QFALSE);
     }
     // listed once the file has run, as in CRuby (Zeitwerk's require hook reads
     // `$LOADED_FEATURES.last`); a circular require sees the file's loading flag instead

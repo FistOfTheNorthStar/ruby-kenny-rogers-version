@@ -419,56 +419,11 @@ fn tr_squeeze(s: &str, from: &str, to: &str) -> String {
     out
 }
 
-fn is_extend(c: char) -> bool {
-    let u = c as u32;
-    matches!(u,
-        0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05BD | 0x0610..=0x061A | 0x064B..=0x065F
-        | 0x0900..=0x0903 | 0x093A..=0x094F | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E
-        | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200C | 0x20D0..=0x20FF | 0x302A..=0x302F
-        | 0x3099..=0x309A | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F
-        | 0xE0100..=0xE01EF)
-}
-fn is_regional(c: char) -> bool {
-    (0x1F1E6..=0x1F1FF).contains(&(c as u32))
-}
-/// Extended grapheme clusters (approximation: combining marks, ZWJ sequences, flags, CRLF).
+/// Extended grapheme clusters: Oniguruma's `\X`, as CRuby's String#grapheme_clusters.
 fn graphemes(s: &str) -> Vec<String> {
-    let cs: Vec<char> = s.chars().collect();
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < cs.len() {
-        let mut g = String::new();
-        g.push(cs[i]);
-        if cs[i] == '\r' && cs.get(i + 1) == Some(&'\n') {
-            g.push('\n');
-            out.push(g);
-            i += 2;
-            continue;
-        }
-        let first_regional = is_regional(cs[i]);
-        i += 1;
-        if first_regional && i < cs.len() && is_regional(cs[i]) {
-            g.push(cs[i]);
-            i += 1;
-        }
-        while i < cs.len() {
-            if is_extend(cs[i]) {
-                g.push(cs[i]);
-                i += 1;
-            } else if cs[i] == '\u{200D}' {
-                g.push(cs[i]);
-                i += 1;
-                if i < cs.len() {
-                    g.push(cs[i]);
-                    i += 1;
-                }
-            } else {
-                break;
-            }
-        }
-        out.push(g);
-    }
-    out
+    static RE: std::sync::OnceLock<onig::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| onig::Regex::new(r"\X").expect("\\X"));
+    re.find_iter(s).map(|(a, b)| s[a..b].to_string()).collect()
 }
 
 fn undump(b: &[u8]) -> Result<Vec<u8>, V> {
@@ -1140,6 +1095,64 @@ fn init_encoding(st: *mut Class, enc: *mut Class) {
             return bool_v(rstr(s).b.is_ascii());
         }
         bool_v(std::str::from_utf8(&rstr(s).b).is_ok())
+    });
+    // scrub(repl = U+FFFD / "?") / scrub { |bytes| ... }: each invalid byte sequence (UTF-8's
+    // maximal invalid subparts, as CRuby splits them) replaced; a BINARY String has none
+    defn(st, "scrub", 0, 1, |s, a, b| {
+        let ascii = hdr(s).flags & FL_ASCII != 0;
+        let bytes = rstr(s).b.to_vec();
+        if is_bin(s) || (if ascii { bytes.is_ascii() } else { std::str::from_utf8(&bytes).is_ok() }) {
+            return new_like(s, bytes);
+        }
+        let repl = match a.first() {
+            Some(&r) if r != QNIL => {
+                if !is_str(r) {
+                    return type_error(&format!("no implicit conversion of {} into String", crate::core::class_name(real_class(r))));
+                }
+                Some(rstr(r).b.to_vec())
+            }
+            _ => None,
+        };
+        let mut out = Vec::with_capacity(bytes.len());
+        let put = |out: &mut Vec<u8>, bad: &[u8]| -> bool {
+            if let Some(r) = &repl {
+                out.extend_from_slice(r);
+            } else if b != QNIL {
+                let v = call_block(b, &[crate::pack::bin_str(bad.to_vec())]);
+                if v == UNDEF {
+                    return false;
+                }
+                if !is_str(v) {
+                    type_error(&format!("no implicit conversion of {} into String", crate::core::class_name(real_class(v))));
+                    return false;
+                }
+                out.extend_from_slice(&rstr(v).b);
+            } else {
+                out.extend_from_slice(if ascii { b"?" } else { "\u{FFFD}".as_bytes() });
+            }
+            true
+        };
+        if ascii {
+            for &c in &bytes {
+                if c.is_ascii() {
+                    out.push(c);
+                } else if !put(&mut out, &[c]) {
+                    return UNDEF;
+                }
+            }
+        } else {
+            for chunk in bytes.utf8_chunks() {
+                out.extend_from_slice(chunk.valid().as_bytes());
+                if !chunk.invalid().is_empty() && !put(&mut out, chunk.invalid()) {
+                    return UNDEF;
+                }
+            }
+        }
+        let r = new_like(s, out);
+        if ascii {
+            hdr(r).flags |= FL_ASCII;
+        }
+        r
     });
     let us = object_new(enc);
     ivar_set(us, sym("@__name"), str_from("US-ASCII"));

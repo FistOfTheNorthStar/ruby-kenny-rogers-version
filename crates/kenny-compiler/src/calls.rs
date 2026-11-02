@@ -90,7 +90,8 @@ impl<M: Module> Compiler<M> {
             return self.call(fx, "kn_send_refined", &[cache, sc, recv, mid, n, buf, blk]);
         }
         match args.splat {
-            Some(a) => self.call(fx, "kn_send_splat", &[cache, recv, mid, a, blk]),
+            // (`obj.foo(*a)` must not reach a private method either)
+            Some(a) => self.call(fx, if explicit { "kn_send_splat_pub" } else { "kn_send_splat" }, &[cache, recv, mid, a, blk]),
             None => {
                 let no_blk = blk_given.is_none();
                 if no_blk {
@@ -382,8 +383,13 @@ impl<M: Module> Compiler<M> {
                     if name == "coverage" {
                         self.uses_coverage = true;
                     }
-                    // only Ruby sources are compiled in (.so/.bundle/.jar stay runtime requires)
-                    let found = if name.ends_with(".so") || name.ends_with(".bundle") || name.ends_with(".jar") || name.ends_with(".dll") {
+                    // only Ruby sources are compiled in (.so/.bundle/.jar stay runtime requires).
+                    // `rubygems` is the runtime's own Gem (lib/kenny/kenny/gem.rb), loaded as
+                    // CRuby preloads RubyGems: never the stdlib's rubygems.rb, whose
+                    // Kernel#require override would then activate gems (Discourse's boot.rb)
+                    let found = if name == "rubygems" || name == "rubygems.rb" {
+                        None
+                    } else if name.ends_with(".so") || name.ends_with(".bundle") || name.ends_with(".jar") || name.ends_with(".dll") {
                         // a Ruby file standing in for a C extension (Kenny's overlay), never a real binary
                         self.load_paths.iter().map(|d| d.join(&name)).find(|p| {
                             p.is_file()
@@ -823,9 +829,14 @@ impl<M: Module> Compiler<M> {
         let rel = String::from_utf8_lossy(arg.as_string_node().unwrap().unescaped()).into_owned();
         let base = self.file.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let full = rb_file(base.join(&rel));
-        if self.file_unit {
+        // no Ruby file there (a C extension: landlock's `require_relative "landlock"` next to its
+        // landlock.bundle): the runtime's require, which finds a linked-in extension by its
+        // feature name, or raises LoadError
+        let bare = base.join(&rel);
+        if self.file_unit || !full.is_file() {
             // a file compiled at runtime: the program's own copy of the file (compiled in, or
             // loaded from disk by the runtime), not a second one inside this unit
+            let full = if full.is_file() { full } else { bare };
             let abs = full.canonicalize().unwrap_or(full);
             let s = self.self_val(fx);
             let p = self.str_lit(fx, abs.display().to_string().as_bytes());
@@ -844,6 +855,11 @@ impl<M: Module> Compiler<M> {
     /// calls a Ruby definition of `require` instead once there is one (Zeitwerk's,
     /// bootsnap's), as CRuby does.
     fn require_path_as(&mut self, fx: &mut Fx, full: PathBuf, at: usize, req: Option<&[u8]>) -> Value {
+        // the stdlib's rubygems.rb (`require_relative "../rubygems"` in RubyGems' own files):
+        // already "loaded", as the runtime's Gem stands in for it (see `require "rubygems"`)
+        if full.file_name().is_some_and(|n| n == "rubygems.rb") && full.with_file_name("rubygems/core_ext/kernel_require.rb").is_file() {
+            return self.iconst(fx, QFALSE);
+        }
         let Some((fid, flag)) = self.require_file(full, at) else {
             return self.iconst(fx, QFALSE);
         };

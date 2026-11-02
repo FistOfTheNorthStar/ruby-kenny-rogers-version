@@ -1,0 +1,11 @@
+[2, 0]
+["inner 1", "outer 1", "inner 2", "outer 2", "inner 3", "outer 3"]
+[10, 2, 30]
+["ensure 1", "ensure 2", "ensure 3"]
+:broke
+["ensure 1", "ensure 2"]
+[2, "e0", 1, "e1", 2, "e2", "outer"]
+[0, "ensure 0 nil", "boom 1", "ensure 1 nil", "ensure 2 nil", 3, "ensure 3 nil"]
+"rescued from ensure"
+[:n, :b, [true, false]]
+[200, 3]

@@ -1,0 +1,7 @@
+/ -> 200 root |/ (outer)
+/x -> 200 root |/x (outer)
+/admin -> 200 admin /admin| (outer)
+/admin/users -> 200 admin /admin|/users (outer)
+/api/v1/t -> 200 api /api/v1|/t (inner,outer)
+/apix -> 200 root |/apix (outer)
+/api -> 200 root |/api (outer)
