@@ -1,0 +1,15 @@
+source "https://rubygems.org"
+
+# Bundler leaves out an optional group unless asked for (`bundle config with`), and never
+# evaluates the body of a false condition: none of these gems is installed, and the lock
+# lists them all (it was written with KENNY_TEST_IMPORT=1 and the optional group).
+group :extras, optional: true do
+  gem "kenny-not-installed-a"
+end
+if ENV["KENNY_TEST_IMPORT"] == "1"
+  gem "kenny-not-installed-b"
+end
+%w[c].each { |x| gem "kenny-not-installed-#{x}" } if RUBY_VERSION < "2"
+unless File.exist?(File.join(__dir__, "Gemfile"))
+  gem "kenny-not-installed-d"
+end
