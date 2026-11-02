@@ -855,6 +855,11 @@ impl<M: Module> Compiler<M> {
     /// calls a Ruby definition of `require` instead once there is one (Zeitwerk's,
     /// bootsnap's), as CRuby does.
     fn require_path_as(&mut self, fx: &mut Fx, full: PathBuf, at: usize, req: Option<&[u8]>) -> Value {
+        // the stdlib's rubygems.rb (`require_relative "../rubygems"` in RubyGems' own files):
+        // already "loaded", as the runtime's Gem stands in for it (see `require "rubygems"`)
+        if full.file_name().is_some_and(|n| n == "rubygems.rb") && full.with_file_name("rubygems/core_ext/kernel_require.rb").is_file() {
+            return self.iconst(fx, QFALSE);
+        }
         let Some((fid, flag)) = self.require_file(full, at) else {
             return self.iconst(fx, QFALSE);
         };

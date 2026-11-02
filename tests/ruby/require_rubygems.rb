@@ -9,3 +9,11 @@ begin
 rescue LoadError => e
   puts e.message.sub(/\d+\.\d+/, "X.Y")
 end
+# (a RubyGems file that loads rubygems.rb by require_relative)
+require "rubygems/local_remote_options"
+p Gem::LocalRemoteOptions.class
+begin
+  require "nonexistent/#{RUBY_VERSION}/other_c"
+rescue LoadError => e
+  puts e.class
+end
