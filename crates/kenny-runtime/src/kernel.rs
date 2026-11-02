@@ -896,7 +896,7 @@ pub fn init() {
                 let p = pst();
                 p.eval_locals = QNIL;
                 p.eval_src = QNIL;
-                eval_string_l(a[0], 0, r, crate::compat::binding_locals(b), a.get(2).copied().unwrap_or(QNIL), a.get(3).copied().unwrap_or(QNIL))
+                crate::backtrace::with_binding_label(b, || eval_string_l(a[0], 0, r, crate::compat::binding_locals(b), a.get(2).copied().unwrap_or(QNIL), a.get(3).copied().unwrap_or(QNIL)))
             }
             None => type_error("wrong argument type (expected binding)"),
         },

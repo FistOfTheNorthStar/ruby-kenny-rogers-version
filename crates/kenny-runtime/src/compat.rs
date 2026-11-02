@@ -387,7 +387,9 @@ fn init_binding() {
     set_global_const("TOPLEVEL_BINDING", kn_binding_new(rt().main_obj));
     defn(b, "receiver", 0, 0, |s, _, _| ivar_get(s, sym("@__self")));
     defn(b, "eval", 1, 3, |s, a, _| {
-        crate::kernel::eval_string_l(a[0], 0, ivar_get(s, sym("@__self")), binding_locals(s), a.get(1).copied().unwrap_or(QNIL), a.get(2).copied().unwrap_or(QNIL))
+        crate::backtrace::with_binding_label(s, || {
+            crate::kernel::eval_string_l(a[0], 0, ivar_get(s, sym("@__self")), binding_locals(s), a.get(1).copied().unwrap_or(QNIL), a.get(2).copied().unwrap_or(QNIL))
+        })
     });
     // (a snapshot taken where `binding` was called: local_variable_set changes the
     // Binding's copy, which later evals through it see, not the original variable)

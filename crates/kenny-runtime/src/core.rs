@@ -1024,6 +1024,9 @@ pub struct PState {
     pub definee: Vec<*mut Class>,
     /// Methods defined with define_method that are running (for `super` inside them).
     pub dm_stack: Vec<*const Method>,
+    /// Evals through a Binding that are running: (stack pointer at the call, the label of
+    /// where the Binding was made), for backtraces (backtrace.rs `relabel_evals`).
+    pub eval_ctx: Vec<(usize, String)>,
     /// Methods running through `super` from a module that appears more than once in the
     /// receiver's ancestors: (receiver, name, ancestor index it was found at), so a further
     /// `super` goes on from that copy (`find_super_method_at`)
@@ -1129,6 +1132,7 @@ pub fn new_pstate() -> *mut PState {
         stack_limit: 0,
         definee: Vec::new(),
         dm_stack: Vec::new(),
+        eval_ctx: Vec::new(),
         super_at: Vec::new(),
         current_block: Vec::new(),
         mcache: HashMap::default(),
