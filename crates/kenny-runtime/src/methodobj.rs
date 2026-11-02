@@ -84,6 +84,11 @@ fn wrap(class: *mut Class, recv: V, m: *const Method, name: u32) -> V {
         // keeps the method's class (and so the method and its code) alive: a singleton class
         // is freed once nothing reaches it
         ivar_set(o, sym("@__owner"), unsafe { (*m).owner } as V);
+        // and a define_method body's block: once the method is removed or redefined, only
+        // this object reaches it (rspec-mocks keeps the Method of what it stubs)
+        if let Body::Proc(p) = unsafe { &(*m).body } {
+            ivar_set(o, sym("@__body"), *p);
+        }
         crate::gc::note_method_object(m);
     }
     o
