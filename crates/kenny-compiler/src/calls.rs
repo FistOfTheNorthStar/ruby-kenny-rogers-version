@@ -383,8 +383,13 @@ impl<M: Module> Compiler<M> {
                     if name == "coverage" {
                         self.uses_coverage = true;
                     }
-                    // only Ruby sources are compiled in (.so/.bundle/.jar stay runtime requires)
-                    let found = if name.ends_with(".so") || name.ends_with(".bundle") || name.ends_with(".jar") || name.ends_with(".dll") {
+                    // only Ruby sources are compiled in (.so/.bundle/.jar stay runtime requires).
+                    // `rubygems` is the runtime's own Gem (lib/kenny/kenny/gem.rb), loaded as
+                    // CRuby preloads RubyGems: never the stdlib's rubygems.rb, whose
+                    // Kernel#require override would then activate gems (Discourse's boot.rb)
+                    let found = if name == "rubygems" || name == "rubygems.rb" {
+                        None
+                    } else if name.ends_with(".so") || name.ends_with(".bundle") || name.ends_with(".jar") || name.ends_with(".dll") {
                         // a Ruby file standing in for a C extension (Kenny's overlay), never a real binary
                         self.load_paths.iter().map(|d| d.join(&name)).find(|p| {
                             p.is_file()
