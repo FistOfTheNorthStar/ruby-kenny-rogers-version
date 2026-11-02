@@ -50,11 +50,13 @@ Run by hand (their setups need databases, Redis and local edits), before the fix
 | Rails' own tests (activesupport, activemodel, actionview, activerecord on SQLite) | 9,242 tests pass, against CRuby's 9,896 |
 | Jekyll | its Minitest suite runs, and its docs site builds about 30% faster than under CRuby |
 | Mastodon | Rails and RSpec boot; one run of the validator, policy and presenter specs passes (387 of 387, as under CRuby); validators, policies, presenters, serializers, helpers and models together: 2,527 examples, 57 failures, 44 of which fail under CRuby too on the same machine (libvips, Vite manifest) |
-| Discourse | doesn't boot yet |
+| Discourse | (after the fixes listed below) Rails boots and eager-loads (244 models, 158 controllers, as under CRuby); its `config.ru`, built into a binary, serves HTTP with the same responses as CRuby gives (`/srv/status`, `/about.json`, `/site.json`, `/u/system.json`; `/latest.json` and `/` need the JavaScript build, under both); a slice of lib, model and serializer specs: 1,660 examples, 95 failures, the same 93 as under CRuby on the same machine (no JavaScript build: `pnpm install`), plus 2 |
 
 Still open from them: Mastodon's 13 other failures (`Time` given an `ActiveSupport::TimeZone`,
-`be "a"` on frozen string literals, a few others); `st_foreach`/`st_table` (stackprof);
-`rb_fdset_t` (hiredis, eventmachine).
+`be "a"` on frozen string literals, a few others); Discourse's 2 (`equal?` on two equal frozen
+string literals, which CRuby deduplicates; mini_racer); `st_foreach`/`st_table` (stackprof);
+`rb_fdset_t` (hiredis, eventmachine); `rb_absint_numwords` (mini_racer), `rb_enc_sprintf`
+(smarter_json), rbtrace's and rbs's extensions; FFI calls (Discourse stubs mini_suffix's).
 
 Fixed since (each with a test in tests/ruby or tests/bundle):
 - The GC crash in long multi-file runs (Mastodon): a minor collection ran C mark functions on
@@ -73,6 +75,17 @@ Fixed since (each with a test in tests/ruby or tests/bundle):
 - Literal `require`s go through a `Kernel#require` override once one is defined, and are
   listed in `$LOADED_FEATURES` by absolute path.
 - `__callee__` through an alias of a plain `def` returns the alias's name.
+- From Discourse: a trailing Hash with unknown keys stays positional in dependency code, and
+  the app's own `-I` directories count as the app; a `def` in a block at a file's top level
+  (`ActiveSupport.on_load`) defines on the receiver of `instance_eval`/`class_exec`;
+  `next`/`break` run the `ensure` clauses they leave; JIT code and data stay within ADRP
+  range of each other; `require` skips a compiled-in file the program listed in
+  `$LOADED_FEATURES` itself; `require_relative` of a C extension; `require "rubygems"` doesn't
+  compile in the stdlib's RubyGems; `obj.foo(*args)` doesn't reach a private method;
+  YAML flow collections indented as far as their key; `String#scrub` with a replacement;
+  `Array#flatten` of objects with `to_ary`; case mapping with `:turkic`/`:ascii`/`:fold`;
+  `grapheme_clusters` by Oniguruma's `\X`; ASCII-only `\w \d \s` in regexps; Nokogiri SAX
+  parsers given an `Encoding`; `map` in a config.ru.
 
 ## Fixed
 
