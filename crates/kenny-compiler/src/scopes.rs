@@ -1108,7 +1108,8 @@ impl<M: Module> Compiler<M> {
 
         let maxpos = if has_rest { -1 } else { (nreq + nopt + npost) as i64 };
         let consume = kwrest.as_ref().is_some_and(|k| k.as_keyword_rest_parameter_node().is_some());
-        let kwh = if has_kw { Some(self.extract_kwhash(fx, nreq + npost, maxpos, nreq + npost, consume)) } else { None };
+        let known = if consume { None } else { Some(Self::keyword_names(&kws)) };
+        let kwh = if has_kw { Some(self.extract_kwhash(fx, nreq + npost, maxpos, nreq + npost, consume, known.as_deref())) } else { None };
 
         self.arity_check(fx, (nreq + npost) as i64, if has_rest { -1 } else { (nreq + nopt + npost) as i64 });
 
@@ -1192,7 +1193,9 @@ impl<M: Module> Compiler<M> {
     /// for the trailing-Hash keyword rule applied to code from dependencies (see kn_take_kwhash2).
     /// `consume`: a copy whose keys `bind_keywords` removes (for a `**rest` parameter);
     /// otherwise the caller's hash itself, read only, or nil when none was passed.
-    fn extract_kwhash(&mut self, fx: &mut Fx, npos_required: usize, maxpos: i64, nreq2: usize, consume: bool) -> Value {
+    /// `known`: the keyword names when there is no `**rest` (a dependency's trailing Hash with
+    /// other keys stays positional when it fits, see kn_take_kwhash3).
+    fn extract_kwhash(&mut self, fx: &mut Fx, npos_required: usize, maxpos: i64, nreq2: usize, consume: bool, known: Option<&[Vec<u8>]>) -> Value {
         let argc = fx.b.use_var(fx.argc_v);
         let enough = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, argc, npos_required as i64);
         let check = fx.b.create_block();
@@ -1204,7 +1207,15 @@ impl<M: Module> Compiler<M> {
         fx.b.switch_to_block(check);
         let last_i = fx.b.ins().iadd_imm_s(argc, -1);
         let last = self.arg_at(fx, last_i);
-        let is_kw = if self.in_dependency() || self.eval_unit {
+        let is_kw = if let (true, Some(known)) = (self.in_dependency() || self.eval_unit, known) {
+            let argc = fx.b.use_var(fx.argc_v);
+            let nr = self.iconst(fx, nreq2 as i64);
+            let mp = self.iconst(fx, maxpos);
+            let syms: Vec<Value> = known.iter().map(|k| self.sym_val(fx, k)).collect();
+            let buf = self.args_buf(fx, &syms);
+            let nk = self.iconst(fx, syms.len() as i64);
+            self.call(fx, "kn_take_kwhash3", &[last, argc, nr, mp, buf, nk])
+        } else if self.in_dependency() || self.eval_unit {
             let argc = fx.b.use_var(fx.argc_v);
             let nr = self.iconst(fx, nreq2 as i64);
             self.call(fx, "kn_take_kwhash2", &[last, argc, nr])
@@ -1228,6 +1239,20 @@ impl<M: Module> Compiler<M> {
         fx.b.ins().jump(done, &[h.into()]);
         fx.b.switch_to_block(done);
         fx.b.block_params(done)[0]
+    }
+
+    /// The names of keyword parameters (without the `:`).
+    fn keyword_names(kws: &[Node]) -> Vec<Vec<u8>> {
+        kws.iter()
+            .filter_map(|k| {
+                let name = if let Some(r) = k.as_required_keyword_parameter_node() {
+                    r.name().as_slice().to_vec()
+                } else {
+                    k.as_optional_keyword_parameter_node()?.name().as_slice().to_vec()
+                };
+                Some(name.strip_suffix(b":").unwrap_or(&name).to_vec())
+            })
+            .collect()
     }
 
     fn bind_keywords(&mut self, fx: &mut Fx, h: Value, kws: &[Node], kwrest: Option<&Node>) {
@@ -1374,7 +1399,8 @@ impl<M: Module> Compiler<M> {
         let (nreq, nopt, npost) = (reqs.len(), opts.len(), posts.len());
         let has_kw = !kws.is_empty() || kwrest.as_ref().is_some_and(|k| k.as_keyword_rest_parameter_node().is_some());
         let consume = kwrest.as_ref().is_some_and(|k| k.as_keyword_rest_parameter_node().is_some());
-        let kwh = if has_kw { Some(self.extract_kwhash(fx, 0, -1, nreq + npost, consume)) } else { None };
+        let known = if consume { None } else { Some(Self::keyword_names(&kws)) };
+        let kwh = if has_kw { Some(self.extract_kwhash(fx, 0, -1, nreq + npost, consume, known.as_deref())) } else { None };
         let has_rest = rest.is_some();
         let implicit_rest = rest.as_ref().is_some_and(|r| r.as_implicit_rest_node().is_some());
         if !has_rest && npost == 0 {

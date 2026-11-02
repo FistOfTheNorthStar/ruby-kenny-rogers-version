@@ -440,6 +440,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_ary_push_kw", &[I64, I64], &[I64]),
     ("kn_take_kwhash", &[I64, I64, I64], &[I64]),
     ("kn_take_kwhash2", &[I64, I64, I64], &[I64]),
+    ("kn_take_kwhash3", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_kw_dup", &[I64], &[I64]),
     ("kn_kw_take", &[I64, I64], &[I64]),
     ("kn_kw_get", &[I64, I64], &[I64]),

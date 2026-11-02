@@ -105,7 +105,9 @@ loaded after `setup`, as in CRuby. The differences:
   NotImplementedError saying so.
 - **Trailing-Hash keyword arguments in dependencies.** Methods and blocks defined in files found
   via load paths (gems, the stdlib) and in `eval`'d strings take a trailing positional Hash with
-  Symbol keys as their keywords — older gems still pass options that way. The app's own code
+  Symbol keys as their keywords — older gems still pass options that way — unless the method has
+  no `**rest`, the Hash has a key it doesn't take, and there is room for it as a positional
+  argument (then it stays positional, as in Ruby 3). The app's own code
   keeps today's keyword semantics (except that a Hash which would otherwise be one positional
   argument too many is taken as keywords instead of raising ArgumentError).
 - **`DidYouMean` and `ARGF` load on first use** (CRuby sets them up at startup): when code

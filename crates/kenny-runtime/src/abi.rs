@@ -1898,6 +1898,21 @@ pub extern "C" fn kn_take_kwhash2(v: V, argc: u64, nreq: u64) -> u64 {
     }
     (argc > nreq && rhash(v).m.keys().all(|k| is_sym(k.0))) as u64
 }
+/// `kn_take_kwhash2` for a method or block that takes only the `n` keywords at `keys` (no
+/// `**rest`): a trailing Hash (not passed as keywords) with a key it doesn't take stays a
+/// positional argument when there is room for one (`maxpos` < 0: a rest parameter), as in
+/// Ruby 3 (`def schema(props = {}, required: [])` called as `schema({type: ...})`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_take_kwhash3(v: V, argc: u64, nreq: u64, maxpos: i64, keys: *const V, n: u64) -> u64 {
+    if kn_take_kwhash2(v, argc, nreq) == 0 {
+        return 0;
+    }
+    if hdr(v).flags & FL_KWHASH != 0 || (maxpos >= 0 && argc as i64 > maxpos) {
+        return 1;
+    }
+    let known = if n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(keys, n as usize) } };
+    rhash(v).m.keys().all(|k| known.contains(&k.0)) as u64
+}
 /// Copy of the keyword hash so keys can be consumed.
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_kw_dup(v: V) -> V {

@@ -88,6 +88,7 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_ary_push_kw", kenny_runtime::abi::kn_ary_push_kw as *const u8),
         ("kn_take_kwhash", kenny_runtime::abi::kn_take_kwhash as *const u8),
         ("kn_take_kwhash2", kenny_runtime::abi::kn_take_kwhash2 as *const u8),
+        ("kn_take_kwhash3", kenny_runtime::abi::kn_take_kwhash3 as *const u8),
         ("kn_kw_dup", kenny_runtime::abi::kn_kw_dup as *const u8),
         ("kn_kw_take", kenny_runtime::abi::kn_kw_take as *const u8),
         ("kn_kw_get", kenny_runtime::abi::kn_kw_get as *const u8),
