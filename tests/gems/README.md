@@ -15,7 +15,7 @@ tests/gems/run.sh rack json       # some
 Outputs land in `target/gems/<gem>.{ruby,build,kenny}` (stderr in `.ruby.err`, `.kenny.err`).
 The gems must be installed for the Ruby the tests run against (`bundle install` in a gem's directory).
 
-## Results (Ruby 3.4.12, 2026-10-30): 131 of 134 pass
+## Results (Ruby 3.4.12, 2026-11-02): 132 of 134 pass
 
 40 passed when the suite was added; the fixes on the `gem-fixes-1` branch brought it to
 76, RSA keys, the SSL/X509 names and an empty `RubyVM` (`openssl-pkey`) to 81, Nokogiri's
@@ -25,10 +25,11 @@ Prism and Ripper, C extensions from the lock, chilled string literals, `Coverage
 and sequel, webmock, faker, factory_bot, graphql, sidekiq, sinatra, haml, slim, liquid,
 jbuilder, kramdown, rouge, rack-cors, rack-attack, httparty, rest-client, money, pundit, pagy,
 aasm, chronic, dry-struct, dry-validation, hashie, mustermann, prawn, sorbet-runtime), all
-passing.
+passing. Labelling eval'd code in backtraces as CRuby does (the calling frame's label) made
+pry pass: 132.
 
 Built against Ruby 4.0.9 (`KENNY_RUBY=/path/to/ruby-4.0/bin/ruby tests/gems/run.sh`, with each gem
-directory's `bundle install` run for that Ruby) the result is the same: 131 of 134, the same three failing.
+directory's `bundle install` run for that Ruby) the result was the same before the pry fix: 131 of 134, the same three failing.
 
 Pass (the top 100): actioncable, actionmailer, actionpack, actionview, activejob, activemodel, activerecord, activestorage, activesupport, addressable, ast, aws-eventstream, aws-partitions, aws-sdk-core, aws-sdk-kms, aws-sdk-s3, aws-sigv4, base64, bigdecimal, builder, bundler, coderay, concurrent-ruby, connection_pool, crass, diff-lcs, docile, domain_name, dotenv, erubi, excon, faraday, faraday-net_http, globalid, googleauth, http-cookie, httpclient, i18n, jmespath, json, jwt, loofah, mail, method_source, mime-types, mime-types-data, mini_mime, mini_portile2, minitest, msgpack, multi_json, multi_xml, multipart-post, netrc, nio4r, nokogiri, parallel, parser, public_suffix, racc, rack, rack-protection, rack-test, rails, rails-dom-testing, rails-html-sanitizer, railties, rainbow, rake, rb-fsevent, redis, regexp_parser, rexml, rspec, rspec-core, rspec-expectations, rspec-mocks, rspec-support, rubocop, rubocop-ast, ruby-progressbar, rubygems-update, rubyzip, signet, simplecov, sprockets, sprockets-rails, thor, thread_safe, tilt, tzinfo, unf, unf_ext, unicode-display_width, websocket-driver, websocket-extensions, zeitwerk.
 
@@ -38,7 +39,6 @@ Pass (the top 100): actioncable, actionmailer, actionpack, actionview, activejob
 |---|---|
 | puma | Left out by design: the binary is the server |
 | ffi | Calling C functions through FFI is dropped (docs/LANGUAGE.md); also `FFI.type_size` |
-| pry | Eval'd code is labelled `<eval>` in backtraces (CRuby: the calling frame's label) |
 
 ## Large applications
 
@@ -52,13 +52,23 @@ Run by hand (their setups need databases, Redis and local edits), before the fix
 | Mastodon | Rails and RSpec boot; the validator specs pass one file at a time (103 of 103); a run of several files crashes in the GC |
 | Discourse | doesn't boot yet |
 
-Still open from them: the GC crash in long multi-file runs (Mastodon); C extensions that
-define the same C symbol (rinku and redcarpet both vendor Sundown's `buffer.c`); Gemfile
-`if ENV[...]` branches and `optional: true` groups, which the build takes as always on; a
-compile-time `require` cycle that bakes a `require` as `false`; `require` of a project file
-through a `$LOAD_PATH` entry added at runtime; literal `require`s skip `Kernel#require`
-overrides and aren't listed in `$LOADED_FEATURES`; `__callee__` through an alias of a
-plain `def`; `st_foreach`/`st_table` (stackprof); `rb_fdset_t` (hiredis, eventmachine).
+Still open from them: the GC crash in long multi-file runs (Mastodon); `st_foreach`/`st_table`
+(stackprof); `rb_fdset_t` (hiredis, eventmachine).
+
+Fixed since (each with a test in tests/ruby or tests/bundle):
+- C extensions that define the same C symbol (rinku and redcarpet both vendor Sundown's
+  `buffer.c`) link together: each extension's objects are combined with `ld -r`, and only
+  its `Init_` functions stay global.
+- The Gemfile is evaluated by Bundler's DSL at build time, so `if ENV[...]` branches and
+  other conditions count as Bundler counts them. `optional: true` groups are left out
+  unless `BUNDLE_WITH` names them.
+- A compile-time `require` cycle runs the file when it is entered at runtime; before, the
+  `require` was baked as `false`.
+- `require` finds project files through `$LOAD_PATH` entries added at runtime, and `-I`
+  directories are on `$LOAD_PATH`.
+- Literal `require`s go through a `Kernel#require` override once one is defined, and are
+  listed in `$LOADED_FEATURES` by absolute path.
+- `__callee__` through an alias of a plain `def` returns the alias's name.
 
 ## Fixed
 
