@@ -287,7 +287,11 @@ pub struct Compiler<M: Module> {
     pub(crate) file: PathBuf,
     pub(crate) src: Vec<u8>,
     pub(crate) loaded: HashMap<PathBuf, (FuncId, usize)>,
-    pub(crate) loading: HashSet<PathBuf>,
+    /// Files being compiled (a `require` cycle refers to one): their top-level function,
+    /// declared ahead, and loaded flag.
+    pub(crate) loading: HashMap<PathBuf, (FuncId, usize)>,
+    /// The function the next file's top level is compiled into (declared by `require_file`).
+    pub(crate) top_predeclared: Option<FuncId>,
     /// The program evaluates strings at runtime: link the runtime compiler.
     pub needs_jit: bool,
     /// Compiling an eval'd string: `def` uses the dynamic definee.
@@ -684,7 +688,8 @@ impl<M: Module> Compiler<M> {
             file: path.to_path_buf(),
             src: src.to_vec(),
             loaded: HashMap::new(),
-            loading: HashSet::new(),
+            loading: HashMap::new(),
+            top_predeclared: None,
             needs_jit: false,
             eval_unit: false,
             file_unit: false,
