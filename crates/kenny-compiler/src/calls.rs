@@ -528,7 +528,11 @@ impl<M: Module> Compiler<M> {
             let plain = move |c: &mut Self, fx: &mut Fx, rt: &'static str, args: &[Value]| -> Value {
                 if inline && rt == "kn_vcall" {
                     c.direct_call(fx, cache, recv, &[], false, |c, fx| c.call(fx, rt, args))
-                } else if (inline || stub) && rt == "kn_attr_get" {
+                } else if inline && rt == "kn_attr_get" {
+                    // (in a loop, `attr_fast` tried the attribute first) a compiled method
+                    // called here, anything else through the runtime
+                    c.direct_call(fx, cache, recv, &[], false, |c, fx| c.call(fx, rt, args))
+                } else if stub && rt == "kn_attr_get" {
                     c.call_stub(fx, crate::fastpath::STUB_ATTR_GET, args)
                 } else if stub && rt == "kn_vcall" {
                     c.call_stub(fx, crate::fastpath::STUB_VCALL, args)
@@ -536,11 +540,11 @@ impl<M: Module> Compiler<M> {
                     c.call(fx, rt, args)
                 }
             };
-            let attr = !fx.loops.is_empty() && crate::fastpath::attr_name(&name);
+            let attr = crate::fastpath::attr_name(&name) && (!fx.loops.is_empty() || (!self.in_dependency() && self.attr_names.contains(&name)));
             let dynamic = |c: &mut Self, fx: &mut Fx| -> Value {
                 if attr {
                     let mode = c.iconst(fx, 2);
-                    c.attr_fast(fx, cache, recv, None, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, mode]))
+                    c.attr_fast(fx, cache, recv, None, false, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, mode]))
                 } else {
                     plain(c, fx, "kn_vcall", &[cache, recv, mid])
                 }

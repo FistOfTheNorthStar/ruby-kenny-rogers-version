@@ -87,6 +87,20 @@ Notable choices:
   without a method invocation when the cached method is the builtin one; a monkey patch, subclass override,
   singleton method or `method_missing` resolves to a different method and takes the normal path.
   Instance-variable reads and writes use per-site shape caches.
+- **Calls between compiled methods are direct.** When a site's inline cache maps the receiver's class
+  to a compiled method, compiled code calls that method's native function itself, with its arguments
+  in registers; attr_readers and attr_writers become a load or a store, and `is_a?` in a loop a
+  lookup in the receiver's superclass list. Each of the cache's four classes is checked with one
+  compare, so a site whose receivers are of a few classes (a superclass's method called on its
+  subclasses' objects) stays on the fast path.
+- **Small methods are inlined** (attr-style getters, predicates, arithmetic, `def x = @x`, small
+  `initialize`s through `C.new`, methods taking a literal block): the body is compiled into the caller
+  behind a guard slot holding up to four receiver classes for which the runtime has checked that the
+  call reaches that very `def` under the current method serial. In a loop, a call to a method the
+  program defines in two or three classes inlines each body behind its own guard. Redefining a
+  method, a singleton method, `include`/`prepend`, a visibility change or `method_missing` changes
+  the serial or misses the guard, and the call is made normally. Backtraces still show the inlined
+  method's frame (its calls record an inline location).
 - **Blocks of `times`, `upto`, `downto`, `each`, `each_with_index`, `map`, `select`, `reject`, `any?`, `all?`** (on
   Integers, Arrays and Integer Ranges) are compiled as loops in the caller when the block is small and doesn't need
   its own frame (`return`, nested blocks, ...). A guard checks at runtime that the method is the builtin one;
@@ -254,7 +268,7 @@ against 4.0.
 | Float math: `mandelbrot.rb` | 43x | 41x | 28x |
 | Float math: `spectral_norm.rb` | 8.7x | 7.0x | 1.7x |
 | Float math: `nbody.rb` | 5.0x | 4.5x | 1.9x |
-| Method-call-heavy OO code (`methods.rb`) | 6.6x | 6.5x | 0.86x (YJIT is faster) |
+| Method-call-heavy OO code (`methods.rb`) | 13x | 13x | 1.7x |
 | Object allocation with GC (`objects.rb`) | 5.9x | 4.4x | 2.5x |
 | 12 CPU-bound Ruby threads (`threads.rb`) | 59x | 62x | 26x (Ruby's GVL runs one at a time) |
 
@@ -293,13 +307,15 @@ threads run requests in each (default 4 per `KENNY_THREADS`); `KENNY_MAX_BODY` (
 K/M/G suffix), `KENNY_READ_TIMEOUT` and `KENNY_KEEPALIVE_TIMEOUT` (seconds) are the server's
 limits. `KENNY_SCHED_STATS=1` prints how often
 threads moved between cores (`KENNY_NO_STEAL=1` keeps them where they started, to compare); `KENNY_CRASH_TRACE=1` prints a native backtrace on a crash. `KENNY_NO_INLINE=1 kenny build ...` compiles without block inlining (to compare, or
-to rule it out when debugging). Debugging: `KENNY_DEBUG_RAISE=1` logs every exception raised
+to rule it out when debugging); `KENNY_NO_POLY_INLINE=1` without inlining a call to a method with
+several definitions, and `KENNY_DEBUG_INLINE=1` lists each method it inlines. Debugging: `KENNY_DEBUG_RAISE=1` logs every exception raised
 (rescued or not) with its location; `KENNY_DEBUG_EVAL=1` logs every string compiled at runtime
 by `eval`/`class_eval`; an uncaught exception and a failed request print the full backtrace.
 
 ## Roadmap
 
-1. Direct calls between compiled methods (guarded by the inline cache) and inlining of small methods
+1. Guard slots of inlined and static calls that fill while several OS threads run Ruby code
+   (today they fill only while one does, so code first reached under load takes the normal call)
 2. An event-driven poller for Ruby-level sockets and pipes (park the thread, not poll)
 3. Precise stack maps (Cranelift) for compiled frames and rooted native code, so compaction can
    run under load, not only when idle

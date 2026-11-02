@@ -284,6 +284,10 @@ pub struct Compiler<M: Module> {
     pub(crate) def_cref: HashMap<(PathBuf, usize), usize>,
     /// vobj.rs: the getters of the classes of the program, by class name
     pub(crate) class_getters: HashMap<Vec<u8>, vobj::Getters>,
+    /// Names of the attr_readers this program's class bodies declare (statics.rs
+    /// `scan_defs`): a receiver-less call of one in the program's code tries the attribute
+    /// inline (`attr_fast`) outside loops too.
+    pub(crate) attr_names: HashSet<Vec<u8>>,
     pub(crate) caches_id: DataId,
     pub(crate) syms_id: DataId,
     pub(crate) strs_id: DataId,
@@ -702,6 +706,7 @@ impl<M: Module> Compiler<M> {
             def_stack: Vec::new(),
             def_cref: HashMap::new(),
             class_getters: HashMap::new(),
+            attr_names: HashSet::new(),
             caches_id,
             syms_id,
             strs_id,

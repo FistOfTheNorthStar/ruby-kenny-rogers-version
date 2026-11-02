@@ -5,9 +5,10 @@
 //! Before a file is compiled, `scan_defs` finds its `def`s at the top level and directly in
 //! class/module bodies, and declares each one's fast entry ahead of time. A call site picks
 //! the definition with the right arity in the same class body (else the only one in the
-//! program) and guards the call with a two-word slot, [receiver class, method serial]: the
-//! runtime (`kn_static_fill`) fills it once the receiver's class is seen to have exactly
-//! that method; any method definition anywhere (a new serial) makes it stale again.
+//! program) and guards the call with a slot of [method serial, up to four receiver classes]
+//! (`poly_guard`): the runtime (`kn_static_fill`) adds a receiver's class once it is seen
+//! to have exactly that method; any method definition anywhere (a new serial) makes it
+//! stale again.
 
 use crate::*;
 use crate::fastpath::may_be_ruby_method;
@@ -306,6 +307,9 @@ impl<M: Module> Compiler<M> {
         let mut s = Scan { lex: Vec::new(), kw: Vec::new(), dynamic: 0, found: Vec::new(), all: Vec::new(), getters: Vec::new() };
         s.visit(root);
         for (cls, m, iv, off) in std::mem::take(&mut s.getters) {
+            if off.is_none() {
+                self.attr_names.insert(m.clone());
+            }
             let g = self.class_getters.entry(cls).or_default();
             // (two different getters of that name: neither)
             match g.get(&m) {
@@ -383,26 +387,11 @@ impl<M: Module> Compiler<M> {
 
     /// `static_call` to `fid`, behind the site's slot.
     fn static_guarded(&mut self, fx: &mut Fx, fid: FuncId, recv: Value, mid: Value, vals: &[Value], dynamic: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
-        let f = mem();
-        let slot = self.cache_ptr(fx, 2);
         let slow = fx.b.create_block();
         let done = fx.b.create_block();
         fx.b.append_block_param(done, I64);
         fx.b.set_cold_block(slow);
-        self.require_heap(fx, recv, slow);
-        let k = fx.b.ins().load(I64, f, recv, 0);
-        let sk = fx.b.ins().load(I64, f, slot, 0);
-        let ss = fx.b.ins().load(I64, f, slot, 8);
-        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
-        let dir = fx.b.ins().symbol_value(I64, gv);
-        let cur = fx.b.ins().load(I64, f, dir, 0);
-        // class and serial as one test
-        let d1 = fx.b.ins().bxor(k, sk);
-        let d2 = fx.b.ins().bxor(ss, cur);
-        let d = fx.b.ins().bor(d1, d2);
-        let bad = self.no_room(fx, dir);
-        let d = fx.b.ins().bor(d, bad);
-        self.require_zero(fx, d, slow);
+        let slot = self.poly_guard(fx, recv, slow, true);
         let mut args = vec![recv];
         args.extend_from_slice(vals);
         args.push(fx.b.ins().iconst(I64, QNIL));
@@ -451,6 +440,68 @@ pub(crate) fn calls_itself(name: &[u8], n: usize, body: &Node) -> bool {
     let mut s = S { name, n, found: false };
     s.visit(body);
     s.found
+}
+
+/// Classes a static / inline call site's guard slot holds (kenny-runtime abi.rs
+/// `kn_static_fill`): the slot is [method serial, class 0 .. class POLY_WAYS-1].
+pub(crate) const POLY_WAYS: usize = 4;
+
+impl<M: Module> Compiler<M> {
+    /// The guard of a static or inlined call: a heap receiver whose class is one of the
+    /// site's slot classes (`POLY_WAYS` of them, newest first) under the current method
+    /// serial, and for a call (`call`) room on the stack and no collection pending. Leaves
+    /// the builder in the block where the guard held; anything else jumps to `slow`, which
+    /// is to ask the runtime to fill the slot (`kn_static_fill`). Returns the slot.
+    ///
+    /// Several classes, so that a site whose receivers are of a few classes sharing the
+    /// method (a superclass's method on its subclasses' objects) keeps its fast path; a
+    /// class whose method is another one is recorded too, tagged (`class | 1`, never equal
+    /// to a class), so the runtime needn't look it up again.
+    pub(crate) fn poly_guard(&mut self, fx: &mut Fx, recv: Value, slow: Block, call: bool) -> Value {
+        let slot = self.cache_ptr(fx, 1 + POLY_WAYS);
+        self.poly_guard_slot(fx, slot, recv, slow, call);
+        slot
+    }
+
+    /// `poly_guard` with a slot allocated by the caller (`cache_ptr(fx, 1 + POLY_WAYS)`).
+    fn poly_guard_slot(&mut self, fx: &mut Fx, slot: Value, recv: Value, slow: Block, call: bool) {
+        let f = mem();
+        self.require_heap(fx, recv, slow);
+        let k = fx.b.ins().load(I64, f, recv, 0);
+        let ss = fx.b.ins().load(I64, f, slot, 0);
+        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+        let dir = fx.b.ins().symbol_value(I64, gv);
+        let cur = fx.b.ins().load(I64, f, dir, 0);
+        let k0 = fx.b.ins().load(I64, f, slot, 8);
+        // the serial and the first class as one test
+        let d1 = fx.b.ins().bxor(k, k0);
+        let d2 = fx.b.ins().bxor(ss, cur);
+        let mut d = fx.b.ins().bor(d1, d2);
+        let room = if call { Some(self.no_room(fx, dir)) } else { None };
+        if let Some(r) = room {
+            d = fx.b.ins().bor(d, r);
+        }
+        let ok = fx.b.create_block();
+        let more = fx.b.create_block();
+        fx.b.ins().brif(d, more, &[], ok, &[]);
+        // the other classes
+        fx.b.switch_to_block(more);
+        let bad = match room {
+            Some(r) => fx.b.ins().bor(d2, r),
+            None => d2,
+        };
+        self.require_zero(fx, bad, slow);
+        for w in 1..POLY_WAYS {
+            let kw = fx.b.ins().load(I64, f, slot, (8 * (w + 1)) as i32);
+            let hit = fx.b.ins().icmp(IntCC::Equal, k, kw);
+            let next = if w + 1 < POLY_WAYS { fx.b.create_block() } else { slow };
+            fx.b.ins().brif(hit, ok, &[], next, &[]);
+            if w + 1 < POLY_WAYS {
+                fx.b.switch_to_block(next);
+            }
+        }
+        fx.b.switch_to_block(ok);
+    }
 }
 
 impl<M: Module> Compiler<M> {
@@ -644,6 +695,8 @@ pub(crate) struct YieldTarget {
 const MAX_INLINE_DEPTH: usize = 2;
 /// Most nodes an inlined body may have.
 const MAX_INLINE_NODES: usize = 40;
+/// Most `def`s of one name a call in a loop inlines, each behind its own guard.
+const POLY_INLINE: usize = 3;
 /// kenny-runtime abi.rs `kn_static_fill`: the target must be public (a call with a receiver).
 const FILL_PUBLIC: i64 = 1 << 63;
 
@@ -882,7 +935,109 @@ impl<M: Module> Compiler<M> {
         explicit: bool,
         dynamic: impl FnOnce(&mut Self, &mut Fx) -> Value,
     ) -> Option<Value> {
+        if self.inline_target(fx, name, vals.len(), explicit, false).is_none() {
+            let cands = self.poly_targets(fx, name, vals.len(), explicit)?;
+            return Some(self.inline_poly_call(fx, &cands, recv, name, mid, vals, explicit, dynamic));
+        }
         self.inline_call_with(fx, recv, name, mid, vals, explicit, None, dynamic)
+    }
+
+    /// The methods a call `name(n arguments)` in a loop may reach when the program has
+    /// two or three `def`s of that name and arity (`POLY_INLINE`), all of them inlinable
+    /// here (see `inline_target`); none when one `def` is the call's static target.
+    fn poly_targets(&self, fx: &Fx, name: &[u8], n: usize, explicit: bool) -> Option<Vec<(StaticDef, std::rc::Rc<InlineDef>)>> {
+        if fx.loops.is_empty()
+            || self.refine_scope.is_some()
+            || self.in_dependency()
+            || self.eval_unit
+            || self.cov.is_some()
+            || !may_be_ruby_method(name)
+            || self.inline_ctx.len() >= MAX_INLINE_DEPTH
+            || std::env::var_os("KENNY_NO_POLY_INLINE").is_some()
+        {
+            return None;
+        }
+        let defs: Vec<StaticDef> = self.static_defs.get(name)?.iter().filter(|d| d.arity == n).cloned().collect();
+        if !(2..=POLY_INLINE).contains(&defs.len()) {
+            return None;
+        }
+        if !explicit {
+            let here = self.cur_lex(fx).unwrap_or_default();
+            if defs.iter().filter(|d| d.lex == here && d.file == self.file).count() == 1 {
+                return None;
+            }
+        }
+        let mut out = Vec::new();
+        for d in defs {
+            let key = (d.file.clone(), d.offset);
+            let idef = self.inline_defs.get(&key)?.clone();
+            if idef.file != self.file || idef.yields > 0 || self.inline_ctx.iter().any(|f| f.key == key) || self.def_stack.contains(&key) {
+                return None;
+            }
+            if idef.consts && self.cur_lex(fx).as_ref() != Some(&idef.lex) && !self.def_cref.contains_key(&key) {
+                return None;
+            }
+            out.push((d, idef));
+        }
+        Some(out)
+    }
+
+    /// Inline each of `cands` (`poly_targets`), each behind its own guard slot: the first
+    /// whose slot has the receiver's class runs. Anything else asks the runtime to fill the
+    /// slots (each gets the class, tagged when it has another method) and calls `dynamic`.
+    #[allow(clippy::too_many_arguments)]
+    fn inline_poly_call(
+        &mut self,
+        fx: &mut Fx,
+        cands: &[(StaticDef, std::rc::Rc<InlineDef>)],
+        recv: Value,
+        name: &[u8],
+        mid: Value,
+        vals: &[Value],
+        explicit: bool,
+        dynamic: impl FnOnce(&mut Self, &mut Fx) -> Value,
+    ) -> Value {
+        if std::env::var_os("KENNY_DEBUG_INLINE").is_some() {
+            let line = self.line_of(self.cur_offset);
+            eprintln!(
+                "kenny: inline {} ({} definitions) into {}:{} (depth {})",
+                String::from_utf8_lossy(name),
+                cands.len(),
+                self.file.display(),
+                line,
+                self.inline_ctx.len() + 1
+            );
+        }
+        let slow = fx.b.create_block();
+        let done = fx.b.create_block();
+        fx.b.append_block_param(done, I64);
+        fx.b.set_cold_block(slow);
+        // (all slots made here, where the slow path can reach them)
+        let slots: Vec<Value> = cands.iter().map(|_| self.cache_ptr(fx, 1 + POLY_WAYS)).collect();
+        for (j, (_, idef)) in cands.iter().enumerate() {
+            let miss = if j + 1 < cands.len() { fx.b.create_block() } else { slow };
+            self.poly_guard_slot(fx, slots[j], recv, miss, false);
+            let r = self.inline_method_body(fx, idef, recv, vals, &[], None);
+            fx.b.ins().jump(done, &[r.into()]);
+            if j + 1 < cands.len() {
+                fx.b.switch_to_block(miss);
+            }
+        }
+        fx.b.switch_to_block(slow);
+        let tag = ((vals.len() as i64) + 1) << 56 | if explicit { FILL_PUBLIC } else { 0 };
+        for (j, (sd, _)) in cands.iter().enumerate() {
+            let fa = self.fn_addr(fx, sd.fid);
+            let t = fx.b.ins().iconst(I64, tag);
+            let expect = fx.b.ins().bor(fa, t);
+            self.call(fx, "kn_static_fill", &[slots[j], recv, mid, expect]);
+        }
+        let r = dynamic(self, fx);
+        self.check(fx, r);
+        fx.b.ins().jump(done, &[r.into()]);
+        fx.b.switch_to_block(done);
+        let r = fx.b.block_params(done)[0];
+        fx.checked.insert(r);
+        r
     }
 
     /// The method `inline_call` would inline (with a literal block when `with_block`).
@@ -935,24 +1090,11 @@ impl<M: Module> Compiler<M> {
             let line = self.line_of(self.cur_offset);
             eprintln!("kenny: inline {} into {}:{} (depth {})", String::from_utf8_lossy(name), self.file.display(), line, self.inline_ctx.len() + 1);
         }
-        let f = mem();
-        let slot = self.cache_ptr(fx, 2);
         let slow = fx.b.create_block();
         let done = fx.b.create_block();
         fx.b.append_block_param(done, I64);
         fx.b.set_cold_block(slow);
-        self.require_heap(fx, recv, slow);
-        let k = fx.b.ins().load(I64, f, recv, 0);
-        let sk = fx.b.ins().load(I64, f, slot, 0);
-        let ss = fx.b.ins().load(I64, f, slot, 8);
-        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
-        let dir = fx.b.ins().symbol_value(I64, gv);
-        let cur = fx.b.ins().load(I64, f, dir, 0);
-        // class and serial as one test
-        let d1 = fx.b.ins().bxor(k, sk);
-        let d2 = fx.b.ins().bxor(ss, cur);
-        let d = fx.b.ins().bor(d1, d2);
-        self.require_zero(fx, d, slow);
+        let slot = self.poly_guard(fx, recv, slow, false);
         let r = self.inline_method_body(fx, &idef, recv, vals, &[], yb.map(|y| (y, done)));
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(slow);
@@ -1232,23 +1374,11 @@ impl<M: Module> Compiler<M> {
             let line = self.line_of(self.cur_offset);
             eprintln!("kenny: inline {} (keywords) into {}:{} (depth {})", String::from_utf8_lossy(&idef.name), self.file.display(), line, self.inline_ctx.len() + 1);
         }
-        let f = mem();
-        let slot = self.cache_ptr(fx, 2);
         let slow = fx.b.create_block();
         let done = fx.b.create_block();
         fx.b.append_block_param(done, I64);
         fx.b.set_cold_block(slow);
-        self.require_heap(fx, recv, slow);
-        let k = fx.b.ins().load(I64, f, recv, 0);
-        let sk = fx.b.ins().load(I64, f, slot, 0);
-        let ss = fx.b.ins().load(I64, f, slot, 8);
-        let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
-        let dir = fx.b.ins().symbol_value(I64, gv);
-        let cur = fx.b.ins().load(I64, f, dir, 0);
-        let d1 = fx.b.ins().bxor(k, sk);
-        let d2 = fx.b.ins().bxor(ss, cur);
-        let dd = fx.b.ins().bor(d1, d2);
-        self.require_zero(fx, dd, slow);
+        let slot = self.poly_guard(fx, recv, slow, false);
         let r = self.inline_method_body(fx, &idef, recv, pos, kw, None);
         fx.b.ins().jump(done, &[r.into()]);
         fx.b.switch_to_block(slow);

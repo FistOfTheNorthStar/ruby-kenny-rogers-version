@@ -113,6 +113,18 @@ pub fn dup(v: V, keep_frozen: bool) -> V {
     };
     hdr(r).klass = real_class(v);
     gen_ivar_copy(v, r);
+    // clone copies the singleton class too (its methods, modules, instance variables and
+    // constants): rspec's DSL matchers are cloned when composed (`include(k => matcher)`)
+    let meta = hdr(v).klass;
+    if keep_frozen && !meta.is_null() && unsafe { (*meta).is_singleton && (*meta).attached == v } {
+        let dm = singleton_class(r);
+        copy_singleton_methods(meta, dm);
+        unsafe {
+            (*dm).civars = (*meta).civars.clone();
+            (*dm).consts = (*meta).consts.clone();
+        }
+        bump_serial();
+    }
     // dup calls initialize_dup, clone initialize_clone; both default to initialize_copy
     // (Kernel's are no-ops: skipped; a native class's own, Random's say, is called)
     let hook = if keep_frozen { "initialize_clone" } else { "initialize_dup" };
@@ -1926,24 +1938,29 @@ fn dup_module(v: V) -> V {
     k.civars = src.civars.clone();
     let meta = src.h.klass;
     if !meta.is_null() && unsafe { (*meta).is_singleton && (*meta).attached == v } {
-        let dm = singleton_class(c as V);
-        let (sm, dk) = unsafe { (&*meta, &mut *dm) };
-        for (&id, &m) in sm.methods.iter() {
-            let mm = unsafe { &*m };
-            if let Body::Compiled(f) | Body::Aliased(f, _) = mm.body {
-                crate::abi::share_owner_of(f);
-            }
-            let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: dm, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
-            if dk.methods.insert(id, nm).is_none() {
-                crate::core::method_name_count(id, true);
-            }
-            crate::core::touch_method_name(dm, id);
-        }
-        dk.includes.set(sm.includes.clone());
-        dk.prepends.set(sm.prepends.clone());
+        copy_singleton_methods(meta, singleton_class(c as V));
     }
     bump_serial();
     c as V
+}
+
+/// The methods and modules of singleton class `meta` copied into singleton class `dm`
+/// (`Module#dup`, `clone`).
+fn copy_singleton_methods(meta: *mut Class, dm: *mut Class) {
+    let (sm, dk) = unsafe { (&*meta, &mut *dm) };
+    for (&id, &m) in sm.methods.iter() {
+        let mm = unsafe { &*m };
+        if let Body::Compiled(f) | Body::Aliased(f, _) = mm.body {
+            crate::abi::share_owner_of(f);
+        }
+        let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: dm, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
+        if dk.methods.insert(id, nm).is_none() {
+            crate::core::method_name_count(id, true);
+        }
+        crate::core::touch_method_name(dm, id);
+    }
+    dk.includes.set(sm.includes.clone());
+    dk.prepends.set(sm.prepends.clone());
 }
 
 pub fn clone_body(b: &Body) -> Body {
