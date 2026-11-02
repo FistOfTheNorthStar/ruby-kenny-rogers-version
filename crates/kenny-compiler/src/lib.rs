@@ -394,6 +394,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_cvar_defined", &[I64, I64], &[I64]),
     ("kn_vcall", &[I64, I64, I64], &[I64]),
     ("kn_send_splat", &[I64, I64, I64, I64, I64], &[I64]),
+    ("kn_send_splat_pub", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_super", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_super_splat", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_super_defined", &[I64, I64, I64], &[I64]),

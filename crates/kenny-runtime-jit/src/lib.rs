@@ -17,6 +17,7 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_cvar_defined", kenny_runtime::abi::kn_cvar_defined as *const u8),
         ("kn_vcall", kenny_runtime::abi::kn_vcall as *const u8),
         ("kn_send_splat", kenny_runtime::abi::kn_send_splat as *const u8),
+        ("kn_send_splat_pub", kenny_runtime::abi::kn_send_splat_pub as *const u8),
         ("kn_super", kenny_runtime::abi::kn_super as *const u8),
         ("kn_super_splat", kenny_runtime::abi::kn_super_splat as *const u8),
         ("kn_super_defined", kenny_runtime::abi::kn_super_defined as *const u8),

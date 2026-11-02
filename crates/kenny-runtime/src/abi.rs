@@ -327,6 +327,13 @@ pub unsafe extern "C" fn kn_send_splat(cache: *mut CallCache, recv: V, mid: V, a
     unsafe { kn_send(cache, recv, mid, a.len() as u64, a.as_ptr(), blk) }
 }
 
+/// `obj.foo(*args)`: an explicit receiver, so not a private method (kn_send_pub).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_send_splat_pub(cache: *mut CallCache, recv: V, mid: V, args: V, blk: V) -> V {
+    let a = rary(args).v.clone();
+    unsafe { kn_send_pub(cache, recv, mid, a.len() as u64, a.as_ptr(), blk) }
+}
+
 /// A `def`'s owner slot (where `super` starts looking) once one definition site has defined
 /// methods in more than one class (a `def` run in a loop or a `Module.new` block, or a method
 /// copied by `Module#dup`): the owner is then found from the running method's code.

@@ -90,7 +90,8 @@ impl<M: Module> Compiler<M> {
             return self.call(fx, "kn_send_refined", &[cache, sc, recv, mid, n, buf, blk]);
         }
         match args.splat {
-            Some(a) => self.call(fx, "kn_send_splat", &[cache, recv, mid, a, blk]),
+            // (`obj.foo(*a)` must not reach a private method either)
+            Some(a) => self.call(fx, if explicit { "kn_send_splat_pub" } else { "kn_send_splat" }, &[cache, recv, mid, a, blk]),
             None => {
                 let no_blk = blk_given.is_none();
                 if no_blk {
