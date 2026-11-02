@@ -551,19 +551,12 @@ pub unsafe extern "C" fn native_block_tramp_transparent(p: *mut RProc, self_: V,
 // are counted instead (C_CALLS: rarer, and reached through a C dispatcher).
 #[inline(never)]
 pub fn call_native(f: NativeFn, recv: V, args: &[V], blk: V) -> V {
-    // (the function, in the frame: KENNY_GC_COMPACT_STATS=2 names what blocks compaction)
-    let tag = [crate::stackmap::NATIVE_TAG, f as usize];
-    std::hint::black_box(&tag);
     let r = f(recv, args, blk);
     not_a_tail_call();
     r
 }
 #[inline(never)]
 fn call_native_block(f: &dyn Fn(V, &[V], V) -> V, recv: V, args: &[V], blk: V) -> V {
-    // (the closure's code, in the frame: KENNY_GC_COMPACT_STATS=2 names what blocks compaction)
-    let fat: [usize; 2] = unsafe { std::mem::transmute(f) };
-    let tag = [crate::stackmap::NATIVE_TAG, unsafe { *((fat[1] + 8 * 5) as *const usize) }];
-    std::hint::black_box(&tag);
     let r = f(recv, args, blk);
     not_a_tail_call();
     r
@@ -2080,8 +2073,10 @@ pub(crate) fn approx_sp() -> usize {
 /// splatted array, say) is copied to the caller's frame first (`with_stack_args`).
 #[inline(always)]
 pub fn args_on_stack(args: &[V]) -> bool {
+    // (above this frame: in a caller's; the frame pointer, as a local's address would cost
+    // every caller a stack slot)
     let p = args.as_ptr() as usize;
-    args.is_empty() || (p >= approx_sp() && p < pst().heap.stack_base)
+    args.is_empty() || (p >= crate::stackmap::frame_pointer() && p < pst().heap.stack_base)
 }
 /// `f` with a copy of `args` on this frame (a rooted buffer if there are many).
 #[inline(never)]
@@ -2101,14 +2096,15 @@ pub fn with_stack_args(args: &[V], f: impl FnOnce(&[V]) -> V) -> V {
 
 pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
     if !args_on_stack(args) {
-        // (not `invoke` again: many arguments are copied to a rooted, pinning heap buffer)
-        return with_stack_args(args, |a| invoke_copied(m, recv, a, blk));
+        return invoke_copied(m, recv, args, blk);
     }
     invoke_body(m, recv, args, blk)
 }
+#[cold]
 #[inline(never)]
 fn invoke_copied(m: *const Method, recv: V, args: &[V], blk: V) -> V {
-    invoke_body(m, recv, args, blk)
+    // (not `invoke` again: many arguments are copied to a rooted, pinning heap buffer)
+    with_stack_args(args, |a| invoke_body(m, recv, a, blk))
 }
 #[inline(always)]
 fn invoke_body(m: *const Method, recv: V, args: &[V], blk: V) -> V {
@@ -2277,9 +2273,14 @@ pub fn call_block_with_blk(blk: V, args: &[V], blkarg: V) -> V {
 }
 pub fn call_proc_with_self(pv: V, self_: V, args: &[V], blk: V, as_method: bool) -> V {
     if !args_on_stack(args) {
-        return with_stack_args(args, |a| call_proc_body(pv, self_, a, blk, as_method));
+        return call_proc_copied(pv, self_, args, blk, as_method);
     }
     call_proc_body(pv, self_, args, blk, as_method)
+}
+#[cold]
+#[inline(never)]
+fn call_proc_copied(pv: V, self_: V, args: &[V], blk: V, as_method: bool) -> V {
+    with_stack_args(args, |a| call_proc_body(pv, self_, a, blk, as_method))
 }
 fn call_proc_body(pv: V, self_: V, args: &[V], blk: V, as_method: bool) -> V {
     if crate::gc::safepoint() {

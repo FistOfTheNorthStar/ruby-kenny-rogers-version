@@ -264,8 +264,6 @@ pub fn audited_natives() {
     }
 }
 
-/// Marks the native function's address in `call_native`'s frame.
-pub const NATIVE_TAG: usize = 0x6b6e_6e61_7469_7665;
 
 static NATIVES: std::sync::Mutex<Option<rustc_hash::FxHashMap<usize, (usize, u32)>>> = std::sync::Mutex::new(None);
 fn diag() -> bool {
@@ -307,25 +305,11 @@ pub fn native_report(stacks: &[(usize, usize, usize)]) {
         let mut prev_ret = 0;
         walk(fp, lo, hi, |rec, ret| {
             if ret == marks[0] || ret == marks[1] {
-                // call_native's own frame (above the callee's record) holds the function
+                // (the native function: the one the next frame down returns into, unless
+                // that one was inlined or tail-called; for a block, what called it too)
                 let caller_fp = unsafe { *(rec as *const usize) };
-                let mut f = 0;
-                let mut a = rec + 16;
-                while a + 16 <= caller_fp && a < rec + 256 {
-                    if unsafe { *(a as *const usize) } == NATIVE_TAG {
-                        f = unsafe { *((a + 8) as *const usize) };
-                        break;
-                    }
-                    a += 8;
-                }
-                names.push(if f != 0 {
-                    symbol(f)
-                } else {
-                    // (a native block, or the tag wasn't found): what called the native
-                    // function, and where it went
-                    let up = unsafe { *((caller_fp + 8) as *const usize) } & 0x0000_ffff_ffff_ffff;
-                    format!("{}<{}{}", symbol(prev_ret), if ret == marks[1] { "block " } else { "" }, symbol(up))
-                });
+                let up = unsafe { *((caller_fp + 8) as *const usize) } & 0x0000_ffff_ffff_ffff;
+                names.push(if ret == marks[1] { format!("{}<block {}", symbol(prev_ret), symbol(up)) } else { symbol(prev_ret) });
             }
             prev_ret = ret;
         });
