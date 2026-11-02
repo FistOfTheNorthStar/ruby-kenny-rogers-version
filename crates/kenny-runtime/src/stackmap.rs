@@ -22,7 +22,9 @@ use std::sync::RwLock;
 struct MapFn {
     start: usize,
     end: usize,
-    /// [sites, (ret, span, first, count) * sites, slots...]
+    /// [sites, (ret, span, first, count) * sites, bitmaps...]: a site's slots are the set
+    /// bits of words [first, first + (count & 0xFFFF)): bit i is the word at
+    /// SP + 8 * (32 * (count >> 16) + i)
     table: *const u32,
     /// eval units: the table is a boxed copy (freed by `unregister_range`)
     owned: bool,
@@ -84,13 +86,13 @@ fn table_len(t: *const u32) -> usize {
     let mut n = 1 + 4 * sites;
     for s in 0..sites {
         let e = unsafe { t.add(1 + 4 * s) };
-        n = n.max(unsafe { *e.add(2) + *e.add(3) } as usize);
+        n = n.max(unsafe { *e.add(2) + (*e.add(3) & 0xFFFF) } as usize);
     }
     n
 }
 
-/// The map for return address `ret`: (frame size, slot offsets).
-fn lookup(fns: &[MapFn], ret: usize) -> Option<(usize, &'static [u32])> {
+/// The map for return address `ret`: (frame size, index of the bitmap's first word, bitmap).
+fn lookup(fns: &[MapFn], ret: usize) -> Option<(usize, usize, &'static [u32])> {
     let i = fns.partition_point(|f| f.start < ret);
     let f = fns.get(i.checked_sub(1)?)?;
     if ret <= f.start || ret > f.end {
@@ -107,8 +109,8 @@ fn lookup(fns: &[MapFn], ret: usize) -> Option<(usize, &'static [u32])> {
         let r = site(mid)[0];
         if r == off {
             let e = site(mid);
-            let slots = unsafe { std::slice::from_raw_parts(t.add(e[2] as usize), e[3] as usize) };
-            return Some((e[1] as usize, slots));
+            let slots = unsafe { std::slice::from_raw_parts(t.add(e[2] as usize), (e[3] & 0xFFFF) as usize) };
+            return Some((e[1] as usize, (e[3] >> 16) as usize, slots));
         }
         if r < off { lo = mid + 1 } else { hi = mid }
     }
@@ -147,7 +149,7 @@ pub fn precise_slots(stacks: &[(usize, usize, usize)]) -> Vec<usize> {
     let m = MAPS.read().unwrap();
     for &(fp, lo, hi) in stacks {
         walk(fp, lo, hi, |rec, ret| {
-            let Some((span, slots)) = lookup(&m.fns, ret) else { return };
+            let Some((span, lead, slots)) = lookup(&m.fns, ret) else { return };
             // the caller's frame: its frame pointer is the record's link, its stack pointer
             // at the call is right above the callee's record
             let caller_fp = unsafe { *(rec as *const usize) };
@@ -155,10 +157,15 @@ pub fn precise_slots(stacks: &[(usize, usize, usize)]) -> Vec<usize> {
             if caller_fp <= rec || sp != rec + 16 || sp < lo || caller_fp + 16 > hi {
                 return;
             }
-            for &o in slots {
-                let a = sp + o as usize;
-                if a % 8 == 0 && a + 8 <= caller_fp {
-                    out.push(a);
+            for (w, &bits) in slots.iter().enumerate() {
+                let mut bits = bits;
+                while bits != 0 {
+                    let b = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let a = sp + 8 * (32 * (lead + w) + b);
+                    if a + 8 <= caller_fp {
+                        out.push(a);
+                    }
                 }
             }
         });
@@ -233,6 +240,30 @@ pub fn chain_has(fp: usize, lo: usize, hi: usize, marks: &[usize]) -> Option<boo
     if (next == 0 || next < lo || next >= hi) && hi - last <= 4096 { Some(false) } else { None }
 }
 
+/// Native methods audited to keep object references only on their stack or in rooted
+/// buffers (`RVec`/`Rooted`, which pin) while they call back into Ruby: called directly,
+/// not through `call_native`, so a collection that finds a thread inside one can still
+/// move objects. (The ones that blocked most collections in a Rails app under load.)
+pub fn audited_natives() {
+    use crate::core::{gc_transparent, rt};
+    let c = rt().c;
+    gc_transparent(c.array, &["each", "each_index", "map", "collect"]);
+    gc_transparent(c.proc_, &["call", "()", "yield", "[]", "==="]);
+    gc_transparent(c.kernel, &["send", "__send__", "public_send", "instance_exec", "tap", "then", "yield_self"]);
+    gc_transparent(c.basic_object, &["__send__", "instance_exec"]);
+    gc_transparent(c.hash, &["each", "each_pair", "each_key", "each_value", "fetch"]);
+    gc_transparent(c.class, &["new"]);
+    gc_transparent(c.kernel, &["respond_to?", "dup", "clone"]);
+    gc_transparent(crate::core::singleton_class(c.string as crate::core::V), &["new"]);
+    let named = |n: &str| crate::core::const_lookup(c.object, crate::core::sym(n)).map(|v| v as *mut crate::core::Class);
+    if let Some(mon) = named("Monitor") {
+        gc_transparent(mon, &["wait_for_cond"]);
+    }
+    if let Some(m) = named("Method") {
+        gc_transparent(m, &["call", "()", "[]", "==="]);
+    }
+}
+
 /// Marks the native function's address in `call_native`'s frame.
 pub const NATIVE_TAG: usize = 0x6b6e_6e61_7469_7665;
 
@@ -274,7 +305,6 @@ pub fn native_report(stacks: &[(usize, usize, usize)]) {
     for &(fp, lo, hi) in stacks {
         let mut names: Vec<String> = Vec::new();
         let mut prev_ret = 0;
-        let mut prev_rec = 0;
         walk(fp, lo, hi, |rec, ret| {
             if ret == marks[0] || ret == marks[1] {
                 // call_native's own frame (above the callee's record) holds the function
@@ -288,12 +318,17 @@ pub fn native_report(stacks: &[(usize, usize, usize)]) {
                     }
                     a += 8;
                 }
-                names.push(if f != 0 { symbol(f) } else { symbol(prev_ret) });
+                names.push(if f != 0 {
+                    symbol(f)
+                } else {
+                    // (a native block, or the tag wasn't found): what called the native
+                    // function, and where it went
+                    let up = unsafe { *((caller_fp + 8) as *const usize) } & 0x0000_ffff_ffff_ffff;
+                    format!("{}<{}{}", symbol(prev_ret), if ret == marks[1] { "block " } else { "" }, symbol(up))
+                });
             }
             prev_ret = ret;
-            prev_rec = rec;
         });
-        let _ = prev_rec;
         eprintln!("[gc] stack natives: {}", names.join(" | "));
     }
 }

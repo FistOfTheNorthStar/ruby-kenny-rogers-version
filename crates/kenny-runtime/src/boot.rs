@@ -162,6 +162,8 @@ pub fn boot() {
     crate::cgi_escape::init();
     crate::sqlite::init();
     crate::socket::init();
+    // (before blockless_enumerators wraps some of them)
+    crate::stackmap::audited_natives();
     crate::misc::blockless_enumerators();
     crate::opt::init();
     crate::visibility::finish_boot();

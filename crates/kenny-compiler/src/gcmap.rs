@@ -220,15 +220,39 @@ impl<M: Module> Compiler<M> {
         if maps.is_empty() {
             return;
         }
+        // each site's slots as a bitmap of the frame's words (bit i: SP + 8 * i), from its
+        // first word with a slot; sites with
+        // the same slots share one (a long function keeps the same values across many calls)
         let mut words: Vec<u32> = vec![maps.len() as u32];
-        let mut slots: Vec<u32> = Vec::new();
+        let mut bitmaps: Vec<u32> = Vec::new();
+        let mut seen: std::collections::HashMap<Vec<u32>, u32> = std::collections::HashMap::new();
         let base = 1 + 4 * maps.len();
         for (ret, span, map) in maps {
-            let offs: Vec<u32> = map.entries().filter(|(ty, _)| *ty == I64).map(|(_, o)| o).collect();
-            words.extend([*ret, *span, (base + slots.len()) as u32, offs.len() as u32]);
-            slots.extend(offs);
+            let mut bm: Vec<u32> = Vec::new();
+            // (a slot not on an 8-byte boundary is left out: scanned conservatively)
+            for o in map.entries().filter(|(ty, o)| *ty == I64 && o % 8 == 0).map(|(_, o)| o / 8) {
+                let (w, b) = ((o / 32) as usize, o % 32);
+                if bm.len() <= w {
+                    bm.resize(w + 1, 0);
+                }
+                bm[w] |= 1 << b;
+            }
+            // (leading zero words left out: count's high 16 bits say how many)
+            let lead = bm.iter().take_while(|&&w| w == 0).count().min(0xFFFF);
+            bm.drain(..lead);
+            let n = bm.len() as u32 | (lead as u32) << 16;
+            let at = match seen.get(&bm) {
+                Some(&at) => at,
+                None => {
+                    let at = (base + bitmaps.len()) as u32;
+                    bitmaps.extend_from_slice(&bm);
+                    seen.insert(bm, at);
+                    at
+                }
+            };
+            words.extend([*ret, *span, at, n]);
         }
-        words.extend(slots);
+        words.extend(bitmaps);
         self.stack_maps.push((id, code.buffer.data().len() as u32, words));
     }
 }
@@ -264,6 +288,11 @@ impl Compiler<cranelift_object::ObjectModule> {
             for w in table {
                 words.extend_from_slice(&w.to_le_bytes());
             }
+        }
+        if std::env::var("KENNY_STACK_MAPS").is_ok_and(|v| v == "stats") {
+            let sites: usize = maps.iter().map(|m| m.2[0] as usize).sum();
+            let big = maps.iter().map(|m| (m.2.len(), m.2[0])).max().unwrap_or((0, 0));
+            eprintln!("kenny: stack maps: {} functions, {} call sites, {} KB (largest function: {} KB, {} sites)", maps.len(), sites, words.len() / 1024, big.0 * 4 / 1024, big.1);
         }
         fns.define(fn_bytes.into_boxed_slice());
         fns.set_align(8);

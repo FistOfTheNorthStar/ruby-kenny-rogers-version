@@ -536,6 +536,12 @@ unsafe extern "C" fn native_block_tramp(p: *mut RProc, self_: V, argc: u64, argv
     let args = unsafe { args_slice(argc, argv) };
     call_native_block(unsafe { &**(*p).native }, self_, args, blk)
 }
+/// The entry of a native block audited like a `gc_transparent` method (its closure keeps
+/// object references only on the stack): called directly, not through `call_native_block`.
+pub unsafe extern "C" fn native_block_tramp_transparent(p: *mut RProc, self_: V, argc: u64, argv: *const V, blk: V) -> V {
+    let args = unsafe { args_slice(argc, argv) };
+    (unsafe { &**(*p).native })(self_, args, blk)
+}
 
 // Native (Rust) methods and blocks may keep object references where the GC can't see or
 // update them (in Rust collections), so the GC moves objects only when no stack has such a
@@ -554,6 +560,10 @@ pub fn call_native(f: NativeFn, recv: V, args: &[V], blk: V) -> V {
 }
 #[inline(never)]
 fn call_native_block(f: &dyn Fn(V, &[V], V) -> V, recv: V, args: &[V], blk: V) -> V {
+    // (the closure's code, in the frame: KENNY_GC_COMPACT_STATS=2 names what blocks compaction)
+    let fat: [usize; 2] = unsafe { std::mem::transmute(f) };
+    let tag = [crate::stackmap::NATIVE_TAG, unsafe { *((fat[1] + 8 * 5) as *const usize) }];
+    std::hint::black_box(&tag);
     let r = f(recv, args, blk);
     not_a_tail_call();
     r

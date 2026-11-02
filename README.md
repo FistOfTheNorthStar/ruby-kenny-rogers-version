@@ -120,16 +120,22 @@ Working:
   thread allocates from its own 64 KB pages of fixed-size slots; a collection stops all
   threads, scans their stacks with their help, sweeps in parallel, and leaves most freeing
   (young pages, dead buffers) to a background thread after the pause. A minor pause in the
-  blog example under load is under 1 ms. The stack is scanned conservatively and the heap
-  precisely. A major collection can **move** plain objects, strings, arrays, hashes, ranges,
-  floats and bignums out of sparsely used pages into gaps in fuller ones, rewrite the fields
-  that refer to them, and return the emptied pages to the OS. What it can't update stays put:
-  objects reached from a stack (also through a pointer into them), from a root or a C
-  extension, objects with singleton classes, and objects whose `object_id` or identity hash
-  was taken. Since native code may hold object references in Rust collections, objects move
-  only while no thread is inside a native method (the scheduler's blocking calls excepted):
-  `GC.compact` at top level, and an idle server's tidy-up a second after its last request,
-  which also gives memory back (`KENNY_GC_COMPACT=0` turns it off). Singleton classes of dead
+  blog example under load is under 1 ms. The heap is scanned precisely, and so are compiled
+  frames: the compiler emits a stack map for every call (Cranelift's, in the binary and in
+  eval'd code) listing the slots that hold Ruby values across it, and a compacting collection
+  finds those frames by walking frame pointers. The rest of a stack (native frames,
+  registers, values the maps don't list) is scanned conservatively. A major collection can
+  **move** plain objects, strings, arrays, hashes, ranges, floats and bignums out of sparsely
+  used pages into gaps in fuller ones, rewrite the fields and compiled-frame slots that refer
+  to them, and return the emptied pages to the OS. What it can't update stays put: objects
+  reached from a conservatively scanned word (also through a pointer into them), from a root
+  or a C extension, objects with singleton classes, and objects whose `object_id` or identity
+  hash was taken. Native code may hold object references in Rust collections, so objects move
+  only while no thread is inside a native method that hasn't been audited not to (the
+  scheduler's blocking calls, `each`/`map`/`send`/`instance_exec`/`Proc#call`/`Class#new`
+  and other hot ones are): with precise frames that is most collections of a busy server,
+  not only `GC.compact` and an idle server's tidy-up a second after its last request, which
+  also gives memory back (`KENNY_GC_COMPACT=0` turns it off). Singleton classes of dead
   objects are freed (`extend` per request doesn't grow memory).
 - **Regular expressions** via Oniguruma, the engine family Ruby's own comes from: `$~`/`$1`,
   named captures, and the regex-aware `String` methods.
@@ -238,9 +244,12 @@ Not yet:
 - In development: debuggers (`byebug` loads, but calling `byebug` raises LoadError: its core
   is a C extension), and Action Cable's redis adapter (untested: the redis gem isn't installed
   here).
-- Compacting while requests run: objects move only when no thread is inside a native method,
-  which in a busy server is rare, so compaction mostly happens when the server goes idle (or
-  on `GC.compact`). Precise stack maps would lift this (roadmap).
+- Compacting while requests run is partial: a major collection moves objects only when no
+  thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
+  them). In the blog example under load that is about 4 in 10 majors (none before precise
+  stack maps); the rest skip compaction. Precise frames need frame pointers on every frame,
+  which Apple platforms guarantee; elsewhere (`KENNY_GC_PRECISE=1` turns it on) stacks are
+  still scanned word by word for native frames, which rarely lets a busy server compact.
 - Sockets and pipes are polled while other threads wait for them (2 ms steps), not parked on
   an event loop; the HTTP server's own connections use kqueue/epoll.
 - Memory: serving on 12 cores takes about 1.7x the memory of one (each core has its own
@@ -294,8 +303,14 @@ unmarked (a write-barrier test, slow); `KENNY_GC_SCAN_REGIONS=1` also scans comp
 sections for roots (normally literals are pinned instead). `KENNY_GC_YOUNG_SCALE` (default 4)
 caps how much the young generation grows with the number of cores (less memory, more pauses).
 `KENNY_GC_COMPACT=0` never moves objects, `=always` tries at every major collection;
-`KENNY_GC_COMPACT_STATS=1` reports each compaction (and why one couldn't run);
-`KENNY_GC_COMPACT_VERIFY=1` checks every rewritten reference after compacting.
+`KENNY_GC_COMPACT_STATS=1` reports each compaction (and why one couldn't run; `=2` also names
+the native methods on each stack that kept it from running);
+`KENNY_GC_COMPACT_VERIFY=1` checks every rewritten reference after compacting;
+`KENNY_GC_COMPACT_POISON=1` (a test) evacuates only pages that empty completely and then makes
+them inaccessible for good, so a reference the collector failed to update faults at once.
+`KENNY_GC_PRECISE=0` scans compiled frames conservatively (pinning what they hold), `=1`
+precisely where that is not the default; `KENNY_STACK_MAPS=0` at build time leaves the stack
+maps out of the binary (`=stats` reports their size).
 `KENNY_MALLOC=auto|system|mimalloc` picks the allocator behind Rust allocations: on macOS the
 default `auto` uses mimalloc while one core runs Ruby code and the system allocator once
 several do (it keeps far less memory resident when threads free each other's objects); elsewhere
@@ -317,6 +332,7 @@ by `eval`/`class_eval`; an uncaught exception and a failed request print the ful
 1. Guard slots of inlined and static calls that fill while several OS threads run Ruby code
    (today they fill only while one does, so code first reached under load takes the normal call)
 2. An event-driven poller for Ruby-level sockets and pipes (park the thread, not poll)
-3. Precise stack maps (Cranelift) for compiled frames and rooted native code, so compaction can
-   run under load, not only when idle
+3. Compaction under load, the rest: audit (or root) the remaining native methods that call
+   back into Ruby (`Range#to_a`, `Struct.new`, `sort_by!`, Enumerator, Digest, Fiber...), and
+   frame-pointer builds on Linux so its servers get precise frames too
 4. Measure and tune memory and allocator choice on Linux
