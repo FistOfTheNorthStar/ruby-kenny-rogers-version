@@ -84,6 +84,8 @@ struct GThread {
     last_match: V,
     definee: Vec<*mut Class>,
     dm_stack: Vec<*const Method>,
+    eval_ctx: Vec<(usize, String)>,
+    callee: Vec<(u32, u32, V, usize)>,
     super_at: Vec<(V, u32, usize)>,
     current_block: Vec<V>,
     saved_throws: crate::gc::SavedThrows,
@@ -299,6 +301,8 @@ fn save_state(t: &mut GThread) {
     t.last_match = p.last_match;
     t.definee = std::mem::take(&mut p.definee);
     t.dm_stack = std::mem::take(&mut p.dm_stack);
+    t.eval_ctx = std::mem::take(&mut p.eval_ctx);
+    t.callee = std::mem::take(&mut p.callee);
     t.super_at = std::mem::take(&mut p.super_at);
     t.current_block = std::mem::take(&mut p.current_block);
     t.saved_throws = std::mem::take(&mut p.heap.saved_throws);
@@ -311,6 +315,8 @@ fn restore_state(t: &mut GThread) {
     p.last_match = t.last_match;
     p.definee = std::mem::take(&mut t.definee);
     p.dm_stack = std::mem::take(&mut t.dm_stack);
+    p.eval_ctx = std::mem::take(&mut t.eval_ctx);
+    p.callee = std::mem::take(&mut t.callee);
     p.super_at = std::mem::take(&mut t.super_at);
     p.current_block = std::mem::take(&mut t.current_block);
     p.heap.saved_throws = std::mem::take(&mut t.saved_throws);
@@ -442,6 +448,8 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
             last_match: QNIL,
             definee: Vec::new(),
             dm_stack: Vec::new(),
+            eval_ctx: Vec::new(),
+            callee: Vec::new(),
             super_at: Vec::new(),
             current_block: Vec::new(),
             interrupt: None,

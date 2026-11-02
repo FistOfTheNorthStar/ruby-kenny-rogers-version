@@ -1331,7 +1331,7 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
         match a.loader {
             Some(f) => {
                 LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let r = crate::compat::run_file_once(f, a.flag);
+                let r = crate::compat::run_feature(f, a.flag);
                 LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 autoloads().remove(&(owner as usize, id));
                 if r == UNDEF {
@@ -1579,7 +1579,7 @@ fn autoload_before_define(outer: *mut Class, id: u32) -> bool {
     let done = |flag: *mut V| unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire) == 1;
     match a.loader {
         Some(f) => {
-            let r = crate::compat::run_file_once(f, a.flag);
+            let r = crate::compat::run_feature(f, a.flag);
             if done(a.flag) {
                 autoloads().remove(&(outer as usize, id));
             }
@@ -1685,6 +1685,11 @@ pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owne
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn, owner_slot: *mut V, params: *const u8, fast: usize, claim: *mut u64) -> V {
     let r = rt();
+    // (8: the body uses `__callee__`, so its aliases must tell it their name)
+    if kind & 8 != 0 {
+        crate::core::CALLEE_FNS.get().get_or_insert_with(Default::default).insert(f as usize);
+    }
+    let kind = kind & !8;
     let cls: *mut Class = match kind {
         0 => cref_class(target),
         1 => r.c.object,
@@ -1817,11 +1822,25 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
     if m.is_null() {
         return raise(rt().c.name_error, &format!("undefined method '{}' for class '{}'", sym_str(old), class_name(c)));
     }
-    let body = crate::kernel::clone_body(unsafe { &(*m).body });
+    let mut body = crate::kernel::clone_body(unsafe { &(*m).body });
     // a define_method body keeps its original name: its `super` looks for that one, as in
     // CRuby (rspec's `alias_method :only_failures?, :only_failures` of a reader that calls super)
     let name = if matches!(body, Body::Proc(_)) { unsafe { (*m).name } } else { new };
-    let nm = Box::into_raw(Box::new(Method { fast: unsafe { (*m).fast }, body, owner: unsafe { (*m).owner }, name, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
+    let fast = unsafe { (*m).fast };
+    // a method using `__callee__`: the alias tells it its name (and isn't called directly)
+    if let Body::Compiled(f) = body {
+        if new != unsafe { (*m).name } && crate::core::CALLEE_FNS.get().as_ref().is_some_and(|s| s.contains(&(f as usize))) {
+            // (it keeps the fast entry, for source_location: compiled code calls it only
+            // for a `Body::Compiled` method)
+            body = Body::Aliased(f, unsafe { (*m).name });
+        }
+    } else if let Body::Aliased(f, orig) = body {
+        // (an alias of the method's own name runs it as itself again)
+        if new == orig {
+            body = Body::Compiled(f);
+        }
+    }
+    let nm = Box::into_raw(Box::new(Method { fast, body, owner: unsafe { (*m).owner }, name, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
     if unsafe { (*c).methods.insert(new, nm) }.is_none() {
         crate::core::method_name_count(new, true);
     }

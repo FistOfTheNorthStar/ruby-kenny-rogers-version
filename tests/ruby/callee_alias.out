@@ -1,0 +1,24 @@
+[:|, :|, 1]
+[:&, :|, 2]
+[:^, :|, 3]
+:each
+:each_pair
+[:each]
+:in_block
+:in_block2
+:plain
+:plain2
+[:chain, :plain2, :plain]
+[:chain2, :plain2, :plain]
+[:&, :|, 4]
+[:^, :|, 5]
+:plain2
+[:k, 1]
+[:k2, 2]
+1
+Array
+:plain3
+:orig
+NoMethodError
+"bang failed"
+"boom failed"

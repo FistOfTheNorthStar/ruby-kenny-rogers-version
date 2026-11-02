@@ -6,7 +6,18 @@
 //! (lib/kenny/bundler.rb) uses for `require "bundler/setup"` and `Bundler.require(*groups)`.
 //!
 //! Groups left out of the binary: `BUNDLE_WITHOUT` (env or `.bundle/config`), else
-//! `development:test`. `BUNDLE_WITH` adds groups back.
+//! `development:test`. `BUNDLE_WITH` adds groups back. As with Bundler, `optional: true`
+//! groups are left out unless `BUNDLE_WITH` names them.
+//!
+//! The Gemfile is Ruby: which gems it declares can depend on its conditions (`if
+//! ENV["IMPORT"] == "1"`, `RUBY_VERSION`, files that exist ...), `eval_gemfile`, `gemspec`
+//! and loops. So it is evaluated as Bundler evaluates it, by Bundler's own DSL in the Ruby
+//! the program is built against, at build time (the binary's gems are fixed then, as a
+//! `bundle install` fixes them): the gems it declares now, with their groups, platforms and
+//! `require:` options. The lock file gives their versions (and the gems they depend on);
+//! a gem the lock lists that the Gemfile doesn't declare now is left out, as Bundler leaves
+//! it out. Without a usable Ruby/Bundler, the Gemfile is read statically instead (both
+//! branches of a condition taken, and the lock's DEPENDENCIES trusted).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -104,19 +115,32 @@ pub fn resolve(lockfile: &Path) -> Result<Bundle, String> {
     let lock = std::fs::read_to_string(lockfile).map_err(|e| format!("{}: {e}", lockfile.display()))?;
     let (specs, lock_reqs, bundled_with) = parse_lock(&lock, &root);
     let lock_deps: Vec<String> = lock_reqs.iter().map(|(n, _)| n.clone()).collect();
-    let gemfile_src = std::fs::read(&gemfile).map_err(|e| format!("{}: {e}", gemfile.display()))?;
-    let mut deps = parse_gemfile(&gemfile_src);
-    // the lock's DEPENDENCIES is the authority on which gems the Gemfile declares
-    deps.retain(|d| lock_deps.contains(&d.name));
-    let mut seen: HashSet<String> = deps.iter().map(|d| d.name.clone()).collect();
-    for n in &lock_deps {
-        if seen.insert(n.clone()) {
-            deps.push(Dep { name: n.clone(), groups: vec!["default".into()], ..Default::default() });
+    let (mut deps, optional) = match evaluate_gemfile(&gemfile, &root) {
+        Ok(r) => r,
+        Err(e) => {
+            if std::env::var_os("KENNY_QUIET").is_none() {
+                eprintln!("kenny: warning: couldn't evaluate {} with Bundler ({e}); reading it statically", gemfile.display());
+            }
+            let gemfile_src = std::fs::read(&gemfile).map_err(|e| format!("{}: {e}", gemfile.display()))?;
+            let (mut deps, optional) = parse_gemfile(&gemfile_src);
+            // (read statically, conditions and loops are unknown: the lock's DEPENDENCIES
+            // is the authority on which gems the Gemfile declares)
+            let mut seen: HashSet<String> = deps.iter().map(|d| d.name.clone()).collect();
+            for n in &lock_deps {
+                if seen.insert(n.clone()) {
+                    deps.push(Dep { name: n.clone(), groups: vec!["default".into()], ..Default::default() });
+                }
+            }
+            (deps, optional)
         }
-    }
+    };
+    // (a gem the Gemfile declares that isn't locked: Bundler would refuse to run)
+    deps.retain(|d| lock_deps.contains(&d.name));
 
     let (without, with) = group_settings(&root);
-    let included = |d: &Dep| platform_ok(&d.platforms) && d.groups.iter().any(|g| !without.contains(g) || with.contains(g));
+    // Bundler's groups: all but BUNDLE_WITHOUT's, and optional ones only when asked for
+    let wanted = |g: &String| with.contains(g) || !(without.contains(g) || optional.contains(g));
+    let included = |d: &Dep| platform_ok(&d.platforms) && d.groups.iter().any(wanted);
 
     // gems reachable from the included dependencies
     let by_name: HashMap<&str, Vec<&Spec>> = specs.iter().fold(HashMap::new(), |mut m, s| {
@@ -211,7 +235,7 @@ pub fn resolve(lockfile: &Path) -> Result<Bundle, String> {
     rb.push_str(&format!("    ROOT = {}\n", rstr(&root.display().to_string())));
     rb.push_str(&format!("    GEMFILE = {}\n", rstr(&gemfile.display().to_string())));
     rb.push_str(&format!("    LOCKFILE = {}\n", rstr(&lockfile.display().to_string())));
-    rb.push_str(&format!("    WITHOUT = [{}]\n", without.iter().filter(|g| !with.contains(*g)).map(|g| format!(":{g}")).collect::<Vec<_>>().join(", ")));
+    rb.push_str(&format!("    WITHOUT = [{}]\n", without.iter().chain(optional.iter()).filter(|g| !with.contains(*g)).map(|g| format!(":{g}")).collect::<Vec<_>>().join(", ")));
     rb.push_str(&format!("    # gems replaced by the binary itself (its HTTP server)\n    REPLACED = [{}].freeze\n", REPLACED.iter().map(|g| rstr(g)).collect::<Vec<_>>().join(", ")));
     rb.push_str(&format!("    # the lock's BUNDLED WITH\n    BUNDLED_WITH = {}\n", bundled_with.as_deref().map(rstr).unwrap_or_else(|| "nil".into())));
     rb.push_str("    # name, groups, autorequire (nil: the gem's name), for this platform, compiled in,\n    # version requirements (from the lock)\n    DEPENDENCIES = [\n");
@@ -242,7 +266,12 @@ pub fn resolve(lockfile: &Path) -> Result<Bundle, String> {
         ));
     }
     rb.push_str("    ].freeze\n  end\nend\n");
-    let without = without.into_iter().filter(|g| !with.contains(g)).collect();
+    let mut without: Vec<String> = without.into_iter().filter(|g| !with.contains(g)).collect();
+    for g in optional {
+        if !with.contains(&g) && !without.contains(&g) {
+            without.push(g);
+        }
+    }
     let psych_version = specs.iter().find(|s| s.name == "psych").map(|s| s.version.split('-').next().unwrap_or("").to_string());
     Ok(Bundle { root, load_paths, project_dirs, engine_dirs, ruby: rb, without, psych_version, exts })
 }
@@ -569,14 +598,61 @@ fn find_extconfs(dir: &Path) -> Vec<String> {
 
 // ---------- Gemfile (read statically with Prism) ----------
 
-fn parse_gemfile(src: &[u8]) -> Vec<Dep> {
+/// The script `evaluate_gemfile` runs: Bundler's DSL evaluates the Gemfile (ARGV[0]); one
+/// line per dependency: name, groups, `require:` files (`*` when not given), platforms; then
+/// the optional groups.
+const EVAL_GEMFILE_RB: &str = r#"
+require "bundler"
+dsl = Bundler::Dsl.new
+dsl.eval_gemfile(ARGV[0])
+dsl.dependencies.each do |d|
+  auto = d.autorequire.nil? ? "*" : d.autorequire.join(",")
+  puts ["DEP", d.name, d.groups.join(","), auto, d.platforms.join(",")].join("\t")
+end
+puts ["OPTIONAL", Array(dsl.instance_variable_get(:@optional_groups)).join(",")].join("\t")
+"#;
+
+/// The Gemfile's dependencies (and optional groups), as Bundler evaluates it with the build
+/// Ruby, in the Gemfile's directory and with this environment.
+fn evaluate_gemfile(gemfile: &Path, root: &Path) -> Result<(Vec<Dep>, Vec<String>), String> {
+    let ruby = crate::ruby::get().ok_or("no Ruby")?;
+    let mut cmd = ruby.command();
+    cmd.current_dir(root).env("BUNDLE_GEMFILE", gemfile).args(["-e", EVAL_GEMFILE_RB, "--"]).arg(gemfile);
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(err.lines().next().unwrap_or("failed").to_string());
+    }
+    let list = |s: &str| s.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect::<Vec<_>>();
+    let mut deps = Vec::new();
+    let mut optional = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        match f.as_slice() {
+            ["DEP", name, groups, auto, platforms] => deps.push(Dep {
+                name: name.to_string(),
+                groups: list(groups),
+                autorequire: if *auto == "*" { None } else { Some(list(auto)) },
+                platforms: list(platforms),
+            }),
+            ["OPTIONAL", groups] => optional = list(groups),
+            _ => {}
+        }
+    }
+    Ok((deps, optional))
+}
+
+/// The Gemfile read without running it (see the module docs): its dependencies and the
+/// groups declared `optional: true`.
+fn parse_gemfile(src: &[u8]) -> (Vec<Dep>, Vec<String>) {
     let result = ruby_prism::parse(src);
     let mut out = Vec::new();
+    let mut optional = Vec::new();
     let node = result.node();
     if let Some(p) = node.as_program_node() {
-        walk(&p.statements().as_node(), &["default".to_string()], &[], &mut out);
+        walk(&p.statements().as_node(), &["default".to_string()], &[], &mut out, &mut optional);
     }
-    out
+    (out, optional)
 }
 
 fn str_of(n: &ruby_prism::Node) -> Option<String> {
@@ -596,32 +672,32 @@ fn strs_of(n: &ruby_prism::Node) -> Vec<String> {
     str_of(n).into_iter().collect()
 }
 
-fn walk(n: &ruby_prism::Node, groups: &[String], platforms: &[String], out: &mut Vec<Dep>) {
+fn walk(n: &ruby_prism::Node, groups: &[String], platforms: &[String], out: &mut Vec<Dep>, optional: &mut Vec<String>) {
     if let Some(s) = n.as_statements_node() {
         for x in s.body().iter() {
-            walk(&x, groups, platforms, out);
+            walk(&x, groups, platforms, out, optional);
         }
         return;
     }
     if let Some(i) = n.as_if_node() {
         // conditions can't be evaluated at build time: take both branches (the lock decides)
         if let Some(s) = i.statements() {
-            walk(&s.as_node(), groups, platforms, out);
+            walk(&s.as_node(), groups, platforms, out, optional);
         }
         if let Some(e) = i.subsequent() {
-            walk(&e, groups, platforms, out);
+            walk(&e, groups, platforms, out, optional);
         }
         return;
     }
     if let Some(e) = n.as_else_node() {
         if let Some(s) = e.statements() {
-            walk(&s.as_node(), groups, platforms, out);
+            walk(&s.as_node(), groups, platforms, out, optional);
         }
         return;
     }
     if let Some(u) = n.as_unless_node() {
         if let Some(s) = u.statements() {
-            walk(&s.as_node(), groups, platforms, out);
+            walk(&s.as_node(), groups, platforms, out, optional);
         }
         return;
     }
@@ -670,20 +746,23 @@ fn walk(n: &ruby_prism::Node, groups: &[String], platforms: &[String], out: &mut
         }
         b"group" | b"groups" => {
             let g: Vec<String> = pos.iter().flat_map(strs_of).collect();
+            if opts.iter().any(|(k, v)| k == "optional" && v.as_true_node().is_some()) {
+                optional.extend(g.iter().cloned());
+            }
             if let Some(b) = body {
-                walk(&b, &g, platforms, out);
+                walk(&b, &g, platforms, out, optional);
             }
         }
         b"platforms" | b"platform" => {
             let p: Vec<String> = pos.iter().flat_map(strs_of).collect();
             if let Some(b) = body {
-                walk(&b, groups, &p, out);
+                walk(&b, groups, &p, out, optional);
             }
         }
         _ => {
             // source/path/git/github blocks
             if let Some(b) = body {
-                walk(&b, groups, platforms, out);
+                walk(&b, groups, platforms, out, optional);
             }
         }
     }

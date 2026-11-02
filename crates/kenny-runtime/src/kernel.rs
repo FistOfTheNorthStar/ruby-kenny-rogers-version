@@ -652,6 +652,10 @@ pub fn init() {
         if feature_listed(base) {
             return QFALSE;
         }
+        // a directory the program put on $LOAD_PATH itself
+        if let Some(r) = crate::compat::require_via_load_path(&name) {
+            return r;
+        }
         let le = const_lookup(rt().c.object, sym("LoadError")).unwrap() as *mut Class;
         let e = exc_new(le, &format!("cannot load such file -- {name}"));
         ivar_set(e, sym("@path"), str_from(&name));
@@ -918,7 +922,7 @@ pub fn init() {
                 let p = pst();
                 p.eval_locals = QNIL;
                 p.eval_src = QNIL;
-                eval_string_l(a[0], 0, r, crate::compat::binding_locals(b), a.get(2).copied().unwrap_or(QNIL), a.get(3).copied().unwrap_or(QNIL))
+                crate::backtrace::with_binding_label(b, || eval_string_l(a[0], 0, r, crate::compat::binding_locals(b), a.get(2).copied().unwrap_or(QNIL), a.get(3).copied().unwrap_or(QNIL)))
             }
             None => type_error("wrong argument type (expected binding)"),
         },
@@ -1899,7 +1903,7 @@ fn dup_module(v: V) -> V {
     let k = unsafe { &mut *c };
     for (&id, &m) in src.methods.iter() {
         let mm = unsafe { &*m };
-        if let Body::Compiled(f) = mm.body {
+        if let Body::Compiled(f) | Body::Aliased(f, _) = mm.body {
             crate::abi::share_owner_of(f);
         }
         let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: c, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
@@ -1926,7 +1930,7 @@ fn dup_module(v: V) -> V {
         let (sm, dk) = unsafe { (&*meta, &mut *dm) };
         for (&id, &m) in sm.methods.iter() {
             let mm = unsafe { &*m };
-            if let Body::Compiled(f) = mm.body {
+            if let Body::Compiled(f) | Body::Aliased(f, _) = mm.body {
                 crate::abi::share_owner_of(f);
             }
             let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: dm, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
@@ -1951,6 +1955,7 @@ pub fn clone_body(b: &Body) -> Body {
         Body::Proc(p) => Body::Proc(*p),
         Body::CFunc(f, a) => Body::CFunc(*f, *a),
         Body::Undefined => Body::Undefined,
+        Body::Aliased(f, n) => Body::Aliased(*f, *n),
     }
 }
 
