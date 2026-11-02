@@ -90,6 +90,14 @@ pub(crate) struct LoopCtx {
     pub rescue_depth: usize,
 }
 
+pub(crate) struct EnsureCtx {
+    pub stmts: Option<ruby_prism::StatementsNode<'static>>,
+    /// `fx.unwind`, `fx.rescue_prev` and `fx.loops` lengths outside the `begin`
+    pub unwind_len: usize,
+    pub rescue_len: usize,
+    pub loops_len: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct MethodCtx {
     pub name: Vec<u8>,
@@ -133,6 +141,9 @@ pub(crate) struct Fx<'a> {
     pub locals: HashMap<Vec<u8>, Local>,
     pub unwind: Vec<Block>,
     pub ensure_depth: usize,
+    /// The `ensure` clauses whose bodies are being compiled (outermost first): `next` and
+    /// `break` jumping out of them run them on the way (CRuby inlines them there too).
+    pub ensures: Vec<EnsureCtx>,
     /// `$!` from before each rescue body being compiled (outermost first): jumping out of
     /// one (`return`, `next`, `break`, `retry`) restores it, as leaving it normally does.
     pub rescue_prev: Vec<Value>,

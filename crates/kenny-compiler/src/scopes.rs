@@ -500,6 +500,7 @@ impl<M: Module> Compiler<M> {
                 locals,
                 unwind: vec![exit],
                 ensure_depth: 0,
+                ensures: Vec::new(),
                 rescue_prev: Vec::new(),
                 loops: Vec::new(),
                 retry: Vec::new(),
