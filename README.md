@@ -123,9 +123,17 @@ Working:
   thread per core), with `Queue`, `SizedQueue`, `Mutex`, `ConditionVariable`, `Monitor`, a
   10 ms fairness timer, `Thread#raise`/`kill`, and deadlock detection. A core with nothing to
   run takes waiting threads from busy ones (work stealing), so threads move between cores.
-  Waiting on a socket, pipe or `IO.select` lets the core's other threads run; file reads and
-  writes and SQLite queries run as blocking calls, during which the core's waiting threads go
-  to an idle (or spare) core and collections don't wait for them. No GVL: a data race can lose
+  A thread waiting on a socket, pipe or child process (`read`, `write`, `accept`, `connect`,
+  `IO.select`, `wait_readable`, `Process.wait`, also inside a Fiber) is parked and woken by
+  kqueue/epoll; a core with nothing to run waits in the event loop itself, so a wake-up costs
+  one OS wake. Timeouts, `Thread#raise`/`kill`, `fork`, and closing the IO from another thread
+  (`IOError`, as in CRuby) all end such waits; a thread waiting on IO doesn't count as
+  deadlocked. Measured on an M4 Pro: a thread ping-pong over a socket pair takes 10 µs a round
+  trip (CRuby 9 µs), with 1,000 other threads parked on sockets 16 µs (CRuby 10 µs, the 2 ms
+  polling Kenny had 8.7 ms); those 1,000 idle threads use no CPU (polling used 6.6 cores), and
+  writing to all 1,000 wakes them in 6 ms (CRuby 14 ms). File reads and writes and SQLite
+  queries run as blocking calls, during which the core's waiting threads go to an idle (or
+  spare) core and collections don't wait for them. No GVL: a data race can lose
   an update but never crashes the process ([docs/LANGUAGE.md](docs/LANGUAGE.md), rule 4).
   As in CRuby, a thread that reaches a constant another thread is autoloading waits until that
   file has run, and one IO object can be used by several threads at once.
@@ -227,8 +235,6 @@ Not yet:
 - Compacting while requests run: objects move only when no thread is inside a native method,
   which in a busy server is rare, so compaction mostly happens when the server goes idle (or
   on `GC.compact`). Precise stack maps would lift this (roadmap).
-- Sockets and pipes are polled while other threads wait for them (2 ms steps), not parked on
-  an event loop; the HTTP server's own connections use kqueue/epoll.
 - Memory: serving on 12 cores takes about 1.7x the memory of one (each core has its own
   young-generation space, `KENNY_GC_YOUNG_SCALE=1` trades some throughput for ~1.3x); still
   far less than 12 Puma workers. The allocator choice was measured on macOS only (see
@@ -298,7 +304,6 @@ by `eval`/`class_eval`; an uncaught exception and a failed request print the ful
 ## Roadmap
 
 1. Direct calls between compiled methods (guarded by the inline cache) and inlining of small methods
-2. An event-driven poller for Ruby-level sockets and pipes (park the thread, not poll)
-3. Precise stack maps (Cranelift) for compiled frames and rooted native code, so compaction can
+2. Precise stack maps (Cranelift) for compiled frames and rooted native code, so compaction can
    run under load, not only when idle
-4. Measure and tune memory and allocator choice on Linux
+3. Measure and tune memory and allocator choice on Linux
