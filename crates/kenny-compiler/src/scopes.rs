@@ -1569,6 +1569,7 @@ impl<M: Module> Compiler<M> {
         let saved_ctx = std::mem::take(&mut self.inline_ctx);
         self.def_stack.push((self.file.clone(), offset));
         self.def_cref.insert((self.file.clone(), offset), fx.cref_slot);
+        let saved_callee = std::mem::replace(&mut self.callee_used, false);
         let fid = self.build_fn(spec, |c, fx| {
             c.bind_method_params(fx, params);
             c.cov_method(fx, cov_key);
@@ -1583,6 +1584,8 @@ impl<M: Module> Compiler<M> {
         });
         self.def_stack.pop();
         self.inline_ctx = saved_ctx;
+        let uses_callee = std::mem::replace(&mut self.callee_used, saved_callee);
+        let kind = if uses_callee { kind | 8 } else { kind };
         let (fid, fast) = match fast_n {
             Some(n) => {
                 let w = self.fast_wrapper(fid, n, &wrapper_label, def_line);

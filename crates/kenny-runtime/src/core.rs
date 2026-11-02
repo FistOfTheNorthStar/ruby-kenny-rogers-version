@@ -823,6 +823,10 @@ pub enum Body {
     /// C extension function and its arity (-1 = argc/argv, 0..15 = fixed).
     CFunc(*const std::ffi::c_void, i32),
     Undefined,
+    /// An alias of a compiled method whose body uses `__callee__` (and that method's name):
+    /// it runs the same function, telling it the name it was called by (`kn_callee`).
+    /// Never called directly by compiled code, so it always goes through `invoke`.
+    Aliased(CompiledFn, u32),
 }
 #[repr(C)]
 pub struct Method {
@@ -1027,6 +1031,9 @@ pub struct PState {
     /// Evals through a Binding that are running: (stack pointer at the call, the label of
     /// where the Binding was made), for backtraces (backtrace.rs `relabel_evals`).
     pub eval_ctx: Vec<(usize, String)>,
+    /// Methods running through an alias that `Body::Aliased` stands for: (the method's own
+    /// name, the alias, the receiver, the stack pointer at the call), innermost last (`kn_callee`).
+    pub callee: Vec<(u32, u32, V, usize)>,
     /// Methods running through `super` from a module that appears more than once in the
     /// receiver's ancestors: (receiver, name, ancestor index it was found at), so a further
     /// `super` goes on from that copy (`find_super_method_at`)
@@ -1133,6 +1140,7 @@ pub fn new_pstate() -> *mut PState {
         definee: Vec::new(),
         dm_stack: Vec::new(),
         eval_ctx: Vec::new(),
+        callee: Vec::new(),
         super_at: Vec::new(),
         current_block: Vec::new(),
         mcache: HashMap::default(),
@@ -2065,6 +2073,34 @@ pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
             r
         }
         Body::Undefined => QNIL,
+        Body::Aliased(f, orig) => {
+            if approx_sp() < pst().stack_limit {
+                return raise(rt().c.system_stack_error, "stack level too deep");
+            }
+            let sp = approx_sp();
+            pst().callee.push((*orig, m.name, recv, sp));
+            let r = unsafe { f(recv, args.len() as u64, args.as_ptr(), blk) };
+            let c = &mut pst().callee;
+            if let Some(i) = c.iter().rposition(|e| e.3 == sp) {
+                c.remove(i);
+            }
+            r
+        }
+    }
+}
+
+/// Compiled methods whose body uses `__callee__` (their aliases are `Body::Aliased`).
+pub static CALLEE_FNS: crate::mt::L<Option<std::collections::HashSet<usize>>> = crate::mt::L::new(None);
+
+/// `__callee__` in a method `def`'d as `name` running on `recv`: the alias it was called by
+/// (`Body::Aliased`), else `name`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_callee(name: V, recv: V) -> V {
+    // (the innermost entry on this stack: a Fiber suspended inside an alias left its own)
+    let Some((lo, hi)) = crate::thread::current_stack() else { return name };
+    match pst().callee.iter().rev().find(|e| e.3 > lo && e.3 < hi) {
+        Some(&(orig, alias, r, _)) if is_sym(name) && orig == sym_id(name) && r == recv => mksym(alias),
+        _ => name,
     }
 }
 

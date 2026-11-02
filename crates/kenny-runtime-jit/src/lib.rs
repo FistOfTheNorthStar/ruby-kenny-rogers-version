@@ -127,6 +127,8 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_match_save", kenny_runtime::regex::kn_match_save as *const u8),
         ("kn_eval_scope", kenny_runtime::compat::kn_eval_scope as *const u8),
         ("kn_dm_name", kenny_runtime::regex::kn_dm_name as *const u8),
+        ("kn_dm_name_for", kenny_runtime::regex::kn_dm_name_for as *const u8),
+        ("kn_callee", kenny_runtime::core::kn_callee as *const u8),
         ("kn_match_restore", kenny_runtime::regex::kn_match_restore as *const u8),
         ("kn_pm_deconstruct", kenny_runtime::abi::kn_pm_deconstruct as *const u8),
         ("kn_pm_deconstruct_keys", kenny_runtime::abi::kn_pm_deconstruct_keys as *const u8),

@@ -338,6 +338,8 @@ pub struct Compiler<M: Module> {
     pub(crate) cov: Option<Box<coverage::Build>>,
     /// a `require "coverage"` was compiled (see `compile_with`)
     pub(crate) uses_coverage: bool,
+    /// The method body being compiled uses `__callee__` (its def tells the runtime: kind 8).
+    pub(crate) callee_used: bool,
 }
 
 /// Backtrace information of one compiled function: its file and label (offsets into the
@@ -479,6 +481,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_match_save", &[], &[I64]),
     ("kn_dm_name", &[I64], &[I64]),
     ("kn_dm_name_for", &[I64, I64, I64], &[I64]),
+    ("kn_callee", &[I64, I64], &[I64]),
     ("kn_match_restore", &[I64], &[]),
     ("kn_pm_deconstruct", &[I64], &[I64]),
     ("kn_pm_deconstruct_keys", &[I64, I64], &[I64]),
@@ -707,6 +710,7 @@ impl<M: Module> Compiler<M> {
             line_index: (PathBuf::new(), 0, 0, Vec::new()),
             cov: None,
             uses_coverage: false,
+            callee_used: false,
         })
     }
 }

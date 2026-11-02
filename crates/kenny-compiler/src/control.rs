@@ -579,6 +579,14 @@ impl<M: Module> Compiler<M> {
             return self.call(fx, "kn_dm_name", &[c]);
         }
         let lexical = match fx.method.clone() {
+            // `__callee__` in a def: the name of the alias it was called by, if one (the
+            // runtime knows it for aliases of methods that ask: kn_def kind 8)
+            Some(m) if callee => {
+                self.callee_used = true;
+                let n = self.sym_val(fx, &m.name);
+                let s = self.self_val(fx);
+                self.call(fx, "kn_callee", &[n, s])
+            }
             Some(m) => self.sym_val(fx, &m.name),
             None => self.nil(fx),
         };

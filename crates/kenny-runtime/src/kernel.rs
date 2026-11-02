@@ -1877,7 +1877,7 @@ fn dup_module(v: V) -> V {
     let k = unsafe { &mut *c };
     for (&id, &m) in src.methods.iter() {
         let mm = unsafe { &*m };
-        if let Body::Compiled(f) = mm.body {
+        if let Body::Compiled(f) | Body::Aliased(f, _) = mm.body {
             crate::abi::share_owner_of(f);
         }
         let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: c, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
@@ -1904,7 +1904,7 @@ fn dup_module(v: V) -> V {
         let (sm, dk) = unsafe { (&*meta, &mut *dm) };
         for (&id, &m) in sm.methods.iter() {
             let mm = unsafe { &*m };
-            if let Body::Compiled(f) = mm.body {
+            if let Body::Compiled(f) | Body::Aliased(f, _) = mm.body {
                 crate::abi::share_owner_of(f);
             }
             let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: dm, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
@@ -1929,6 +1929,7 @@ pub fn clone_body(b: &Body) -> Body {
         Body::Proc(p) => Body::Proc(*p),
         Body::CFunc(f, a) => Body::CFunc(*f, *a),
         Body::Undefined => Body::Undefined,
+        Body::Aliased(f, n) => Body::Aliased(*f, *n),
     }
 }
 
