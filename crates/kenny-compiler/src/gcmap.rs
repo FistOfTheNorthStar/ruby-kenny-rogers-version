@@ -206,7 +206,40 @@ impl<M: Module> Compiler<M> {
         for &(r, _, _) in &selects {
             fed.insert(r);
         }
-        objs.extend(maybe.into_iter().filter(|v| fed.contains(v)));
+        // (and one only constants reach holds no object: a loop's `iter = 50` stays a
+        // constant the optimizer can fold, instead of a stack slot reloaded every iteration)
+        let mut reached: HashSet<Value> = HashSet::new();
+        loop {
+            let mut changed = false;
+            let real = |v: Value, reached: &HashSet<Value>| {
+                let v = dfg.resolve_aliases(v);
+                objs.contains(&v) || reached.contains(&v)
+            };
+            for block in func.layout.blocks() {
+                let Some(inst) = func.layout.last_inst(block) else { continue };
+                for call in dfg.insts[inst].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+                    let dest = call.block(&dfg.value_lists);
+                    let ps = dfg.block_params(dest);
+                    for (i, a) in call.args(&dfg.value_lists).enumerate() {
+                        let Some(&p) = ps.get(i) else { break };
+                        if maybe.contains(&p) && !reached.contains(&p) && matches!(a, BlockArg::Value(v) if real(v, &reached)) {
+                            reached.insert(p);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            for &(r, x, y) in &selects {
+                if maybe.contains(&r) && !reached.contains(&r) && (real(x, &reached) || real(y, &reached)) {
+                    reached.insert(r);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        objs.extend(maybe.into_iter().filter(|v| fed.contains(v) && reached.contains(v)));
         let mut objs: Vec<Value> = objs.into_iter().filter(|&v| !dfg.value_is_alias(v)).collect();
         objs.sort();
         for v in objs {

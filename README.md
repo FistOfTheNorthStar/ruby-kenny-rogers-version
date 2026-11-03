@@ -317,7 +317,7 @@ them inaccessible for good, so a reference the collector failed to update faults
 `KENNY_GC_PRECISE=0` scans compiled frames conservatively (pinning what they hold), `=1`
 precisely where that is not the default; `KENNY_STACK_MAPS=0` at build time leaves the stack
 maps out of the binary (`=stats` reports their size: about a fifth of the blog example's
-binary; keeping values in their slots across calls costs 0-4% in most of bench/, 19% in
+binary; keeping values in their slots across calls costs 0-4% in bench/, about 3% in
 mandelbrot.rb).
 `KENNY_MALLOC=auto|system|mimalloc` picks the allocator behind Rust allocations: on macOS the
 default `auto` uses mimalloc while one core runs Ruby code and the system allocator once
