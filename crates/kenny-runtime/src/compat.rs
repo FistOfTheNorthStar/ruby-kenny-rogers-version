@@ -387,7 +387,9 @@ fn init_binding() {
     set_global_const("TOPLEVEL_BINDING", kn_binding_new(rt().main_obj));
     defn(b, "receiver", 0, 0, |s, _, _| ivar_get(s, sym("@__self")));
     defn(b, "eval", 1, 3, |s, a, _| {
-        crate::kernel::eval_string_l(a[0], 0, ivar_get(s, sym("@__self")), binding_locals(s), a.get(1).copied().unwrap_or(QNIL), a.get(2).copied().unwrap_or(QNIL))
+        crate::backtrace::with_binding_label(s, || {
+            crate::kernel::eval_string_l(a[0], 0, ivar_get(s, sym("@__self")), binding_locals(s), a.get(1).copied().unwrap_or(QNIL), a.get(2).copied().unwrap_or(QNIL))
+        })
     });
     // (a snapshot taken where `binding` was called: local_variable_set changes the
     // Binding's copy, which later evals through it see, not the original variable)
@@ -576,7 +578,7 @@ pub fn init() {
     }
     // $LOAD_PATH / $: and $LOADED_FEATURES / $" (files are resolved at build time; these
     // exist so code that inspects or extends them keeps working)
-    let lp = ary_new(vec![]);
+    let lp = ary_new(INITIAL_LOAD_PATH.get().iter().map(|d| str_from(d)).collect());
     let lf = ary_new(vec![]);
     for (n, v) in [("$LOAD_PATH", lp), ("$:", lp), ("$-I", lp), ("$LOADED_FEATURES", lf), ("$\"", lf)] {
         rt().gvars.insert(sym(n), v);
@@ -746,12 +748,115 @@ pub fn require_feature(base: &str) -> Option<V> {
 
 /// key -> (top-level function, loaded flag, content hash of the source it was compiled from)
 static FILE_TABLE: G<Option<std::collections::HashMap<String, (CompiledFn, *mut V, u64)>>> = G::new(None);
+/// The `-I` directories the program was built with: `$LOAD_PATH` starts with them.
+static INITIAL_LOAD_PATH: G<Vec<String>> = G::new(Vec::new());
+
+/// Called by the program's `main` before the runtime starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_register_load_path(p: *const u8, len: u64) {
+    INITIAL_LOAD_PATH.get().push(String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len as usize) }).into_owned());
+}
+
+/// Each compiled file's absolute path, by its loaded flag: what `$LOADED_FEATURES` lists.
+static FEATURE_PATHS: G<Option<std::collections::HashMap<usize, String>>> = G::new(None);
 
 /// Called by the program's `main` before the runtime starts (no Ruby objects involved).
+/// Keys: a file's absolute path (with its extension), then its names under the load paths.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_register_file(key: *const u8, len: u64, f: CompiledFn, flag: *mut V, hash: u64) {
     let k = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(key, len as usize) }).into_owned();
+    let paths = FEATURE_PATHS.get().get_or_insert_with(std::collections::HashMap::new);
+    if k.starts_with('/') {
+        paths.entry(flag as usize).or_insert_with(|| k.clone());
+    } else if !feature_name(&k).ends_with(".rb") {
+        // (Kenny's Ruby file standing in for a library CRuby has as a C extension: listed as
+        // that, `stringio.bundle`)
+        paths.insert(flag as usize, feature_name(&k));
+    }
+    let k = k.strip_suffix(".rb").map(str::to_string).unwrap_or(k);
     FILE_TABLE.get().get_or_insert_with(std::collections::HashMap::new).entry(k).or_insert((f, flag, hash));
+}
+
+/// The absolute path `$LOADED_FEATURES` lists for the compiled file with this loaded flag.
+fn feature_path(flag: *mut V) -> Option<String> {
+    FEATURE_PATHS.get().as_ref()?.get(&(flag as usize)).cloned()
+}
+
+/// A compiled file just ran for a `require`: list it in `$LOADED_FEATURES` (by its
+/// absolute path, as CRuby does).
+pub fn run_feature(f: CompiledFn, flag: *mut V) -> V {
+    if listed_by_hand(flag) {
+        return QFALSE;
+    }
+    let r = run_file_once(f, flag);
+    if r == QTRUE {
+        provide_compiled(flag);
+    }
+    r
+}
+fn provide_compiled(flag: *mut V) {
+    let Some(feature) = feature_path(flag) else { return };
+    if let Some(lf) = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf)) {
+        rary(lf).v.push(str_from(&feature));
+        note_pushed(&feature);
+    }
+}
+
+/// `require "name"` (or `require_relative`, with `name` nil) compiled to the file it names,
+/// when that file isn't loaded yet or `require` may have been redefined: calls the Ruby
+/// definition of `require` if there is one (`KnDirect::require_hook`), else runs the file
+/// once and lists it in `$LOADED_FEATURES`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_require_lit(flag: *mut V, f: CompiledFn, self_: V, name: V) -> V {
+    if is_sym(name) && crate::core::KN_DIRECT.require_hook.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        let mid = sym("require");
+        let m = find_method(class_of(self_), mid);
+        if !m.is_null() && !matches!(unsafe { &(*m).body }, Body::Native(..)) {
+            return send(self_, mid, &[str_from(&sym_str(sym_id(name)))], QNIL);
+        }
+    }
+    let fl = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) };
+    if fl.load(std::sync::atomic::Ordering::Acquire) == 1 {
+        return QFALSE;
+    }
+    run_feature(f, flag)
+}
+
+/// `require "name"` of a file that isn't compiled in under that name: looked for along
+/// `$LOAD_PATH` as it is now (a directory the program added at runtime, as RSpec and Rails
+/// add `lib/`): a compiled-in file there by its absolute path, else (with the runtime
+/// compiler) one on disk or in the binary's embedded files.
+pub fn require_via_load_path(name: &str) -> Option<V> {
+    if name.starts_with('/') || name.starts_with("./") || name.starts_with("../") || name.is_empty() {
+        return None;
+    }
+    let lp = rt().gvars.get(&sym("$LOAD_PATH")).copied().filter(|v| is_ary(*v))?;
+    let dirs: Vec<V> = rary(lp).v.to_vec();
+    let file = if name.ends_with(".rb") { name.to_string() } else { format!("{name}.rb") };
+    let jit = LOAD_HOOK.get().is_some();
+    for d in dirs {
+        let d = if is_str(d) {
+            d
+        } else if respond_to(d, sym("to_path")) {
+            match send(d, sym("to_path"), &[], QNIL) {
+                v if is_str(v) => v,
+                _ => continue,
+            }
+        } else {
+            continue;
+        };
+        let dir = String::from_utf8_lossy(&rstr(d).b).into_owned();
+        let Ok(dir) = std::path::absolute(&dir) else { continue };
+        let cand = dir.join(&file);
+        let cand = cand.to_string_lossy();
+        if file_entry(&cand).is_some() {
+            return require_compiled(&cand);
+        }
+        if jit && disk_source(&cand, false).is_some() {
+            return require_from_disk(&cand);
+        }
+    }
+    None
 }
 
 /// Same as `kenny_compiler::src_hash` (FNV-1a 64): the hash recorded for each compiled file.
@@ -912,6 +1017,43 @@ pub fn compiled_entry(name: &str) -> Option<(CompiledFn, *mut V)> {
     FILE_TABLE.get().as_ref()?.get(key).map(|e| (e.0, e.1))
 }
 
+/// A compiled file that hasn't run, whose path the program put in `$LOADED_FEATURES` itself
+/// (a stand-in loaded in its place; rails_helper's skipped capybara files): loaded, as in
+/// CRuby. The entries seen so far are kept in a set, so this is cheap for the thousands of
+/// files a Rails app requires.
+fn listed_by_hand(flag: *mut V) -> bool {
+    let fl = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) };
+    if fl.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return false;
+    }
+    let Some(feature) = feature_path(flag) else { return false };
+    let Some(lf) = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf)) else { return false };
+    let mut g = LF_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (arr, seen, set) = g.get_or_insert_with(|| (0, 0, std::collections::HashSet::new()));
+    let v = &rary(lf).v;
+    if *arr != lf as usize || v.len() < *seen {
+        (*arr, *seen) = (lf as usize, 0);
+        set.clear();
+    }
+    for x in v.iter().skip(*seen) {
+        if is_str(*x) {
+            set.insert(rstr(*x).b.to_vec());
+        }
+    }
+    *seen = v.len();
+    if !set.contains(feature.as_bytes()) {
+        return false;
+    }
+    drop(g);
+    // (the set may still hold an entry deleted since; and one this runtime added is a file
+    // that ran and was unloaded)
+    let by_hand = lf_contains(lf, &feature) && !PUSHED_FEATURES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&feature));
+    // (the flag stays: taken out of $LOADED_FEATURES again, the file loads)
+    by_hand
+}
+/// `listed_by_hand`'s view of `$LOADED_FEATURES`: (the Array, entries seen, their strings)
+static LF_SEEN: std::sync::Mutex<Option<(usize, usize, std::collections::HashSet<Vec<u8>>)>> = std::sync::Mutex::new(None);
+
 /// Whether `$LOADED_FEATURES` lists `feature`.
 fn lf_contains(lf: V, feature: &str) -> bool {
     rary(lf).v.iter().any(|x| is_str(*x) && rstr(*x).b[..] == *feature.as_bytes())
@@ -919,8 +1061,8 @@ fn lf_contains(lf: V, feature: &str) -> bool {
 
 /// Features this runtime added to `$LOADED_FEATURES` (by a `require` that went through it). If
 /// one is gone from there later, a program unloaded it (Zeitwerk's reload deletes the file's
-/// path and requires it again), and the next `require` runs the file again, as in CRuby. Files
-/// required by a literal `require` in compiled code aren't listed, so they aren't affected.
+/// path and requires it again), and the next `require` runs the file again, as in CRuby
+/// (also those a literal `require` in compiled code ran: kn_require_lit)
 static PUSHED_FEATURES: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
 
 fn note_pushed(feature: &str) {
@@ -936,12 +1078,20 @@ fn was_unloaded(lf: Option<V>, feature: &str) -> bool {
 
 pub fn require_compiled(name: &str) -> Option<V> {
     let key = name.trim_end_matches(".rb");
-    let (f, flag, _) = *FILE_TABLE.get().as_ref()?.get(key)?;
-    let feature = feature_name(key);
+    let (f, flag, _) = match FILE_TABLE.get().as_ref()?.get(key) {
+        Some(e) => *e,
+        // (an absolute path through a symlink, or not canonical)
+        None if key.starts_with('/') => file_entry(name)?,
+        None => return None,
+    };
+    let feature = feature_path(flag).unwrap_or_else(|| feature_name(key));
     let lf = rt().gvars.get(&sym("$LOADED_FEATURES")).copied().filter(|lf| is_ary(*lf));
     let fl = unsafe { &*(flag as *const std::sync::atomic::AtomicU64) };
     if fl.load(std::sync::atomic::Ordering::Acquire) == 1 && was_unloaded(lf, &feature) {
         let _ = fl.compare_exchange(1, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
+    }
+    if listed_by_hand(flag) {
+        return Some(QFALSE);
     }
     // listed once the file has run, as in CRuby (Zeitwerk's require hook reads
     // `$LOADED_FEATURES.last`); a circular require sees the file's loading flag instead

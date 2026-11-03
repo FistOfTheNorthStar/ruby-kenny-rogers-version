@@ -1,0 +1,13 @@
+[:mm, :pv, [1], {}]
+[:mm, :pv, [1, 2], {}]
+[:mm, :pv, [], {k: 1}]
+[:mm, :pv, [1, 2], {k: 1}]
+[:mm, :pv, [1, 2], {}]
+[[:pv, [1, 2], {}], [:pv, [1, 2], {}], [:pv, [], {k: 1}]]
+[:pv, [1, 2], {}]
+[:mm, :eval, ["1 + 1"], {}]
+[:mm, :eval, ["s", ["k"], ["a"]], {}]
+[:pr, [3]]
+protected method 'pr' called for an instance of B
+private method 'eval' called for an instance of Plain
+3

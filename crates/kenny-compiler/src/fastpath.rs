@@ -1251,10 +1251,11 @@ impl<M: Module> Compiler<M> {
                 "kn_attr_set" => Some(STUB_ATTR_SET),
                 _ => None,
             };
-            let attr_rt = matches!(rt, "kn_attr_get" | "kn_attr_set");
-            if inline && !attr_rt {
+            // (an attribute site's slow path, after `attr_fast`, goes through the stub, which
+            // also makes direct calls: one call keeps the loop's code small)
+            if inline && !matches!(rt, "kn_attr_get" | "kn_attr_set") {
                 c.direct_call(fx, cache, recv, &vs, explicit, |c, fx| c.call(fx, rt, args))
-            } else if let (true, Some(k)) = (stub || (inline && attr_rt), kind) {
+            } else if let (true, Some(k)) = (stub || inline, kind) {
                 c.call_stub(fx, k, args)
             } else {
                 c.call(fx, rt, args)
@@ -1313,16 +1314,62 @@ impl<M: Module> Compiler<M> {
                 self.bool_jump_value(fx, done, r);
                 return self.bool_result(fx, done);
             }
+            (b"is_a?" | b"kind_of?", [a]) if in_loop && !self.in_dependency() => {
+                // in a loop, the direct-call stub's answer for a heap receiver and a class
+                // (not a module) without the call: while every heap object's is_a? is the
+                // builtin one, the receiver's class has the argument at its depth in its
+                // superclass list (kenny-runtime core.rs `is_a`); anything else the stub
+                let a = *a;
+                let f = mem();
+                let slow = fx.b.create_block();
+                let done = self.bool_merge(fx);
+                fx.b.set_cold_block(slow);
+                self.require_heap(fx, recv, slow);
+                let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+                let dir = fx.b.ins().symbol_value(I64, gv);
+                let flags = fx.b.ins().load(I64, f, dir, KD_FLAGS);
+                let bit = fx.b.ins().band_imm_s(flags, DIRECT_IS_A_HEAP);
+                self.require_nonzero(fx, bit, slow);
+                self.require_heap(fx, a, slow);
+                let kind = fx.b.ins().uload32(f, a, HDR_KIND);
+                let not_cls = fx.b.ins().icmp_imm_s(IntCC::NotEqual, kind, KIND_CLASS);
+                let c1 = fx.b.create_block();
+                fx.b.ins().brif(not_cls, slow, &[], c1, &[]);
+                fx.b.switch_to_block(c1);
+                let cs_len = fx.b.ins().load(I64, f, a, CLASS_SUP_LEN);
+                self.require_nonzero(fx, cs_len, slow);
+                let k = fx.b.ins().load(I64, f, recv, 0);
+                let ks_len = fx.b.ins().load(I64, f, k, CLASS_SUP_LEN);
+                let d = fx.b.ins().iadd_imm_s(cs_len, -1);
+                let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, d, ks_len);
+                let c2 = fx.b.create_block();
+                let no = fx.b.create_block();
+                fx.b.ins().brif(inb, c2, &[], no, &[]);
+                fx.b.switch_to_block(no);
+                let fls = fx.b.ins().iconst(I8, 0);
+                self.bool_jump(fx, done, fls);
+                fx.b.switch_to_block(c2);
+                let ksp = fx.b.ins().load(I64, f, k, CLASS_SUP_PTR);
+                let off = fx.b.ins().ishl_imm_u(d, 3);
+                let addr = fx.b.ins().iadd(ksp, off);
+                let x = fx.b.ins().load(I64, f, addr, 0);
+                let same = fx.b.ins().icmp(IntCC::Equal, x, a);
+                self.bool_jump(fx, done, same);
+                fx.b.switch_to_block(slow);
+                let r = self.call_stub(fx, STUB_IS_A, &[cache, recv, mid, a, e]);
+                self.bool_jump_value(fx, done, r);
+                return self.bool_result(fx, done);
+            }
             (b"is_a?" | b"kind_of?", [a]) => return self.call_stub(fx, STUB_IS_A, &[cache, recv, mid, *a, e]),
             _ => {}
         }
         match vals {
             // (not names that are mostly core methods: `words.size` is a plain call)
-            [] if (in_loop || !self.in_dependency()) && attr_name(name) && may_be_ruby_method(name) => self.attr_fast(fx, cache, recv, None, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, e])),
+            [] if (in_loop || !self.in_dependency()) && attr_name(name) && may_be_ruby_method(name) => self.attr_fast(fx, cache, recv, None, explicit, |c, fx| plain(c, fx, "kn_attr_get", &[cache, recv, mid, e])),
             [] => plain(self, fx, "kn_send0", &[cache, recv, mid, e]),
             [a] if (in_loop || !self.in_dependency()) && name.last() == Some(&b'=') && attr_name(&name[..name.len() - 1]) => {
                 let a = *a;
-                self.attr_fast(fx, cache, recv, Some(a), |c, fx| plain(c, fx, "kn_attr_set", &[cache, recv, mid, a, e]))
+                self.attr_fast(fx, cache, recv, Some(a), explicit, |c, fx| plain(c, fx, "kn_attr_set", &[cache, recv, mid, a, e]))
             }
             [a] => plain(self, fx, "kn_send1", &[cache, recv, mid, *a, e]),
             [a, b] => plain(self, fx, "kn_send2", &[cache, recv, mid, *a, *b, e]),
@@ -1340,7 +1387,12 @@ impl<M: Module> Compiler<M> {
     /// elsewhere the call itself is most of the cost, and inlining at every site would grow
     /// a Rails binary's code by a quarter. (Checking several classes here, from the cache
     /// entry, made monomorphic loops like nbody's 3-5% slower.)
-    pub(crate) fn attr_fast(&mut self, fx: &mut Fx, cache: Value, recv: Value, val: Option<Value>, slow: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
+    ///
+    /// A receiver of another class (a site whose receivers are of a few classes) looks for
+    /// its class in the ways of the site's cache entry (newest first), whose attribute word
+    /// for it (core.rs `attr_of`) gives the slot, before going to `slow`. `explicit`: the
+    /// call has a receiver, so a private attribute takes `slow`.
+    pub(crate) fn attr_fast(&mut self, fx: &mut Fx, cache: Value, recv: Value, val: Option<Value>, explicit: bool, slow: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
         let f = mem();
         let remember = if val.is_none() { self.licm_take(fx, false) } else { None };
         let slow_b = fx.b.create_block();
@@ -1360,16 +1412,78 @@ impl<M: Module> Compiler<M> {
         let wk = fx.b.ins().ushr_imm_u(word, 16);
         let diff = fx.b.ins().bxor(klass, wk);
         let bad = fx.b.ins().bor(diff, kfm);
-        self.require_zero(fx, bad, slow_b);
+        let access = fx.b.create_block();
+        fx.b.append_block_param(access, I64);
+        // (dependencies' code: other classes through `slow`, the direct-call stub, which
+        // checks the same ways; inline everywhere it would grow a Rails binary's code by 2%)
+        let app = !self.in_dependency();
+        let ways = if app { fx.b.create_block() } else { slow_b };
+        let idx0 = fx.b.ins().band_imm_s(word, 0xFFFF);
+        fx.b.ins().brif(bad, ways, &[], access, &[idx0.into()]);
+        if app {
+            // another class: a plain Object (as above) allocated from its class, and the
+            // attribute of the right kind in the way of the site's current entry for that class.
+            // (All of it with the cold code: out of the way of the recorded class's path.)
+            fx.b.set_cold_block(ways);
+            fx.b.switch_to_block(ways);
+            let cold = |fx: &mut Fx, v: Value, zero_ok: bool, slow_b: Block| {
+                let b = fx.b.create_block();
+                fx.b.set_cold_block(b);
+                if zero_ok {
+                    fx.b.ins().brif(v, slow_b, &[], b, &[]);
+                } else {
+                    fx.b.ins().brif(v, b, &[], slow_b, &[]);
+                }
+                fx.b.switch_to_block(b);
+            };
+            let e = fx.b.ins().load(I64, f, cache, 0);
+            cold(fx, e, false, slow_b);
+            let shape = fx.b.ins().load(I64, f, recv, OBJ_SHAPE);
+            let dshape = fx.b.ins().bxor(shape, klass);
+            let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
+            let dir = fx.b.ins().symbol_value(I64, gv);
+            let ser = fx.b.ins().load(I64, f, e, CE_SERIAL);
+            let cur = fx.b.ins().load(I64, f, dir, 0);
+            let stale = fx.b.ins().bxor(ser, cur);
+            let bad = fx.b.ins().bor(dshape, kfm);
+            let bad = fx.b.ins().bor(bad, stale);
+            cold(fx, bad, true, slow_b);
+            let hit = fx.b.create_block();
+            fx.b.set_cold_block(hit);
+            fx.b.append_block_param(hit, I64);
+            for w in 0..WAYS {
+                let kw = fx.b.ins().load(I64, f, e, CE_KLASS + 8 * w as i32);
+                let same = fx.b.ins().icmp(IntCC::Equal, kw, klass);
+                let base = if w == 0 { e } else { fx.b.ins().iadd_imm_s(e, 8 * w as i64) };
+                if w + 1 < WAYS {
+                    let next = fx.b.create_block();
+                    fx.b.set_cold_block(next);
+                    fx.b.ins().brif(same, hit, &[base.into()], next, &[]);
+                    fx.b.switch_to_block(next);
+                } else {
+                    fx.b.ins().brif(same, hit, &[base.into()], slow_b, &[]);
+                }
+            }
+            fx.b.switch_to_block(hit);
+            let way = fx.b.block_params(hit)[0];
+            let a = fx.b.ins().load(I64, f, way, CE_ATTR);
+            // `slot << 8 | 4 | writer << 1 | private` (private only without a receiver)
+            let tag = fx.b.ins().band_imm_s(a, if explicit { 7 } else { 6 });
+            let want = if val.is_some() { 6 } else { 4 };
+            let wrong = fx.b.ins().bxor_imm_s(tag, want);
+            let idx1 = fx.b.ins().ushr_imm_u(a, 8);
+            fx.b.ins().brif(wrong, slow_b, &[], access, &[idx1.into()]);
+        }
 
         // the slot is within the object's ivar buffer (capacity first, as SVec::snap does)
+        fx.b.switch_to_block(access);
+        let idx = fx.b.block_params(access)[0];
         let cap_addr = fx.b.ins().iadd_imm_s(recv, OBJ_IVARS_CAP as i64);
         let cap = fx.b.ins().atomic_load(I64, f, cap_addr);
         let ptr = fx.b.ins().load(I64, f, recv, OBJ_IVARS_PTR);
         let len = fx.b.ins().load(I64, f, recv, OBJ_IVARS_LEN);
         let capn = fx.b.ins().band_imm_s(cap, SVEC_CAP_MASK);
         let n = fx.b.ins().umin(len, capn);
-        let idx = fx.b.ins().band_imm_s(word, 0xFFFF);
         let inb = fx.b.ins().icmp(IntCC::UnsignedLessThan, idx, n);
         let off = fx.b.ins().ishl_imm_u(idx, 3);
         let addr = fx.b.ins().iadd(ptr, off);
@@ -2235,23 +2349,12 @@ impl<M: Module> Compiler<M> {
         fx.b.append_block_param(done, I64);
         fx.b.set_cold_block(slow_b);
 
-        // a filled cache with a compiled method in a checked way (sites of core methods,
-        // most of them, leave here)
+        // a filled cache, current, with the receiver's class (a heap object) in one of its
+        // ways (newest first; unused ways hold no class)
         let e = fx.b.ins().load(I64, f, cache, 0);
         let b0 = fx.b.create_block();
         fx.b.ins().brif(e, b0, &[], slow_b, &[]);
         fx.b.switch_to_block(b0);
-        let ways = WAYS;
-        let fs: Vec<Value> = (0..ways).map(|w| fx.b.ins().load(I64, f, e, CE_DIRECT + 8 * w as i32)).collect();
-        let mut any = fs[0];
-        for fw in &fs[1..] {
-            any = fx.b.ins().bor(any, *fw);
-        }
-        let b1 = fx.b.create_block();
-        fx.b.ins().brif(any, b1, &[], slow_b, &[]);
-
-        // a heap receiver whose class is in one of those ways, under the current serial
-        fx.b.switch_to_block(b1);
         self.require_heap(fx, recv, slow_b);
         let k = fx.b.ins().load(I64, f, recv, 0);
         let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
@@ -2259,28 +2362,37 @@ impl<M: Module> Compiler<M> {
         let ser = fx.b.ins().load(I64, f, e, CE_SERIAL);
         let cur = fx.b.ins().load(I64, f, dir, 0);
         let stale = fx.b.ins().bxor(ser, cur);
-        let bad = self.no_room(fx, dir);
-        let mut bad = fx.b.ins().bor(stale, bad);
-        let mut func = fx.b.ins().iconst(I64, 0);
-        let mut msel = fx.b.ins().iconst(I64, 0);
-        for w in (0..ways).rev() {
+        let room = self.no_room(fx, dir);
+        let bad = fx.b.ins().bor(stale, room);
+        self.require_zero(fx, bad, slow_b);
+        let hit = fx.b.create_block();
+        fx.b.append_block_param(hit, I64);
+        for w in 0..WAYS {
             let kw = fx.b.ins().load(I64, f, e, CE_KLASS + 8 * w as i32);
-            let hit = fx.b.ins().icmp(IntCC::Equal, kw, k);
-            func = fx.b.ins().select(hit, fs[w], func);
-            let mw = fx.b.ins().load(I64, f, e, CE_METHOD + 8 * w as i32);
-            msel = fx.b.ins().select(hit, mw, msel);
+            let same = fx.b.ins().icmp(IntCC::Equal, kw, k);
+            let base = if w == 0 { e } else { fx.b.ins().iadd_imm_s(e, 8 * w as i64) };
+            if w + 1 < WAYS {
+                let next = fx.b.create_block();
+                fx.b.ins().brif(same, hit, &[base.into()], next, &[]);
+                fx.b.switch_to_block(next);
+            } else {
+                fx.b.ins().brif(same, hit, &[base.into()], slow_b, &[]);
+            }
         }
-        // a compiled method (public, with an explicit receiver: the low bit marks private),
-        // the current serial, room for the call: one branch on (all fine ? func : 0)
-        if explicit {
+        // that way's compiled method (public, with an explicit receiver: the low bit marks
+        // private)
+        fx.b.switch_to_block(hit);
+        let way = fx.b.block_params(hit)[0];
+        let mut func = fx.b.ins().load(I64, f, way, CE_DIRECT);
+        let msel = fx.b.ins().load(I64, f, way, CE_METHOD);
+        let go = if explicit {
             let priv_bit = fx.b.ins().band_imm_s(func, 1);
-            bad = fx.b.ins().bor(bad, priv_bit);
+            let zero = fx.b.ins().iconst(I64, 0);
+            fx.b.ins().select(priv_bit, zero, func)
         } else {
             func = fx.b.ins().band_imm_s(func, !1);
-        }
-        let fine = fx.b.ins().icmp_imm_s(IntCC::Equal, bad, 0);
-        let zero = fx.b.ins().iconst(I64, 0);
-        let go = fx.b.ins().select(fine, func, zero);
+            func
+        };
         let b2 = fx.b.create_block();
         fx.b.ins().brif(go, b2, &[], slow_b, &[]);
         fx.b.switch_to_block(b2);
@@ -2490,114 +2602,47 @@ impl<M: Module> Compiler<M> {
                 }
             }
 
-            if attr == 1 && !var {
-                // the common case first: way 0 is an attribute reader of the receiver's
-                // class (a plain Object of that class, the slot within its buffer)
-                let general = b.create_block();
-                let e = b.ins().load(I64, f, cache, 0);
-                let w0 = b.create_block();
-                b.ins().brif(e, w0, &[], general, &[]);
-                // (a site that calls a method: to the general path after one check)
-                b.switch_to_block(w0);
-                let a0 = b.ins().load(I64, f, e, CE_ATTR);
-                let ak = b.ins().band_imm_s(a0, 6);
-                let da = b.ins().bxor_imm_s(ak, 4);
-                let w1 = b.create_block();
-                b.ins().brif(da, general, &[], w1, &[]);
-                b.switch_to_block(w1);
-                let low = b.ins().band_imm_s(recv, 7);
-                let aligned = b.ins().icmp_imm_s(IntCC::Equal, low, 0);
-                let not_nil = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, recv, QNIL);
-                let heap = b.ins().band(aligned, not_nil);
-                let w2 = b.create_block();
-                b.ins().brif(heap, w2, &[], general, &[]);
-                b.switch_to_block(w2);
-                let k = b.ins().load(I64, f, recv, 0);
-                let k0 = b.ins().load(I64, f, e, CE_KLASS);
-                let ser = b.ins().load(I64, f, e, CE_SERIAL);
-                let cur = b.ins().load(I64, f, dir, 0);
-                let kf = b.ins().load(I64, f, recv, OBJ_KIND);
-                let shape = b.ins().load(I64, f, recv, OBJ_SHAPE);
-                // differences, all 0 when it is that case
-                let dk = b.ins().bxor(k, k0);
-                let ds = b.ins().bxor(ser, cur);
-                let dshape = b.ins().bxor(shape, k);
-                let kfm = b.ins().band_imm_s(kf, 0xFFFF_FFFF);
-                let mut bad = b.ins().bor(dk, ds);
-                bad = b.ins().bor(bad, dshape);
-                bad = b.ins().bor(bad, kfm);
-                if let Some(x) = explicit {
-                    let pb = b.ins().band_imm_s(a0, 1);
-                    let denied = b.ins().band(pb, x);
-                    bad = b.ins().bor(bad, denied);
-                }
-                let w3 = b.create_block();
-                b.ins().brif(bad, general, &[], w3, &[]);
-                b.switch_to_block(w3);
-                let cap_addr = b.ins().iadd_imm_s(recv, OBJ_IVARS_CAP as i64);
-                let cap = b.ins().atomic_load(I64, f, cap_addr);
-                let ptr = b.ins().load(I64, f, recv, OBJ_IVARS_PTR);
-                let len = b.ins().load(I64, f, recv, OBJ_IVARS_LEN);
-                let capn = b.ins().band_imm_s(cap, SVEC_CAP_MASK);
-                let n = b.ins().umin(len, capn);
-                let idx = b.ins().ushr_imm_u(a0, 8);
-                let inb = b.ins().icmp(IntCC::UnsignedLessThan, idx, n);
-                let w4 = b.create_block();
-                b.ins().brif(inb, w4, &[], general, &[]);
-                b.switch_to_block(w4);
-                let off = b.ins().ishl_imm_u(idx, 3);
-                let addr = b.ins().iadd(ptr, off);
-                let v = b.ins().load(I64, f, addr, 0);
-                let unset = b.ins().icmp_imm_s(IntCC::Equal, v, UNDEF);
-                let nil = b.ins().iconst(I64, QNIL);
-                let r = b.ins().select(unset, nil, v);
-                b.ins().return_(&[r]);
-                b.switch_to_block(general);
-            }
-
-            // a filled cache with a compiled method or an attribute in a checked way
+            // a filled cache, current, with the receiver's class (a heap object) in one of
+            // its ways: tried in order, newest first (unused ways hold no class)
             let e = b.ins().load(I64, f, cache, 0);
             let b0 = b.create_block();
             b.ins().brif(e, b0, &[], slow, &[]);
             b.switch_to_block(b0);
-            let ways = WAYS;
-            let fs: Vec<Value> = (0..ways).map(|w| b.ins().load(I64, f, e, CE_DIRECT + 8 * w as i32)).collect();
-            let at: Vec<Value> = if attr != 0 { (0..ways).map(|w| b.ins().load(I64, f, e, CE_ATTR + 8 * w as i32)).collect() } else { vec![] };
-            let mut any = fs[0];
-            for v in fs[1..].iter().chain(at.iter()) {
-                any = b.ins().bor(any, *v);
-            }
-            let b1 = b.create_block();
-            b.ins().brif(any, b1, &[], slow, &[]);
-
-            // a heap receiver of a class in those ways, under the current serial
-            b.switch_to_block(b1);
             let low = b.ins().band_imm_s(recv, 7);
             let aligned = b.ins().icmp_imm_s(IntCC::Equal, low, 0);
             let not_nil = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, recv, QNIL);
             let heap = b.ins().band(aligned, not_nil);
-            let b2 = b.create_block();
-            b.ins().brif(heap, b2, &[], slow, &[]);
-            b.switch_to_block(b2);
+            let b1 = b.create_block();
+            b.ins().brif(heap, b1, &[], slow, &[]);
+            b.switch_to_block(b1);
             let k = b.ins().load(I64, f, recv, 0);
             let ser = b.ins().load(I64, f, e, CE_SERIAL);
             let cur = b.ins().load(I64, f, dir, 0);
-            let current = b.ins().icmp(IntCC::Equal, ser, cur);
-            let mut fsel = b.ins().iconst(I64, 0);
-            let mut asel = b.ins().iconst(I64, 0);
-            let mut msel = b.ins().iconst(I64, 0);
-            for w in (0..ways).rev() {
+            let stale = b.ins().bxor(ser, cur);
+            let b2 = b.create_block();
+            b.ins().brif(stale, slow, &[], b2, &[]);
+            b.switch_to_block(b2);
+            let hit = b.create_block();
+            b.append_block_param(hit, I64);
+            for w in 0..WAYS {
                 let kw = b.ins().load(I64, f, e, CE_KLASS + 8 * w as i32);
-                let hit = b.ins().icmp(IntCC::Equal, kw, k);
-                fsel = b.ins().select(hit, fs[w], fsel);
-                if !var {
-                    let mw = b.ins().load(I64, f, e, CE_METHOD + 8 * w as i32);
-                    msel = b.ins().select(hit, mw, msel);
-                }
-                if attr != 0 {
-                    asel = b.ins().select(hit, at[w], asel);
+                let same = b.ins().icmp(IntCC::Equal, kw, k);
+                let base = if w == 0 { e } else { b.ins().iadd_imm_s(e, 8 * w as i64) };
+                if w + 1 < WAYS {
+                    let next = b.create_block();
+                    b.ins().brif(same, hit, &[base.into()], next, &[]);
+                    b.switch_to_block(next);
+                } else {
+                    b.ins().brif(same, hit, &[base.into()], slow, &[]);
                 }
             }
+            // that way's method, compiled function and attribute word
+            b.switch_to_block(hit);
+            let way = b.block_params(hit)[0];
+            let fsel = b.ins().load(I64, f, way, CE_DIRECT);
+            let msel = if var { b.ins().iconst(I64, 0) } else { b.ins().load(I64, f, way, CE_METHOD) };
+            let asel = if attr != 0 { b.ins().load(I64, f, way, CE_ATTR) } else { b.ins().iconst(I64, 0) };
+            let current = b.ins().iconst(I8, 1);
             // private (low bit) only without an explicit receiver (explicit/mode 1)
             let allowed = |b: &mut cranelift_frontend::FunctionBuilder, v: Value| match explicit {
                 Some(x) => {
@@ -2799,9 +2844,11 @@ pub(crate) fn may_be_ruby_method(name: &[u8]) -> bool {
     )
 }
 
-/// How many ways of a cache entry compiled code checks (of kenny-runtime's `IC_WAYS`):
-/// checking 3 or 4 made the method benchmarks slower.
-const WAYS: usize = 2;
+/// How many ways of a cache entry compiled code checks (kenny-runtime's `IC_WAYS`, all of
+/// them): one compare and branch per way, newest first, so a monomorphic site pays for one.
+/// (Checking each way with selects, as before, made 3 or 4 ways slower than 2; but a site
+/// whose receivers are of 3 classes then missed a third of the time.)
+const WAYS: usize = 4;
 /// (check inline at the call site, call through the stub) for a call of `name`: inline in
 /// loops; elsewhere the shared stub (inline at every site grew a Rails binary's code from
 /// 60 to 92 MB).

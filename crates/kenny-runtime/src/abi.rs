@@ -327,6 +327,13 @@ pub unsafe extern "C" fn kn_send_splat(cache: *mut CallCache, recv: V, mid: V, a
     unsafe { kn_send(cache, recv, mid, a.len() as u64, a.as_ptr(), blk) }
 }
 
+/// `obj.foo(*args)`: an explicit receiver, so not a private method (kn_send_pub).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_send_splat_pub(cache: *mut CallCache, recv: V, mid: V, args: V, blk: V) -> V {
+    let a = rary(args).v.clone();
+    unsafe { kn_send_pub(cache, recv, mid, a.len() as u64, a.as_ptr(), blk) }
+}
+
 /// A `def`'s owner slot (where `super` starts looking) once one definition site has defined
 /// methods in more than one class (a `def` run in a loop or a `Module.new` block, or a method
 /// copied by `Module#dup`): the owner is then found from the running method's code.
@@ -724,11 +731,26 @@ pub unsafe extern "C" fn kn_is_a_fill(cache: *mut CallCache, v: V, c: V) -> V {
     }
     bool_v(r)
 }
-/// A static call site's slot ([class, serial], kenny-compiler statics.rs): filled when the
-/// receiver's class has the method whose `Method::fast` is `expect` (one OS thread only).
+/// Classes in a static call site's slot (kenny-compiler statics.rs `POLY_WAYS`).
+pub const STATIC_WAYS: usize = 4;
+/// A static or inlined call site's slot ([serial, class 0 .. class 3], kenny-compiler
+/// statics.rs `poly_guard`): the receiver's class is added (newest first) when it has the
+/// method whose `Method::fast` is `expect`; a class that has another method is added as
+/// `class | 1`, which compiled code never takes for a class, so it isn't looked up again.
+/// A slot of an older serial starts over. (One OS thread only: the words are written one
+/// by one.)
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn kn_static_fill(slot: *mut [u64; 2], recv: V, mid: V, expect: usize) -> V {
+pub unsafe extern "C" fn kn_static_fill(slot: *mut [u64; 1 + STATIC_WAYS], recv: V, mid: V, expect: usize) -> V {
     if !is_heap(recv) || crate::mt::multi() {
+        return QNIL;
+    }
+    let s = unsafe { &mut *slot };
+    let k = hdr(recv).klass;
+    let serial = KN_DIRECT.serial.load(std::sync::atomic::Ordering::Acquire);
+    if s[0] != serial {
+        *s = [0; 1 + STATIC_WAYS];
+        s[0] = serial;
+    } else if s[1..].iter().any(|&w| w == k as u64 | 1 || w == k as u64) {
         return QNIL;
     }
     // top bit: a call with a receiver (only a public method will do); bit 62: `expect` is
@@ -736,16 +758,13 @@ pub unsafe extern "C" fn kn_static_fill(slot: *mut [u64; 2], recv: V, mid: V, ex
     let public = expect >> 63 != 0;
     let by_params = (expect >> 62) & 1 != 0;
     let expect = expect & !(3 << 62);
-    let k = hdr(recv).klass;
     let m = find_method(k, sym_id(mid));
     let have = if m.is_null() { 0 } else if by_params { unsafe { (*m).params as usize } } else { unsafe { (*m).fast } };
     let same = have != 0 && have == expect;
-    if same && (!public || unsafe { (*m).vis } == VIS_PUBLIC) {
-        unsafe {
-            (*slot)[0] = k as u64;
-            (*slot)[1] = KN_DIRECT.serial.load(std::sync::atomic::Ordering::Acquire);
-        }
-    }
+    let word = if same && (!public || unsafe { (*m).vis } == VIS_PUBLIC) { k as u64 } else { k as u64 | 1 };
+    // newest first: the oldest class drops out
+    s.copy_within(1..STATIC_WAYS, 2);
+    s[1] = word;
     QNIL
 }
 /// On entry to a compiled method that calls itself (kenny-compiler statics.rs
@@ -1331,7 +1350,7 @@ fn const_missing_in(c: *mut Class, id: u32, owner: Option<*mut Class>) -> V {
         match a.loader {
             Some(f) => {
                 LOADING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let r = crate::compat::run_file_once(f, a.flag);
+                let r = crate::compat::run_feature(f, a.flag);
                 LOADING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 autoloads().remove(&(owner as usize, id));
                 if r == UNDEF {
@@ -1579,7 +1598,7 @@ fn autoload_before_define(outer: *mut Class, id: u32) -> bool {
     let done = |flag: *mut V| unsafe { &*(flag as *const std::sync::atomic::AtomicU64) }.load(std::sync::atomic::Ordering::Acquire) == 1;
     match a.loader {
         Some(f) => {
-            let r = crate::compat::run_file_once(f, a.flag);
+            let r = crate::compat::run_feature(f, a.flag);
             if done(a.flag) {
                 autoloads().remove(&(outer as usize, id));
             }
@@ -1674,7 +1693,8 @@ pub extern "C" fn kn_singleton_class_for(v: V) -> V {
 const PROTECTED_OPS: &[&str] = &["+", "-", "*", "/", "%", "<", "<=", ">", ">=", "==", "!=", "&", "|", "^"];
 
 /// kind: 0 = def in class body (target = self), 1 = top level, 2 = def inside a method/block,
-/// 3 = singleton def (`def obj.name`).
+/// 3 = singleton def (`def obj.name`), 4 = `define_method` compiled as a def, 5 = def in a
+/// block of a file's top level (as 2, but private when it lands in Object).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owner_slot: *mut V, params: *const u8, fast: usize) -> V {
     unsafe { kn_def_claim(target, kind, id, f, owner_slot, params, fast, std::ptr::null_mut()) }
@@ -1684,6 +1704,11 @@ pub unsafe extern "C" fn kn_def(target: V, kind: u64, id: V, f: CompiledFn, owne
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn, owner_slot: *mut V, params: *const u8, fast: usize, claim: *mut u64) -> V {
     let r = rt();
+    // (8: the body uses `__callee__`, so its aliases must tell it their name)
+    if kind & 8 != 0 {
+        crate::core::CALLEE_FNS.get().get_or_insert_with(Default::default).insert(f as usize);
+    }
+    let kind = kind & !8;
     let cls: *mut Class = match kind {
         0 => cref_class(target),
         1 => r.c.object,
@@ -1703,7 +1728,7 @@ pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn
             }
             singleton_class(target)
         }
-        _ => match crate::kernel::definee_top() {
+        _ => match crate::kernel::definee_for(target) {
             Some(c) => c,
             None => {
                 if is_class(target) {
@@ -1713,6 +1738,12 @@ pub unsafe extern "C" fn kn_def_claim(target: V, kind: u64, id: V, f: CompiledFn
                 }
             }
         },
+    };
+    // a def in a block of a file's top level, run as a plain block: private, as at top level
+    let kind = match kind {
+        5 if target == r.main_obj && cls == r.c.object => 1,
+        5 => 2,
+        k => k,
     };
     if check_frozen_definee(cls) == UNDEF {
         return UNDEF;
@@ -1810,11 +1841,25 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
     if m.is_null() {
         return raise(rt().c.name_error, &format!("undefined method '{}' for class '{}'", sym_str(old), class_name(c)));
     }
-    let body = crate::kernel::clone_body(unsafe { &(*m).body });
+    let mut body = crate::kernel::clone_body(unsafe { &(*m).body });
     // a define_method body keeps its original name: its `super` looks for that one, as in
     // CRuby (rspec's `alias_method :only_failures?, :only_failures` of a reader that calls super)
     let name = if matches!(body, Body::Proc(_)) { unsafe { (*m).name } } else { new };
-    let nm = Box::into_raw(Box::new(Method { fast: unsafe { (*m).fast }, body, owner: unsafe { (*m).owner }, name, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
+    let fast = unsafe { (*m).fast };
+    // a method using `__callee__`: the alias tells it its name (and isn't called directly)
+    if let Body::Compiled(f) = body {
+        if new != unsafe { (*m).name } && crate::core::CALLEE_FNS.get().as_ref().is_some_and(|s| s.contains(&(f as usize))) {
+            // (it keeps the fast entry, for source_location: compiled code calls it only
+            // for a `Body::Compiled` method)
+            body = Body::Aliased(f, unsafe { (*m).name });
+        }
+    } else if let Body::Aliased(f, orig) = body {
+        // (an alias of the method's own name runs it as itself again)
+        if new == orig {
+            body = Body::Compiled(f);
+        }
+    }
+    let nm = Box::into_raw(Box::new(Method { fast, body, owner: unsafe { (*m).owner }, name, params: unsafe { (*m).params }, vis: unsafe { (*m).vis }, opt: unsafe { (*m).opt }, gc_transparent: unsafe { (*m).gc_transparent }, attr_slot: Default::default() }));
     if unsafe { (*c).methods.insert(new, nm) }.is_none() {
         crate::core::method_name_count(new, true);
     }
@@ -1825,7 +1870,7 @@ pub fn alias(c: *mut Class, new: u32, old: u32) -> V {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_alias(target: V, new: V, old: V) -> V {
-    let c = match crate::kernel::definee_top() {
+    let c = match crate::kernel::definee_for(target) {
         Some(c) => c,
         None => {
             if is_class(target) {
@@ -1897,6 +1942,21 @@ pub extern "C" fn kn_take_kwhash2(v: V, argc: u64, nreq: u64) -> u64 {
         return 1;
     }
     (argc > nreq && rhash(v).m.keys().all(|k| is_sym(k.0))) as u64
+}
+/// `kn_take_kwhash2` for a method or block that takes only the `n` keywords at `keys` (no
+/// `**rest`): a trailing Hash (not passed as keywords) with a key it doesn't take stays a
+/// positional argument when there is room for one (`maxpos` < 0: a rest parameter), as in
+/// Ruby 3 (`def schema(props = {}, required: [])` called as `schema({type: ...})`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_take_kwhash3(v: V, argc: u64, nreq: u64, maxpos: i64, keys: *const V, n: u64) -> u64 {
+    if kn_take_kwhash2(v, argc, nreq) == 0 {
+        return 0;
+    }
+    if hdr(v).flags & FL_KWHASH != 0 || (maxpos >= 0 && argc as i64 > maxpos) {
+        return 1;
+    }
+    let known = if n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(keys, n as usize) } };
+    rhash(v).m.keys().all(|k| known.contains(&k.0)) as u64
 }
 /// Copy of the keyword hash so keys can be consumed.
 #[unsafe(no_mangle)]

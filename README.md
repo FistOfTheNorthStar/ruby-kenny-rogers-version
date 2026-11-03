@@ -87,6 +87,20 @@ Notable choices:
   without a method invocation when the cached method is the builtin one; a monkey patch, subclass override,
   singleton method or `method_missing` resolves to a different method and takes the normal path.
   Instance-variable reads and writes use per-site shape caches.
+- **Calls between compiled methods are direct.** When a site's inline cache maps the receiver's class
+  to a compiled method, compiled code calls that method's native function itself, with its arguments
+  in registers; attr_readers and attr_writers become a load or a store, and `is_a?` in a loop a
+  lookup in the receiver's superclass list. Each of the cache's four classes is checked with one
+  compare, so a site whose receivers are of a few classes (a superclass's method called on its
+  subclasses' objects) stays on the fast path.
+- **Small methods are inlined** (attr-style getters, predicates, arithmetic, `def x = @x`, small
+  `initialize`s through `C.new`, methods taking a literal block): the body is compiled into the caller
+  behind a guard slot holding up to four receiver classes for which the runtime has checked that the
+  call reaches that very `def` under the current method serial. In a loop, a call to a method the
+  program defines in two or three classes inlines each body behind its own guard. Redefining a
+  method, a singleton method, `include`/`prepend`, a visibility change or `method_missing` changes
+  the serial or misses the guard, and the call is made normally. Backtraces still show the inlined
+  method's frame (its calls record an inline location).
 - **Blocks of `times`, `upto`, `downto`, `each`, `each_with_index`, `map`, `select`, `reject`, `any?`, `all?`** (on
   Integers, Arrays and Integer Ranges) are compiled as loops in the caller when the block is small and doesn't need
   its own frame (`return`, nested blocks, ...). A guard checks at runtime that the method is the builtin one;
@@ -106,16 +120,22 @@ Working:
   thread allocates from its own 64 KB pages of fixed-size slots; a collection stops all
   threads, scans their stacks with their help, sweeps in parallel, and leaves most freeing
   (young pages, dead buffers) to a background thread after the pause. A minor pause in the
-  blog example under load is under 1 ms. The stack is scanned conservatively and the heap
-  precisely. A major collection can **move** plain objects, strings, arrays, hashes, ranges,
-  floats and bignums out of sparsely used pages into gaps in fuller ones, rewrite the fields
-  that refer to them, and return the emptied pages to the OS. What it can't update stays put:
-  objects reached from a stack (also through a pointer into them), from a root or a C
-  extension, objects with singleton classes, and objects whose `object_id` or identity hash
-  was taken. Since native code may hold object references in Rust collections, objects move
-  only while no thread is inside a native method (the scheduler's blocking calls excepted):
-  `GC.compact` at top level, and an idle server's tidy-up a second after its last request,
-  which also gives memory back (`KENNY_GC_COMPACT=0` turns it off). Singleton classes of dead
+  blog example under load is under 1 ms. The heap is scanned precisely, and so are compiled
+  frames: the compiler emits a stack map for every call (Cranelift's, in the binary and in
+  eval'd code) listing the slots that hold Ruby values across it, and a compacting collection
+  finds those frames by walking frame pointers. The rest of a stack (native frames,
+  registers, values the maps don't list) is scanned conservatively. A major collection can
+  **move** plain objects, strings, arrays, hashes, ranges, floats and bignums out of sparsely
+  used pages into gaps in fuller ones, rewrite the fields and compiled-frame slots that refer
+  to them, and return the emptied pages to the OS. What it can't update stays put: objects
+  reached from a conservatively scanned word (also through a pointer into them), from a root
+  or a C extension, objects with singleton classes, and objects whose `object_id` or identity
+  hash was taken. Native code may hold object references in Rust collections, so objects move
+  only while no thread is inside a native method that hasn't been audited not to (the
+  scheduler's blocking calls, `each`/`map`/`send`/`instance_exec`/`Proc#call`/`Class#new`
+  and other hot ones are): with precise frames that is most collections of a busy server,
+  not only `GC.compact` and an idle server's tidy-up a second after its last request, which
+  also gives memory back (`KENNY_GC_COMPACT=0` turns it off). Singleton classes of dead
   objects are freed (`extend` per request doesn't grow memory).
 - **Regular expressions** via Oniguruma, the engine family Ruby's own comes from: `$~`/`$1`,
   named captures, and the regex-aware `String` methods.
@@ -123,9 +143,17 @@ Working:
   thread per core), with `Queue`, `SizedQueue`, `Mutex`, `ConditionVariable`, `Monitor`, a
   10 ms fairness timer, `Thread#raise`/`kill`, and deadlock detection. A core with nothing to
   run takes waiting threads from busy ones (work stealing), so threads move between cores.
-  Waiting on a socket, pipe or `IO.select` lets the core's other threads run; file reads and
-  writes and SQLite queries run as blocking calls, during which the core's waiting threads go
-  to an idle (or spare) core and collections don't wait for them. No GVL: a data race can lose
+  A thread waiting on a socket, pipe or child process (`read`, `write`, `accept`, `connect`,
+  `IO.select`, `wait_readable`, `Process.wait`, also inside a Fiber) is parked and woken by
+  kqueue/epoll; a core with nothing to run waits in the event loop itself, so a wake-up costs
+  one OS wake. Timeouts, `Thread#raise`/`kill`, `fork`, and closing the IO from another thread
+  (`IOError`, as in CRuby) all end such waits; a thread waiting on IO doesn't count as
+  deadlocked. Measured on an M4 Pro: a thread ping-pong over a socket pair takes 10 µs a round
+  trip (CRuby 9 µs), with 1,000 other threads parked on sockets 16 µs (CRuby 10 µs, the 2 ms
+  polling Kenny had 8.7 ms); those 1,000 idle threads use no CPU (polling used 6.6 cores), and
+  writing to all 1,000 wakes them in 6 ms (CRuby 14 ms). File reads and writes and SQLite
+  queries run as blocking calls, during which the core's waiting threads go to an idle (or
+  spare) core and collections don't wait for them. No GVL: a data race can lose
   an update but never crashes the process ([docs/LANGUAGE.md](docs/LANGUAGE.md), rule 4).
   As in CRuby, a thread that reaches a constant another thread is autoloading waits until that
   file has run, and one IO object can be used by several threads at once.
@@ -224,11 +252,12 @@ Not yet:
 - In development: debuggers (`byebug` loads, but calling `byebug` raises LoadError: its core
   is a C extension), and Action Cable's redis adapter (untested: the redis gem isn't installed
   here).
-- Compacting while requests run: objects move only when no thread is inside a native method,
-  which in a busy server is rare, so compaction mostly happens when the server goes idle (or
-  on `GC.compact`). Precise stack maps would lift this (roadmap).
-- Sockets and pipes are polled while other threads wait for them (2 ms steps), not parked on
-  an event loop; the HTTP server's own connections use kqueue/epoll.
+- Compacting while requests run is partial: a major collection moves objects only when no
+  thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
+  them). In the blog example under load that is about 4 in 10 majors (none before precise
+  stack maps); the rest skip compaction. Precise frames need frame pointers on every frame,
+  which Apple platforms guarantee; elsewhere (`KENNY_GC_PRECISE=1` turns it on) stacks are
+  still scanned word by word for native frames, which rarely lets a busy server compact.
 - Memory: serving on 12 cores takes about 1.7x the memory of one (each core has its own
   young-generation space, `KENNY_GC_YOUNG_SCALE=1` trades some throughput for ~1.3x); still
   far less than 12 Puma workers. The allocator choice was measured on macOS only (see
@@ -254,7 +283,7 @@ against 4.0.
 | Float math: `mandelbrot.rb` | 43x | 41x | 28x |
 | Float math: `spectral_norm.rb` | 8.7x | 7.0x | 1.7x |
 | Float math: `nbody.rb` | 5.0x | 4.5x | 1.9x |
-| Method-call-heavy OO code (`methods.rb`) | 6.6x | 6.5x | 0.86x (YJIT is faster) |
+| Method-call-heavy OO code (`methods.rb`) | 13x | 13x | 1.7x |
 | Object allocation with GC (`objects.rb`) | 5.9x | 4.4x | 2.5x |
 | 12 CPU-bound Ruby threads (`threads.rb`) | 59x | 62x | 26x (Ruby's GVL runs one at a time) |
 
@@ -265,7 +294,9 @@ Web (the machine was also running other work, so treat these as rough; `ab -c 10
 | Whole Rails 8.1 app (`examples/blog8`, SQLite, Solid Cache/Queue), scaffold index | 2.2k req/s, 119 MB | 6.7k req/s, 195 MB | 1.3k req/s, 71 MB (1 thread, Ruby 3.3); 4.8k req/s, 1,040 MB (12 workers) |
 
 Run them yourself: `bench/run.sh` (`RUBY=/path/to/ruby`, `RUBY_OPTS=--yjit`). Tests: `tests/run.sh` (against Ruby 3.4), `tests/run.sh 4.0`
-(against an installed Ruby 4.0; a test's `.4.0.out` holds what 4.0 prints differently). Compile-check a file without linking: `kenny check file.rb`.
+(against an installed Ruby 4.0; a test's `.4.0.out` holds what 4.0 prints differently); `tests/gems/run.sh [gem ...]`
+(gems, under CRuby and Kenny); `tests/server/run.sh [pattern]` (the HTTP server: a test app's
+binary started with different settings, driven over raw sockets by a CRuby script; ~20 s). Compile-check a file without linking: `kenny check file.rb`.
 
 GC tuning and diagnostics (environment variables read by compiled programs):
 `KENNY_GC_STATS=1` prints collections, GC time and heap size at exit (`=2` after every
@@ -278,8 +309,16 @@ unmarked (a write-barrier test, slow); `KENNY_GC_SCAN_REGIONS=1` also scans comp
 sections for roots (normally literals are pinned instead). `KENNY_GC_YOUNG_SCALE` (default 4)
 caps how much the young generation grows with the number of cores (less memory, more pauses).
 `KENNY_GC_COMPACT=0` never moves objects, `=always` tries at every major collection;
-`KENNY_GC_COMPACT_STATS=1` reports each compaction (and why one couldn't run);
-`KENNY_GC_COMPACT_VERIFY=1` checks every rewritten reference after compacting.
+`KENNY_GC_COMPACT_STATS=1` reports each compaction (and why one couldn't run; `=2` also names
+the native methods on each stack that kept it from running);
+`KENNY_GC_COMPACT_VERIFY=1` checks every rewritten reference after compacting;
+`KENNY_GC_COMPACT_POISON=1` (a test) evacuates only pages that empty completely and then makes
+them inaccessible for good, so a reference the collector failed to update faults at once.
+`KENNY_GC_PRECISE=0` scans compiled frames conservatively (pinning what they hold), `=1`
+precisely where that is not the default; `KENNY_STACK_MAPS=0` at build time leaves the stack
+maps out of the binary (`=stats` reports their size: about a fifth of the blog example's
+binary; keeping values in their slots across calls costs 0-4% in bench/, about 3% in
+mandelbrot.rb).
 `KENNY_MALLOC=auto|system|mimalloc` picks the allocator behind Rust allocations: on macOS the
 default `auto` uses mimalloc while one core runs Ruby code and the system allocator once
 several do (it keeps far less memory resident when threads free each other's objects); elsewhere
@@ -291,14 +330,16 @@ threads run requests in each (default 4 per `KENNY_THREADS`); `KENNY_MAX_BODY` (
 K/M/G suffix), `KENNY_READ_TIMEOUT` and `KENNY_KEEPALIVE_TIMEOUT` (seconds) are the server's
 limits. `KENNY_SCHED_STATS=1` prints how often
 threads moved between cores (`KENNY_NO_STEAL=1` keeps them where they started, to compare); `KENNY_CRASH_TRACE=1` prints a native backtrace on a crash. `KENNY_NO_INLINE=1 kenny build ...` compiles without block inlining (to compare, or
-to rule it out when debugging). Debugging: `KENNY_DEBUG_RAISE=1` logs every exception raised
+to rule it out when debugging); `KENNY_NO_POLY_INLINE=1` without inlining a call to a method with
+several definitions, and `KENNY_DEBUG_INLINE=1` lists each method it inlines. Debugging: `KENNY_DEBUG_RAISE=1` logs every exception raised
 (rescued or not) with its location; `KENNY_DEBUG_EVAL=1` logs every string compiled at runtime
 by `eval`/`class_eval`; an uncaught exception and a failed request print the full backtrace.
 
 ## Roadmap
 
-1. Direct calls between compiled methods (guarded by the inline cache) and inlining of small methods
-2. An event-driven poller for Ruby-level sockets and pipes (park the thread, not poll)
-3. Precise stack maps (Cranelift) for compiled frames and rooted native code, so compaction can
-   run under load, not only when idle
-4. Measure and tune memory and allocator choice on Linux
+1. Guard slots of inlined and static calls that fill while several OS threads run Ruby code
+   (today they fill only while one does, so code first reached under load takes the normal call)
+2. Compaction under load, the rest: audit (or root) the remaining native methods that call
+   back into Ruby (`Range#to_a`, `Struct.new`, `sort_by!`, Enumerator, Digest, Fiber...), and
+   frame-pointer builds on Linux so its servers get precise frames too
+3. Measure and tune memory and allocator choice on Linux

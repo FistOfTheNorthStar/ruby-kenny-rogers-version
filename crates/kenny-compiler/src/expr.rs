@@ -733,7 +733,12 @@ impl<M: Module> Compiler<M> {
                 let parent = match n.parent() {
                     // (`Ripper::EVENTS` ...: Ripper's data, not its parser)
                     Some(p) if crate::ripper::is_data_const(&name) && crate::ripper::is_ripper(&p) => self.ripper_quietly(|c| c.expr(fx, &p)),
-                    Some(p) => self.expr(fx, &p),
+                    Some(p) => {
+                        if crate::gem_extras::is_extra(&name) && crate::gem_extras::is_gem(&p) {
+                            self.note_gem_extras();
+                        }
+                        self.expr(fx, &p)
+                    }
                     None => {
                         if name == b"Ripper" {
                             self.note_ripper();

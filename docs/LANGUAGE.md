@@ -105,7 +105,9 @@ loaded after `setup`, as in CRuby. The differences:
   NotImplementedError saying so.
 - **Trailing-Hash keyword arguments in dependencies.** Methods and blocks defined in files found
   via load paths (gems, the stdlib) and in `eval`'d strings take a trailing positional Hash with
-  Symbol keys as their keywords — older gems still pass options that way. The app's own code
+  Symbol keys as their keywords — older gems still pass options that way — unless the method has
+  no `**rest`, the Hash has a key it doesn't take, and there is room for it as a positional
+  argument (then it stays positional, as in Ruby 3). The app's own code
   keeps today's keyword semantics (except that a Hash which would otherwise be one positional
   argument too many is taken as keywords instead of raising ArgumentError).
 - **`DidYouMean` and `ARGF` load on first use** (CRuby sets them up at startup): when code
@@ -136,9 +138,14 @@ No GVL. No new concurrency API. The existing ones become lightweight:
   blocking call, during which the core's waiting threads are handed to an idle core (or a spare
   one when all are busy) and collections go ahead without waiting for it. Ruby's
   `Fiber::Scheduler` behaviour, built in, no gem. A thread waiting on a socket, pipe or
-  terminal (`read`, `gets`, `IO.select`, `accept`, `connect`) is parked, and woken by an event
-  loop (kqueue on macOS and the BSDs, epoll on Linux) when the fd is ready; inside a `Fiber`
-  it polls instead. `KENNY_NO_POLLER=1` turns the event loop off.
+  terminal (`read`, `gets`, `write`, `IO.select`, `accept`, `connect`, `wait_readable`) or a
+  child process (`Process.wait(pid)`) is parked, also inside a `Fiber`, and woken by kqueue
+  (macOS and the BSDs) or epoll (Linux) when the fd is ready: a core with nothing to run waits
+  in the event loop itself, so a wake costs one OS wake-up. Closing an IO another thread waits
+  on raises `IOError` ("stream closed in another thread") in it; `Thread#raise`/`kill` and
+  timeouts end the wait; a forked child gets its own event loop. Sockets and pipes are
+  non-blocking at the OS level, as in CRuby. `KENNY_NO_POLLER=1` turns the event loop off
+  (waits then poll in 2 ms steps).
 - **`Mutex`, `Queue`, `SizedQueue`, `ConditionVariable`, `Monitor`** work as documented, backed by
   the scheduler (parking, not OS blocking).
 - **`Fiber`** keeps its Ruby semantics (`Enumerator#next` etc.).

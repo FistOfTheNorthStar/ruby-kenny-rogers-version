@@ -441,8 +441,8 @@ fn lazy_sweep(pg: &mut Page) {
             if hd.flags & FL_MARK == 0 {
                 pg.alloc[wi] &= !(1u64 << b);
                 freed += 1;
-                if !matches!(hd.kind, Kind::String | Kind::Array | Kind::Hash | Kind::Object | Kind::Env) {
-                    // these keep instance variables in the shared table (its lock without
+                if hd.flags & crate::core::FL_EXIVAR != 0 {
+                    // instance variables in the shared table (its lock without
                     // stopping: a collection must not find this page half swept; its holders
                     // never stop while holding it, see core.rs)
                     if let Some(t) = crate::core::GENERIC_IVARS.get_unstoppable().as_mut() {
@@ -772,8 +772,8 @@ pub fn wb_obj(v: V) {
         }
     }
 }
-/// C-extension data objects (their mark functions see values the barrier can't): scanned by
-/// every minor collection.
+/// C-extension data objects (their mark functions see values the barrier can't): the old ones
+/// are traced by every minor collection. Every collection drops the ones that died.
 static DATA_MARKED: crate::mt::L<Vec<V>> = crate::mt::L::new(Vec::new());
 pub fn register_marked_data(v: V) {
     DATA_MARKED.get().push(v);
@@ -1221,7 +1221,7 @@ fn sweep_help() -> bool {
                             Kind::String | Kind::Array | Kind::Hash | Kind::Object | Kind::Env => unsafe { free_obj(p) },
                             // these keep instance variables in the shared table (read-only
                             // during the sweep); with an entry, the collector removes it
-                            Kind::Float | Kind::Bignum | Kind::Range | Kind::Proc if !gen_tbl.is_some_and(|t| t.contains_key(&p)) => unsafe { free_obj(p) },
+                            Kind::Float | Kind::Bignum | Kind::Range | Kind::Proc if hd.flags & crate::core::FL_EXIVAR == 0 || !gen_tbl.is_some_and(|t| t.contains_key(&p)) => unsafe { free_obj(p) },
                             _ => deferred.push(p),
                         }
                     }
@@ -2148,8 +2148,11 @@ fn collect_locked() {
         }
         phase("old_envs", &mut lap);
         DBG_NDATA.store(DATA_MARKED.raw().len(), std::sync::atomic::Ordering::Relaxed);
+        // (only the old ones: a young one is traced if something reaches it)
         for &d in DATA_MARKED.raw().iter() {
-            m.trace(d);
+            if hdr(d).flags & FL_MARK != 0 {
+                m.trace(d);
+            }
         }
     } else {
         for &(kind, p) in &remembered {
@@ -2164,17 +2167,25 @@ fn collect_locked() {
         }
     }
     phase("old", &mut lap);
+    // (compacting) compiled frames' stack-map slots are precise: set aside while the stacks
+    // are scanned conservatively, then marked without pinning
+    let precise = m.compacting && crate::stackmap::precise_enabled();
+    if precise {
+        take_precise_slots();
+    }
     scan_with_registers(&mut m);
+    if precise {
+        mark_precise(&mut m);
+    }
     phase("stacks", &mut lap);
     m.drain();
     phase("trace", &mut lap);
     if !major && verify_mode() {
         verify_minor(h);
     }
-    if major {
-        // C-extension data that died
-        DATA_MARKED.raw().retain(|&d| hdr(d).flags & FL_MARK != 0);
-    }
+    // C-extension data that died (also young data in a minor collection: its page is swept
+    // later, and the list must not keep its address once its free function ran)
+    DATA_MARKED.raw().retain(|&d| hdr(d).flags & FL_MARK != 0);
     free_retired(std::mem::take(&mut m.retired), std::mem::take(&mut m.keep));
 
     // sweep: pages are split among this thread and the stopped ones (`sweep_help`); objects
@@ -2242,6 +2253,8 @@ fn collect_locked() {
     } else if major && h.compact_request == 2 {
         h.last_compact = None;
     }
+    // (compact puts the precise slots back; this is for when nothing did)
+    restore_precise();
     if !orphans.is_empty() {
         free_dead_units(h, &mut m, orphans);
     }
@@ -2432,6 +2445,10 @@ fn mark_roots(m: &mut Marker, h: &mut Heap, all_classes: bool) {
         for &b in &p.current_block {
             m.value(b);
         }
+        // (receivers `super` compares with; pinned like every root)
+        for &(r, _, _) in &p.super_at {
+            m.value(r);
+        }
         let mut cls = Vec::new();
         definee_values(&p.definee, &p.dm_stack, &mut cls);
         for v in cls {
@@ -2520,13 +2537,37 @@ fn compaction_mode(h: &Heap) -> CompactMode {
 /// a return address into `call_native`/`call_native_block` (see core.rs).
 fn compaction_safe() -> bool {
     let why = compaction_blocker();
+    if std::env::var_os("KENNY_GC_COMPACT_STATS").is_some_and(|v| v == "2") {
+        crate::stackmap::native_report(&all_stacks());
+    }
     if let Some(why) = why {
-        if std::env::var_os("KENNY_GC_COMPACT_STATS").is_some() && heap().compact_request != 0 {
+        if let Some(st) = std::env::var_os("KENNY_GC_COMPACT_STATS") {
+            let _ = st;
             eprintln!("[gc] can't compact now: {why}");
         }
         return false;
     }
     true
+}
+/// Every stack a collection scans, as (frame pointer, lowest, highest address): this
+/// thread's (from here), the other Ps' (stopped or idle) and suspended threads' and Fibers'.
+#[inline(never)]
+fn all_stacks() -> Vec<(usize, usize, usize)> {
+    let mut out = vec![(crate::stackmap::frame_pointer(), approx_sp_here(), crate::core::pst().heap.stack_base)];
+    let me = &crate::core::pst().heap as *const PHeap;
+    for &p in gc_ps().iter() {
+        let ph = unsafe { &(*(p as *const PState)).heap };
+        if !std::ptr::eq(ph, me) && ph.saved_sp != 0 {
+            out.push((ph.regs[crate::stackmap::FP_REG], ph.saved_sp, ph.stack_base));
+        }
+    }
+    for (sp, base, fp) in crate::thread::suspended_frames() {
+        out.push((fp, sp, base));
+    }
+    out
+}
+fn stacks_hi(s: &[(usize, usize, usize)]) -> FxHashSet<usize> {
+    s.iter().map(|x| x.2).collect()
 }
 fn compaction_blocker() -> Option<&'static str> {
     if crate::core::C_CALLS.load(Ordering::SeqCst) != 0 {
@@ -2553,6 +2594,35 @@ fn compaction_blocker() -> Option<&'static str> {
         }
         false
     };
+    if crate::stackmap::precise_enabled() {
+        // (frame records, not every word: a dead word in a frame often holds an old return
+        // address; a stack whose chain of records is broken is scanned word by word)
+        let stacks = all_stacks();
+        let me = &crate::core::pst().heap as *const PHeap;
+        for &p in gc_ps().iter() {
+            let ph = unsafe { &(*(p as *const PState)).heap };
+            if !std::ptr::eq(ph, me) && ph.regs.iter().any(|&w| has_mark(w)) {
+                return Some("another thread is in a native method");
+            }
+        }
+        for (i, &(fp, lo, hi)) in stacks.iter().enumerate() {
+            let native = match crate::stackmap::chain_has(fp, lo, hi, &marks) {
+                Some(b) => b,
+                None => scan(lo, hi),
+            };
+            if native {
+                return Some(if i == 0 { "this thread is in a native method" } else { "another thread, or a suspended thread or Fiber, is in a native method" });
+            }
+        }
+        if let Some(stacks) = heap().stack_provider {
+            // (the suspended stacks again, for any all_stacks doesn't know)
+            let known: FxHashSet<usize> = stacks_hi(&all_stacks());
+            if stacks().into_iter().any(|(lo, hi)| !known.contains(&hi) && scan(lo, hi)) {
+                return Some("a suspended thread or Fiber is in a native method");
+            }
+        }
+        return None;
+    }
     // this thread's stack (from here up), the others' (stopped or idle) and their registers
     if scan(approx_sp_here(), crate::core::pst().heap.stack_base) {
         return Some("this thread is in a native method");
@@ -2642,6 +2712,96 @@ fn compact_verify(h: &Heap) {
     }
 }
 
+/// (compacting) The stack slots where compiled frames keep objects at their current calls
+/// (stackmap.rs), with the values they held: zeroed while the stacks are scanned
+/// conservatively (so those words don't pin), marked without pinning, and written back by
+/// `restore_precise` with the moved objects' new addresses. Every thread is stopped
+/// meanwhile, and none of them runs code of those frames until the collection is over.
+static PRECISE: G<Vec<(usize, V)>> = G::new(Vec::new());
+fn take_precise_slots() {
+    let slots = crate::stackmap::precise_slots(&all_stacks());
+    let p = PRECISE.get();
+    p.clear();
+    p.reserve(slots.len());
+    for a in slots {
+        let v = unsafe { *(a as *const V) };
+        p.push((a, v));
+        unsafe { *(a as *mut V) = 0 };
+    }
+}
+fn mark_precise(m: &mut Marker) {
+    for &(_, v) in PRECISE.get().iter() {
+        if v & 15 == 0 && v >= 4096 && is_object(v as usize) {
+            m.pinning = false;
+            m.value(v);
+            m.pinning = true;
+        } else {
+            // (not exactly an object: whatever it is, as conservatively as any stack word)
+            m.word(v as usize);
+        }
+    }
+}
+fn restore_precise() {
+    let p = PRECISE.get();
+    if p.is_empty() {
+        return;
+    }
+    let verify = std::env::var_os("KENNY_GC_COMPACT_VERIFY").is_some();
+    let mut moved = 0;
+    for &(a, v) in p.iter() {
+        let n = forwarded(v);
+        if n != v {
+            moved += 1;
+        }
+        unsafe { *(a as *mut V) = n };
+        if verify && n & 15 == 0 && n >= 4096 && is_object(n as usize) && (hdr(n).flags & FL_MOVED != 0 || hdr(n).flags & FL_MARK == 0) {
+            eprintln!("[compact verify] stack slot {a:#x} -> {n:#x}: flags {:#x}", hdr(n).flags);
+        }
+    }
+    if std::env::var_os("KENNY_GC_COMPACT_STATS").is_some() {
+        eprintln!("[gc] precise stack slots: {} ({} updated)", p.len(), moved);
+    }
+    p.clear();
+}
+
+/// KENNY_GC_COMPACT_POISON=1 (a test of compaction): only pages whose every object can move
+/// are evacuated, and those pages are then made inaccessible for good, so that any use of a
+/// reference the collector didn't update (a stale copy somewhere) faults at once instead of
+/// reading whatever reuses the memory.
+fn poison_mode() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var_os("KENNY_GC_COMPACT_POISON").is_some_and(|v| v != "0"))
+}
+fn quarantine_pages(h: &mut Heap, idx: &[usize]) {
+    if idx.is_empty() {
+        return;
+    }
+    let drop: FxHashSet<usize> = idx.iter().copied().collect();
+    for &i in idx {
+        // (the address range stays reserved: nothing else is ever mapped there)
+        let base = h.pages[i].base;
+        unsafe { libc::mmap(base as *mut libc::c_void, PAGE, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED, -1, 0) };
+    }
+    let mut i = 0;
+    h.pages.retain(|_| {
+        i += 1;
+        !drop.contains(&(i - 1))
+    });
+    h.page_index.clear();
+    h.page_lo = usize::MAX;
+    h.page_hi = 0;
+    for (i, pg) in h.pages.iter().enumerate() {
+        h.page_index.insert(pg.base, i);
+        h.page_lo = h.page_lo.min(pg.base);
+        h.page_hi = h.page_hi.max(pg.base + PAGE);
+    }
+    rebuild_page_table(h);
+    // (page indices changed: the pool is rebuilt after the collection, by release_and_refill)
+    for p in h.pool.iter_mut() {
+        p.clear();
+    }
+}
+
 /// Rewrite moved objects' addresses in a container's elements, in place.
 fn rewrite_elems((p, n): (*mut V, usize)) {
     for i in 0..n {
@@ -2690,6 +2850,14 @@ fn compact(h: &mut Heap, forced: bool) -> (usize, usize) {
         if k >= min_pages {
             sources.extend(pages[..k].iter().map(|(_, i)| *i));
         }
+    }
+    let poison = poison_mode();
+    if poison {
+        // only pages that empty completely (they are then made inaccessible)
+        sources.retain(|&i| {
+            let pg = &h.pages[i];
+            (0..pg.nslots).all(|s| pg.alloc[s / 64] & (1 << (s % 64)) == 0 || movable(pg.base + s * pg.slot))
+        });
     }
     let mut moved = Vec::new();
     if !sources.is_empty() {
@@ -2795,6 +2963,9 @@ fn compact(h: &mut Heap, forced: bool) -> (usize, usize) {
     if !moved.is_empty() {
         crate::mt::LAZY_SWEEP.with(|l| l.set(false));
     }
+    // compiled frames' slots: the new addresses (before the old slots, which say where
+    // their objects went, are freed)
+    restore_precise();
     // the old slots are free now (their contents live on at the new address)
     let mut touched: FxHashSet<usize> = FxHashSet::default();
     for &(si, s, p) in &moved {
@@ -2808,6 +2979,10 @@ fn compact(h: &mut Heap, forced: bool) -> (usize, usize) {
     let emptied = touched.iter().filter(|&&i| used(&h.pages[i]) == 0).count();
     if !moved.is_empty() && std::env::var_os("KENNY_GC_COMPACT_VERIFY").is_some() {
         compact_verify(h);
+    }
+    if poison {
+        let empty: Vec<usize> = touched.iter().copied().filter(|&i| used(&h.pages[i]) == 0).collect();
+        quarantine_pages(h, &empty);
     }
     if !moved.is_empty() {
         // (constant caches may hold a moved value)
@@ -2834,7 +3009,7 @@ pub fn definee_values(definee: &[*mut Class], dm_stack: &[*const Method], out: &
 /// can call it after the method is removed from its class).
 static METHOD_OBJECT_CODE: crate::mt::L<Option<FxHashSet<usize>>> = crate::mt::L::new(None);
 pub fn note_method_object(m: *const Method) {
-    if let Body::Compiled(f) = unsafe { &(*m).body } {
+    if let Body::Compiled(f) | Body::Aliased(f, _) = unsafe { &(*m).body } {
         METHOD_OBJECT_CODE.get().get_or_insert_with(FxHashSet::default).insert(*f as usize);
     }
 }
@@ -2850,7 +3025,7 @@ fn free_dead_units(h: &mut Heap, m: &mut Marker, orphans: Vec<OrphanUnit>) {
             if meth.is_null() {
                 continue;
             }
-            if let Body::Compiled(f) = unsafe { &(*meth).body } {
+            if let Body::Compiled(f) | Body::Aliased(f, _) = unsafe { &(*meth).body } {
                 let f = *f as usize;
                 if f >= m.code_lo && f < m.code_hi {
                     m.code_word(f);

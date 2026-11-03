@@ -371,6 +371,9 @@ impl<M: Module> Compiler<M> {
         fx.b.append_block_param(after, I64);
         let ens_unwind = ensure.as_ref().map(|_| fx.b.create_block());
         if let Some(eu) = ens_unwind {
+            // (the parse tree outlives the compilation of this function)
+            let stmts = ensure.as_ref().and_then(|e| e.statements()).map(|s| unsafe { std::mem::transmute::<StatementsNode<'_>, StatementsNode<'static>>(s) });
+            fx.ensures.push(EnsureCtx { stmts, unwind_len: fx.unwind.len(), rescue_len: fx.rescue_prev.len(), loops_len: fx.loops.len() });
             fx.unwind.push(eu);
             fx.ensure_depth += 1;
         }
@@ -447,6 +450,7 @@ impl<M: Module> Compiler<M> {
         match (ensure, ens_unwind) {
             (Some(e), Some(eu)) => {
                 fx.unwind.pop();
+                fx.ensures.pop();
                 fx.ensure_depth -= 1;
                 self.stmts(fx, e.statements());
                 fx.b.ins().jump(after, &[v.into()]);
@@ -579,6 +583,14 @@ impl<M: Module> Compiler<M> {
             return self.call(fx, "kn_dm_name", &[c]);
         }
         let lexical = match fx.method.clone() {
+            // `__callee__` in a def: the name of the alias it was called by, if one (the
+            // runtime knows it for aliases of methods that ask: kn_def kind 8)
+            Some(m) if callee => {
+                self.callee_used = true;
+                let n = self.sym_val(fx, &m.name);
+                let s = self.self_val(fx);
+                self.call(fx, "kn_callee", &[n, s])
+            }
             Some(m) => self.sym_val(fx, &m.name),
             None => self.nil(fx),
         };
@@ -607,8 +619,47 @@ impl<M: Module> Compiler<M> {
         }
     }
 
+    /// Before `next`/`break` leaves the `ensure`d bodies entered since `fx.ensures[from]`:
+    /// run their ensure clauses, innermost first, each where its `begin` is (its exceptions go
+    /// to the handlers outside it).
+    fn run_ensures_from(&mut self, fx: &mut Fx, from: usize) {
+        let mut done = Vec::new();
+        while fx.ensures.len() > from {
+            // (while it compiles, the ensures outside it are still in `fx.ensures`)
+            let e = fx.ensures.pop().unwrap();
+            let unwind = fx.unwind.split_off(e.unwind_len.min(fx.unwind.len()));
+            // (leaving the rescue bodies inside it: `$!` as before them)
+            self.restore_errinfo_to(fx, e.rescue_len);
+            let rescue = fx.rescue_prev.split_off(e.rescue_len.min(fx.rescue_prev.len()));
+            let depth = std::mem::replace(&mut fx.ensure_depth, fx.ensures.len());
+            // (a node is a pointer into the parse tree, no Drop)
+            self.stmts_void(fx, e.stmts.as_ref().map(|s| unsafe { std::ptr::read(s) }));
+            fx.ensure_depth = depth;
+            fx.unwind.extend(unwind);
+            fx.rescue_prev.extend(rescue);
+            done.push(e);
+        }
+        // the rest of the `begin` bodies still compiles inside them
+        fx.ensures.extend(done.into_iter().rev());
+    }
+
+    /// `run_ensures_from` for a jump to the innermost loop (or, with no loop, out of the
+    /// function).
+    fn run_loop_ensures(&mut self, fx: &mut Fx) {
+        let from = match fx.loops.len() {
+            0 => 0,
+            n => fx.ensures.iter().position(|e| e.loops_len >= n).unwrap_or(fx.ensures.len()),
+        };
+        if from < fx.ensures.len() {
+            self.run_ensures_from(fx, from);
+        }
+    }
+
     pub(crate) fn break_node(&mut self, fx: &mut Fx, args: Option<ArgumentsNode>, at: usize) -> Value {
         let v = self.jump_value(fx, args);
+        if !fx.loops.is_empty() || (fx.kind == ScopeKind::Block && fx.lambda) {
+            self.run_loop_ensures(fx);
+        }
         if let Some(l) = fx.loops.last() {
             let (exit, depth) = (l.exit, l.rescue_depth);
             self.restore_errinfo_to(fx, depth);
@@ -632,6 +683,9 @@ impl<M: Module> Compiler<M> {
 
     pub(crate) fn next_node(&mut self, fx: &mut Fx, args: Option<ArgumentsNode>, at: usize) -> Value {
         let v = self.jump_value(fx, args);
+        if !fx.loops.is_empty() || fx.kind == ScopeKind::Block {
+            self.run_loop_ensures(fx);
+        }
         if let Some(l) = fx.loops.last() {
             let (next, depth, next_val) = (l.next, l.rescue_depth, l.next_val);
             self.restore_errinfo_to(fx, depth);

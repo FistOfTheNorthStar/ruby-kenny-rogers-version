@@ -1,0 +1,10 @@
+3
+2
+[[:req, :a], [:req, :b]]
+"hi bob!"
+"hi amy?"
+[[:req, :name], [:key, :punct]]
+42
+10
+7
+"replaced"

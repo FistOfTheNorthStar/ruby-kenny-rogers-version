@@ -43,22 +43,66 @@ fn jit_write_mode(on: bool) {
     }
     let _ = on;
 }
-fn map_code(len: usize) -> std::io::Result<usize> {
+/// Map `len` bytes for code, at `hint` if it is free (0: anywhere).
+fn map_code(len: usize, hint: usize) -> std::io::Result<usize> {
     if !MAC_JIT {
-        return map_rw(len);
+        return map_rw(len, hint);
     }
     #[cfg(target_os = "macos")]
     let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT;
     #[cfg(not(target_os = "macos"))]
     let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
-    let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC, flags, -1, 0) };
+    let p = unsafe { libc::mmap(hint as *mut libc::c_void, len, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC, flags, -1, 0) };
     if p == libc::MAP_FAILED {
         return Err(std::io::Error::last_os_error());
     }
     Ok(p as usize)
 }
 
+/// Address space reserved for all the chunks: a unit's code reaches its data (caches, symbols,
+/// strings) and the other functions of its unit pc-relatively (ADRP on aarch64, RIP-relative
+/// on x86-64: within 2 GB), but separate mmaps can land further apart than that in a large
+/// process (Discourse's test boot). Chunks are mapped into this range (at a hint, after
+/// unmapping that part of the reservation: macOS refuses MAP_FIXED with MAP_JIT).
+const RESERVE: usize = 1 << 30;
+
+struct Reserve {
+    base: usize,
+    pos: usize,
+}
+
+impl Reserve {
+    /// A new chunk of `len` bytes (a multiple of the page size) inside the reservation, or
+    /// anywhere once it is used up (or couldn't be made).
+    fn map(&mut self, len: usize, code: bool) -> std::io::Result<usize> {
+        let plain = |len| if code { map_code(len, 0) } else { map_rw(len, 0) };
+        if self.base == 0 {
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), RESERVE, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+            if p == libc::MAP_FAILED {
+                return plain(len);
+            }
+            self.base = p as usize;
+        }
+        if self.pos + len > RESERVE {
+            return plain(len);
+        }
+        let at = self.base + self.pos;
+        if unsafe { libc::munmap(at as *mut libc::c_void, len) } != 0 {
+            return plain(len);
+        }
+        let got = if code { map_code(len, at) } else { map_rw(len, at) }?;
+        if got != at {
+            // (another thread mapped the hole first): the rest of the reservation stays put
+            self.pos = RESERVE;
+            return Ok(got);
+        }
+        self.pos += len;
+        Ok(at)
+    }
+}
+
 struct SharedMemory {
+    reserve: Reserve,
     code: Pool,
     data: Pool,
     /// code written since the last finalize: (start, len)
@@ -74,8 +118,8 @@ fn page_size() -> usize {
     *P.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize })
 }
 
-fn map_rw(len: usize) -> std::io::Result<usize> {
-    let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+fn map_rw(len: usize, hint: usize) -> std::io::Result<usize> {
+    let p = unsafe { libc::mmap(hint as *mut libc::c_void, len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
     if p == libc::MAP_FAILED {
         return Err(std::io::Error::last_os_error());
     }
@@ -146,7 +190,7 @@ impl Pool {
             self.free.remove(i);
         }
     }
-    fn alloc(&mut self, size: usize, align: usize, code: bool) -> std::io::Result<(usize, bool)> {
+    fn alloc(&mut self, size: usize, align: usize, code: bool, reserve: &mut Reserve) -> std::io::Result<(usize, bool)> {
         if !code || MAC_JIT {
             if let Some(at) = self.alloc_freed(size, align) {
                 return Ok((at, false));
@@ -159,7 +203,7 @@ impl Pool {
         let mut fresh = false;
         if self.base == 0 || at + size > self.base + self.len {
             let len = CHUNK.max((size + page_size() - 1) & !(page_size() - 1));
-            self.base = if code { map_code(len)? } else { map_rw(len)? };
+            self.base = reserve.map(len, code)?;
             if std::env::var_os("KENNY_DEBUG_EVAL").is_some() {
                 eprintln!("[eval] new {} chunk of {} KB (free ranges: {}, {} KB)", if code { "code" } else { "data" }, len >> 10, self.free.len(), self.free.iter().map(|r| r.1).sum::<usize>() >> 10);
             }
@@ -179,13 +223,13 @@ struct SharedJitMemory;
 impl JITMemoryProvider for SharedJitMemory {
     fn allocate(&mut self, size: usize, align: u64, kind: JITMemoryKind) -> std::io::Result<*mut u8> {
         let mut g = SHARED.lock().unwrap();
-        let s = g.get_or_insert_with(|| SharedMemory { code: Pool::new(), data: Pool::new(), dirty: Vec::new(), unit: Vec::new() });
+        let s = g.get_or_insert_with(|| SharedMemory { reserve: Reserve { base: 0, pos: 0 }, code: Pool::new(), data: Pool::new(), dirty: Vec::new(), unit: Vec::new() });
         let align = (align as usize).max(16);
         // whole 16-byte granules, so freed neighbours coalesce (no padding left between them)
         let size = (size.max(1) + 15) & !15;
         match kind {
             JITMemoryKind::Executable => {
-                let (p, _fresh) = s.code.alloc(size, align, true)?;
+                let (p, _fresh) = s.code.alloc(size, align, true, &mut s.reserve)?;
                 if MAC_JIT {
                     // this thread may write MAP_JIT pages now; others keep executing them
                     jit_write_mode(true);
@@ -196,7 +240,7 @@ impl JITMemoryProvider for SharedJitMemory {
             }
             // read-only data stays writable: it is only ever written by the JIT itself
             JITMemoryKind::Writable | JITMemoryKind::ReadOnly => {
-                let p = s.data.alloc(size, align, false)?.0;
+                let p = s.data.alloc(size, align, false, &mut s.reserve)?.0;
                 s.unit.push((p, size, false));
                 Ok(p as *mut u8)
             }
@@ -249,6 +293,8 @@ pub struct JitUnit {
     /// (address, size, label, file, calls, definition line)
     pub debug: Vec<(usize, u32, u32, u32, Vec<(u32, u32)>, u32)>,
     pub strs: *const u8,
+    /// stack maps (gcmap.rs): (function address, code size, table)
+    pub maps: Vec<(usize, u32, Vec<u32>)>,
     /// The unit's memory: (start, len, is_code); see `free_unit`.
     pub memory: Vec<(usize, usize, bool)>,
     /// Cache slots holding runtime-allocated entries: (word offset into `caches`, kind).
@@ -320,11 +366,13 @@ pub fn compile(src: &[u8], mode: EvalMode, file: &str, symbols: &[(&'static str,
         .into_iter()
         .map(|f| (c.module.get_finalized_function(f.id) as usize, f.size | if f.exact { crate::DEBUG_EXACT } else { 0 }, f.label, f.file, f.calls, f.def_line))
         .collect();
+    let maps = std::mem::take(&mut c.stack_maps).into_iter().map(|(id, size, t)| (c.module.get_finalized_function(id) as usize, size, t)).collect();
     let memory = SHARED.lock().unwrap().as_mut().map(|s| std::mem::take(&mut s.unit)).unwrap_or_default();
     let unit = JitUnit {
         owned_caches: std::mem::take(&mut c.owned_caches),
         memory,
         debug,
+        maps,
         strs: strs_ptr,
         entry,
         caches: caches as *mut u8,

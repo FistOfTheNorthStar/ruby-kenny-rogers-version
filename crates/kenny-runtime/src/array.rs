@@ -239,9 +239,36 @@ fn aset(s: V, a: &[V]) -> V {
     val
 }
 
+/// `x.to_ary` when `x` (not an Array) has one (rb_check_array_type): Ok(None) otherwise.
+fn check_to_ary(x: V) -> Result<Option<V>, V> {
+    if !is_heap(x) || is_str(x) && !crate::kernel::is_user_method(x, "to_ary") {
+        return Ok(None);
+    }
+    let has = respond_to(x, sym("to_ary"))
+        || crate::kernel::is_user_method(x, "respond_to_missing?")
+            && truthy(send(x, sym("respond_to_missing?"), &[mksym(sym("to_ary")), QTRUE], QNIL));
+    if !has {
+        return Ok(None);
+    }
+    let r = send0(x, "to_ary");
+    if r == UNDEF {
+        return Err(UNDEF);
+    }
+    if r == QNIL {
+        return Ok(None);
+    }
+    if !is_ary(r) {
+        let c = class_name(real_class(x));
+        return Err(type_error(&format!("can't convert {c} to Array ({c}#to_ary gives {})", class_name(real_class(r)))));
+    }
+    Ok(Some(r))
+}
+
 pub fn flatten_into(out: &mut Vec<V>, v: &[V], depth: i64, seen: &mut Vec<V>) -> Result<bool, V> {
     let mut changed = false;
     for &x in v {
+        // (an object with to_ary is flattened as its Array: ActiveRecord relations)
+        let x = if !is_ary(x) && depth != 0 { check_to_ary(x)?.unwrap_or(x) } else { x };
         if is_ary(x) && depth != 0 {
             if seen.contains(&x) {
                 return Err(arg_error("tried to flatten recursive array"));

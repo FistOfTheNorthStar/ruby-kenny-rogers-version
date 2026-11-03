@@ -357,6 +357,58 @@ struct PErr {
     unknown_anchor: Option<String>,
 }
 
+/// libyaml (so Psych) doesn't check indentation inside a flow collection; saphyr wants its
+/// lines indented past the enclosing block (faker's locales close a multi-line `[` at the
+/// key's column). Returns `src` with such lines indented as far as their collection's opening
+/// bracket (whitespace there is insignificant), or None when it has none.
+fn relax_flow_indentation(src: &str) -> Option<String> {
+    let mut text = src.to_string();
+    let mut changed = false;
+    for _ in 0..1000 {
+        let mut p = Parser::new_from_str(&text);
+        // the columns of the open collections' openings: Some for a flow one
+        let mut open: Vec<Option<usize>> = Vec::new();
+        let chars: Vec<char> = text.chars().collect();
+        let fix = loop {
+            match p.next_event() {
+                None => break None,
+                Some(Ok((ev, span))) => match ev {
+                    Event::SequenceStart(..) | Event::MappingStart(..) => {
+                        let i = span.start.index();
+                        open.push(matches!(chars.get(i), Some('[' | '{')).then(|| span.start.col()));
+                    }
+                    Event::SequenceEnd | Event::MappingEnd => {
+                        open.pop();
+                    }
+                    _ => {}
+                },
+                Some(Err(e)) => {
+                    // (the scanner may report it before the parser opened the collection: then
+                    // only its "in flow construct" error says so, and the line moves by one)
+                    let col = open.iter().rev().flatten().next().copied();
+                    let line = e.marker().line();
+                    match col {
+                        Some(c) if e.info() == "invalid indentation" || e.info().ends_with("invalid indentation in flow construct") => break Some((line, Some(c + 1))),
+                        _ if e.info().ends_with("invalid indentation in flow construct") => break Some((line, None)),
+                        _ => break None,
+                    }
+                }
+            }
+        };
+        let Some((line, want)) = fix else { break };
+        // indent line `line` (1-based) to column `want`
+        let start = text.split_inclusive('\n').take(line.saturating_sub(1)).map(str::len).sum::<usize>();
+        let have = text[start..].chars().take_while(|c| *c == ' ').count();
+        let want = want.unwrap_or(have + 1);
+        if have >= want {
+            break;
+        }
+        text.insert_str(start, &" ".repeat(want - have));
+        changed = true;
+    }
+    changed.then_some(text)
+}
+
 /// Parse a stream into documents (root node indices into `nodes`).
 fn parse_stream(src: &str, first_only: bool, nodes: &mut Vec<Node>) -> Result<Vec<usize>, PErr> {
     let mut p = Parser::new_from_str(src);
@@ -996,7 +1048,14 @@ fn kn_load(src: V, opts: V) -> V {
         text.remove(0);
     }
     let mut nodes = Vec::new();
-    let docs = match parse_stream(&text, truthy(opt(opts, "first_only")), &mut nodes) {
+    let mut parsed = parse_stream(&text, truthy(opt(opts, "first_only")), &mut nodes);
+    if parsed.as_ref().is_err_and(|e| e.problem.contains("invalid indentation")) {
+        if let Some(t) = relax_flow_indentation(&text) {
+            nodes.clear();
+            parsed = parse_stream(&t, truthy(opt(opts, "first_only")), &mut nodes);
+        }
+    }
+    let docs = match parsed {
         Ok(d) => d,
         Err(e) => {
             if let Some(name) = e.unknown_anchor {
@@ -2494,6 +2553,14 @@ fn kn_events(src: V, path: V) -> V {
     let mut text = s_of(src);
     if text.starts_with('\u{feff}') {
         text.remove(0);
+    }
+    // (positions then refer to the relaxed text: only lines inside a flow collection moved)
+    // (the parser repeats its error forever: stop at the first)
+    let first_err = Parser::new_from_str(&text).find_map(|e| e.err());
+    if first_err.is_some_and(|e| e.info().contains("invalid indentation")) {
+        if let Some(t) = relax_flow_indentation(&text) {
+            text = t;
+        }
     }
     let chars: Vec<char> = text.chars().collect();
     let mut line_starts = vec![0usize];

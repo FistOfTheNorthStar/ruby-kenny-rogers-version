@@ -54,9 +54,15 @@ impl StampVal {
     }
 }
 static MIDDLEWARE: G<Vec<(V, Vec<V>, V)>> = G::new(Vec::new());
+/// config.ru's `map path do ... end` blocks, in order
+static MAPS: G<Vec<(V, V)>> = G::new(Vec::new());
 
 pub fn static_roots() -> Vec<V> {
     let mut v: Vec<V> = APP.get().iter().copied().collect();
+    for (p, b) in MAPS.get().iter() {
+        v.push(*p);
+        v.push(*b);
+    }
     for (m, args, b) in MIDDLEWARE.get().iter() {
         v.push(*m);
         v.extend(args.iter().copied());
@@ -197,6 +203,50 @@ pub fn init() {
         MIDDLEWARE.get().push((a[0], a[1..].to_vec(), b));
         QNIL
     });
+    // (only at a config.ru's top level: elsewhere `map` is the object's own, or method_missing)
+    defn(k, "map", 0, -1, |s, a, b| {
+        if s != rt().main_obj || a.len() != 1 {
+            return method_missing(s, sym("map"), a, b, false);
+        }
+        MAPS.get().push((a[0], b));
+        QNIL
+    });
+}
+
+/// The app of a config.ru that used `map`: as Rack::Builder makes it, a Rack::URLMap of each
+/// path's app (a Rack::Builder of its block, falling back to the `run` app) and the `run`
+/// app at "/".
+fn mapped_app(default_app: Option<V>) -> V {
+    let r = send(rt().main_obj, sym("require"), &[str_from("rack")], QNIL);
+    if r == UNDEF {
+        return UNDEF;
+    }
+    // (Rack autoloads them)
+    let Some(rack) = const_lookup(rt().c.object, sym("Rack")) else {
+        return raise(rt().c.runtime_error, "config.ru's `map` needs Rack");
+    };
+    let builder = send(rack, sym("const_get"), &[mksym(sym("Builder"))], QNIL);
+    let urlmap = send(rack, sym("const_get"), &[mksym(sym("URLMap"))], QNIL);
+    if builder == UNDEF || urlmap == UNDEF {
+        return UNDEF;
+    }
+    let h = hash_new();
+    let dflt = default_app.unwrap_or(QNIL);
+    if let Some(d) = default_app {
+        crate::hash::hset(h, str_from("/"), d);
+    }
+    for (path, blk) in MAPS.get().clone() {
+        let b = send(builder, sym("new"), &[dflt], blk);
+        if b == UNDEF {
+            return UNDEF;
+        }
+        let app = send0(b, "to_app");
+        if app == UNDEF {
+            return UNDEF;
+        }
+        crate::hash::hset(h, path, app);
+    }
+    send(urlmap, sym("new"), &[h], QNIL)
 }
 
 // ---------- serving ----------
@@ -253,7 +303,17 @@ fn report(prefix: &str) {
 
 /// Called after the program's top level ran. Returns an exit code if a server ran.
 pub fn maybe_serve() -> Option<i32> {
-    let mut app = (*APP.get())?;
+    let mut app = if MAPS.get().is_empty() {
+        (*APP.get())?
+    } else {
+        let a = mapped_app(*APP.get());
+        if a == UNDEF {
+            report("config.ru's map failed");
+            return Some(1);
+        }
+        *APP.get() = Some(a);
+        a
+    };
     // `kenny build` precompiles a Rails app's assets with the app's own binary: the app is
     // loaded, then lib/kenny/kenny/assets_precompile.rb runs instead of the server
     if std::env::var_os("KENNY_ASSETS_PRECOMPILE").is_some() {
@@ -731,7 +791,8 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
         }
         // the requests the request threads finished meanwhile; then let this P's threads
         // (request threads among them) run before polling again; a few rounds while they
-        // keep finishing this loop's requests, then back to the network
+        // keep finishing this loop's requests, then back to the network. (Without request
+        // threads too: the app's own threads on this P run only here.)
         for _ in 0..4 {
             for d in mailbox.take() {
                 if let Some(c) = conns.get_mut(&d.token) {
@@ -744,12 +805,12 @@ fn worker_loop(std_listener: std::net::TcpListener, app: V) -> i32 {
                 }
             }
             flush_out();
-            if !pooled || !crate::thread::active() {
+            if !crate::thread::active() {
                 break;
             }
             crate::thread::pass();
             pst().pending = Throw::None;
-            if mailbox.is_empty() {
+            if !pooled || mailbox.is_empty() {
                 break;
             }
         }

@@ -27,6 +27,8 @@ mod felem;
 mod hoist;
 mod chilled;
 mod ripper;
+mod gem_extras;
+mod gcmap;
 #[cfg(feature = "jit")]
 pub mod jit;
 
@@ -55,6 +57,8 @@ pub const PROC_ENV_OFFSET: i32 = 24;
 pub const ENV_PARENT: i32 = 0;
 /// kenny-runtime core.rs `KnDirect::entry_limit`
 pub const KN_DIRECT_ENTRY_LIMIT: i32 = 56;
+/// kenny-runtime core.rs `KnDirect::require_hook`
+pub const KN_DIRECT_REQUIRE_HOOK: i32 = 72;
 pub const ENV_BLK: i32 = 8;
 pub const ENV_SLOTS: i32 = 16;
 
@@ -86,6 +90,14 @@ pub(crate) struct LoopCtx {
     /// `fx.rescue_prev.len()` where the loop starts: `break`/`next` restore `$!` of the
     /// rescue bodies they leave.
     pub rescue_depth: usize,
+}
+
+pub(crate) struct EnsureCtx {
+    pub stmts: Option<ruby_prism::StatementsNode<'static>>,
+    /// `fx.unwind`, `fx.rescue_prev` and `fx.loops` lengths outside the `begin`
+    pub unwind_len: usize,
+    pub rescue_len: usize,
+    pub loops_len: usize,
 }
 
 #[derive(Clone)]
@@ -131,6 +143,9 @@ pub(crate) struct Fx<'a> {
     pub locals: HashMap<Vec<u8>, Local>,
     pub unwind: Vec<Block>,
     pub ensure_depth: usize,
+    /// The `ensure` clauses whose bodies are being compiled (outermost first): `next` and
+    /// `break` jumping out of them run them on the way (CRuby inlines them there too).
+    pub ensures: Vec<EnsureCtx>,
     /// `$!` from before each rescue body being compiled (outermost first): jumping out of
     /// one (`return`, `next`, `break`, `retry`) restores it, as leaving it normally does.
     pub rescue_prev: Vec<Value>,
@@ -271,6 +286,10 @@ pub struct Compiler<M: Module> {
     pub(crate) def_cref: HashMap<(PathBuf, usize), usize>,
     /// vobj.rs: the getters of the classes of the program, by class name
     pub(crate) class_getters: HashMap<Vec<u8>, vobj::Getters>,
+    /// Names of the attr_readers this program's class bodies declare (statics.rs
+    /// `scan_defs`): a receiver-less call of one in the program's code tries the attribute
+    /// inline (`attr_fast`) outside loops too.
+    pub(crate) attr_names: HashSet<Vec<u8>>,
     pub(crate) caches_id: DataId,
     pub(crate) syms_id: DataId,
     pub(crate) strs_id: DataId,
@@ -287,7 +306,11 @@ pub struct Compiler<M: Module> {
     pub(crate) file: PathBuf,
     pub(crate) src: Vec<u8>,
     pub(crate) loaded: HashMap<PathBuf, (FuncId, usize)>,
-    pub(crate) loading: HashSet<PathBuf>,
+    /// Files being compiled (a `require` cycle refers to one): their top-level function,
+    /// declared ahead, and loaded flag.
+    pub(crate) loading: HashMap<PathBuf, (FuncId, usize)>,
+    /// The function the next file's top level is compiled into (declared by `require_file`).
+    pub(crate) top_predeclared: Option<FuncId>,
     /// The program evaluates strings at runtime: link the runtime compiler.
     pub needs_jit: bool,
     /// Compiling an eval'd string: `def` uses the dynamic definee.
@@ -300,10 +323,16 @@ pub struct Compiler<M: Module> {
     pub(crate) load_paths: Vec<PathBuf>,
     /// see `Options::ruby`
     pub(crate) ruby: String,
+    /// `Options::runtime_load_path`
+    pub(crate) runtime_load_path: Vec<PathBuf>,
     /// see `Options::ripper_backend`; set once a compiled file names Ripper's parser
     pub(crate) ripper_backend: Option<PathBuf>,
     pub(crate) ripper_used: bool,
     pub(crate) ripper_quiet: bool,
+    /// see `Options::gem_extras`; set once a compiled file names one of its classes
+    pub(crate) gem_extras: Option<PathBuf>,
+    pub(crate) gem_extras_used: bool,
+    pub(crate) gem_extras_quiet: Option<PathBuf>,
     /// Canonical load paths and dependency directories (code compiled with gem semantics).
     pub(crate) dep_roots: Vec<PathBuf>,
     pub warnings: Vec<String>,
@@ -328,6 +357,8 @@ pub struct Compiler<M: Module> {
     pub(crate) block_parent: Option<String>,
     /// Per compiled function: return-address offsets of its calls and their source locations.
     pub(crate) debug_fns: Vec<DebugFn>,
+    /// Stack maps of the compiled functions (gcmap.rs): (function, code size, table).
+    pub(crate) stack_maps: Vec<(FuncId, u32, Vec<u32>)>,
     /// The definition line of the next function `build_fn` compiles (see `DebugFn::def_line`).
     pub(crate) def_line_next: u32,
     /// Proc#parameters descriptors of the blocks compiled (`scopes::params_desc` form).
@@ -338,6 +369,8 @@ pub struct Compiler<M: Module> {
     pub(crate) cov: Option<Box<coverage::Build>>,
     /// a `require "coverage"` was compiled (see `compile_with`)
     pub(crate) uses_coverage: bool,
+    /// The method body being compiled uses `__callee__` (its def tells the runtime: kind 8).
+    pub(crate) callee_used: bool,
 }
 
 /// Backtrace information of one compiled function: its file and label (offsets into the
@@ -369,6 +402,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_cvar_defined", &[I64, I64], &[I64]),
     ("kn_vcall", &[I64, I64, I64], &[I64]),
     ("kn_send_splat", &[I64, I64, I64, I64, I64], &[I64]),
+    ("kn_send_splat_pub", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_super", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_super_splat", &[I64, I64, I64, I64, I64], &[I64]),
     ("kn_super_defined", &[I64, I64, I64], &[I64]),
@@ -440,6 +474,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_ary_push_kw", &[I64, I64], &[I64]),
     ("kn_take_kwhash", &[I64, I64, I64], &[I64]),
     ("kn_take_kwhash2", &[I64, I64, I64], &[I64]),
+    ("kn_take_kwhash3", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_kw_dup", &[I64], &[I64]),
     ("kn_kw_take", &[I64, I64], &[I64]),
     ("kn_kw_get", &[I64, I64], &[I64]),
@@ -479,6 +514,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_match_save", &[], &[I64]),
     ("kn_dm_name", &[I64], &[I64]),
     ("kn_dm_name_for", &[I64, I64, I64], &[I64]),
+    ("kn_callee", &[I64, I64], &[I64]),
     ("kn_match_restore", &[I64], &[]),
     ("kn_pm_deconstruct", &[I64], &[I64]),
     ("kn_pm_deconstruct_keys", &[I64, I64], &[I64]),
@@ -489,6 +525,7 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_pm_nomatch", &[I64], &[I64]),
     ("kn_autoload", &[I64, I64, I64, I64], &[I64]),
     ("kn_require_file", &[I64, I64], &[I64]),
+    ("kn_require_lit", &[I64, I64, I64, I64], &[I64]),
     ("kn_wb_env", &[I64], &[I64]),
     ("kn_using", &[I64, I64, I64], &[I64]),
     ("kn_refine_scope", &[I64, I64, I64], &[I64]),
@@ -504,7 +541,9 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_eval_locals", &[I64, I64], &[I64]),
     ("kn_register_file", &[I64, I64, I64, I64, I64], &[]),
     ("kn_register_debug", &[I64, I64, I64, I64], &[]),
+    ("kn_register_stackmaps", &[I64, I64, I64], &[]),
     ("kn_register_ruby", &[I64, I64], &[]),
+    ("kn_register_load_path", &[I64, I64], &[]),
     ("kn_send_refined", &[I64, I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_send0", &[I64, I64, I64, I64], &[I64]),
     ("kn_send1", &[I64, I64, I64, I64, I64], &[I64]),
@@ -554,6 +593,10 @@ pub struct Options {
     /// Further directories of dependency code that are not load paths (a Rails engine's
     /// `app/` and `config/`): compiled like gem code (see `in_dependency`).
     pub dep_dirs: Vec<PathBuf>,
+    /// Load paths that hold the app's own code (a `-I lib` or `-I spec` inside the Bundler
+    /// project): searched by `require` like the others, but compiled as the app, not as a
+    /// dependency.
+    pub app_load_paths: Vec<PathBuf>,
     /// The Ruby the program is built against, "VERSION PATCHLEVEL RELEASE_DATE" (empty: the
     /// runtime's default, Ruby 3.4). The program reports it (RUBY_VERSION ...) and gets that
     /// version's behavior where 3.4 and 4.0 differ.
@@ -564,6 +607,13 @@ pub struct Options {
     /// Ripper's parsing backend (Kenny's kenny/ripper_prism.rb, which loads Prism): compiled in
     /// only when the program's code names Ripper's parser (see ripper.rs).
     pub ripper_backend: Option<PathBuf>,
+    /// The rest of RubyGems for Kenny's Gem (kenny/gem_rubygems.rb): compiled in only when the
+    /// program's code names one of its classes (see gem_extras.rs).
+    pub gem_extras: Option<PathBuf>,
+    /// The standard library's `rubygems/` directory: its files don't count for `gem_extras`.
+    pub gem_extras_quiet: Option<PathBuf>,
+    /// The `-I` directories (absolute): `$LOAD_PATH` starts with them, as in CRuby.
+    pub runtime_load_path: Vec<PathBuf>,
 }
 
 pub fn compile_file(path: &Path) -> Result<Output, Vec<String>> {
@@ -586,8 +636,13 @@ pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, V
     }
     c.load_paths = opts.load_paths.clone();
     c.ruby = opts.ruby.clone();
+    c.runtime_load_path = opts.runtime_load_path.clone();
     c.ripper_backend = opts.ripper_backend.clone();
-    c.dep_roots = opts.load_paths.iter().chain(opts.dep_dirs.iter()).map(|p| p.canonicalize().unwrap_or(p.clone())).collect();
+    c.gem_extras = opts.gem_extras.clone();
+    let canon = |p: &PathBuf| p.canonicalize().unwrap_or(p.clone());
+    c.gem_extras_quiet = opts.gem_extras_quiet.as_ref().map(canon);
+    let app: Vec<PathBuf> = opts.app_load_paths.iter().map(canon).collect();
+    c.dep_roots = opts.load_paths.iter().map(canon).filter(|p| !app.contains(p)).chain(opts.dep_dirs.iter().map(canon)).collect();
     let top = c.compile_program(src, path);
     c.embed(&opts.embed_dirs);
     for f in &opts.embed_files {
@@ -596,6 +651,11 @@ pub fn compile_with(src: &[u8], path: &Path, opts: &Options) -> Result<Output, V
     if c.ripper_used {
         if let Some(b) = &opts.ripper_backend {
             c.require_file(b.clone(), 0);
+        }
+    }
+    if c.gem_extras_used {
+        if let Some(g) = &opts.gem_extras {
+            c.require_file(g.clone(), 0);
         }
     }
     if !c.errors.is_empty() {
@@ -668,6 +728,7 @@ impl<M: Module> Compiler<M> {
             def_stack: Vec::new(),
             def_cref: HashMap::new(),
             class_getters: HashMap::new(),
+            attr_names: HashSet::new(),
             caches_id,
             syms_id,
             strs_id,
@@ -681,16 +742,21 @@ impl<M: Module> Compiler<M> {
             file: path.to_path_buf(),
             src: src.to_vec(),
             loaded: HashMap::new(),
-            loading: HashSet::new(),
+            loading: HashMap::new(),
+            top_predeclared: None,
             needs_jit: false,
             eval_unit: false,
             file_unit: false,
             src_hashes: HashMap::new(),
             load_paths: Vec::new(),
             ruby: String::new(),
+            runtime_load_path: Vec::new(),
             ripper_backend: None,
             ripper_used: false,
             ripper_quiet: false,
+            gem_extras: None,
+            gem_extras_used: false,
+            gem_extras_quiet: None,
             dep_roots: Vec::new(),
             warnings: Vec::new(),
             refine_scope: None,
@@ -702,11 +768,13 @@ impl<M: Module> Compiler<M> {
             block_parent: None,
             cref_parents: HashMap::new(),
             debug_fns: Vec::new(),
+            stack_maps: Vec::new(),
             def_line_next: 0,
             block_params: Vec::new(),
             line_index: (PathBuf::new(), 0, 0, Vec::new()),
             cov: None,
             uses_coverage: false,
+            callee_used: false,
         })
     }
 }
@@ -752,6 +820,17 @@ impl Compiler<ObjectModule> {
                 let f = self.module.declare_func_in_func(f, b.func);
                 b.ins().call(f, &[p, n]);
             }
+            // the -I directories: $LOAD_PATH's first entries
+            for dir in std::mem::take(&mut self.runtime_load_path) {
+                let d = dir.display().to_string().into_bytes();
+                let off = self.str_offset(&d);
+                let strs = gv(&mut self.module, &mut b, self.strs_id);
+                let p = b.ins().iadd_imm_s(strs, off as i64);
+                let n = b.ins().iconst(I64, d.len() as i64);
+                let f = self.rt_id("kn_register_load_path");
+                let f = self.module.declare_func_in_func(f, b.func);
+                b.ins().call(f, &[p, n]);
+            }
             // file table for runtime `require` / autoload of precompiled files
             let reg_id = self.rt_id("kn_register_file");
             let reg = self.module.declare_func_in_func(reg_id, b.func);
@@ -791,6 +870,8 @@ impl Compiler<ObjectModule> {
                 let n = b.ins().iconst(I64, bp.len() as i64);
                 b.ins().call(reg, &[tp, n, strs_base]);
             }
+            // stack maps (gcmap.rs)
+            self.emit_stack_maps(&mut b)?;
             // backtrace tables: functions (address, size, label, calls) and their call sites
             {
                 let fns_id = self.module.declare_data("__kn_dbg_fns", Linkage::Local, false, false).map_err(e)?;
@@ -1242,7 +1323,8 @@ impl<M: Module> Compiler<M> {
         for (path, (fid, flag)) in &self.loaded {
             let hash = self.src_hashes.get(path).copied().unwrap_or(0);
             let abs = path.display().to_string();
-            keyed.push((0, abs.clone(), abs.trim_end_matches(".rb").to_string(), *fid, *flag, hash));
+            // (the absolute path whole: `$LOADED_FEATURES` lists it; the runtime drops `.rb`)
+            keyed.push((0, abs.clone(), abs.clone(), *fid, *flag, hash));
             for (i, lp) in lps.iter().enumerate() {
                 if let Ok(rel) = path.strip_prefix(lp) {
                     let r = rel.display().to_string();

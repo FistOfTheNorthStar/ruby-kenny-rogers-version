@@ -1,0 +1,41 @@
+[8, {circle: 4, rect: 8}, 8]
+[14, {circle: 4, pent: 3, rect: 11, tri: 3}, 11]
+[8, {circle: 4, rect: 8}, 8]
+["rect:200", "rect:25", "circle:147", "rect:200", "rect:25", "circle:147"]
+[12, {circle: 4, rect: 8}, 8]
+[18, {circle: 4, pent: 3, rect: 11, tri: 3}, 11]
+12
+[:never]
+[12, {circle: 4, rect: 8}, 8]
+[12, {circle: 4, rect: 8}, 8]
+[12, {circle: 4, rect: 8}, 8]
+[13, {circle: 4, odd: 1, rect: 8}, 9]
+[18, {circle: 4, pent: 3, rect: 11, tri: 3}, 11]
+[15, {circle: 4, pent: 3, rect: 11, tri: 3}, 11]
+[12, {circle: 4, pent: 3, rect: 11, tri: 3}, 11]
+[true, true, true, true, true, true, true, true, true, true, true, true, false]
+[:rect, :rect, :circle, :rect, :rect, :circle, :rect, :rect, :circle, :rect, :rect, :circle, :ghost]
+[1, 2, 3]
+[1, 2, 3]
+[1, 2, 3]
+:private
+[1, 2, 3]
+[2, 2, 1]
+:protected
+"divided by 0"
+["181:in 'Calc#ratio'", "189:in 'block in <main>'", "189:in '<main>'"]
+["181:in 'Calc#ratio'", "196:in 'block in <main>'", "196:in '<main>'"]
+[[false, true, false], [true, true, false], [false, true, true]]
+TypeError
+[true, :custom]
+[[1, 2, false, 1], [2, 4, false, 2], [3, 6, false, 3], [4, 8, false, 4], [5, 10, false, 5], [6, 12, false, 6], [7, 14, false, 7], [8, 16, false, 8], [9, 18, false, 9]]
+2012
+[:item, :item, :item, :item]
+2059
+1054
+1054.5
+2056
+2063
+:private
+2056
+["234:in 'Bag#cost'", "240:in 'block in Object#total'", "240:in 'Object#total'"]

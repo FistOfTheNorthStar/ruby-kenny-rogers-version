@@ -113,6 +113,18 @@ pub fn dup(v: V, keep_frozen: bool) -> V {
     };
     hdr(r).klass = real_class(v);
     gen_ivar_copy(v, r);
+    // clone copies the singleton class too (its methods, modules, instance variables and
+    // constants): rspec's DSL matchers are cloned when composed (`include(k => matcher)`)
+    let meta = hdr(v).klass;
+    if keep_frozen && !meta.is_null() && unsafe { (*meta).is_singleton && (*meta).attached == v } {
+        let dm = singleton_class(r);
+        copy_singleton_methods(meta, dm);
+        unsafe {
+            (*dm).civars = (*meta).civars.clone();
+            (*dm).consts = (*meta).consts.clone();
+        }
+        bump_serial();
+    }
     // dup calls initialize_dup, clone initialize_clone; both default to initialize_copy
     // (Kernel's are no-ops: skipped; a native class's own, Random's say, is called)
     let hook = if keep_frozen { "initialize_clone" } else { "initialize_dup" };
@@ -258,6 +270,28 @@ pub fn definee_top() -> Option<*mut Class> {
     // (re-read: making the class may run Ruby code, and the thread may have moved P)
     *pst().definee.last_mut().unwrap() = sc;
     Some(sc)
+}
+
+/// `definee_top`, when that class/module body, `class_eval` or `instance_eval` is the one whose
+/// `self` is `slf`: a block from elsewhere called inside it (a hook run from an
+/// `instance_exec`'d block) defines into its own scope, as CRuby's cref does.
+pub fn definee_for(slf: V) -> Option<*mut Class> {
+    let &c = pst().definee.last()?;
+    let owner = if c as usize & 1 == 1 {
+        (c as usize & !1) as V
+    } else if unsafe { (*c).is_singleton } && !is_heap(slf) {
+        return (class_of(slf) == c).then_some(c);
+    } else if unsafe { (*c).is_singleton } {
+        unsafe { (*c).attached }
+    } else if !is_heap(slf) {
+        return (c as V == slf || class_of(slf) == c).then_some(c);
+    } else {
+        c as V
+    };
+    if owner != slf {
+        return None;
+    }
+    definee_top()
 }
 
 /// instance_eval / instance_exec: `def` inside defines singleton methods of `obj`, but most
@@ -630,6 +664,10 @@ pub fn init() {
         if feature_listed(base) {
             return QFALSE;
         }
+        // a directory the program put on $LOAD_PATH itself
+        if let Some(r) = crate::compat::require_via_load_path(&name) {
+            return r;
+        }
         let le = const_lookup(rt().c.object, sym("LoadError")).unwrap() as *mut Class;
         let e = exc_new(le, &format!("cannot load such file -- {name}"));
         ivar_set(e, sym("@path"), str_from(&name));
@@ -896,7 +934,7 @@ pub fn init() {
                 let p = pst();
                 p.eval_locals = QNIL;
                 p.eval_src = QNIL;
-                eval_string_l(a[0], 0, r, crate::compat::binding_locals(b), a.get(2).copied().unwrap_or(QNIL), a.get(3).copied().unwrap_or(QNIL))
+                crate::backtrace::with_binding_label(b, || eval_string_l(a[0], 0, r, crate::compat::binding_locals(b), a.get(2).copied().unwrap_or(QNIL), a.get(3).copied().unwrap_or(QNIL)))
             }
             None => type_error("wrong argument type (expected binding)"),
         },
@@ -1877,7 +1915,7 @@ fn dup_module(v: V) -> V {
     let k = unsafe { &mut *c };
     for (&id, &m) in src.methods.iter() {
         let mm = unsafe { &*m };
-        if let Body::Compiled(f) = mm.body {
+        if let Body::Compiled(f) | Body::Aliased(f, _) = mm.body {
             crate::abi::share_owner_of(f);
         }
         let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: c, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
@@ -1900,24 +1938,29 @@ fn dup_module(v: V) -> V {
     k.civars = src.civars.clone();
     let meta = src.h.klass;
     if !meta.is_null() && unsafe { (*meta).is_singleton && (*meta).attached == v } {
-        let dm = singleton_class(c as V);
-        let (sm, dk) = unsafe { (&*meta, &mut *dm) };
-        for (&id, &m) in sm.methods.iter() {
-            let mm = unsafe { &*m };
-            if let Body::Compiled(f) = mm.body {
-                crate::abi::share_owner_of(f);
-            }
-            let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: dm, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
-            if dk.methods.insert(id, nm).is_none() {
-                crate::core::method_name_count(id, true);
-            }
-            crate::core::touch_method_name(dm, id);
-        }
-        dk.includes.set(sm.includes.clone());
-        dk.prepends.set(sm.prepends.clone());
+        copy_singleton_methods(meta, singleton_class(c as V));
     }
     bump_serial();
     c as V
+}
+
+/// The methods and modules of singleton class `meta` copied into singleton class `dm`
+/// (`Module#dup`, `clone`).
+fn copy_singleton_methods(meta: *mut Class, dm: *mut Class) {
+    let (sm, dk) = unsafe { (&*meta, &mut *dm) };
+    for (&id, &m) in sm.methods.iter() {
+        let mm = unsafe { &*m };
+        if let Body::Compiled(f) | Body::Aliased(f, _) = mm.body {
+            crate::abi::share_owner_of(f);
+        }
+        let nm = Box::into_raw(Box::new(Method { fast: mm.fast, body: clone_body(&mm.body), owner: dm, name: mm.name, params: mm.params, vis: mm.vis, opt: 0, gc_transparent: mm.gc_transparent, attr_slot: Default::default() }));
+        if dk.methods.insert(id, nm).is_none() {
+            crate::core::method_name_count(id, true);
+        }
+        crate::core::touch_method_name(dm, id);
+    }
+    dk.includes.set(sm.includes.clone());
+    dk.prepends.set(sm.prepends.clone());
 }
 
 pub fn clone_body(b: &Body) -> Body {
@@ -1929,6 +1972,7 @@ pub fn clone_body(b: &Body) -> Body {
         Body::Proc(p) => Body::Proc(*p),
         Body::CFunc(f, a) => Body::CFunc(*f, *a),
         Body::Undefined => Body::Undefined,
+        Body::Aliased(f, n) => Body::Aliased(*f, *n),
     }
 }
 

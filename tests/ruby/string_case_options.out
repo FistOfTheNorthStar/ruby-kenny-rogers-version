@@ -1,0 +1,23 @@
+"gıda"
+"İstanbul"
+"ı"
+"İ"
+"i̇"
+"gida"
+"gıda"
+"Iİ"
+"İstanbul"
+"SS"
+"ǅ"
+"ʼN"
+"ıi"
+"Àb"
+"àB"
+"strasse"
+"σασ"
+"AB"
+[ArgumentError, "invalid option"]
+[ArgumentError, "invalid option"]
+"AB\xFF"
+#<Encoding:BINARY (ASCII-8BIT)>
+"Ab\xFF"

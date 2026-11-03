@@ -158,6 +158,10 @@ pub const FL_STR_ASCII: u32 = 1 << 12;
 /// comment, as in CRuby 3.4 and 4.0): not frozen, but its first change clears the flag and,
 /// with `Warning[:deprecated]` on, warns that literals will be frozen (`unchill`).
 pub const FL_CHILLED: u32 = 1 << 13;
+/// The object has (or had) an entry in `GENERIC_IVARS` (as CRuby's FL_EXIVAR): objects
+/// without it skip that table's lock, which the sweep would otherwise take for every dead
+/// Proc, Range or Float.
+pub const FL_EXIVAR: u32 = 1 << 22;
 
 #[repr(C)]
 pub struct Header {
@@ -536,6 +540,12 @@ unsafe extern "C" fn native_block_tramp(p: *mut RProc, self_: V, argc: u64, argv
     let args = unsafe { args_slice(argc, argv) };
     call_native_block(unsafe { &**(*p).native }, self_, args, blk)
 }
+/// The entry of a native block audited like a `gc_transparent` method (its closure keeps
+/// object references only on the stack): called directly, not through `call_native_block`.
+pub unsafe extern "C" fn native_block_tramp_transparent(p: *mut RProc, self_: V, argc: u64, argv: *const V, blk: V) -> V {
+    let args = unsafe { args_slice(argc, argv) };
+    (unsafe { &**(*p).native })(self_, args, blk)
+}
 
 // Native (Rust) methods and blocks may keep object references where the GC can't see or
 // update them (in Rust collections), so the GC moves objects only when no stack has such a
@@ -823,6 +833,10 @@ pub enum Body {
     /// C extension function and its arity (-1 = argc/argv, 0..15 = fixed).
     CFunc(*const std::ffi::c_void, i32),
     Undefined,
+    /// An alias of a compiled method whose body uses `__callee__` (and that method's name):
+    /// it runs the same function, telling it the name it was called by (`kn_callee`).
+    /// Never called directly by compiled code, so it always goes through `invoke`.
+    Aliased(CompiledFn, u32),
 }
 #[repr(C)]
 pub struct Method {
@@ -1024,6 +1038,12 @@ pub struct PState {
     pub definee: Vec<*mut Class>,
     /// Methods defined with define_method that are running (for `super` inside them).
     pub dm_stack: Vec<*const Method>,
+    /// Evals through a Binding that are running: (stack pointer at the call, the label of
+    /// where the Binding was made), for backtraces (backtrace.rs `relabel_evals`).
+    pub eval_ctx: Vec<(usize, String)>,
+    /// Methods running through an alias that `Body::Aliased` stands for: (the method's own
+    /// name, the alias, the receiver, the stack pointer at the call), innermost last (`kn_callee`).
+    pub callee: Vec<(u32, u32, V, usize)>,
     /// Methods running through `super` from a module that appears more than once in the
     /// receiver's ancestors: (receiver, name, ancestor index it was found at), so a further
     /// `super` goes on from that copy (`find_super_method_at`)
@@ -1129,6 +1149,8 @@ pub fn new_pstate() -> *mut PState {
         stack_limit: 0,
         definee: Vec::new(),
         dm_stack: Vec::new(),
+        eval_ctx: Vec::new(),
+        callee: Vec::new(),
         super_at: Vec::new(),
         current_block: Vec::new(),
         mcache: HashMap::default(),
@@ -1175,6 +1197,10 @@ pub struct KnDirect {
     /// The String class (compiled code runs getbyte/setbyte of plain Strings inline while
     /// `DIRECT_STR_BYTE` is set).
     pub string_class: std::sync::atomic::AtomicUsize,
+    /// Nonzero once Ruby code redefines `require` where a receiverless `require` finds it
+    /// (Kernel, Object, ...: Zeitwerk's and bootsnap's wrappers): compiled `require "x"`
+    /// then calls it as a method instead of running the compiled file itself.
+    pub require_hook: std::sync::atomic::AtomicU64,
 }
 #[unsafe(no_mangle)]
 pub static KN_DIRECT: KnDirect = KnDirect {
@@ -1187,7 +1213,9 @@ pub static KN_DIRECT: KnDirect = KnDirect {
     array_class: std::sync::atomic::AtomicUsize::new(0),
     entry_limit: std::sync::atomic::AtomicUsize::new(0),
     string_class: std::sync::atomic::AtomicUsize::new(0),
+    require_hook: std::sync::atomic::AtomicU64::new(0),
 };
+const _: () = assert!(std::mem::offset_of!(KnDirect, require_hook) == 72);
 const _: () = assert!(std::mem::offset_of!(KnDirect, array_class) == 48 && std::mem::offset_of!(KnDirect, math_module) == 40);
 const _: () = assert!(std::mem::offset_of!(KnDirect, entry_limit) == 56 && std::mem::offset_of!(KnDirect, string_class) == 64);
 /// What compiled code reads of a String (fastpath.rs `STR_*`): the buffer's ptr, len, cap.
@@ -1588,6 +1616,9 @@ pub static EQQ_TOUCHED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// Class `c`'s method table entry of name `mid` changed (see `IS_A_TOUCHED`, `EQQ_TOUCHED`).
 pub fn touch_method_name(c: *mut Class, mid: u32) {
     use std::sync::atomic::Ordering::SeqCst;
+    if mid == require_id() && !c.is_null() {
+        note_require_override(c, c);
+    }
     if !DIRECT_READY.load(SeqCst) {
         return;
     }
@@ -1605,9 +1636,34 @@ pub fn touch_method_name(c: *mut Class, mid: u32) {
         }
     }
 }
+fn require_id() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| sym("require"))
+}
+/// `target` got the methods of `m` (itself, or a module mixed in): if that gives a
+/// receiverless `require` a Ruby definition, compiled `require "x"` calls it from now on
+/// (`KnDirect::require_hook`).
+fn note_require_override(target: *mut Class, m: *mut Class) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if KN_DIRECT.require_hook.load(SeqCst) != 0 || target.is_null() || m.is_null() {
+        return;
+    }
+    let r = rt();
+    let t = unsafe { &*target };
+    let reached = [r.c.kernel, r.c.object, r.c.basic_object, r.c.module, r.c.class].contains(&target) || (t.is_singleton && t.attached == r.main_obj);
+    if !reached {
+        return;
+    }
+    if let Some(&meth) = unsafe { (*m).methods.get(&require_id()) } {
+        if !meth.is_null() && !matches!(unsafe { &(*meth).body }, Body::Native(..) | Body::Undefined) {
+            KN_DIRECT.require_hook.store(1, SeqCst);
+        }
+    }
+}
 /// Module `m` was included in or prepended to `target`: its methods named === count as
 /// defined in `target` (`EQQ_TOUCHED`).
 pub fn touch_mixin(target: *mut Class, m: *mut Class) {
+    note_require_override(target, m);
     if DIRECT_READY.load(std::sync::atomic::Ordering::SeqCst) && !find_method(m, sym("===")).is_null() {
         touch_method_name(target, sym("==="));
     }
@@ -1968,6 +2024,9 @@ fn find_super_method_uncached(klass: *mut Class, owner: *mut Class, mid: u32) ->
 }
 
 pub fn add_method(c: *mut Class, mid: u32, body: Body) -> *const Method {
+    if let Body::Native(f, _, _) = &body {
+        crate::stackmap::note_native(*f as usize, c, mid);
+    }
     let m = Box::into_raw(Box::new(Method { fast: 0, body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: false, attr_slot: Default::default() })) as *const Method;
     if unsafe { (*c).methods.insert(mid, m) }.is_none() {
         method_name_count(mid, true);
@@ -2012,7 +2071,47 @@ pub(crate) fn approx_sp() -> usize {
     &x as *const u8 as usize
 }
 
+/// Arguments are handed to a method or block only from a stack: a callee may run while the
+/// collector moves objects, and reads its arguments whenever it likes, so they must be where
+/// the collector sees them (and pins them). A slice in a Rust heap buffer (the copy of a
+/// splatted array, say) is copied to the caller's frame first (`with_stack_args`).
+#[inline(always)]
+pub fn args_on_stack(args: &[V]) -> bool {
+    // (above this frame: in a caller's; the frame pointer, as a local's address would cost
+    // every caller a stack slot)
+    let p = args.as_ptr() as usize;
+    args.is_empty() || (p >= crate::stackmap::frame_pointer() && p < pst().heap.stack_base)
+}
+/// `f` with a copy of `args` on this frame (a rooted buffer if there are many).
+#[inline(never)]
+pub fn with_stack_args(args: &[V], f: impl FnOnce(&[V]) -> V) -> V {
+    const N: usize = 16;
+    if args.len() <= N {
+        let mut buf = [QNIL; N];
+        buf[..args.len()].copy_from_slice(args);
+        let r = f(&buf[..args.len()]);
+        std::hint::black_box(&buf);
+        r
+    } else {
+        let r = crate::gc::RVec::from(args.to_vec());
+        f(&r)
+    }
+}
+
 pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
+    if !args_on_stack(args) {
+        return invoke_copied(m, recv, args, blk);
+    }
+    invoke_body(m, recv, args, blk)
+}
+#[cold]
+#[inline(never)]
+fn invoke_copied(m: *const Method, recv: V, args: &[V], blk: V) -> V {
+    // (not `invoke` again: many arguments are copied to a rooted, pinning heap buffer)
+    with_stack_args(args, |a| invoke_body(m, recv, a, blk))
+}
+#[inline(always)]
+fn invoke_body(m: *const Method, recv: V, args: &[V], blk: V) -> V {
     if crate::gc::safepoint() {
         return UNDEF;
     }
@@ -2061,6 +2160,34 @@ pub fn invoke(m: *const Method, recv: V, args: &[V], blk: V) -> V {
             r
         }
         Body::Undefined => QNIL,
+        Body::Aliased(f, orig) => {
+            if approx_sp() < pst().stack_limit {
+                return raise(rt().c.system_stack_error, "stack level too deep");
+            }
+            let sp = approx_sp();
+            pst().callee.push((*orig, m.name, recv, sp));
+            let r = unsafe { f(recv, args.len() as u64, args.as_ptr(), blk) };
+            let c = &mut pst().callee;
+            if let Some(i) = c.iter().rposition(|e| e.3 == sp) {
+                c.remove(i);
+            }
+            r
+        }
+    }
+}
+
+/// Compiled methods whose body uses `__callee__` (their aliases are `Body::Aliased`).
+pub static CALLEE_FNS: crate::mt::L<Option<std::collections::HashSet<usize>>> = crate::mt::L::new(None);
+
+/// `__callee__` in a method `def`'d as `name` running on `recv`: the alias it was called by
+/// (`Body::Aliased`), else `name`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_callee(name: V, recv: V) -> V {
+    // (the innermost entry on this stack: a Fiber suspended inside an alias left its own)
+    let Some((lo, hi)) = crate::thread::current_stack() else { return name };
+    match pst().callee.iter().rev().find(|e| e.3 > lo && e.3 < hi) {
+        Some(&(orig, alias, r, _)) if is_sym(name) && orig == sym_id(name) && r == recv => mksym(alias),
+        _ => name,
     }
 }
 
@@ -2149,6 +2276,17 @@ pub fn call_block_with_blk(blk: V, args: &[V], blkarg: V) -> V {
     call_proc_with_self(blk, p.self_, args, blkarg, false)
 }
 pub fn call_proc_with_self(pv: V, self_: V, args: &[V], blk: V, as_method: bool) -> V {
+    if !args_on_stack(args) {
+        return call_proc_copied(pv, self_, args, blk, as_method);
+    }
+    call_proc_body(pv, self_, args, blk, as_method)
+}
+#[cold]
+#[inline(never)]
+fn call_proc_copied(pv: V, self_: V, args: &[V], blk: V, as_method: bool) -> V {
+    with_stack_args(args, |a| call_proc_body(pv, self_, a, blk, as_method))
+}
+fn call_proc_body(pv: V, self_: V, args: &[V], blk: V, as_method: bool) -> V {
     if crate::gc::safepoint() {
         return UNDEF;
     }
@@ -2163,7 +2301,7 @@ pub fn call_proc_with_self(pv: V, self_: V, args: &[V], blk: V, as_method: bool)
         }
     } else if p.autosplat && args.len() == 1 && is_ary(args[0]) {
         let v = rary(args[0]).v.clone();
-        return unsafe { (p.func)(pv as *mut RProc, self_, v.len() as u64, v.as_ptr(), blk) };
+        return with_stack_args(&v, |a| unsafe { (p.func)(pv as *mut RProc, self_, a.len() as u64, a.as_ptr(), blk) });
     }
     unsafe { (p.func)(pv as *mut RProc, self_, args.len() as u64, args.as_ptr(), blk) }
 }
@@ -2279,8 +2417,14 @@ fn gen_slot(v: V) -> Option<&'static GenIv> {
 pub fn gen_ivar_get(v: V, id: u32) -> Option<V> {
     match gen_slot(v) {
         Some(g) => g.map().and_then(|m| m.get(&id).copied()),
+        None if !has_exivar(v) => None,
         None => GENERIC_IVARS.get().as_ref().and_then(|t| t.get(&(v as usize))).and_then(|m| m.get(&id).copied()),
     }
+}
+/// Can `v` have an entry in `GENERIC_IVARS`? (Immediates are looked up as before.)
+#[inline]
+fn has_exivar(v: V) -> bool {
+    !is_heap(v) || hdr(v).flags & FL_EXIVAR != 0
 }
 pub fn gen_ivar_set(v: V, id: u32, val: V) {
     crate::gc::wb_obj(v);
@@ -2291,18 +2435,23 @@ pub fn gen_ivar_set(v: V, id: u32, val: V) {
         }
         None => {
             GENERIC_IVARS.get().get_or_insert_with(HashMap::default).entry(v as usize).or_default().insert_untracked(id, val);
+            if is_heap(v) {
+                hdr(v).flags |= FL_EXIVAR;
+            }
         }
     }
 }
 pub fn gen_ivar_remove(v: V, id: u32) -> Option<V> {
     match gen_slot(v) {
         Some(g) => g.map().and_then(|m| m.remove(&id)),
+        None if !has_exivar(v) => None,
         None => GENERIC_IVARS.get().as_mut().and_then(|t| t.get_mut(&(v as usize))).and_then(|m| m.remove(&id)),
     }
 }
 pub fn gen_ivar_list(v: V) -> Vec<(u32, V)> {
     match gen_slot(v) {
         Some(g) => g.map().map(|m| m.iter().map(|(&k, &v)| (k, v)).collect()).unwrap_or_default(),
+        None if !has_exivar(v) => Vec::new(),
         None => GENERIC_IVARS.get().as_ref().and_then(|t| t.get(&(v as usize))).map(|m| m.iter().map(|(&k, &v)| (k, v)).collect()).unwrap_or_default(),
     }
 }
@@ -2320,6 +2469,7 @@ pub fn gen_ivar_values(v: V, out: &mut Vec<V>) {
                 out.extend(m.values().copied());
             }
         }
+        None if !has_exivar(v) => {}
         None => {
             if let Some(m) = GENERIC_IVARS.raw().as_ref().and_then(|t| t.get(&(v as usize))) {
                 out.extend(m.values().copied());

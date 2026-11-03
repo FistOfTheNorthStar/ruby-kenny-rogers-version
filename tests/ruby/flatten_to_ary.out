@@ -1,0 +1,10 @@
+[1, 2, 3, 4]
+[]
+[1, 2]
+[7, 8]
+1
+[5]
+[5]
+[1, 2, 3]
+nil
+[TypeError, "can't convert Bad to Array (Bad#to_ary gives Integer)"]

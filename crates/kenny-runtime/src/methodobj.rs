@@ -35,7 +35,7 @@ pub fn method_location(m: *const Method) -> V {
     }
     let m = unsafe { &*m };
     match &m.body {
-        Body::Compiled(f) => {
+        Body::Compiled(f) | Body::Aliased(f, _) => {
             let r = code_location(*f as usize);
             if r != QNIL || m.fast == 0 {
                 return r;
@@ -84,6 +84,11 @@ fn wrap(class: *mut Class, recv: V, m: *const Method, name: u32) -> V {
         // keeps the method's class (and so the method and its code) alive: a singleton class
         // is freed once nothing reaches it
         ivar_set(o, sym("@__owner"), unsafe { (*m).owner } as V);
+        // and a define_method body's block: once the method is removed or redefined, only
+        // this object reaches it (rspec-mocks keeps the Method of what it stubs)
+        if let Body::Proc(p) = unsafe { &(*m).body } {
+            ivar_set(o, sym("@__body"), *p);
+        }
         crate::gc::note_method_object(m);
     }
     o
@@ -223,7 +228,7 @@ pub fn arity(m: *const Method) -> i64 {
             let pr = rproc(*p);
             if pr.max < 0 || pr.min != pr.max { -(pr.min as i64) - 1 } else { pr.min as i64 }
         }
-        Body::Compiled(_) => {
+        Body::Compiled(_) | Body::Aliased(..) => {
             if mm.params.is_null() {
                 return -1;
             }
@@ -294,6 +299,8 @@ pub fn method_body(v: V) -> V {
         pr.lambda = true;
         pr.min = if ar < 0 { (-ar - 1) as i32 } else { ar as i32 };
         pr.max = if ar < 0 { -1 } else { ar as i32 };
+        // (audited: the method's object is a root of the proc; the call takes the arguments)
+        pr.func = crate::core::native_block_tramp_transparent;
         return p;
     }
     v
@@ -347,6 +354,8 @@ pub fn init() {
         let p = proc_new_native_rooted(Box::new(move |_, a, b| call(me, a, b)), 0, -1, vec![s]);
         let pr = rproc(p);
         pr.lambda = true;
+        // (audited: `me` is a root of the proc; `call` takes the arguments)
+        pr.func = crate::core::native_block_tramp_transparent;
         let ar = arity(mptr(s));
         pr.min = if ar < 0 { (-ar - 1) as i32 } else { ar as i32 };
         pr.max = if ar < 0 { -1 } else { ar as i32 };

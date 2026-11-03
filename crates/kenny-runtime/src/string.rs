@@ -544,6 +544,8 @@ pub fn sym_to_proc(id: u32) -> V {
     );
     rproc(p).lambda = true;
     rproc(p).autosplat = false;
+    // (audited: `send` with the arguments it was given)
+    rproc(p).func = crate::core::native_block_tramp_transparent;
     SYM_PROCS.get().get_or_insert_with(HashMap::new).insert(id, p);
     p
 }
@@ -816,20 +818,118 @@ pub fn init() {
             });
         };
     }
-    fn capitalize(x: &str) -> String {
-        let mut cs = x.chars();
-        match cs.next() {
-            Some(f) => f.to_uppercase().collect::<String>() + &cs.as_str().to_lowercase(),
-            None => String::new(),
+    // the case-mapping options (`:ascii`, `:turkic`, `:lithuanian`, `:fold`)
+    #[derive(Clone, Copy, PartialEq)]
+    enum CaseOpt {
+        Full,
+        Ascii,
+        Turkic,
+        Fold,
+    }
+    fn case_opt(a: &[V]) -> Result<CaseOpt, V> {
+        let mut o = CaseOpt::Full;
+        for &x in a {
+            if !is_sym(x) {
+                return Err(arg_error("invalid option"));
+            }
+            o = match sym_str(sym_id(x)).as_str() {
+                "ascii" => CaseOpt::Ascii,
+                "turkic" => CaseOpt::Turkic,
+                "fold" => CaseOpt::Fold,
+                "lithuanian" => o,
+                _ => return Err(arg_error("invalid option")),
+            };
+        }
+        Ok(o)
+    }
+    fn lower_c(c: char, o: CaseOpt, out: &mut String) {
+        match (o, c) {
+            (CaseOpt::Ascii, _) => out.push(c.to_ascii_lowercase()),
+            (CaseOpt::Turkic, 'I') => out.push('ı'),
+            (CaseOpt::Turkic, 'İ') => out.push('i'),
+            (CaseOpt::Fold, 'ß' | 'ẞ') => out.push_str("ss"),
+            _ => out.extend(c.to_lowercase()),
         }
     }
-    fn swapcase(x: &str) -> String {
-        x.chars().map(|c| if c.is_uppercase() { c.to_lowercase().collect::<String>() } else { c.to_uppercase().collect() }).collect()
+    fn upper_c(c: char, o: CaseOpt, out: &mut String) {
+        match (o, c) {
+            (CaseOpt::Ascii, _) => out.push(c.to_ascii_uppercase()),
+            (CaseOpt::Turkic, 'i') => out.push('İ'),
+            _ => out.extend(c.to_uppercase()),
+        }
     }
-    map_str!("upcase", "upcase!", |x: &str| x.to_uppercase());
-    map_str!("downcase", "downcase!", |x: &str| x.to_lowercase());
-    map_str!("capitalize", "capitalize!", capitalize);
-    map_str!("swapcase", "swapcase!", swapcase);
+    fn lower(x: &str, o: CaseOpt) -> String {
+        // (per character, as CRuby: no final sigma)
+        let mut out = String::with_capacity(x.len());
+        x.chars().for_each(|c| lower_c(c, o, &mut out));
+        out
+    }
+    fn upper(x: &str, o: CaseOpt) -> String {
+        let mut out = String::with_capacity(x.len());
+        x.chars().for_each(|c| upper_c(c, o, &mut out));
+        out
+    }
+    fn capitalize(x: &str, o: CaseOpt) -> String {
+        let mut cs = x.chars();
+        let mut out = String::with_capacity(x.len());
+        match cs.next() {
+            // titlecase: the Latin digraphs (ǆ -> ǅ); otherwise the upper case
+            Some(f) if o != CaseOpt::Ascii && matches!(f, '\u{1C4}'..='\u{1CC}' | '\u{1F1}'..='\u{1F3}') => {
+                out.push(match f as u32 {
+                    0x1C4..=0x1C6 => '\u{1C5}',
+                    0x1C7..=0x1C9 => '\u{1C8}',
+                    0x1CA..=0x1CC => '\u{1CB}',
+                    _ => '\u{1F2}',
+                })
+            }
+            Some(f) => upper_c(f, o, &mut out),
+            None => return out,
+        }
+        out + &lower(cs.as_str(), o)
+    }
+    fn swapcase(x: &str, o: CaseOpt) -> String {
+        let mut out = String::with_capacity(x.len());
+        for c in x.chars() {
+            if c.is_uppercase() { lower_c(c, o, &mut out) } else { upper_c(c, o, &mut out) }
+        }
+        out
+    }
+    macro_rules! map_case {
+        ($name:expr, $bang:expr, $f:expr) => {
+            defn(c, $name, 0, -1, |s, a, _| {
+                let o = match case_opt(a) {
+                    Ok(o) => o,
+                    Err(e) => return e,
+                };
+                if is_binary(s) {
+                    let r = str_new(from_bytewise(&$f(&bytewise(&rstr(s).b), CaseOpt::Ascii)));
+                    return crate::transcode::like(r, s);
+                }
+                new_str_v($f(&s_of(s), o))
+            });
+            defn(c, $bang, 0, -1, |s, a, _| {
+                let o = match case_opt(a) {
+                    Ok(o) => o,
+                    Err(e) => return e,
+                };
+                let n = if is_binary(s) { from_bytewise(&$f(&bytewise(&rstr(s).b), CaseOpt::Ascii)) } else { $f(&s_of(s), o).into_bytes() };
+                if n == rstr(s).b.as_slice() {
+                    return QNIL;
+                }
+                match mutate(s) {
+                    Ok(bs) => {
+                        bs.set(n);
+                        s
+                    }
+                    Err(e) => e,
+                }
+            });
+        };
+    }
+    map_case!("upcase", "upcase!", upper);
+    map_case!("downcase", "downcase!", lower);
+    map_case!("capitalize", "capitalize!", capitalize);
+    map_case!("swapcase", "swapcase!", swapcase);
     map_str!("reverse", "reverse!", |x: &str| x.chars().rev().collect::<String>());
     // strip(*selectors): whitespace, or in Ruby 4.0 with selectors the characters they select
     // (as String#count's do: "a-z", "^x", several intersect) instead
