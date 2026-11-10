@@ -8,6 +8,7 @@ use crate::core::*;
 use crate::kernel::flush_out;
 use crate::tri;
 use std::ffi::{c_char, CStr};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static AT_EXIT: crate::mt::L<Vec<V>> = crate::mt::L::new(Vec::new());
 
@@ -737,22 +738,35 @@ pub const STATIC_WAYS: usize = 4;
 /// statics.rs `poly_guard`): the receiver's class is added (newest first) when it has the
 /// method whose `Method::fast` is `expect`; a class that has another method is added as
 /// `class | 1`, which compiled code never takes for a class, so it isn't looked up again.
-/// A slot of an older serial starts over. (One OS thread only: the words are written one
-/// by one.)
+/// A slot of an older serial starts over. While several OS threads run Ruby code, see
+/// `static_fill_mt`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_static_fill(slot: *mut [u64; 1 + STATIC_WAYS], recv: V, mid: V, expect: usize) -> V {
-    if !is_heap(recv) || crate::mt::multi() {
+    if !is_heap(recv) {
         return QNIL;
     }
-    let s = unsafe { &mut *slot };
     let k = hdr(recv).klass;
-    let serial = KN_DIRECT.serial.load(std::sync::atomic::Ordering::Acquire);
+    if crate::mt::multi() {
+        unsafe { static_fill_mt(&*(slot as *const [AtomicU64; 1 + STATIC_WAYS]), k, mid, expect) };
+        return QNIL;
+    }
+    // (one OS thread: the words are written one by one)
+    let s = unsafe { &mut *slot };
+    let serial = KN_DIRECT.serial.load(Ordering::Acquire);
     if s[0] != serial {
         *s = [0; 1 + STATIC_WAYS];
         s[0] = serial;
     } else if s[1..].iter().any(|&w| w == k as u64 | 1 || w == k as u64) {
         return QNIL;
     }
+    let word = unsafe { static_word(k, mid, expect) };
+    // newest first: the oldest class drops out
+    s.copy_within(1..STATIC_WAYS, 2);
+    s[1] = word;
+    QNIL
+}
+/// The word for class `k` in a slot filled for `mid` and `expect` (`kn_static_fill`).
+unsafe fn static_word(k: *mut Class, mid: V, expect: usize) -> u64 {
     // top bit: a call with a receiver (only a public method will do); bit 62: `expect` is
     // the address of the method's parameter descriptor (a keyword def), else its fast entry
     let public = expect >> 63 != 0;
@@ -761,11 +775,100 @@ pub unsafe extern "C" fn kn_static_fill(slot: *mut [u64; 1 + STATIC_WAYS], recv:
     let m = find_method(k, sym_id(mid));
     let have = if m.is_null() { 0 } else if by_params { unsafe { (*m).params as usize } } else { unsafe { (*m).fast } };
     let same = have != 0 && have == expect;
-    let word = if same && (!public || unsafe { (*m).vis } == VIS_PUBLIC) { k as u64 } else { k as u64 | 1 };
-    // newest first: the oldest class drops out
-    s.copy_within(1..STATIC_WAYS, 2);
-    s[1] = word;
-    QNIL
+    if same && (!public || unsafe { (*m).vis } == VIS_PUBLIC) { k as u64 } else { k as u64 | 1 }
+}
+
+// ---------- guard slots filled while several OS threads run Ruby code ----------
+//
+// Compiled code reads a slot's words with plain loads, in no set order, while other threads
+// may be writing them. It must never find a class next to a serial the class wasn't checked
+// under. So while several threads run:
+// * a slot of the current serial only gains classes, into free ways (nothing moves: every
+//   class word compiled code can read was checked under that serial);
+// * an empty slot gets its class word first, then the serial (a reader that sees the serial
+//   but not yet the class sees no class);
+// * a slot of an older serial is cleared and its serial word set to `SLOT_CLEARED` | the
+//   count of stops (gc.rs `stops`). Another thread may have read an old class word before
+//   the clear and the serial after a refill (loads may pass each other), so the slot is only
+//   filled again once every thread has stopped since: then it is an empty slot.
+// A full slot stays full (no churn on a cache line every core reads). Fillers take MT_FILL
+// in turn, so two never mix their words; one that finds it taken skips (a fill only speeds
+// things up). Method tables change before the serial is bumped (core.rs `add_method`), and
+// fills load the serial before they look at the tables, so a fill that saw the new serial
+// sees the new tables.
+static MT_FILL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const SLOT_CLEARED: u64 = 1 << 63;
+
+#[derive(Clone, Copy, PartialEq)]
+enum MtSlot {
+    /// filled under the current serial
+    Current,
+    /// never filled, or cleared and every thread stopped since
+    Empty,
+    /// filled under an older serial
+    Stale,
+    /// cleared, waiting for every thread to stop
+    Wait,
+}
+fn mt_slot(w: u64, serial: u64) -> MtSlot {
+    if w == serial {
+        MtSlot::Current
+    } else if w == 0 {
+        MtSlot::Empty
+    } else if w & SLOT_CLEARED == 0 {
+        MtSlot::Stale
+    } else if crate::gc::stops() > w & !SLOT_CLEARED {
+        MtSlot::Empty
+    } else {
+        MtSlot::Wait
+    }
+}
+/// Whether `kn_static_fill` may add class `k` to a slot of the current serial: neither it
+/// nor its tagged word is there, and a way is free.
+fn mt_room(s: &[AtomicU64; 1 + STATIC_WAYS], k: *mut Class) -> bool {
+    let ws = s[1..].iter().map(|w| w.load(Ordering::Relaxed));
+    let mut free = false;
+    for w in ws {
+        if w == k as u64 || w == k as u64 | 1 {
+            return false;
+        }
+        free |= w == 0;
+    }
+    free
+}
+/// `kn_static_fill` while several OS threads run Ruby code (see above).
+unsafe fn static_fill_mt(s: &[AtomicU64; 1 + STATIC_WAYS], k: *mut Class, mid: V, expect: usize) {
+    // (first without the lock: a site that misses often mostly has nothing to do)
+    let serial = KN_DIRECT.serial.load(Ordering::Acquire);
+    match mt_slot(s[0].load(Ordering::Relaxed), serial) {
+        MtSlot::Wait => return,
+        MtSlot::Current if !mt_room(s, k) => return,
+        _ => {}
+    }
+    let Ok(_g) = MT_FILL.try_lock() else { return };
+    let serial = KN_DIRECT.serial.load(Ordering::Acquire);
+    match mt_slot(s[0].load(Ordering::Relaxed), serial) {
+        MtSlot::Current => {
+            if mt_room(s, k) {
+                let word = unsafe { static_word(k, mid, expect) };
+                if let Some(w) = s[1..].iter().find(|w| w.load(Ordering::Relaxed) == 0) {
+                    w.store(word, Ordering::Relaxed);
+                }
+            }
+        }
+        MtSlot::Empty => {
+            let word = unsafe { static_word(k, mid, expect) };
+            s[1].store(word, Ordering::Relaxed);
+            s[0].store(serial, Ordering::Release);
+        }
+        MtSlot::Stale => {
+            for w in &s[1..] {
+                w.store(0, Ordering::Relaxed);
+            }
+            s[0].store(SLOT_CLEARED | crate::gc::stops(), Ordering::Release);
+        }
+        MtSlot::Wait => {}
+    }
 }
 /// On entry to a compiled method that calls itself (kenny-compiler statics.rs
 /// `entry_check`): the stack below `KN_DIRECT.entry_limit` or a collection pending.
@@ -829,37 +932,71 @@ pub fn cfold_invalidate(id: u32) {
 }
 /// For an inlined `C.new` (kenny-compiler statics.rs `inline_new`): fill `slot` with
 /// [C, method serial] if C makes plain objects, its `new` is the builtin Class#new and its
-/// `initialize` has the fast entry `expect`.
+/// `initialize` has the fast entry `expect`. (While several OS threads run Ruby code:
+/// `new_fill_mt`.)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_new_fill(slot: *mut [u64; 2], cls: V, expect: usize) -> V {
-    if !is_class(cls) || crate::mt::multi() {
+    if !is_class(cls) {
         return QNIL;
     }
+    if crate::mt::multi() {
+        let serial = KN_DIRECT.serial.load(Ordering::Acquire);
+        unsafe { new_fill_mt(&*(slot as *const [AtomicU64; 2]), cls, expect, serial) };
+        return QNIL;
+    }
+    if !new_ok(cls, expect) {
+        return QNIL;
+    }
+    unsafe {
+        (*slot)[0] = cls as u64;
+        (*slot)[1] = KN_DIRECT.serial.load(Ordering::Acquire);
+    }
+    QNIL
+}
+/// Whether class `cls` makes plain objects with the builtin `new`, its `initialize` having
+/// the fast entry `expect` (`kn_new_fill`).
+fn new_ok(cls: V, expect: usize) -> bool {
     let k = cls as *mut Class;
     if unsafe { (*k).is_module || !matches!((*k).alloc, Kind::Object) } || crate::capi::alloc_func(k).is_some() {
-        return QNIL;
+        return false;
     }
     static IDS: std::sync::OnceLock<[u32; 2]> = std::sync::OnceLock::new();
     let [new_id, init_id] = *IDS.get_or_init(|| [sym("new"), sym("initialize")]);
     let nm = find_method(hdr(cls).klass, new_id);
     let im = find_method(k, init_id);
-    if nm.is_null() || unsafe { (*nm).opt } != crate::opt::OPT_CLASS_NEW || im.is_null() || unsafe { (*im).fast } != expect {
-        return QNIL;
+    !(nm.is_null() || unsafe { (*nm).opt } != crate::opt::OPT_CLASS_NEW || im.is_null() || unsafe { (*im).fast } != expect)
+}
+/// `kn_new_fill` while several OS threads run Ruby code, with the serial loaded before any
+/// method was looked at (see `static_fill_mt`; the slot's serial word is its second). A slot
+/// filled for one class keeps it.
+unsafe fn new_fill_mt(s: &[AtomicU64; 2], cls: V, expect: usize, serial: u64) {
+    let st = mt_slot(s[1].load(Ordering::Relaxed), serial);
+    if st == MtSlot::Current || st == MtSlot::Wait || (st == MtSlot::Empty && !new_ok(cls, expect)) {
+        return;
     }
-    unsafe {
-        (*slot)[0] = cls as u64;
-        (*slot)[1] = KN_DIRECT.serial.load(std::sync::atomic::Ordering::Acquire);
+    let Ok(_g) = MT_FILL.try_lock() else { return };
+    match mt_slot(s[1].load(Ordering::Relaxed), serial) {
+        MtSlot::Empty => {
+            s[0].store(cls as u64, Ordering::Relaxed);
+            s[1].store(serial, Ordering::Release);
+        }
+        MtSlot::Stale => {
+            s[0].store(0, Ordering::Relaxed);
+            s[1].store(SLOT_CLEARED | crate::gc::stops(), Ordering::Release);
+        }
+        MtSlot::Current | MtSlot::Wait => {}
     }
-    QNIL
 }
 /// For a virtual object (kenny-compiler vobj.rs): `kn_new_fill`, when also each getter in
 /// `desc` (`n` pairs [name, expect]) is a public method of `cls` that is the attr_reader of
 /// the instance variable `expect` (a Symbol) or has the fast entry `expect`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_vobj_fill(slot: *mut [u64; 2], cls: V, expect: usize, desc: *const V, n: u64) -> V {
-    if !is_class(cls) || crate::mt::multi() {
+    if !is_class(cls) {
         return QNIL;
     }
+    // (loaded before the getters are looked at: see `static_fill_mt`)
+    let serial = KN_DIRECT.serial.load(Ordering::Acquire);
     let k = cls as *mut Class;
     for i in 0..n as usize {
         let (name, e) = unsafe { (*desc.add(2 * i), *desc.add(2 * i + 1)) };
@@ -875,6 +1012,10 @@ pub unsafe extern "C" fn kn_vobj_fill(slot: *mut [u64; 2], cls: V, expect: usize
         if !ok {
             return QNIL;
         }
+    }
+    if crate::mt::multi() {
+        unsafe { new_fill_mt(&*(slot as *const [AtomicU64; 2]), cls, expect, serial) };
+        return QNIL;
     }
     unsafe { kn_new_fill(slot, cls, expect) }
 }

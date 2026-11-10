@@ -205,8 +205,10 @@ dependencies. Every file in those directories is compiled into the binary.
   call reaches that very `def` under the current method serial. In a loop, a call to a method the
   program defines in two or three classes inlines each body behind its own guard. Redefining a
   method, a singleton method, `include`/`prepend`, a visibility change or `method_missing` changes
-  the serial or misses the guard, and the call is made normally. Backtraces still show the inlined
-  method's frame (its calls record an inline location).
+  the serial or misses the guard, and the call is made normally. Slots fill while several threads
+  run Ruby code too: classes go into free ways, and a slot a method definition made stale is
+  cleared, then filled again once every thread has stopped (at the next collection). Backtraces
+  still show the inlined method's frame (its calls record an inline location).
 - **Blocks of `times`, `upto`, `downto`, `each`, `each_with_index`, `map`, `select`, `reject`, `any?`, `all?`** (on
   Integers, Arrays and Integer Ranges) are compiled as loops in the caller when the block is small and doesn't need
   its own frame (`return`, nested blocks, ...). A guard checks at runtime that the method is the builtin one;
@@ -547,8 +549,10 @@ An uncaught exception and a failed request always print the full backtrace.
 
 ## Roadmap
 
-1. Guard slots of inlined and static calls that fill while several OS threads run Ruby code
-   (today they fill only while one does, so code first reached under load takes the normal call)
+1. Direct calls while several OS threads run Ruby code: compiled code checks the stack against
+   one global limit, so then every compiled-to-compiled call (inline-cache direct calls, static
+   calls) goes through the runtime. A per-thread limit compiled code can reach cheaply would keep
+   them direct (inlined bodies, inlined `C.new` and virtual objects already stay on their fast path)
 2. Compaction under load, the rest: audit (or root) the remaining native methods that call
    back into Ruby (`Range#to_a`, `Struct.new`, `sort_by!`, Enumerator, Digest, Fiber...), and
    frame-pointer builds on Linux so its servers get precise frames too

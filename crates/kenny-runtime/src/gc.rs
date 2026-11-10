@@ -963,6 +963,13 @@ fn lock_ps() -> std::sync::MutexGuard<'static, Vec<usize>> {
     g
 }
 static STW_EPOCH: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+/// How many times every other OS thread running Ruby code has stopped: a point after which
+/// none of them still holds a value it read before (abi.rs `kn_static_fill` waits for one
+/// before refilling a slot it cleared). Counted while they are stopped.
+static STOPS: AtomicU64 = AtomicU64::new(0);
+pub fn stops() -> u64 {
+    STOPS.load(Ordering::SeqCst)
+}
 static STW_CV: std::sync::Condvar = std::sync::Condvar::new();
 
 /// At a safepoint with a collection due: become the collector (stop every other thread,
@@ -994,6 +1001,7 @@ fn stop_the_world_collect() {
         }
     }
     STOP_NANOS.fetch_add(t_stop.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    STOPS.fetch_add(1, Ordering::SeqCst);
     if KN_GC_PENDING.load(Ordering::Relaxed) & 1 != 0 {
         GC_TOP.store(approx_sp_here(), Ordering::Relaxed);
         collect_locked();
