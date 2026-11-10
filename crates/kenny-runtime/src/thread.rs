@@ -2418,6 +2418,10 @@ pub fn init() {
         gc_transparent(c, &["pop", "shift", "deq", "push", "<<", "enq", "close"]);
     }
     gc_transparent(mon, &["synchronize", "mon_synchronize", "enter", "exit", "mon_enter", "mon_exit"]);
+    // (they reach Ruby through Thread.current, or wait on the symbol table's lock)
+    if let Some(fb) = const_lookup(rt().c.object, sym("Fiber")) {
+        gc_transparent(singleton_class(fb), &["current", "[]", "[]="]);
+    }
 }
 
 /// Enumerator#next / peek via a Fiber (works for infinite enumerators).

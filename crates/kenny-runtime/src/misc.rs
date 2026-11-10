@@ -89,6 +89,8 @@ pub fn each_to_vec(v: V) -> Result<Vec<V>, V> {
         -1,
     );
     rproc(nb).autosplat = false; // a yielded [x] must stay an array
+    // (audited: what it collects is in an RVec)
+    rproc(nb).func = crate::core::native_block_tramp_transparent;
     let r = send(v, sym("each"), &[], nb);
     if r == UNDEF {
         return Err(UNDEF);
@@ -107,6 +109,18 @@ pub fn each_until(v: V, mut f: impl FnMut(V) -> Result<bool, V> + 'static) -> Re
 /// Iterate `each` with the values of each yield as given (several for `yield a, b`),
 /// stopping early when `f` returns Ok(true).
 pub fn each_args_until(v: V, f: impl FnMut(&[V]) -> Result<bool, V> + 'static) -> Result<(), V> {
+    each_args_until_in(v, f, false)
+}
+/// `each_until` for a closure audited to keep Ruby values only in Procs (which never move)
+/// or in RVecs (which pin): its block doesn't keep a collection from moving objects.
+pub fn each_until_audited(v: V, mut f: impl FnMut(V) -> Result<bool, V> + 'static) -> Result<(), V> {
+    each_args_until_in(v, move |a| f(yielded(a)), true)
+}
+/// `each_args_until` for a closure audited like `each_until_audited`'s.
+pub fn each_args_until_audited(v: V, f: impl FnMut(&[V]) -> Result<bool, V> + 'static) -> Result<(), V> {
+    each_args_until_in(v, f, true)
+}
+fn each_args_until_in(v: V, f: impl FnMut(&[V]) -> Result<bool, V> + 'static, audited: bool) -> Result<(), V> {
     let tag = STOP_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let f = Rc::new(RefCell::new(f));
     let nb = proc_new_native(
@@ -122,6 +136,9 @@ pub fn each_args_until(v: V, f: impl FnMut(&[V]) -> Result<bool, V> + 'static) -
         -1,
     );
     rproc(nb).autosplat = false; // a yielded [x] must stay an array
+    if audited {
+        rproc(nb).func = crate::core::native_block_tramp_transparent;
+    }
     let r = send(v, sym("each"), &[], nb);
     if r == UNDEF {
         if let Throw::Break { tag: t, .. } = pst().pending {
@@ -1027,7 +1044,9 @@ pub fn init() {
         Ok(v) => ary_new(v),
         Err(e) => e,
     });
+    gc_transparent(en, &["to_a"]);
     defn(en, "each_entry", 0, 0, |s, _, b| send(s, sym("each"), &[], b));
+    gc_transparent(en, &["each_entry"]);
     defn(en, "each_with_index", 0, 0, |s, _, b| {
         if !is_proc(b) {
             return enum_for(s, "each_with_index", &[]);
@@ -1161,7 +1180,9 @@ pub fn init() {
         let found = Rc::new(Cell::new(false));
         let f2 = found.clone();
         let pat = a.first().copied();
-        match each_until(s, move |x| {
+        // (the closure's copy of the pattern: pinned while `each` runs)
+        let _keep = RVec::from(pat.into_iter().collect());
+        match each_until_audited(s, move |x| {
             let r = match pat {
                 Some(p) => send1(p, "===", x),
                 None if is_proc(b) => call_block(b, &[x]),
@@ -1179,6 +1200,7 @@ pub fn init() {
             Err(e) => e,
         }
     });
+    gc_transparent(en, &["any?"]);
 
     // ---- Enumerator ----
     let er = c.enumerator;
@@ -1194,8 +1216,12 @@ pub fn init() {
             return call_block(generator, &[y]);
         }
         let (recv, m, args) = enum_parts(s);
+        // (the callee may read its arguments after calling Ruby: pinned)
+        let args = RVec::from(args);
         send(recv, m, &args, b)
     });
+    // (audited: the yielder and the arguments are on the stack or pinned)
+    gc_transparent(er, &["each"]);
     fn with_index(s: V, off: i64, b: V) -> V {
         let (recv, m, args) = enum_parts(s);
         if !is_proc(b) {
@@ -2030,7 +2056,7 @@ fn init_enum_streaming(en: *mut Class) {
     fn collect(s: V, mut f: impl FnMut(&[V], &mut RVec) -> Result<(), V> + 'static) -> V {
         let acc = Rc::new(RefCell::new(RVec::new()));
         let a2 = acc.clone();
-        match each_args_until(s, move |a| f(a, &mut a2.borrow_mut()).map(|_| false)) {
+        match each_args_until_audited(s, move |a| f(a, &mut a2.borrow_mut()).map(|_| false)) {
             Ok(()) => {
                 let v = acc.borrow_mut().take();
                 ary_new(v)
@@ -2057,6 +2083,9 @@ fn init_enum_streaming(en: *mut Class) {
                 0,
                 -1,
             );
+            // (audited, every `f` below: blocks are Procs, which never move, and the values
+            // they collect are in RVecs, which pin)
+            rproc(p).func = crate::core::native_block_tramp_transparent;
             add_method(en, id, Body::Proc(p));
         }
     }
@@ -2103,7 +2132,7 @@ fn init_enum_streaming(en: *mut Class) {
     streamed(en, &["each_with_object"], 1, 1, |s, a, b| {
         let memo = RVec::from(vec![a[0]]);
         let m = memo[0];
-        match each_args_until(s, move |x| {
+        match each_args_until_audited(s, move |x| {
             call!(b, &[yielded(x), m]);
             Ok(false)
         }) {
@@ -2115,7 +2144,7 @@ fn init_enum_streaming(en: *mut Class) {
     streamed(en, &["inject", "reduce"], 0, 1, |s, a, b| {
         let acc = Rc::new(RefCell::new(RVec::from(a.to_vec())));
         let a2 = acc.clone();
-        let r = each_args_until(s, move |x| {
+        let r = each_args_until_audited(s, move |x| {
             let v = yielded(x);
             let cur = a2.borrow().first().copied();
             let next = match cur {
@@ -2134,7 +2163,7 @@ fn init_enum_streaming(en: *mut Class) {
     streamed(en, &["count"], 0, 0, |s, _, b| {
         let n = Rc::new(Cell::new(0i64));
         let n2 = n.clone();
-        match each_args_until(s, move |a| {
+        match each_args_until_audited(s, move |a| {
             if truthy(call!(b, a)) {
                 n2.set(n2.get() + 1);
             }
@@ -2162,7 +2191,7 @@ fn init_enum_streaming(en: *mut Class) {
     streamed(en, &["group_by"], 0, 0, |s, _, b| {
         let h = RVec::from(vec![hash_new()]);
         let hv = h[0];
-        match each_args_until(s, move |a| {
+        match each_args_until_audited(s, move |a| {
             let k = call!(b, a);
             let cur = rhash(hv).m.get(&HKey(k)).copied();
             match cur {
@@ -2180,7 +2209,7 @@ fn init_enum_streaming(en: *mut Class) {
     streamed(en, &["partition"], 0, 0, |s, _, b| {
         let both = RVec::from(vec![ary_new(vec![]), ary_new(vec![])]);
         let (yes, no) = (both[0], both[1]);
-        match each_args_until(s, move |a| {
+        match each_args_until_audited(s, move |a| {
             let r = call!(b, a);
             rary(if truthy(r) { yes } else { no }).v.push(yielded(a));
             Ok(false)
@@ -2219,9 +2248,11 @@ fn init_enum_streaming(en: *mut Class) {
     // all? / none? stop at the first element that decides them (a pattern argument uses ===)
     fn pred(s: V, a: &[V], b: V, stop_on: bool) -> V {
         let pat = a.first().copied();
+        // (the closure's copy of the pattern: pinned while `each` runs)
+        let _keep = RVec::from(pat.into_iter().collect());
         let stopped = Rc::new(Cell::new(false));
         let st = stopped.clone();
-        let r = each_args_until(s, move |x| {
+        let r = each_args_until_audited(s, move |x| {
             let t = match pat {
                 Some(p) => send(p, sym("==="), &[yielded(x)], QNIL),
                 None if is_proc(b) => call_block(b, x),
@@ -2243,6 +2274,7 @@ fn init_enum_streaming(en: *mut Class) {
     }
     defn(en, "all?", 0, 1, |s, a, b| pred(s, a, b, false));
     defn(en, "none?", 0, 1, |s, a, b| pred(s, a, b, true));
+    gc_transparent(en, &["all?", "none?"]);
     streamed(en, &["each_slice"], 1, 1, |s, a, b| {
         let n = if is_fix(a[0]) { fix(a[0]) } else { 0 };
         if n <= 0 {
@@ -2250,7 +2282,7 @@ fn init_enum_streaming(en: *mut Class) {
         }
         let buf = Rc::new(RefCell::new(RVec::new()));
         let b2 = buf.clone();
-        let r = each_args_until(s, move |x| {
+        let r = each_args_until_audited(s, move |x| {
             let full = {
                 let mut bb = b2.borrow_mut();
                 bb.push(yielded(x));
@@ -2276,7 +2308,7 @@ fn init_enum_streaming(en: *mut Class) {
             return arg_error("invalid size");
         }
         let buf = Rc::new(RefCell::new(RVec::new()));
-        let r = each_args_until(s, move |x| {
+        let r = each_args_until_audited(s, move |x| {
             let win = {
                 let mut bb = buf.borrow_mut();
                 bb.push(yielded(x));

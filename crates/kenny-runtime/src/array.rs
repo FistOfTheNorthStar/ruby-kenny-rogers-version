@@ -1410,6 +1410,7 @@ pub fn init() {
     defn(c, "chunk_while", 0, 0, |s, _, b| chunk_impl(s, b, false));
     defn(c, "slice_when", 0, 0, |s, _, b| chunk_impl(s, b, true));
     defn(c, "each_entry", 0, 0, |s, _, b| send(s, sym("each"), &[], b));
+    gc_transparent(c, &["each_entry"]);
     defn(c, "cycle", 0, 1, |s, a, b| {
         if !is_proc(b) {
             return crate::misc::enum_for(s, "cycle", a);

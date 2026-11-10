@@ -616,7 +616,8 @@ pub fn init() {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let mut args = vec![s];
+        // (rooted: `send` may stop for a collection before Regexp#match? reads them)
+        let mut args = crate::gc::RVec::from(vec![s]);
         args.extend(a.get(1).copied());
         send(re, sym("match?"), &args, QNIL)
     });

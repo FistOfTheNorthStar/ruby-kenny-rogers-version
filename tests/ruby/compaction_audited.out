@@ -1,0 +1,30 @@
+Array#include?: true [false, "apple!"]
+Array#delete: true ["fig?", "none", 6, "grape?"]
+Array#find: true "cherry!"
+Array#inject: true "apple!bcdefg"
+Array#sort_by!: true ["banana!", "cherry!", "apple!", "elder!", "grape!", "date!", "fig!"]
+Array#map!: true ["APPLE!", "BANANA!", "CHERRY!", "DATE!", "ELDER!", "FIG!", "GRAPE!"]
+Array#select!: true ["apple!", "banana!", "cherry!", "elder!", "grape!"]
+Array#reject: true ["banana!", "fig!"]
+Array#filter_map: true ["date!date!"]
+Array#any? (pattern): true [true, true]
+Hash#[] (default proc): true ["abab", "abab", 1]
+Hash#==: true [true]
+Hash#transform_keys: true {"k1!" => 1, "k2!" => 2}
+Hash#select: true {"b" => "yy"}
+Range#each: true "aaabacad"
+Range#to_a: true [1, 2, 3]
+Kernel#Array: true ["to_a"]
+BasicObject#!=: true [false, true]
+Exception#message: true "mmm"
+String#match: true "ll!"
+Enumerable#to_a: true ["p!", "q!"]
+String#tr!: true "heLLo"
+Struct.new: true "xy"
+Enumerable#map: true ["apple-banana", "cherry-date", "elder-fig", "grape"]
+Enumerable#group_by: true {5 => ["apple", "elder", "grape"], 6 => ["banana", "cherry"], 4 => ["date"], 3 => ["fig"]}
+Enumerable#each_with_object: true ["ap", "ba", "ch", "da", "el", "fi", "gr"]
+Enumerable#sort_by: true ["banana", "apple", "grape", "date", "fig", "elder", "cherry"]
+Enumerable#any? (pattern): true true
+Fiber[]: true "vvFiber"
+Digest#hexdigest: true "ba7816bf8f01cfea"

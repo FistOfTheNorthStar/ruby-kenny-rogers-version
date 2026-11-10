@@ -262,6 +262,30 @@ pub fn audited_natives() {
     if let Some(m) = named("Method") {
         gc_transparent(m, &["call", "()", "[]", "==="]);
     }
+    // the next ones that blocked most collections (blog8 under load): they iterate rooted
+    // snapshots (`Rooted`, `RVec`) or re-read through their receiver after each call, and
+    // keep everything else in locals
+    gc_transparent(
+        c.array,
+        &[
+            "include?", "delete", "find", "detect", "inject", "reduce", "sort_by", "sort_by!", "map!", "collect!", "select", "filter", "find_all", "reject", "select!", "filter!",
+            "reject!", "keep_if", "delete_if", "filter_map", "any?", "all?", "none?", "one?",
+        ],
+    );
+    gc_transparent(c.hash, &["[]", "==", "eql?", "transform_keys", "transform_keys!", "select", "filter", "reject"]);
+    gc_transparent(c.range, &["each", "to_a"]);
+    gc_transparent(c.kernel, &["Array"]);
+    gc_transparent(c.basic_object, &["!="]);
+    gc_transparent(c.exception, &["message"]);
+    // (String's bang methods that call the plain method and copy its bytes back)
+    if let Some(re) = named("Regexp") {
+        gc_transparent(re, &["match"]);
+    }
+    gc_transparent(c.string, &["match", "match?", "delete!", "delete_prefix!", "delete_suffix!", "tr!", "tr_s!", "scrub!", "unicode_normalize!", "succ!", "next!"]);
+    gc_transparent(crate::core::singleton_class(c.struct_ as crate::core::V), &["new"]);
+    if let Some(mon) = named("Monitor") {
+        gc_transparent(mon, &["mon_check_owner"]);
+    }
 }
 
 

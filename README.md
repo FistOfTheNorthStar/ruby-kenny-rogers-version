@@ -450,8 +450,8 @@ CRuby's, and `Ripper#state`/`#token` are nil.
   here).
 - Compacting while requests run is partial: a major collection moves objects only when no
   thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
-  them). In the blog example under load that is about 4 in 10 majors (none before precise
-  stack maps); the rest skip compaction. Precise frames need frame pointers on every frame,
+  them). In the blog example under load that is about 85 in 100 majors (none before precise
+  stack maps); the rest skip compaction (a thread writing to IO, mostly). Precise frames need frame pointers on every frame,
   which Apple platforms guarantee; elsewhere (`KENNY_GC_PRECISE=1` turns it on) stacks are
   still scanned word by word for native frames, which rarely lets a busy server compact.
 - Memory: serving on 12 cores takes about 1.7x the memory of one (each core has its own
@@ -553,7 +553,7 @@ An uncaught exception and a failed request always print the full backtrace.
    one global limit, so then every compiled-to-compiled call (inline-cache direct calls, static
    calls) goes through the runtime. A per-thread limit compiled code can reach cheaply would keep
    them direct (inlined bodies, inlined `C.new` and virtual objects already stay on their fast path)
-2. Compaction under load, the rest: audit (or root) the remaining native methods that call
-   back into Ruby (`Range#to_a`, `Struct.new`, `sort_by!`, Enumerator, Digest, Fiber...), and
-   frame-pointer builds on Linux so its servers get precise frames too
+2. Compaction under load, the rest: `IO#write` (pin the string it writes while it blocks, then
+   audit it) and the long tail of other natives, and frame-pointer builds on Linux so its
+   servers get precise frames too
 3. Measure and tune memory and allocator choice on Linux
