@@ -257,6 +257,10 @@ pub fn init_stats() {
 /// and the native backtrace of the crashing thread.
 fn install_crash_trace() {
     extern "C" fn on_crash(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut std::ffi::c_void) {
+        // (a field on Apple platforms, a method in Linux's libc)
+        #[cfg(target_os = "linux")]
+        let addr = unsafe { (*info).si_addr() } as usize;
+        #[cfg(not(target_os = "linux"))]
         let addr = unsafe { (*info).si_addr } as usize;
         let name = std::thread::current().name().map(|s| s.to_string()).unwrap_or_default();
         eprintln!("\n*** signal {sig} at address {addr:#x} on thread {name:?}\n{}", std::backtrace::Backtrace::force_capture());
@@ -1324,8 +1328,8 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
 
 #[inline(always)]
 fn approx_sp_here() -> usize {
-    let x = 0u8;
-    std::hint::black_box(&x) as *const u8 as usize
+    // (below every frame record and local of the callers: see stackmap.rs `stack_pointer`)
+    crate::stackmap::stack_pointer()
 }
 
 /// Save the callee-saved registers (they may hold the only reference to an object).

@@ -117,14 +117,15 @@ fn lookup(fns: &[MapFn], ret: usize) -> Option<(usize, usize, &'static [u32])> {
     None
 }
 
-/// Precise scanning of compiled frames: on where frame pointers are always kept (Apple
-/// platforms); KENNY_GC_PRECISE=0 / =1 overrides.
+/// Precise scanning of compiled frames: where frame pointers are always kept (Apple
+/// platforms, and a runtime built with them: Linux, by .cargo/config.toml); KENNY_GC_PRECISE=0
+/// / =1 overrides.
 pub fn precise_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("KENNY_GC_PRECISE").as_deref() {
         Ok("0") => false,
         Ok("1") => true,
-        _ => cfg!(target_vendor = "apple"),
+        _ => cfg!(any(target_vendor = "apple", kenny_frame_pointers)),
     })
 }
 
@@ -192,6 +193,28 @@ pub fn frame_pointer() -> usize {
         fp = 0;
     }
     fp
+}
+
+/// The stack pointer of the calling function. (Not the address of a local: on Linux a
+/// frame's locals can sit above its frame record, so that address can be above the frame
+/// pointer, which would end a walk from it at once.)
+#[inline(always)]
+pub fn stack_pointer() -> usize {
+    let sp: usize;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let x = 0u8;
+        sp = std::hint::black_box(&x) as *const u8 as usize;
+    }
+    sp
 }
 
 /// Index of the frame pointer in `PHeap::regs` (see gc::spill_registers).

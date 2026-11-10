@@ -338,7 +338,7 @@ pub fn static_roots(out: &mut Vec<V>) {
 /// (lowest, highest) address of the stack Ruby code is running on (for backtraces).
 pub fn current_stack() -> Option<(usize, usize)> {
     let hi = pst().heap.stack_base;
-    if hi == 0 { None } else { Some((approx_sp(), hi)) }
+    if hi == 0 { None } else { Some((crate::stackmap::stack_pointer(), hi)) }
 }
 
 fn new_ctx(s: &mut Sched, base: usize, limit: usize) -> usize {

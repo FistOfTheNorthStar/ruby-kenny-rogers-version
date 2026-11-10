@@ -522,7 +522,7 @@ pub fn strftime(t: V, f: &str) -> String {
     } else if tm.tm_zone.is_null() {
         String::new()
     } else {
-        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone).to_string_lossy().into_owned() }
+        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone as *const std::ffi::c_char).to_string_lossy().into_owned() }
     };
     let mut out = String::new();
     let mut it = f.chars().peekable();
