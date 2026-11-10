@@ -25,7 +25,7 @@ use crate::gc::RVec;
 use crate::kernel::new_str_v;
 use crate::mt::L;
 use crate::tri;
-use corosensei::stack::{DefaultStack, Stack};
+use corosensei::stack::{Stack, StackPointer};
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -43,8 +43,58 @@ const STACK_MARGIN: usize = 1 << 20;
 const P_STACK: usize = 8 << 20;
 pub const PREEMPT_BIT: u8 = 2;
 
-type ThreadCo = Coroutine<(), (), V, DefaultStack>;
-type FiberCo = Coroutine<V, V, V, DefaultStack>;
+type ThreadCo = Coroutine<(), (), V, RStack>;
+type FiberCo = Coroutine<V, V, V, RStack>;
+
+/// A coroutine stack (corosensei's `DefaultStack`, a guard page at the bottom) whose top is
+/// on a MiB boundary of the room table (core.rs `room_mark`): its top MiB, where shallow
+/// code runs, is then wholly the stack's own and can have room.
+pub struct RStack {
+    lo: usize,
+    len: usize,
+}
+impl RStack {
+    fn new(size: usize) -> std::io::Result<RStack> {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let align = 1usize << crate::core::ROOM_SHIFT;
+        let len = (size + 2 * page - 1) & !(page - 1);
+        let total = len + align;
+        unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), total, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+            if p == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+            let p = p as usize;
+            let top = (p + total) & !(align - 1);
+            let lo = top - len;
+            // (the parts below and above go back)
+            if lo > p {
+                libc::munmap(p as *mut _, lo - p);
+            }
+            if p + total > top {
+                libc::munmap(top as *mut _, p + total - top);
+            }
+            let s = RStack { lo, len };
+            if libc::mprotect((lo + page) as *mut _, len - page, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(s)
+        }
+    }
+}
+impl Drop for RStack {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.lo as *mut _, self.len) };
+    }
+}
+unsafe impl Stack for RStack {
+    fn base(&self) -> StackPointer {
+        StackPointer::new(self.lo + self.len).unwrap()
+    }
+    fn limit(&self) -> StackPointer {
+        StackPointer::new(self.lo).unwrap()
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum St {
@@ -342,6 +392,8 @@ pub fn current_stack() -> Option<(usize, usize)> {
 }
 
 fn new_ctx(s: &mut Sched, base: usize, limit: usize) -> usize {
+    // (`enter_ctx` sets this limit)
+    crate::core::room_mark(limit, limit + STACK_MARGIN, base);
     s.ctxs.push(Ctx { base, limit, saved_sp: 0, saved_fp: 0, live: true, running: false });
     s.ctxs.len() - 1
 }
@@ -469,7 +521,7 @@ fn thread_obj(tid: usize) -> V {
 /// Create a thread running `f`, on P `on` (or the next P in turn); a `pinned` thread never
 /// moves to another P. Returns its id.
 fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize>, pinned: bool) -> usize {
-    let stack = DefaultStack::new(stack_size).expect("thread stack");
+    let stack = RStack::new(stack_size).expect("thread stack");
     let (base, limit) = (stack.base().get(), stack.limit().get());
     let limit = if stack_size == MAIN_STACK { limit.max(base.saturating_sub(MAIN_USABLE)) } else { limit };
     // pick the P; starting a second P switches the runtime into multi-threaded mode first
@@ -1514,7 +1566,7 @@ pub fn fiber_status(v: V) -> &'static str {
 }
 
 pub fn fiber_new(blk: V) -> V {
-    let stack = DefaultStack::new(FIBER_STACK).expect("fiber stack");
+    let stack = RStack::new(FIBER_STACK).expect("fiber stack");
     let (base, limit) = (stack.base().get(), stack.limit().get());
     let fiber_class = sraw().unwrap().fiber_class;
     let o = object_new(fiber_class);

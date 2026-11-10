@@ -21,10 +21,9 @@ pub fn multi() -> bool {
 }
 pub fn set_multi() {
     MULTI.store(true, Ordering::SeqCst);
-    // direct calls from compiled code check one global stack limit: only for one P
+    // (compiled code reads these as "one OS thread": core.rs `KnDirect`)
     crate::core::KN_DIRECT.call_limit.store(usize::MAX, Ordering::SeqCst);
     crate::core::KN_DIRECT.entry_limit.store(0, Ordering::SeqCst);
-    crate::core::drop_claims();
     crate::gc::malloc_multi();
 }
 pub fn set_in_sweep(b: bool) {

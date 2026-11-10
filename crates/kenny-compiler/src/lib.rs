@@ -676,6 +676,22 @@ pub(crate) fn mem() -> MemFlagsData {
     MemFlagsData::trusted()
 }
 
+/// kenny-runtime core.rs `KnDirect::room`, `ROOM_SHIFT`
+pub const KN_DIRECT_ROOM: i32 = 80;
+const ROOM_SHIFT: i64 = 20;
+/// 1 (I64) when the stack has room for a call made without the runtime here, else 0: the
+/// room table's byte for the stack pointer's MiB (kenny-runtime core.rs `room_mark`), the
+/// same table for every thread. `dir`: KN_DIRECT.
+pub(crate) fn stack_room(b: &mut FunctionBuilder, dir: ir::Value) -> ir::Value {
+    let f = mem();
+    let t = b.ins().load(ir::types::I64, f, dir, KN_DIRECT_ROOM);
+    let sp = b.ins().get_stack_pointer(ir::types::I64);
+    // (stacks are below 2^48, where the table ends: core.rs `room_mark`)
+    let i = b.ins().ushr_imm_u(sp, ROOM_SHIFT);
+    let a = b.ins().iadd(t, i);
+    b.ins().uload8(ir::types::I64, f, a, 0)
+}
+
 pub(crate) fn host_isa(pic: bool) -> Result<std::sync::Arc<dyn isa::TargetIsa>, String> {
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").map_err(|e| e.to_string())?;

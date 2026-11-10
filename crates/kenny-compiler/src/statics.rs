@@ -555,16 +555,13 @@ impl<M: Module> Compiler<M> {
     }
 
     /// On entry to a method that calls itself (`self_call`s skip these checks): room on the
-    /// stack (`KN_DIRECT.entry_limit`: 0 while several OS threads run Ruby code, their calls
-    /// to themselves going through the runtime) and no collection pending.
+    /// stack (`stack_room`) and no collection pending.
     pub(crate) fn entry_check(&mut self, fx: &mut Fx) {
         let f = mem();
         let gv = self.module.declare_data_in_func(self.direct_id, fx.b.func);
         let dir = fx.b.ins().symbol_value(I64, gv);
-        let lim = fx.b.ins().load(I64, f, dir, KN_DIRECT_ENTRY_LIMIT);
-        let sp = fx.b.ins().get_stack_pointer(I64);
-        let low = fx.b.ins().icmp(IntCC::UnsignedLessThan, sp, lim);
-        let low = fx.b.ins().uextend(I64, low);
+        let room = stack_room(&mut fx.b, dir);
+        let low = fx.b.ins().bxor_imm_s(room, 1);
         let gc = fx.b.ins().uload8(I64, f, fx.gcflag, 0);
         let bad = fx.b.ins().bor(low, gc);
         let slow = fx.b.create_block();

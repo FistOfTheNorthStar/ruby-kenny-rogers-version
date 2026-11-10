@@ -1169,12 +1169,12 @@ pub fn new_pstate() -> *mut PState {
 pub static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// What compiled code checks before calling a method directly (kenny-compiler fastpath.rs
-/// `direct_call`): a copy of `SERIAL`, and the stack limit while only one OS thread runs
-/// Ruby code (then it is this P's `stack_limit`; usize::MAX otherwise, which sends every
-/// call through the runtime, where `pst()` gives the right limit).
+/// `direct_call`): a copy of `SERIAL`, and room on the stack (`room`).
 #[repr(C)]
 pub struct KnDirect {
     pub serial: std::sync::atomic::AtomicU64,
+    /// This P's `stack_limit` while only one OS thread runs Ruby code, usize::MAX otherwise
+    /// (compiled code reads it as "one OS thread": kenny-compiler licm.rs).
     pub call_limit: std::sync::atomic::AtomicUsize,
     /// Core methods compiled code may skip calling while they are the builtin ones:
     /// `DIRECT_SYM_EQ` (Symbol#==), `DIRECT_NIL_P` (nil? of every class of immediate
@@ -1190,9 +1190,8 @@ pub struct KnDirect {
     /// The Array class (compiled code indexes plain Arrays inline while `DIRECT_ARY_AREF` /
     /// `DIRECT_ARY_ASET` are set).
     pub array_class: std::sync::atomic::AtomicUsize,
-    /// The stack limit checked on entry to compiled methods that call themselves directly
-    /// (kenny-compiler statics.rs `entry_check`): `call_limit` while only one OS thread runs
-    /// Ruby code, else 0 (no such direct calls then).
+    /// `call_limit` while only one OS thread runs Ruby code, else 0: compiled code reads it
+    /// as "one OS thread" (inline Array#push, kenny-compiler ispec.rs copies).
     pub entry_limit: std::sync::atomic::AtomicUsize,
     /// The String class (compiled code runs getbyte/setbyte of plain Strings inline while
     /// `DIRECT_STR_BYTE` is set).
@@ -1201,6 +1200,8 @@ pub struct KnDirect {
     /// (Kernel, Object, ...: Zeitwerk's and bootsnap's wrappers): compiled `require "x"`
     /// then calls it as a method instead of running the compiled file itself.
     pub require_hook: std::sync::atomic::AtomicU64,
+    /// The room table (`room_mark`).
+    pub room: std::sync::atomic::AtomicUsize,
 }
 #[unsafe(no_mangle)]
 pub static KN_DIRECT: KnDirect = KnDirect {
@@ -1214,8 +1215,60 @@ pub static KN_DIRECT: KnDirect = KnDirect {
     entry_limit: std::sync::atomic::AtomicUsize::new(0),
     string_class: std::sync::atomic::AtomicUsize::new(0),
     require_hook: std::sync::atomic::AtomicU64::new(0),
+    room: std::sync::atomic::AtomicUsize::new(0),
 };
-const _: () = assert!(std::mem::offset_of!(KnDirect, require_hook) == 72);
+const _: () = assert!(std::mem::offset_of!(KnDirect, require_hook) == 72 && std::mem::offset_of!(KnDirect, room) == 80);
+
+/// Room on the stack for calls made without the runtime, the same for every thread: one
+/// byte per MiB of address space (`1 << ROOM_SHIFT`), 1 where that MiB lies wholly in a
+/// stack that Ruby code runs on and above its limit (`PState::stack_limit`), else 0.
+/// Compiled code indexes it with its stack pointer (kenny-compiler fastpath.rs `no_room`);
+/// a 0 sends the call through the runtime, which checks the exact limit. So a deep stack
+/// takes the runtime's path for its last MiB or two, and a thread needn't find its own limit.
+/// A stack's bytes are written when it is made (`room_mark`): a 1 left by a freed stack can
+/// only be under a new stack's limit, which the stack pointer reaches through the 0 below it.
+pub const ROOM_SHIFT: u32 = 20;
+/// Index bits: the table covers the low 2^48 bytes of address space, where macOS and Linux
+/// put every stack (compiled code doesn't check: `room_mark` does).
+pub const ROOM_BITS: u32 = 28;
+fn room_table() -> *mut std::sync::atomic::AtomicU8 {
+    use std::sync::atomic::Ordering::*;
+    let t = KN_DIRECT.room.load(Acquire);
+    if t != 0 {
+        return t as *mut _;
+    }
+    static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = INIT.lock().unwrap_or_else(|e| e.into_inner());
+    let t = KN_DIRECT.room.load(Acquire);
+    if t != 0 {
+        return t as *mut _;
+    }
+    // reserved address space: only the pages written (a few, near the stacks) take memory
+    #[cfg(target_os = "linux")]
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), 1 << ROOM_BITS, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
+    assert!(p != libc::MAP_FAILED, "kenny: can't reserve the stack room table");
+    KN_DIRECT.room.store(p as usize, Release);
+    p as *mut _
+}
+/// A stack Ruby code will run on: usable from `lo` up to `hi`, its limit `limit`.
+pub fn room_mark(lo: usize, limit: usize, hi: usize) {
+    if hi <= lo {
+        return;
+    }
+    if hi > 1 << (ROOM_SHIFT + ROOM_BITS) || crate::stackmap::stack_pointer() > 1 << (ROOM_SHIFT + ROOM_BITS) {
+        eprintln!("kenny: a stack above 2^48 ({hi:#x}): not supported");
+        std::process::abort();
+    }
+    let t = room_table();
+    for c in (lo >> ROOM_SHIFT)..=((hi - 1) >> ROOM_SHIFT) {
+        let (clo, chi) = (c << ROOM_SHIFT, (c + 1) << ROOM_SHIFT);
+        let ok = clo >= limit && chi <= hi;
+        unsafe { (*t.add(c)).store(ok as u8, std::sync::atomic::Ordering::Relaxed) };
+    }
+}
 const _: () = assert!(std::mem::offset_of!(KnDirect, array_class) == 48 && std::mem::offset_of!(KnDirect, math_module) == 40);
 const _: () = assert!(std::mem::offset_of!(KnDirect, entry_limit) == 56 && std::mem::offset_of!(KnDirect, string_class) == 64);
 /// What compiled code reads of a String (fastpath.rs `STR_*`): the buffer's ptr, len, cap.
@@ -1433,6 +1486,7 @@ pub fn init_runtime_at(stack_base: usize) {
         script_name: String::new(),
     });
     *RT.get() = Box::into_raw(r);
+    room_table();
     new_pstate();
     pst().heap.stack_base = stack_base;
     crate::mt::SPIN_HOOK.store(crate::gc::park_if_stopping as fn() as *mut (), std::sync::atomic::Ordering::Release);
@@ -1696,9 +1750,8 @@ pub fn methods_named(mid: u32) -> u32 {
     g.as_ref().and_then(|m| m.get(&mid).copied()).unwrap_or(0)
 }
 /// A compiled method's word for its calls to itself (kenny-compiler statics.rs
-/// `self_call`): 0 while the method is the only one of its name in any method table, its
-/// owner a class (a module's method may be bound to any object), and one OS thread runs
-/// Ruby code; else 1. Set by its `def` (abi.rs `kn_def_claim`), redone on every method table
+/// `self_call`): 0 while the method is the only one of its name in any method table and
+/// its owner a class (a module's method may be bound to any object); else 1. Set by its `def` (abi.rs `kn_def_claim`), redone on every method table
 /// change (`bump_serial`).
 struct Claim {
     word: usize,
@@ -1709,8 +1762,7 @@ struct Claim {
 static CLAIMS: std::sync::Mutex<Vec<Claim>> = std::sync::Mutex::new(Vec::new());
 fn claim_holds(c: &Claim) -> bool {
     let k = c.owner as *mut Class;
-    !crate::mt::multi()
-        && methods_named(c.mid) == 1
+    methods_named(c.mid) == 1
         && unsafe { (*k).methods.get(&c.mid) }.is_some_and(|&m| unsafe { (*m).fast } == c.fast)
 }
 fn set_claim_word(c: &Claim) {
@@ -1724,7 +1776,7 @@ pub fn claim(word: *mut u64, owner: *mut Class, mid: u32, fast: usize) {
     // (a singleton class may be freed: never kept here)
     let kept = unsafe { !(*owner).is_module && !(*owner).is_singleton };
     // (the method's fast entry is set after `add_method`: so is this)
-    let holds = kept && !crate::mt::multi() && methods_named(mid) == 1;
+    let holds = kept && methods_named(mid) == 1;
     unsafe { (*(word as *const std::sync::atomic::AtomicU64)).store(if holds { 0 } else { 1 }, std::sync::atomic::Ordering::SeqCst) };
     if kept {
         cs.push(Claim { word: word as usize, owner: owner as usize, mid, fast });
@@ -1734,10 +1786,6 @@ fn redo_claims() {
     for c in CLAIMS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         set_claim_word(c);
     }
-}
-/// Several OS threads may now run Ruby code: no more claims.
-pub fn drop_claims() {
-    redo_claims();
 }
 
 pub fn bump_serial() {

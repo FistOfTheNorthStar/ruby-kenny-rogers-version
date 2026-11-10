@@ -290,16 +290,14 @@ impl<M: Module> Compiler<M> {
             b.switch_to_block(entry);
             let p = b.block_params(entry).to_vec();
             let f = mem();
-            // room on the stack (`KN_DIRECT.entry_limit`), no collection or switch pending
+            // room on the stack (`stack_room`), no collection or switch pending
             let dg = self.module.declare_data_in_func(self.direct_id, b.func);
             let dir = b.ins().symbol_value(I64, dg);
-            let lim = b.ins().load(I64, f, dir, KN_DIRECT_ENTRY_LIMIT);
+            let room = stack_room(&mut b, dir);
             let gg = self.module.declare_data_in_func(self.gc_flag_id, b.func);
             let gcp = b.ins().symbol_value(I64, gg);
             let gc = b.ins().uload8(I64, f, gcp, 0);
-            let sp = b.ins().get_stack_pointer(I64);
-            let low = b.ins().icmp(IntCC::UnsignedLessThan, sp, lim);
-            let low = b.ins().uextend(I64, low);
+            let low = b.ins().bxor_imm_s(room, 1);
             let bad = b.ins().bor(low, gc);
             let poll = b.create_block();
             let go = b.create_block();
@@ -369,13 +367,6 @@ impl<M: Module> Compiler<M> {
         let cp = fx.b.ins().symbol_value(I64, cg);
         let cw = fx.b.ins().load(I64, f, cp, 0);
         let mut bad = fx.b.ins().bor(off, cw);
-        // (several OS threads running Ruby code: no stack check in the copy)
-        let dg = self.module.declare_data_in_func(self.direct_id, fx.b.func);
-        let dir = fx.b.ins().symbol_value(I64, dg);
-        let lim = fx.b.ins().load(I64, f, dir, KN_DIRECT_ENTRY_LIMIT);
-        let nolim = fx.b.ins().icmp_imm_s(IntCC::Equal, lim, 0);
-        let nolim = fx.b.ins().uextend(I64, nolim);
-        bad = fx.b.ins().bor(bad, nolim);
         if !args.is_empty() {
             let mut all = args[0];
             for a in &args[1..] {

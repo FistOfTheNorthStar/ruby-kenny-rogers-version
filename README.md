@@ -198,7 +198,9 @@ dependencies. Every file in those directories is compiled into the binary.
   in registers; attr_readers and attr_writers become a load or a store, and `is_a?` in a loop a
   lookup in the receiver's superclass list. Each of the cache's four classes is checked with one
   compare, so a site whose receivers are of a few classes (a superclass's method called on its
-  subclasses' objects) stays on the fast path.
+  subclasses' objects) stays on the fast path. The stack check before such a call works for every
+  thread at once: a table with a byte per MiB of address space says whether that MiB of a stack
+  is clear of its limit, so threads on several cores keep their direct calls.
 - **Small methods are inlined** (attr-style getters, predicates, arithmetic, `def x = @x`, small
   `initialize`s through `C.new`, methods taking a literal block): the body is compiled into the caller
   behind a guard slot holding up to four receiver classes for which the runtime has checked that the
@@ -552,11 +554,7 @@ An uncaught exception and a failed request always print the full backtrace.
 
 ## Roadmap
 
-1. Direct calls while several OS threads run Ruby code: compiled code checks the stack against
-   one global limit, so then every compiled-to-compiled call (inline-cache direct calls, static
-   calls) goes through the runtime. A per-thread limit compiled code can reach cheaply would keep
-   them direct (inlined bodies, inlined `C.new` and virtual objects already stay on their fast path)
-2. Compaction under load, the rest: `IO#write` (pin the string it writes while it blocks, then
+1. Compaction under load, the rest: `IO#write` (pin the string it writes while it blocks, then
    audit it) and the long tail of other natives
-3. Linux: its test outputs (errno numbers, `Fcntl` constants and libm's last digits differ
+2. Linux: its test outputs (errno numbers, `Fcntl` constants and libm's last digits differ
    from macOS's: 8 tests), x86-64, and a CI run there

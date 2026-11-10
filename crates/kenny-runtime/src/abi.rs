@@ -83,7 +83,9 @@ pub unsafe extern "C" fn kn_start(
             crate::gc::heap().extra_roots.push(static_roots);
             crate::gc::register_region(caches, cache_words as usize);
             let r = rt();
-            set_stack_limit((&x as *const u8 as usize).saturating_sub(STACK_SIZE - (4 << 20)));
+            let limit = (&x as *const u8 as usize).saturating_sub(STACK_SIZE - (4 << 20));
+            set_stack_limit(limit);
+            crate::core::room_mark(limit - (1 << 20), limit, pst().heap.stack_base);
             r.script_name = script.clone();
             // intern compiled-in symbols in order
             let mut p = symnames as *const u8;
@@ -871,7 +873,7 @@ unsafe fn static_fill_mt(s: &[AtomicU64; 1 + STATIC_WAYS], k: *mut Class, mid: V
     }
 }
 /// On entry to a compiled method that calls itself (kenny-compiler statics.rs
-/// `entry_check`): the stack below `KN_DIRECT.entry_limit` or a collection pending.
+/// `entry_check`): near the stack's limit (`room_mark`) or a collection pending.
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_entry_slow() -> V {
     if crate::gc::safepoint() {
@@ -882,12 +884,12 @@ pub extern "C" fn kn_entry_slow() -> V {
     }
     QNIL
 }
-/// On entry to an integer copy of a method (kenny-compiler ispec.rs) with the stack below
-/// `KN_DIRECT.entry_limit` or a collection pending: 1 to give up on the copy (the normal
+/// On entry to an integer copy of a method (kenny-compiler ispec.rs) near the stack's limit
+/// (`room_mark`) or a collection pending: 1 to give up on the copy (the normal
 /// method then runs and reports a deep stack), UNDEF for an exception delivered, else 0.
 #[unsafe(no_mangle)]
 pub extern "C" fn kn_ispec_poll() -> V {
-    if crate::core::approx_sp() < crate::core::KN_DIRECT.entry_limit.load(std::sync::atomic::Ordering::Relaxed) {
+    if crate::core::approx_sp() < pst().stack_limit {
         return 1;
     }
     if crate::gc::safepoint() {
