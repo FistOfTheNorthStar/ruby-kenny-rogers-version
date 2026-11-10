@@ -863,6 +863,7 @@ fn safepoint_slow(f: u8) -> bool {
     if f & (1 | STW_BIT) != 0 {
         if crate::mt::multi() {
             stop_the_world_collect();
+            trim_after_collection();
         } else if f & 1 != 0 {
             collect();
         }
@@ -887,11 +888,43 @@ pub extern "C" fn kn_safepoint() -> V {
     if safepoint() { UNDEF } else { QNIL }
 }
 
+// mimalloc with several Ps (Linux's default): objects are freed by whichever thread sweeps
+// their page, and mimalloc takes a block freed by another thread back only when the owning
+// thread looks at its heap, and returns emptied pages to the OS only after a delay. The blog
+// on 12 cores (Linux, aarch64) held 446-466 MB at peak, 252 MB with glibc's malloc. So once
+// several Ps run: pages are purged at once, and each P collects its own heap after every
+// major collection (KENNY_MI_TRIM=0 turns both off).
+unsafe extern "C" {
+    fn mi_collect(force: bool);
+    fn mi_option_set(option: i32, value: std::ffi::c_long);
+}
+/// `mi_option_purge_delay` (its position in mimalloc.h's `mi_option_e`, v2 and v3 alike).
+const MI_OPTION_PURGE_DELAY: i32 = 15;
+static MAJORS_DONE: AtomicU64 = AtomicU64::new(0);
+fn mi_trim() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    which_alloc() == USE_MIMALLOC && *T.get_or_init(|| std::env::var_os("KENNY_MI_TRIM").is_none_or(|v| v != "0"))
+}
+/// Several Ps now run Ruby code.
+pub fn malloc_multi() {
+    if mi_trim() {
+        unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, 0) };
+    }
+}
+/// After a collection, on each P: its share of the allocator's tidy-up after a major one.
+#[inline]
+fn trim_after_collection() {
+    thread_local!(static SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) });
+    let m = MAJORS_DONE.load(Ordering::Relaxed);
+    if SEEN.with(|s| s.replace(m)) != m && mi_trim() {
+        unsafe { mi_collect(false) };
+    }
+}
+
 /// GC.start: collect now (with several threads, stopping the others first).
 /// Give the allocator's free memory back to the OS (an idle server).
 pub fn release_malloc_memory() {
     unsafe extern "C" {
-        fn mi_collect(force: bool);
         #[cfg(target_os = "macos")]
         fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
     }
@@ -2302,6 +2335,7 @@ fn collect_locked() {
         h.major_live = h.live;
         h.minors = 0;
         h.majors += 1;
+        MAJORS_DONE.fetch_add(1, Ordering::Relaxed);
     } else {
         // old objects: what was old before, plus what this collection promoted
         h.live += m.newly_marked;

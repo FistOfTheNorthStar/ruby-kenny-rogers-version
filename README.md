@@ -451,13 +451,16 @@ CRuby's, and `Ripper#state`/`#token` are nil.
 - Compacting while requests run is partial: a major collection moves objects only when no
   thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
   them). In the blog example under load that is about 85 in 100 majors (none before precise
-  stack maps); the rest skip compaction (a thread writing to IO, mostly). Precise frames need frame pointers on every frame,
-  which Apple platforms guarantee; elsewhere (`KENNY_GC_PRECISE=1` turns it on) stacks are
-  still scanned word by word for native frames, which rarely lets a busy server compact.
+  stack maps; about 90 in 100 on Linux); the rest skip compaction (a thread writing to IO,
+  mostly). Precise frames need frame pointers on every frame: Apple platforms keep them, and
+  on Linux the runtime and the C it builds are compiled with them (`.cargo/config.toml`).
+  A runtime built without them scans stacks word by word for native frames instead, which
+  rarely lets a busy server compact (`KENNY_GC_PRECISE=1` forces precise frames).
 - Memory: serving on 12 cores takes about 1.7x the memory of one (each core has its own
   young-generation space, `KENNY_GC_YOUNG_SCALE=1` trades some throughput for ~1.3x); still
-  far less than 12 Puma workers. The allocator choice was measured on macOS only (see
-  `KENNY_MALLOC`).
+  far less than 12 Puma workers. On Linux (aarch64, 12 cores) the blog peaks at ~350 MB with
+  mimalloc, the default, and ~255 MB with glibc's malloc (`KENNY_MALLOC=system`), which serves
+  about 30% fewer requests; one core takes ~190 MB.
 - `ObjectSpace`, `TracePoint` (dropped by design).
 
 ## Testing
@@ -517,7 +520,7 @@ Environment variables read by `kenny build` or by compiled programs.
 | `KENNY_GC_GENERATIONAL=0` | Turn minor collections off |
 | `KENNY_GC_COMPACT` | `0` never moves objects, `always` tries at every major collection |
 | `KENNY_GC_PRECISE` | `0` scans compiled frames conservatively (pinning what they hold), `1` precisely where that is not the default |
-| `KENNY_MALLOC` | `auto` / `system` / `mimalloc`: the allocator behind Rust allocations. On macOS `auto` (the default) uses mimalloc while one core runs Ruby code and the system allocator once several do (it keeps far less memory resident when threads free each other's objects); elsewhere mimalloc |
+| `KENNY_MALLOC` | `auto` / `system` / `mimalloc`: the allocator behind Rust allocations. On macOS `auto` (the default) uses mimalloc while one core runs Ruby code and the system allocator once several do (it keeps far less memory resident when threads free each other's objects); elsewhere mimalloc, which once several cores run Ruby code purges freed pages at once and has each core tidy its heap after every major collection (`KENNY_MI_TRIM=0` doesn't: ~470 MB instead of ~350 for the blog on Linux) |
 | `KENNY_EVAL_CACHE` | Size of the cache of `eval`'d code (default 2000) |
 
 GC testing and diagnostics:
@@ -554,6 +557,6 @@ An uncaught exception and a failed request always print the full backtrace.
    calls) goes through the runtime. A per-thread limit compiled code can reach cheaply would keep
    them direct (inlined bodies, inlined `C.new` and virtual objects already stay on their fast path)
 2. Compaction under load, the rest: `IO#write` (pin the string it writes while it blocks, then
-   audit it) and the long tail of other natives, and frame-pointer builds on Linux so its
-   servers get precise frames too
-3. Measure and tune memory and allocator choice on Linux
+   audit it) and the long tail of other natives
+3. Linux: its test outputs (errno numbers, `Fcntl` constants and libm's last digits differ
+   from macOS's: 8 tests), x86-64, and a CI run there

@@ -25,6 +25,7 @@ pub fn set_multi() {
     crate::core::KN_DIRECT.call_limit.store(usize::MAX, Ordering::SeqCst);
     crate::core::KN_DIRECT.entry_limit.store(0, Ordering::SeqCst);
     crate::core::drop_claims();
+    crate::gc::malloc_multi();
 }
 pub fn set_in_sweep(b: bool) {
     IN_SWEEP.store(b, Ordering::Relaxed);
