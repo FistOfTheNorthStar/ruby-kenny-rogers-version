@@ -53,5 +53,31 @@ check("Enumerable#sort_by") { |gc| words.each_entry.sort_by { |w| gc.(); w.rever
 check("Enumerable#any? (pattern)") { |gc| p = Object.new; p.define_singleton_method(:===) { |x| gc.(); x == "fig" }; words.each_entry.any?(p) }
 check("Fiber[]") { |gc| Fiber[:k] = "v" * 2; gc.(); Fiber[:k] + Fiber.current.class.name }
 check("Digest#hexdigest") { |gc| d = Digest::SHA256.new; d << "abc"; gc.(); d.hexdigest[0, 16] }
+class ToS
+  def initialize(s, gc) = (@s, @gc = s, gc)
+  def to_s = (@gc.(); @s + "!")
+  def inspect = (@gc.(); "<#{@s}>")
+end
+check("IO#write") { |gc| r, w = IO.pipe; n = w.write(ToS.new("a" * 2, gc), "-", ToS.new("b", gc)); w << ToS.new("c", gc); w.print(ToS.new("d", gc)); w.close; [n, r.read] }
+check("IO#puts") { |gc| r, w = IO.pipe; w.puts([ToS.new("x", gc), [ToS.new("y", gc)]], ToS.new("z", gc)); w.close; r.read }
+check("Kernel#p") { |gc| $stdout.flush; v = p(ToS.new("q", gc)); [v.to_s] }
+class HashKey
+  def initialize(k, gc) = (@k, @gc = k, gc)
+  attr_reader :k
+  def hash = (@gc.(); @k.hash)
+  def eql?(o) = (@gc.(); o.is_a?(HashKey) && o.k == @k)
+end
+check("Hash#delete") { |gc| h = { HashKey.new("a" * 2, gc) => "v1", HashKey.new("b", gc) => "v2" }; [h.delete(HashKey.new("aa", gc)), h.delete(HashKey.new("zz", gc)) { |k| gc.(); k.k + "?" }, h.size] }
+check("Array#hash") { |gc| a = [HashKey.new("e" * 2, gc), "f"]; a.hash == [HashKey.new("ee", gc), "f"].hash }
+check("Array#flat_map") { |gc| mk.().first(3).flat_map { |x| gc.(); [x[0], x[-2]] } }
+check("Array#uniq") { |gc| [mk.().uniq { |x| gc.(); x.size }, [HashKey.new("u", gc), HashKey.new("u", gc), "w" * 2].uniq.size] }
+check("Array#each_with_object") { |gc| mk.().each_with_object(+"") { |x, acc| gc.(); acc << x[0] } }
+class Ver
+  include Comparable
+  def initialize(n, gc) = (@n, @gc = n, gc)
+  attr_reader :n
+  def <=>(o) = (@gc.(); n <=> o.n)
+end
+check("Comparable#<") { |gc| a, b = Ver.new(1, gc), Ver.new(2, gc); [a < b, a >= b, a == Ver.new(1, gc), b.between?(a, b)] }
 
 $ok.each { |name, done, r| puts "#{name}: #{done} #{r.inspect}" }

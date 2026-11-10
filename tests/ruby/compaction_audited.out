@@ -1,3 +1,4 @@
+<q>
 Array#include?: true [false, "apple!"]
 Array#delete: true ["fig?", "none", 6, "grape?"]
 Array#find: true "cherry!"
@@ -28,3 +29,12 @@ Enumerable#sort_by: true ["banana", "apple", "grape", "date", "fig", "elder", "c
 Enumerable#any? (pattern): true true
 Fiber[]: true "vvFiber"
 Digest#hexdigest: true "ba7816bf8f01cfea"
+IO#write: true [6, "aa!-b!c!d!"]
+IO#puts: true "x!\ny!\nz!\n"
+Kernel#p: true ["q!"]
+Hash#delete: true ["v1", "zz?", 1]
+Array#hash: true true
+Array#flat_map: true ["a", "e", "b", "a", "c", "y"]
+Array#uniq: true [["apple!", "banana!", "date!", "fig!"], 2]
+Array#each_with_object: true "abcdefg"
+Comparable#<: true [true, false, true, true]

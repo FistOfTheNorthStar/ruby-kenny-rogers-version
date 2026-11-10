@@ -37,7 +37,8 @@ pub fn puts_to(args: &[V], w: &mut dyn FnMut(&[u8])) -> V {
     }
     for &a in args {
         if is_ary(a) {
-            let items = rary(a).v.clone();
+            // (rooted: `to_s` runs Ruby code, a collection may move the elements)
+            let items = RVec::from(rary(a).v.clone());
             if items.is_empty() {
                 w(b"\n");
             }

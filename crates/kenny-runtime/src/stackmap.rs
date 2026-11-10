@@ -309,6 +309,16 @@ pub fn audited_natives() {
     if let Some(mon) = named("Monitor") {
         gc_transparent(mon, &["mon_check_owner"]);
     }
+    // writes copy each argument's bytes (`to_s`) before they wait for the output lock or a
+    // socket; `puts` roots the elements of an Array argument
+    if let Some(io) = named("IO") {
+        gc_transparent(io, &["write", "print", "puts", "<<", "syswrite"]);
+    }
+    gc_transparent(c.kernel, &["puts", "print", "p", "hash"]);
+    // (Array#hash re-reads the Array by index after each element's `hash`)
+    gc_transparent(c.array, &["hash", "each_with_object", "flat_map", "uniq"]);
+    gc_transparent(c.hash, &["delete"]);
+    gc_transparent(c.comparable, &["<", "<=", ">", ">=", "==", "between?"]);
 }
 
 
