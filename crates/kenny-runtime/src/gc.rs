@@ -1359,6 +1359,35 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Inside `blocking`: this thread counts as stopped, so it must neither touch Ruby objects nor
+/// switch to another Ruby thread (which would then run unseen by a collection).
+fn in_blocking() -> bool {
+    crate::mt::multi() && crate::core::pst_opt().is_some_and(|p| p.heap.status.load(Ordering::SeqCst) == IDLE)
+}
+
+/// Inside `blocking` (a C library calling back, say), run `f` as a running thread again: it
+/// may touch Ruby objects and switch threads. The caller keeps the thread on this OS thread
+/// (`thread::stay_here`) when its frames below must resume on it; the native frames between
+/// are scanned conservatively, as for any native method. Outside `blocking`, just `f()`.
+#[inline(never)]
+pub fn unblocked<R>(f: impl FnOnce() -> R) -> R {
+    if !in_blocking() {
+        return f();
+    }
+    let ph = &mut crate::core::pst().heap;
+    ph.status.store(RUNNING, Ordering::SeqCst);
+    if KN_GC_PENDING.load(Ordering::SeqCst) & STW_BIT != 0 {
+        park();
+    }
+    let r = f();
+    crate::thread::before_blocking();
+    let ph = &mut crate::core::pst().heap;
+    spill_registers(&mut ph.regs);
+    ph.saved_sp = approx_sp_here();
+    ph.status.store(IDLE, Ordering::SeqCst);
+    r
+}
+
 #[inline(always)]
 fn approx_sp_here() -> usize {
     // (below every frame record and local of the callers: see stackmap.rs `stack_pointer`)

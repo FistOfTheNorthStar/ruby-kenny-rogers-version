@@ -115,7 +115,9 @@ fn obj_inspect_inner(v: V) -> Result<String, ()> {
             }
             if is_ary(names) {
                 let want: Vec<u32> = rary(names).v.iter().filter(|x| is_sym(**x)).map(|x| sym_id(*x)).collect();
-                ivs = want.iter().filter_map(|n| ivs.iter().find(|(k, _)| k == n).copied()).collect();
+                // (read again: the call may have changed them, or compacted)
+                let all = ivar_list(v);
+                ivs = want.iter().filter_map(|n| all.iter().find(|(k, _)| k == n).copied()).collect();
             } else if names != QNIL {
                 type_error(&format!("Expected #instance_variables_to_inspect to return an Array or nil, but it returned {}", class_name(real_class(names))));
                 return Err(());
@@ -123,6 +125,8 @@ fn obj_inspect_inner(v: V) -> Result<String, ()> {
         }
     }
     let mut s = format!("#<{}:0x{:016x}", class_name(real_class(v)), v);
+    let values = ivs.iter().map(|x| x.1).collect();
+    let ivs = crate::gc::Rooted::new(ivs, values);
     for (i, (name, val)) in ivs.iter().enumerate() {
         s.push_str(if i == 0 { " " } else { ", " });
         s.push_str(&sym_str(*name));
@@ -245,23 +249,23 @@ pub fn hash_inspect(v: V) -> Result<String, ()> {
     guarded(v, || "{...}".into(), || hash_inspect_inner(v))
 }
 fn hash_inspect_inner(v: V) -> Result<String, ()> {
-    let h = rhash(v);
-    if h.m.is_empty() {
+    if rhash(v).m.is_empty() {
         return Ok("{}".into());
     }
     let mut s = String::from("{");
-    for (i, (k, val)) in h.m.iter().enumerate() {
+    // (a rooted snapshot: the `inspect` calls may change the Hash, or compact)
+    for (i, (k, val)) in crate::hash::pairs(v).into_iter().enumerate() {
         if i > 0 {
             s.push_str(", ");
         }
-        if is_sym(k.0) && is_ident(&sym_str(sym_id(k.0))) && !sym_str(sym_id(k.0)).starts_with(['@', '$']) {
-            s.push_str(&sym_str(sym_id(k.0)));
+        if is_sym(k) && is_ident(&sym_str(sym_id(k))) && !sym_str(sym_id(k)).starts_with(['@', '$']) {
+            s.push_str(&sym_str(sym_id(k)));
             s.push_str(": ");
         } else {
-            s.push_str(&String::from_utf8_lossy(&inspect(k.0)?));
+            s.push_str(&String::from_utf8_lossy(&inspect(k)?));
             s.push_str(" => ");
         }
-        s.push_str(&String::from_utf8_lossy(&inspect(*val)?));
+        s.push_str(&String::from_utf8_lossy(&inspect(val)?));
     }
     s.push('}');
     Ok(s)
@@ -272,7 +276,7 @@ pub fn ary_inspect(v: V) -> Result<String, ()> {
 }
 fn ary_inspect_inner(v: V) -> Result<String, ()> {
     let mut s = String::from("[");
-    let items = rary(v).v.clone();
+    let items = crate::gc::Rooted::of(rary(v).v.clone());
     for (i, x) in items.iter().enumerate() {
         if i > 0 {
             s.push_str(", ");

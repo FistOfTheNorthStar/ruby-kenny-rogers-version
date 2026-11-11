@@ -129,5 +129,15 @@ class Open < Made
   public_class_method :new
 end
 check("Class#new (visibility copies)") { |gc| [Made.make("m", gc).s, Open.new("o", gc).s] }
+check("Array#each_with_index") { |gc| out = []; mk.().each_with_index { |x, i| gc.(); out << "#{i}#{x}" }; out }
+class Shown
+  def initialize(s, gc) = (@s, @gc = s, gc)
+  def inspect = (@gc.(); "<#{@s * 2}>")
+end
+class Holder
+  def initialize(a, b) = (@a, @b = a, b)
+end
+check("Hash#inspect") { |gc| h = { "k" => Shown.new("v", gc), Shown.new("q", gc) => [Shown.new("w", gc), "s"] }; [h.inspect, h.to_s] }
+check("Kernel#inspect") { |gc| Holder.new(Shown.new("a", gc), ["b" * 2, Shown.new("c", gc)]).inspect.sub(/0x\h+/, "X") }
 
 $ok.each { |name, done, r| puts "#{name}: #{done} #{r.inspect}" }

@@ -349,6 +349,12 @@ pub fn audited_natives() {
     gc_transparent(crate::core::singleton_class(c.array as crate::core::V), &["new"]);
     gc_transparent(c.array, &["initialize"]);
     gc_transparent(crate::core::singleton_class(c.exception as crate::core::V), &["exception"]);
+    // (each_with_index re-reads through its receiver like each, or goes through a redefined
+    // `each` with a closure holding only the block; inspect walks rooted snapshots of the
+    // pairs, elements or instance variables)
+    gc_transparent(c.array, &["each_with_index", "inspect", "to_s"]);
+    gc_transparent(c.hash, &["inspect", "to_s"]);
+    gc_transparent(c.kernel, &["inspect"]);
     // (and the copies of these that boot made before this ran; later ones are marked as made)
     crate::core::mark_transparent_copies();
 }
