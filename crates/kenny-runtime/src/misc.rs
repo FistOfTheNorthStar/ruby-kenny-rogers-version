@@ -66,6 +66,17 @@ fn yielded(args: &[V]) -> V {
 }
 
 /// Collect everything `each` yields.
+/// Math.cbrt: as CRuby, with glibc's result refined by a Newton step (glibc's cbrt can be
+/// off by one in the last place).
+pub fn cbrt(x: f64) -> f64 {
+    let r = x.cbrt();
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if r.is_finite() && !(x == 0.0 && r == 0.0) {
+        return (2.0 * r + (x / r / r)) / 3.0;
+    }
+    r
+}
+
 pub fn each_to_vec(v: V) -> Result<Vec<V>, V> {
     if is_ary(v) {
         return Ok(rary(v).v.clone());
@@ -1574,7 +1585,7 @@ pub fn init() {
     }
     // (+0.0 for -0.0, as CRuby)
     math1_pos!("sqrt", |x: f64| x.sqrt() + 0.0);
-    math1!("cbrt", f64::cbrt);
+    math1!("cbrt", cbrt);
     math1!("sin", f64::sin);
     math1!("cos", f64::cos);
     math1!("tan", f64::tan);

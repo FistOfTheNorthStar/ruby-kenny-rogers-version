@@ -1109,6 +1109,7 @@ fn pst_ptr_tls() -> *mut PState {
     std::hint::black_box(PST.with(|c| c.get()))
 }
 /// (Apple Silicon) The pthread key holding each P's state, once checked to work (0: not used).
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 static PST_KEY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 fn set_pst_key(p: *mut PState) {
