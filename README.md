@@ -198,15 +198,19 @@ dependencies. Every file in those directories is compiled into the binary.
   in registers; attr_readers and attr_writers become a load or a store, and `is_a?` in a loop a
   lookup in the receiver's superclass list. Each of the cache's four classes is checked with one
   compare, so a site whose receivers are of a few classes (a superclass's method called on its
-  subclasses' objects) stays on the fast path.
+  subclasses' objects) stays on the fast path. The stack check before such a call works for every
+  thread at once: a table with a byte per MiB of address space says whether that MiB of a stack
+  is clear of its limit, so threads on several cores keep their direct calls.
 - **Small methods are inlined** (attr-style getters, predicates, arithmetic, `def x = @x`, small
   `initialize`s through `C.new`, methods taking a literal block): the body is compiled into the caller
   behind a guard slot holding up to four receiver classes for which the runtime has checked that the
   call reaches that very `def` under the current method serial. In a loop, a call to a method the
   program defines in two or three classes inlines each body behind its own guard. Redefining a
   method, a singleton method, `include`/`prepend`, a visibility change or `method_missing` changes
-  the serial or misses the guard, and the call is made normally. Backtraces still show the inlined
-  method's frame (its calls record an inline location).
+  the serial or misses the guard, and the call is made normally. Slots fill while several threads
+  run Ruby code too: classes go into free ways, and a slot a method definition made stale is
+  cleared, then filled again once every thread has stopped (at the next collection). Backtraces
+  still show the inlined method's frame (its calls record an inline location).
 - **Blocks of `times`, `upto`, `downto`, `each`, `each_with_index`, `map`, `select`, `reject`, `any?`, `all?`** (on
   Integers, Arrays and Integer Ranges) are compiled as loops in the caller when the block is small and doesn't need
   its own frame (`return`, nested blocks, ...). A guard checks at runtime that the method is the builtin one;
@@ -448,14 +452,18 @@ CRuby's, and `Ripper#state`/`#token` are nil.
   here).
 - Compacting while requests run is partial: a major collection moves objects only when no
   thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
-  them). In the blog example under load that is about 4 in 10 majors (none before precise
-  stack maps); the rest skip compaction. Precise frames need frame pointers on every frame,
-  which Apple platforms guarantee; elsewhere (`KENNY_GC_PRECISE=1` turns it on) stacks are
-  still scanned word by word for native frames, which rarely lets a busy server compact.
+  them). In the blog example under load that is about 98 in 100 majors on macOS and 97 to 100
+  on Linux (aarch64; none before precise stack maps); the rest skip compaction (a thread
+  inside a native method not audited yet). Precise frames need frame pointers on every
+  frame: Apple platforms keep them, and
+  on Linux the runtime and the C it builds are compiled with them (`.cargo/config.toml`).
+  A runtime built without them scans stacks word by word for native frames instead, which
+  rarely lets a busy server compact (`KENNY_GC_PRECISE=1` forces precise frames).
 - Memory: serving on 12 cores takes about 1.7x the memory of one (each core has its own
   young-generation space, `KENNY_GC_YOUNG_SCALE=1` trades some throughput for ~1.3x); still
-  far less than 12 Puma workers. The allocator choice was measured on macOS only (see
-  `KENNY_MALLOC`).
+  far less than 12 Puma workers. On Linux (aarch64, 12 cores) the blog peaks at ~350 MB with
+  mimalloc, the default, and ~255 MB with glibc's malloc (`KENNY_MALLOC=system`), which serves
+  about 30% fewer requests; one core takes ~190 MB.
 - `ObjectSpace`, `TracePoint` (dropped by design).
 
 ## Testing
@@ -464,6 +472,8 @@ CRuby's, and `Ripper#state`/`#token` are nil.
 |---|---|
 | `tests/run.sh` | The test suite against Ruby 3.4 |
 | `tests/run.sh 4.0` | Against an installed Ruby 4.0 (a test's `.4.0.out` holds what 4.0 prints differently) |
+| | On Linux a test's `.linux.out` (or `.4.0.linux.out`) holds what CRuby prints there: other errno numbers, `Fcntl` constants and libm digits ([tools/linux/Dockerfile](tools/linux/Dockerfile) runs the suite in a container) |
+| CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) | `tests/run.sh` on Linux x86-64 and arm64 and on macOS, against Ruby 3.4 and 4.0 |
 | `tests/gems/run.sh [gem ...]` | Gems, under CRuby and Kenny |
 | `tests/server/run.sh [pattern]` | The HTTP server: a test app's binary started with different settings, driven over raw sockets by a CRuby script (~20 s) |
 | `bench/run.sh` | The benchmarks (`RUBY=/path/to/ruby`, `RUBY_OPTS=--yjit`) |
@@ -515,7 +525,7 @@ Environment variables read by `kenny build` or by compiled programs.
 | `KENNY_GC_GENERATIONAL=0` | Turn minor collections off |
 | `KENNY_GC_COMPACT` | `0` never moves objects, `always` tries at every major collection |
 | `KENNY_GC_PRECISE` | `0` scans compiled frames conservatively (pinning what they hold), `1` precisely where that is not the default |
-| `KENNY_MALLOC` | `auto` / `system` / `mimalloc`: the allocator behind Rust allocations. On macOS `auto` (the default) uses mimalloc while one core runs Ruby code and the system allocator once several do (it keeps far less memory resident when threads free each other's objects); elsewhere mimalloc |
+| `KENNY_MALLOC` | `auto` / `system` / `mimalloc`: the allocator behind Rust allocations. On macOS `auto` (the default) uses mimalloc while one core runs Ruby code and the system allocator once several do (it keeps far less memory resident when threads free each other's objects); elsewhere mimalloc, which once several cores run Ruby code purges freed pages at once and has each core tidy its heap after every major collection (`KENNY_MI_TRIM=0` doesn't: ~470 MB instead of ~350 for the blog on Linux) |
 | `KENNY_EVAL_CACHE` | Size of the cache of `eval`'d code (default 2000) |
 
 GC testing and diagnostics:
@@ -547,9 +557,4 @@ An uncaught exception and a failed request always print the full backtrace.
 
 ## Roadmap
 
-1. Guard slots of inlined and static calls that fill while several OS threads run Ruby code
-   (today they fill only while one does, so code first reached under load takes the normal call)
-2. Compaction under load, the rest: audit (or root) the remaining native methods that call
-   back into Ruby (`Range#to_a`, `Struct.new`, `sort_by!`, Enumerator, Digest, Fiber...), and
-   frame-pointer builds on Linux so its servers get precise frames too
-3. Measure and tune memory and allocator choice on Linux
+1. Compaction under load: audit the natives still seen now and then (`KENNY_GC_COMPACT_STATS=2`)

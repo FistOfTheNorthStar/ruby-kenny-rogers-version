@@ -117,14 +117,15 @@ fn lookup(fns: &[MapFn], ret: usize) -> Option<(usize, usize, &'static [u32])> {
     None
 }
 
-/// Precise scanning of compiled frames: on where frame pointers are always kept (Apple
-/// platforms); KENNY_GC_PRECISE=0 / =1 overrides.
+/// Precise scanning of compiled frames: where frame pointers are always kept (Apple
+/// platforms, and a runtime built with them: Linux, by .cargo/config.toml); KENNY_GC_PRECISE=0
+/// / =1 overrides.
 pub fn precise_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("KENNY_GC_PRECISE").as_deref() {
         Ok("0") => false,
         Ok("1") => true,
-        _ => cfg!(target_vendor = "apple"),
+        _ => cfg!(any(target_vendor = "apple", kenny_frame_pointers)),
     })
 }
 
@@ -192,6 +193,28 @@ pub fn frame_pointer() -> usize {
         fp = 0;
     }
     fp
+}
+
+/// The stack pointer of the calling function. (Not the address of a local: on Linux a
+/// frame's locals can sit above its frame record, so that address can be above the frame
+/// pointer, which would end a walk from it at once.)
+#[inline(always)]
+pub fn stack_pointer() -> usize {
+    let sp: usize;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let x = 0u8;
+        sp = std::hint::black_box(&x) as *const u8 as usize;
+    }
+    sp
 }
 
 /// Index of the frame pointer in `PHeap::regs` (see gc::spill_registers).
@@ -262,10 +285,76 @@ pub fn audited_natives() {
     if let Some(m) = named("Method") {
         gc_transparent(m, &["call", "()", "[]", "==="]);
     }
+    // the next ones that blocked most collections (blog8 under load): they iterate rooted
+    // snapshots (`Rooted`, `RVec`) or re-read through their receiver after each call, and
+    // keep everything else in locals
+    gc_transparent(
+        c.array,
+        &[
+            "include?", "delete", "find", "detect", "inject", "reduce", "sort_by", "sort_by!", "map!", "collect!", "select", "filter", "find_all", "reject", "select!", "filter!",
+            "reject!", "keep_if", "delete_if", "filter_map", "any?", "all?", "none?", "one?",
+        ],
+    );
+    gc_transparent(c.hash, &["[]", "==", "eql?", "transform_keys", "transform_keys!", "select", "filter", "reject"]);
+    gc_transparent(c.range, &["each", "to_a"]);
+    gc_transparent(c.kernel, &["Array"]);
+    gc_transparent(c.basic_object, &["!="]);
+    gc_transparent(c.exception, &["message"]);
+    // (String's bang methods that call the plain method and copy its bytes back)
+    if let Some(re) = named("Regexp") {
+        gc_transparent(re, &["match"]);
+    }
+    gc_transparent(c.string, &["match", "match?", "delete!", "delete_prefix!", "delete_suffix!", "tr!", "tr_s!", "scrub!", "unicode_normalize!", "succ!", "next!"]);
+    gc_transparent(crate::core::singleton_class(c.struct_ as crate::core::V), &["new"]);
+    if let Some(mon) = named("Monitor") {
+        gc_transparent(mon, &["mon_check_owner"]);
+    }
+    // writes copy each argument's bytes (`to_s`) before they wait for the output lock or a
+    // socket; `puts` roots the elements of an Array argument
+    if let Some(io) = named("IO") {
+        gc_transparent(io, &["write", "print", "puts", "<<", "syswrite"]);
+    }
+    gc_transparent(c.kernel, &["puts", "print", "p", "hash"]);
+    // (Array#hash re-reads the Array by index after each element's `hash`)
+    gc_transparent(c.array, &["hash", "each_with_object", "flat_map", "uniq"]);
+    gc_transparent(c.hash, &["delete"]);
+    gc_transparent(c.comparable, &["<", "<=", ">", ">=", "==", "between?"]);
+    // the long tail (blog8 under load). sub/gsub copy the subject's bytes first and keep the
+    // receiver, Regexp and replacement Hash in locals; the bang forms then write the result
+    // into the receiver. (String#gsub is wrapped later by blockless_enumerators, which calls
+    // this method as audited.)
+    gc_transparent(c.string, &["sub", "gsub", "sub!", "gsub!"]);
+    // sprintf reads its arguments by index and keeps each one in a local (String#% roots a
+    // copy of an Array argument's elements)
+    gc_transparent(c.kernel, &["format", "sprintf", "printf"]);
+    gc_transparent(c.string, &["%"]);
+    // (filter_bang: Hash#select's loop over a rooted snapshot of the pairs)
+    gc_transparent(c.hash, &["delete_if", "keep_if", "select!", "filter!", "reject!"]);
+    // (rooted snapshots of the pairs or elements)
+    gc_transparent(c.hash, &["transform_values", "transform_values!", "any?"]);
+    // (merge_into: a rooted snapshot of the other Hash's pairs; the old value is copied out
+    // before the block runs; `to_hash` conversions keep their result in a local)
+    gc_transparent(c.hash, &["merge", "merge!", "update"]);
+    gc_transparent(c.array, &["drop_while"]);
+    // (a rooted snapshot: sorted sorts one, and its merge buffer copies values it pins;
+    // sort_by_keys keeps items and keys in RVecs; best_by keeps its best pair in a local)
+    gc_transparent(c.array, &["reverse_each", "sort", "sort!", "min", "max", "minmax", "min_by", "max_by", "minmax_by", "sum"]);
+    // these only call `Rational()` / `[]` on a String made from the name
+    if let Some(t) = named("Time") {
+        gc_transparent(t, &["subsec", "to_r"]);
+    }
+    gc_transparent(c.symbol, &["slice", "[]", "=~", "match", "match?", "capitalize"]);
+    // what ends in a tail call of class_new_instance (Class#new's own: the native's frame is
+    // gone, so a stack shows Class#new), and Array.new's fill, into an RVec
+    gc_transparent(crate::core::singleton_class(c.array as crate::core::V), &["new"]);
+    gc_transparent(c.array, &["initialize"]);
+    gc_transparent(crate::core::singleton_class(c.exception as crate::core::V), &["exception"]);
+    // (and the copies of these that boot made before this ran; later ones are marked as made)
+    crate::core::mark_transparent_copies();
 }
 
 
-static NATIVES: std::sync::Mutex<Option<rustc_hash::FxHashMap<usize, (usize, u32)>>> = std::sync::Mutex::new(None);
+static NATIVES: std::sync::Mutex<Option<std::collections::BTreeMap<usize, (usize, u32)>>> = std::sync::Mutex::new(None);
 fn diag() -> bool {
     static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *D.get_or_init(|| std::env::var("KENNY_GC_COMPACT_STATS").is_ok_and(|v| v == "2"))
@@ -281,15 +370,28 @@ fn symbol(addr: usize) -> String {
     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
     if unsafe { libc::dladdr(addr as *const libc::c_void, &mut info) } != 0 && !info.dli_sname.is_null() {
         if let Some(&(c, mid)) = NATIVES.lock().unwrap().as_ref().and_then(|m| m.get(&(info.dli_saddr as usize))) {
-            // (never class_name: a singleton class's name calls `inspect`)
-            let k = unsafe { &*(c as *mut crate::core::Class) };
-            let (owner, sep) = if k.is_singleton && crate::core::is_class(k.attached) { (unsafe { (*(k.attached as *mut crate::core::Class)).name.clone() }, ".") } else { (k.name.clone(), "#") };
-            return format!("{owner}{sep}{}", crate::core::sym_str(mid));
+            return method_label(c, mid);
         }
         let s = unsafe { std::ffi::CStr::from_ptr(info.dli_sname) }.to_string_lossy().into_owned();
         return format!("{s}+{:#x}", addr - info.dli_saddr as usize);
     }
-    format!("{addr:#x}")
+    // (Linux: a function that isn't in the dynamic symbol table) its offset in the binary, for
+    // `addr2line -f -e binary offset`, and the closest native method at or below it, which it
+    // is likely in (`~`: a guess)
+    let guess = NATIVES.lock().unwrap().as_ref().and_then(|m| m.range(..=addr).next_back().map(|(_, &(c, mid))| method_label(c, mid)));
+    let guess = guess.map(|g| format!(" (~{g})")).unwrap_or_default();
+    if !info.dli_fbase.is_null() && !info.dli_fname.is_null() {
+        let file = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy().into_owned();
+        return format!("{file}+{:#x}{guess}", addr - info.dli_fbase as usize);
+    }
+    format!("{addr:#x}{guess}")
+}
+
+fn method_label(c: usize, mid: u32) -> String {
+    // (never class_name: a singleton class's name calls `inspect`)
+    let k = unsafe { &*(c as *mut crate::core::Class) };
+    let (owner, sep) = if k.is_singleton && crate::core::is_class(k.attached) { (unsafe { (*(k.attached as *mut crate::core::Class)).name.clone() }, ".") } else { (k.name.clone(), "#") };
+    format!("{owner}{sep}{}", crate::core::sym_str(mid))
 }
 
 /// (KENNY_GC_COMPACT_STATS=2) The native methods that keep a collection from compacting: the

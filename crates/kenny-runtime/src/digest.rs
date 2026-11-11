@@ -293,6 +293,9 @@ fn init_digest() {
     const_set(dg, sym("Instance"), inst as V);
     *INSTANCE.get() = inst;
     init_instance(inst);
+    // (audited: they hold their objects on the stack across the sends; see stackmap.rs
+    // `audited_natives`)
+    gc_transparent(inst, &["digest", "digest!", "hexdigest", "hexdigest!", "base64digest", "base64digest!", "to_s", "<<", "new"]);
 
     let class = new_class("Digest::Class", r.c.object);
     const_set(dg, sym("Class"), class as V);

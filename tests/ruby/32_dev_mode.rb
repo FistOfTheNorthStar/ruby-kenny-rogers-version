@@ -122,7 +122,9 @@ p IO.select([r], nil, nil, 0.05)
 ticks = []
 sleeper = Thread.new { 3.times { sleep 0.02; ticks << 1 } }
 reader = Thread.new { IO.select([r]); r.gets }
-sleep 0.2
+# (the sleeper finishes while the reader waits; a time limit, not a fixed sleep: timers run
+# late on a loaded or throttled machine)
+sleeper.join(10)
+p reader.alive?
 w.puts "late"
 p reader.value, ticks.size
-sleeper.join

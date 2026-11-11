@@ -68,7 +68,12 @@ fn choose(src: &Path) -> (PathBuf, Option<(PathBuf, Vec<PathBuf>)>) {
             (exe, env)
         }
         None => {
-            eprintln!("kenny: {} asks for Ruby {want}, which isn't installed (rvm, rbenv, asdf, chruby, mise); using `ruby` on PATH", file.display());
+            // (a Ruby installed some other way, e.g. a Docker image's or CI's setup-ruby, is
+            // fine when it is that version)
+            let on_path = Command::new("ruby").args(["-e", "print RUBY_VERSION"]).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+            if !on_path.is_some_and(|v| v == want || v.starts_with(&format!("{want}."))) {
+                eprintln!("kenny: {} asks for Ruby {want}, which isn't installed (rvm, rbenv, asdf, chruby, mise); using `ruby` on PATH", file.display());
+            }
             (PathBuf::from("ruby"), None)
         }
     }
