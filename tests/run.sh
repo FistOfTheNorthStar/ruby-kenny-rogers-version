@@ -6,9 +6,11 @@
 #   KENNY_RUBY=/path/to/ruby tests/run.sh
 #
 # The expected output is the test's .out file, or its .X.Y.out (e.g. .4.0.out) when that Ruby
-# version prints something else. A test may name extra `kenny run` flags in a
-# `# kenny-run-flags: ...` line (shell-expanded, e.g. `$(ruby -e '...')` for a test that needs
-# an installed gem: that `ruby` is the one the tests build against).
+# version prints something else, or its .linux.out / .X.Y.linux.out on Linux, where CRuby
+# prints other errno numbers, Fcntl constants and libm digits. A test may name extra
+# `kenny run` flags in a `# kenny-run-flags: ...` line (shell-expanded, e.g.
+# `$(ruby -e '...')` for a test that needs an installed gem: that `ruby` is the one the tests
+# build against).
 cd "$(dirname "$0")/.."
 
 # An installed Ruby `$1` (exact, or the newest $1.*), as kenny finds it.
@@ -39,10 +41,18 @@ fi
 ver=$(ruby -e 'print RUBY_VERSION[/\A\d+\.\d+/]')
 echo "Ruby $(ruby -e 'print RUBY_VERSION') ($(command -v ruby))"
 
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+# The expected output of a test whose name without extension is $1.
+expected() {
+  for e in "$1.$ver.$os.out" "$1.$os.out" "$1.$ver.out"; do
+    [ -f "$e" ] && { echo "$e"; return; }
+  done
+  echo "$1.out"
+}
+
 pass=0; fail=0
 for f in tests/ruby/*.rb; do
-  exp="${f%.rb}.$ver.out"
-  [ -f "$exp" ] || exp="${f%.rb}.out"
+  exp=$(expected "${f%.rb}")
   flags=$(sed -n 's/^# kenny-run-flags: //p' "$f" | head -1)
   if [ -n "$flags" ]; then eval "set -- $flags"; else set --; fi
   got=$(./target/release/kenny run "$f" "$@" 2>&1)
@@ -52,8 +62,7 @@ done
 for d in tests/bundle/*/; do
   f="${d}test.rb"
   [ -f "$f" ] || continue
-  exp="${d}test.$ver.out"
-  [ -f "$exp" ] || exp="${d}test.out"
+  exp=$(expected "${d}test")
   got=$(cd "$d" && KENNY_QUIET=1 ../../../target/release/kenny run test.rb 2>&1)
   if [ "$got" = "$(cat "$exp")" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL $f"; printf '%s\n' "$got" | diff "$exp" - | head -20; fi
 done

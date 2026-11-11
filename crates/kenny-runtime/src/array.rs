@@ -1112,7 +1112,9 @@ pub fn init() {
     });
     defn(c, "uniq", 0, 0, |s, _, b| {
         if !is_proc(b) {
-            return ary_new(uniq(snapshot(s).into_vec()));
+            // (the snapshot stays rooted while the elements' `hash`/`eql?` run)
+            let snap = snapshot(s);
+            return ary_new(uniq(snap.to_vec()));
         }
         let mut seen = indexmap::IndexSet::new();
         let mut keys = RVec::new();

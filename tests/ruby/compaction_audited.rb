@@ -53,5 +53,81 @@ check("Enumerable#sort_by") { |gc| words.each_entry.sort_by { |w| gc.(); w.rever
 check("Enumerable#any? (pattern)") { |gc| p = Object.new; p.define_singleton_method(:===) { |x| gc.(); x == "fig" }; words.each_entry.any?(p) }
 check("Fiber[]") { |gc| Fiber[:k] = "v" * 2; gc.(); Fiber[:k] + Fiber.current.class.name }
 check("Digest#hexdigest") { |gc| d = Digest::SHA256.new; d << "abc"; gc.(); d.hexdigest[0, 16] }
+class ToS
+  def initialize(s, gc) = (@s, @gc = s, gc)
+  def to_s = (@gc.(); @s + "!")
+  def inspect = (@gc.(); "<#{@s}>")
+end
+check("IO#write") { |gc| r, w = IO.pipe; n = w.write(ToS.new("a" * 2, gc), "-", ToS.new("b", gc)); w << ToS.new("c", gc); w.print(ToS.new("d", gc)); w.close; [n, r.read] }
+check("IO#puts") { |gc| r, w = IO.pipe; w.puts([ToS.new("x", gc), [ToS.new("y", gc)]], ToS.new("z", gc)); w.close; r.read }
+check("Kernel#p") { |gc| $stdout.flush; v = p(ToS.new("q", gc)); [v.to_s] }
+class HashKey
+  def initialize(k, gc) = (@k, @gc = k, gc)
+  attr_reader :k
+  def hash = (@gc.(); @k.hash)
+  def eql?(o) = (@gc.(); o.is_a?(HashKey) && o.k == @k)
+end
+check("Hash#delete") { |gc| h = { HashKey.new("a" * 2, gc) => "v1", HashKey.new("b", gc) => "v2" }; [h.delete(HashKey.new("aa", gc)), h.delete(HashKey.new("zz", gc)) { |k| gc.(); k.k + "?" }, h.size] }
+check("Array#hash") { |gc| a = [HashKey.new("e" * 2, gc), "f"]; a.hash == [HashKey.new("ee", gc), "f"].hash }
+check("Array#flat_map") { |gc| mk.().first(3).flat_map { |x| gc.(); [x[0], x[-2]] } }
+check("Array#uniq") { |gc| [mk.().uniq { |x| gc.(); x.size }, [HashKey.new("u", gc), HashKey.new("u", gc), "w" * 2].uniq.size] }
+check("Array#each_with_object") { |gc| mk.().each_with_object(+"") { |x, acc| gc.(); acc << x[0] } }
+class Ver
+  include Comparable
+  def initialize(n, gc) = (@n, @gc = n, gc)
+  attr_reader :n
+  def <=>(o) = (@gc.(); n <=> o.n)
+end
+check("Comparable#<") { |gc| a, b = Ver.new(1, gc), Ver.new(2, gc); [a < b, a >= b, a == Ver.new(1, gc), b.between?(a, b)] }
+check("String#gsub") { |gc| [("a-b-c" * 2).gsub(/-(.)/) { gc.(); $1.upcase + "+" }, "hello".gsub("l") { gc.(); "L" * 2 }, "abc".gsub(/[ab]/, Hash.new { |_, k| gc.(); k.upcase * 2 })] }
+check("String#sub!") { |gc| s = +"x1y2"; s.sub!(/\d/) { |d| gc.(); (d.to_i * 7).to_s }; t = +"x1y2"; t.gsub!(/\d/) { |d| gc.(); "<#{d}>" }; [s, t] }
+check("Kernel#format") { |gc| [format("%s-%p|%5s", ToS.new("f", gc), ToS.new("g", gc), ToS.new("h", gc)), "%s/%s" % [ToS.new("i", gc), ToS.new("j" * 2, gc)]] }
+check("Hash#delete_if") { |gc| h = { "a" => 1, "bb" => 2, "ccc" => 3 }; h.delete_if { |k, _| gc.(); k.size == 2 }; g = h.dup; g.select! { |k, v| gc.(); v > 1 }; [h, g] }
+check("Array#reverse_each") { |gc| out = []; mk.().reverse_each { |x| gc.(); out << x[0, 2] }; out }
+check("Enumerable#sort") { |gc| e = Object.new; e.extend(Enumerable); e.define_singleton_method(:each) { |&b| %w[m k z].each { |x| b.(x * 2) } }; [e.sort { |x, y| gc.(); y <=> x }, e.min { |x, y| gc.(); x <=> y }] }
+check("Enumerable#find") { |gc| e = Object.new; e.extend(Enumerable); e.define_singleton_method(:each) { |&b| %w[n o p].each { |x| b.(x * 2) } }; [e.find { |x| gc.(); x > "nn" }, e.detect(-> { gc.(); "none" }) { |x| gc.(); x == "q" }] }
+check("Enumerable#find_index") { |gc| e = Object.new; e.extend(Enumerable); e.define_singleton_method(:each) { |&b| %w[n o p].each { |x| gc.(); b.(x * 2) } }; [e.find_index("o" * 2), e.find_index { |x| gc.(); x == "pp" }] }
+check("Hash#merge!") { |gc| h = { "a" => "1", "b" => "2" }; h.merge!({ "b" => "3" * 2, "c" => "4" }) { |k, o, n| gc.(); k + o + n }; [h, h.merge({ "a" => "5" }) { |_, o, n| gc.(); o + n }] }
+class Single
+  def initialize(s, gc) = (gc.(); @s = s * 2)
+  attr_reader :s
+  class << self
+    alias_method :build, :new
+  end
+end
+check("Class#new (alias)") { |gc| Single.build("q", gc).s }
+class Bag < Array
+  def initialize(n, gc) = (gc.(); super(n) { |i| gc.(); "b#{i}" })
+end
+class Oops < StandardError
+  def initialize(m, gc) = (gc.(); super(m * 2))
+end
+check("Array.new") { |gc| [Bag.new(2, gc), Array.new(2) { |i| gc.(); "a#{i}" }, (raise Oops.new("x", gc) rescue $!.message), Oops.exception("y", gc).message] }
+check("Symbol#match") { |gc| :hello.match(/l+/) { |m| gc.(); m[0] + "!" } }
+require "json"
+class J
+  def initialize(s, gc) = (@s, @gc = s, gc)
+  def to_json(*) = (@gc.(); "\"#{@s}\"")
+end
+check("JSON.generate") { |gc| [JSON.generate({ "a" => [J.new("x" * 2, gc), "y"], "b" => { "c" => J.new("z", gc) } }), JSON::State.new.generate([J.new("w", gc), 1]), [J.new("v", gc)].to_json] }
+check("Hash#transform_values") { |gc| h = { "a" => "x", "b" => "y" * 2 }; g = h.dup; g.transform_values! { |v| gc.(); v * 2 }; [h.transform_values { |v| gc.(); v.upcase }, g, h.any? { |k, v| gc.(); v.size > 1 }] }
+check("Array#drop_while") { |gc| mk.().drop_while { |x| gc.(); x < "c" } }
+require "random/formatter"
+class Fmt
+  include Random::Formatter
+  def initialize(gc) = @gc = gc
+  def bytes(n) = (@gc.(); ("\x01\xab" * n)[0, n])
+end
+check("Random::Formatter") { |gc| f = Fmt.new(gc); [f.hex(4), f.base64(3), f.random_number(10).between?(0, 9), f.alphanumeric(3).size] }
+class Made
+  def initialize(s, gc) = (gc.(); @s = s * 2)
+  attr_reader :s
+  private_class_method :new
+  def self.make(s, gc) = new(s, gc)
+end
+class Open < Made
+  public_class_method :new
+end
+check("Class#new (visibility copies)") { |gc| [Made.make("m", gc).s, Open.new("o", gc).s] }
 
 $ok.each { |name, done, r| puts "#{name}: #{done} #{r.inspect}" }

@@ -1,3 +1,4 @@
+<q>
 Array#include?: true [false, "apple!"]
 Array#delete: true ["fig?", "none", 6, "grape?"]
 Array#find: true "cherry!"
@@ -28,3 +29,29 @@ Enumerable#sort_by: true ["banana", "apple", "grape", "date", "fig", "elder", "c
 Enumerable#any? (pattern): true true
 Fiber[]: true "vvFiber"
 Digest#hexdigest: true "ba7816bf8f01cfea"
+IO#write: true [6, "aa!-b!c!d!"]
+IO#puts: true "x!\ny!\nz!\n"
+Kernel#p: true ["q!"]
+Hash#delete: true ["v1", "zz?", 1]
+Array#hash: true true
+Array#flat_map: true ["a", "e", "b", "a", "c", "y"]
+Array#uniq: true [["apple!", "banana!", "date!", "fig!"], 2]
+Array#each_with_object: true "abcdefg"
+Comparable#<: true [true, false, true, true]
+String#gsub: true ["aB+C+aB+C+", "heLLLLo", "AABBc"]
+String#sub!: true ["x7y2", "x<1>y<2>"]
+Kernel#format: true ["f!-<g>|   h!", "i!/jj!"]
+Hash#delete_if: true [{"a" => 1, "ccc" => 3}, {"ccc" => 3}]
+Array#reverse_each: true ["gr", "fi", "el", "da", "ch", "ba", "ap"]
+Enumerable#sort: true [["zz", "mm", "kk"], "kk"]
+Enumerable#find: true ["oo", "none"]
+Enumerable#find_index: true [1, 2]
+Hash#merge!: true [{"a" => "1", "b" => "b233", "c" => "4"}, {"a" => "15", "b" => "b233", "c" => "4"}]
+Class#new (alias): true "qq"
+Array.new: true [["b0", "b1"], ["a0", "a1"], "xx", "yy"]
+Symbol#match: true "ll!"
+JSON.generate: true ["{\"a\":[\"xx\",\"y\"],\"b\":{\"c\":\"z\"}}", "[\"w\",1]", "[\"v\"]"]
+Hash#transform_values: true [{"a" => "X", "b" => "YY"}, {"a" => "xx", "b" => "yyyy"}, true]
+Array#drop_while: true ["cherry!", "date!", "elder!", "fig!", "grape!"]
+Random::Formatter: true ["01ab01ab", "AasB", true, 3]
+Class#new (visibility copies): true ["mm", "oo"]

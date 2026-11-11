@@ -96,8 +96,10 @@ fn want_hash(v: V) -> Result<V, V> {
 fn merge_into(dst: V, src: V, b: V) -> V {
     for (k, v) in pairs(src) {
         let nv = if is_proc(b) {
-            match rhash(dst).m.get(&HKey(k)) {
-                Some(&old) => tri!(call_block(b, &[k, old, v])),
+            // (copied out: no reference into `dst` while the block runs)
+            let old = rhash(dst).m.get(&HKey(k)).copied();
+            match old {
+                Some(old) => tri!(call_block(b, &[k, old, v])),
                 None => v,
             }
         } else {
@@ -345,7 +347,9 @@ pub fn init() {
     defn(c, "transform_values", 0, 0, |s, _, b| {
         let out = new_like(s);
         for (k, v) in pairs(s) {
-            rhash(out).m.insert(HKey(k), tri!(call_block(b, &[v])));
+            // (the block runs before the insert takes a reference into `out`)
+            let nv = tri!(call_block(b, &[v]));
+            rhash(out).m.insert(HKey(k), nv);
         }
         out
     });

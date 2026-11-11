@@ -1,0 +1,36 @@
+# The test suite (tests/run.sh) on Linux x86-64 and arm64 and on macOS, against Ruby 3.4 and 4.0.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Ruby ${{ matrix.ruby }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        ruby: ["3.4.12", "4.0.9"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Gems the tests use
+        run: gem install --no-document sqlite3:1.7.3 sassc:2.4.0 execjs:2.10.0 rack:3.2.8
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        # (the Ruby setup-ruby installed: .ruby-version names 3.4)
+        run: KENNY_RUBY="$(command -v ruby)" tests/run.sh

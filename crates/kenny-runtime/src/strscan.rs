@@ -458,6 +458,7 @@ fn init_scanner() {
 fn init_fcntl() {
     let m = new_module("Fcntl");
     set_global_const("Fcntl", m as V);
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut cs: Vec<(&str, i64)> = vec![
         ("F_DUPFD", libc::F_DUPFD as i64), ("F_GETFD", libc::F_GETFD as i64), ("F_SETFD", libc::F_SETFD as i64),
         ("F_GETFL", libc::F_GETFL as i64), ("F_SETFL", libc::F_SETFL as i64), ("F_GETLK", libc::F_GETLK as i64),

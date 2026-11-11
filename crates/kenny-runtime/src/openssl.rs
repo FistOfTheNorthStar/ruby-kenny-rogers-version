@@ -1431,4 +1431,10 @@ pub fn init() {
         alnum.extend(r.map(|c| str_new(vec![c])));
     }
     const_set(f, sym("ALPHANUMERIC"), ary_new(alnum));
+    // (audited: each one calls `bytes` and copies what it returns; the receiver and the
+    // arguments stay in locals)
+    gc_transparent(
+        f,
+        &["random_bytes", "gen_random", "hex", "base64", "urlsafe_base64", "uuid", "uuid_v4", "uuid_v7", "random_number", "rand", "choose", "alphanumeric"],
+    );
 }

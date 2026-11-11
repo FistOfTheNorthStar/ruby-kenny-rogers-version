@@ -66,6 +66,17 @@ fn yielded(args: &[V]) -> V {
 }
 
 /// Collect everything `each` yields.
+/// Math.cbrt: as CRuby, with glibc's result refined by a Newton step (glibc's cbrt can be
+/// off by one in the last place).
+pub fn cbrt(x: f64) -> f64 {
+    let r = x.cbrt();
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if r.is_finite() && !(x == 0.0 && r == 0.0) {
+        return (2.0 * r + (x / r / r)) / 3.0;
+    }
+    r
+}
+
 pub fn each_to_vec(v: V) -> Result<Vec<V>, V> {
     if is_ary(v) {
         return Ok(rary(v).v.clone());
@@ -1015,18 +1026,9 @@ pub fn init() {
         "entries", "join",
     ] {
         let id = sym(name);
-        let p = proc_new_native(
-            Box::new(move |s, args, blk| match each_to_vec(s) {
-                Ok(v) => {
-                // keep the temporary array (and the values only it references) alive
-                let tmp = RVec::from(vec![ary_new(v)]);
-                send(tmp[0], id, args, blk)
-            }
-                Err(e) => e,
-            }),
-            0,
-            -1,
-        );
+        let p = proc_new_native(Box::new(move |s, args, blk| enum_via_array(s, id, args, blk)), 0, -1);
+        // (audited: what `each` yields is collected in an RVec, then held by a rooted Array)
+        rproc(p).func = crate::core::native_block_tramp_transparent;
         add_method(en, id, Body::Proc(p));
     }
     init_enum_streaming(en);
@@ -1059,7 +1061,8 @@ pub fn init() {
         }
         let found = Rc::new(RefCell::new(RVec::new()));
         let f2 = found.clone();
-        match each_until(s, move |x| {
+        // (audited: the closure holds the block, a Proc, and an RVec)
+        match each_until_audited(s, move |x| {
             let r = call_block(b, &[x]);
             if r == UNDEF {
                 return Err(UNDEF);
@@ -1079,13 +1082,16 @@ pub fn init() {
     }
     defn(en, "find", 0, 1, |s, a, b| find_impl(s, a, b, "find"));
     defn(en, "detect", 0, 1, |s, a, b| find_impl(s, a, b, "detect"));
+    gc_transparent(en, &["find", "detect"]);
     defn(en, "find_index", 0, 1, |s, a, b| {
         let idx = Rc::new(Cell::new(-1i64));
         let i2 = idx.clone();
-        let target = a.first().copied();
+        // (rooted: the closure lives on the heap, where a collection wouldn't see the value)
+        let target = RVec::from(a.first().copied().into_iter().collect::<Vec<V>>());
         let n = Rc::new(Cell::new(0i64));
-        match each_until(s, move |x| {
-            let hit = match target {
+        // (audited: the closure holds the block, a Proc, and an RVec)
+        match each_until_audited(s, move |x| {
+            let hit = match target.first().copied() {
                 Some(t) => {
                     let r = equal(x, t);
                     if r == UNDEF {
@@ -1118,6 +1124,7 @@ pub fn init() {
             Err(e) => e,
         }
     });
+    gc_transparent(en, &["find_index"]);
     defn(en, "first", 0, 1, |s, a, _| {
         let want = a.first().map(|x| fix(*x).max(0) as usize);
         if want == Some(0) {
@@ -1578,7 +1585,7 @@ pub fn init() {
     }
     // (+0.0 for -0.0, as CRuby)
     math1_pos!("sqrt", |x: f64| x.sqrt() + 0.0);
-    math1!("cbrt", f64::cbrt);
+    math1!("cbrt", cbrt);
     math1!("sin", f64::sin);
     math1!("cos", f64::cos);
     math1!("tan", f64::tan);

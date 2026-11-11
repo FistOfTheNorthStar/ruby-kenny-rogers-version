@@ -198,7 +198,9 @@ dependencies. Every file in those directories is compiled into the binary.
   in registers; attr_readers and attr_writers become a load or a store, and `is_a?` in a loop a
   lookup in the receiver's superclass list. Each of the cache's four classes is checked with one
   compare, so a site whose receivers are of a few classes (a superclass's method called on its
-  subclasses' objects) stays on the fast path.
+  subclasses' objects) stays on the fast path. The stack check before such a call works for every
+  thread at once: a table with a byte per MiB of address space says whether that MiB of a stack
+  is clear of its limit, so threads on several cores keep their direct calls.
 - **Small methods are inlined** (attr-style getters, predicates, arithmetic, `def x = @x`, small
   `initialize`s through `C.new`, methods taking a literal block): the body is compiled into the caller
   behind a guard slot holding up to four receiver classes for which the runtime has checked that the
@@ -450,9 +452,10 @@ CRuby's, and `Ripper#state`/`#token` are nil.
   here).
 - Compacting while requests run is partial: a major collection moves objects only when no
   thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
-  them). In the blog example under load that is about 85 in 100 majors (none before precise
-  stack maps; about 90 in 100 on Linux); the rest skip compaction (a thread writing to IO,
-  mostly). Precise frames need frame pointers on every frame: Apple platforms keep them, and
+  them). In the blog example under load that is about 98 in 100 majors on macOS and 97 to 100
+  on Linux (aarch64; none before precise stack maps); the rest skip compaction (a thread
+  inside a native method not audited yet). Precise frames need frame pointers on every
+  frame: Apple platforms keep them, and
   on Linux the runtime and the C it builds are compiled with them (`.cargo/config.toml`).
   A runtime built without them scans stacks word by word for native frames instead, which
   rarely lets a busy server compact (`KENNY_GC_PRECISE=1` forces precise frames).
@@ -469,6 +472,8 @@ CRuby's, and `Ripper#state`/`#token` are nil.
 |---|---|
 | `tests/run.sh` | The test suite against Ruby 3.4 |
 | `tests/run.sh 4.0` | Against an installed Ruby 4.0 (a test's `.4.0.out` holds what 4.0 prints differently) |
+| | On Linux a test's `.linux.out` (or `.4.0.linux.out`) holds what CRuby prints there: other errno numbers, `Fcntl` constants and libm digits ([tools/linux/Dockerfile](tools/linux/Dockerfile) runs the suite in a container) |
+| CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) | `tests/run.sh` on Linux x86-64 and arm64 and on macOS, against Ruby 3.4 and 4.0 |
 | `tests/gems/run.sh [gem ...]` | Gems, under CRuby and Kenny |
 | `tests/server/run.sh [pattern]` | The HTTP server: a test app's binary started with different settings, driven over raw sockets by a CRuby script (~20 s) |
 | `bench/run.sh` | The benchmarks (`RUBY=/path/to/ruby`, `RUBY_OPTS=--yjit`) |
@@ -552,11 +557,4 @@ An uncaught exception and a failed request always print the full backtrace.
 
 ## Roadmap
 
-1. Direct calls while several OS threads run Ruby code: compiled code checks the stack against
-   one global limit, so then every compiled-to-compiled call (inline-cache direct calls, static
-   calls) goes through the runtime. A per-thread limit compiled code can reach cheaply would keep
-   them direct (inlined bodies, inlined `C.new` and virtual objects already stay on their fast path)
-2. Compaction under load, the rest: `IO#write` (pin the string it writes while it blocks, then
-   audit it) and the long tail of other natives
-3. Linux: its test outputs (errno numbers, `Fcntl` constants and libm's last digits differ
-   from macOS's: 8 tests), x86-64, and a CI run there
+1. Compaction under load: audit the natives still seen now and then (`KENNY_GC_COMPACT_STATS=2`)

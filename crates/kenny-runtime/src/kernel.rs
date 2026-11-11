@@ -37,7 +37,8 @@ pub fn puts_to(args: &[V], w: &mut dyn FnMut(&[u8])) -> V {
     }
     for &a in args {
         if is_ary(a) {
-            let items = rary(a).v.clone();
+            // (rooted: `to_s` runs Ruby code, a collection may move the elements)
+            let items = RVec::from(rary(a).v.clone());
             if items.is_empty() {
                 w(b"\n");
             }
@@ -1415,7 +1416,8 @@ pub fn init() {
             if let Ok(id) = sym_arg(n) {
                 let m = find_method(s as *mut Class, id);
                 if !m.is_null() {
-                    add_method(meta, id, clone_body(unsafe { &(*m).body }));
+                    let nm = add_method(meta, id, clone_body(unsafe { &(*m).body }));
+                    unsafe { (*(nm as *mut Method)).gc_transparent = (*m).gc_transparent };
                 }
             }
         }

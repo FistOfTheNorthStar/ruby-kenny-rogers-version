@@ -2322,15 +2322,12 @@ impl<M: Module> Compiler<M> {
         let heap = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, r, (1i64 << 61) - 2);
         self.require(fx, heap, slow);
     }
-    /// Nonzero when there is no room on the stack for a call (one OS thread) or a collection
+    /// Nonzero when there is no room on the stack for a call (`stack_room`) or a collection
     /// is pending (`dir`: KN_DIRECT), to be or-ed into a guard word that must be 0.
     pub(crate) fn no_room(&mut self, fx: &mut Fx, dir: Value) -> Value {
         let f = mem();
-        let sp = fx.b.ins().get_stack_pointer(I64);
-        let lim = fx.b.ins().load(I64, f, dir, 8);
-        // stack addresses are far below 2^63: sp < lim exactly when sp - lim is negative
-        let d = fx.b.ins().isub(sp, lim);
-        let below = fx.b.ins().ushr_imm_u(d, 63);
+        let room = stack_room(&mut fx.b, dir);
+        let below = fx.b.ins().bxor_imm_s(room, 1);
         let gc = fx.b.ins().uload8(I64, f, fx.gcflag, 0);
         fx.b.ins().bor(below, gc)
     }
@@ -2339,8 +2336,7 @@ impl<M: Module> Compiler<M> {
     /// site's inline cache (kenny-runtime core.rs `CacheEntry`) is current and maps the
     /// receiver's class to a compiled method (`direct`), call its function here. Also
     /// required: a heap receiver, a public method for a call with an explicit receiver, no
-    /// collection pending, and the stack above `KN_DIRECT.call_limit` (only one OS thread
-    /// runs Ruby code). Anything else runs `slow` (`kn_send0`...), which also fills the
+    /// collection pending, and room on the stack (`stack_room`). Anything else runs `slow` (`kn_send0`...), which also fills the
     /// cache.
     pub(crate) fn direct_call(&mut self, fx: &mut Fx, cache: Value, recv: Value, vals: &[Value], explicit: bool, slow: impl FnOnce(&mut Self, &mut Fx) -> Value) -> Value {
         let f = mem();
@@ -2673,9 +2669,8 @@ impl<M: Module> Compiler<M> {
             let mut ok = b.ins().band(current, some);
             let al = allowed(&mut b, fsel);
             ok = b.ins().band(ok, al);
-            let sp = b.ins().get_stack_pointer(I64);
-            let lim = b.ins().load(I64, f, dir, 8);
-            let room = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sp, lim);
+            let room = stack_room(&mut b, dir);
+            let room = b.ins().icmp_imm_s(IntCC::NotEqual, room, 0);
             let gfv = self.module.declare_data_in_func(self.gc_flag_id, b.func);
             let gflag = b.ins().symbol_value(I64, gfv);
             let gc = b.ins().load(I8, f, gflag, 0);

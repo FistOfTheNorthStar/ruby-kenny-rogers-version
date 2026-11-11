@@ -130,6 +130,7 @@ fn set_vis(c: *mut Class, names: &[u32], vis: u8) -> V {
                 unsafe {
                     (*(nm as *mut Method)).vis = vis;
                     (*(nm as *mut Method)).params = (*m).params;
+                    (*(nm as *mut Method)).gc_transparent = (*m).gc_transparent;
                 }
                 // (CRuby's ZSUPER entry, not a method of its own: method coverage skips it)
                 crate::coverage::vis_copy(nm);
@@ -340,7 +341,10 @@ pub fn global_function(name: &str) {
         let ks = singleton_class(k as V);
         if unsafe { !(*ks).methods.contains_key(&id) } {
             let nm = add_method(ks, id, crate::kernel::clone_body(unsafe { &(*m).body }));
-            unsafe { (*(nm as *mut Method)).vis = VIS_PUBLIC };
+            unsafe {
+                (*(nm as *mut Method)).vis = VIS_PUBLIC;
+                (*(nm as *mut Method)).gc_transparent = (*m).gc_transparent;
+            }
         }
         bump_serial();
     }
