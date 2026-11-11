@@ -96,8 +96,10 @@ fn want_hash(v: V) -> Result<V, V> {
 fn merge_into(dst: V, src: V, b: V) -> V {
     for (k, v) in pairs(src) {
         let nv = if is_proc(b) {
-            match rhash(dst).m.get(&HKey(k)) {
-                Some(&old) => tri!(call_block(b, &[k, old, v])),
+            // (copied out: no reference into `dst` while the block runs)
+            let old = rhash(dst).m.get(&HKey(k)).copied();
+            match old {
+                Some(old) => tri!(call_block(b, &[k, old, v])),
                 None => v,
             }
         } else {

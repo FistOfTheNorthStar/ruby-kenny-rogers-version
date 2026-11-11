@@ -332,6 +332,9 @@ pub fn audited_natives() {
     gc_transparent(c.hash, &["delete_if", "keep_if", "select!", "filter!", "reject!"]);
     // (rooted snapshots of the pairs or elements)
     gc_transparent(c.hash, &["transform_values", "transform_values!", "any?"]);
+    // (merge_into: a rooted snapshot of the other Hash's pairs; the old value is copied out
+    // before the block runs; `to_hash` conversions keep their result in a local)
+    gc_transparent(c.hash, &["merge", "merge!", "update"]);
     gc_transparent(c.array, &["drop_while"]);
     // (a rooted snapshot: sorted sorts one, and its merge buffer copies values it pins;
     // sort_by_keys keeps items and keys in RVecs; best_by keeps its best pair in a local)
@@ -341,10 +344,17 @@ pub fn audited_natives() {
         gc_transparent(t, &["subsec", "to_r"]);
     }
     gc_transparent(c.symbol, &["slice", "[]", "=~", "match", "match?", "capitalize"]);
+    // what ends in a tail call of class_new_instance (Class#new's own: the native's frame is
+    // gone, so a stack shows Class#new), and Array.new's fill, into an RVec
+    gc_transparent(crate::core::singleton_class(c.array as crate::core::V), &["new"]);
+    gc_transparent(c.array, &["initialize"]);
+    gc_transparent(crate::core::singleton_class(c.exception as crate::core::V), &["exception"]);
+    // (and the copies of these that boot made before this ran; later ones are marked as made)
+    crate::core::mark_transparent_copies();
 }
 
 
-static NATIVES: std::sync::Mutex<Option<rustc_hash::FxHashMap<usize, (usize, u32)>>> = std::sync::Mutex::new(None);
+static NATIVES: std::sync::Mutex<Option<std::collections::BTreeMap<usize, (usize, u32)>>> = std::sync::Mutex::new(None);
 fn diag() -> bool {
     static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *D.get_or_init(|| std::env::var("KENNY_GC_COMPACT_STATS").is_ok_and(|v| v == "2"))
@@ -360,15 +370,28 @@ fn symbol(addr: usize) -> String {
     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
     if unsafe { libc::dladdr(addr as *const libc::c_void, &mut info) } != 0 && !info.dli_sname.is_null() {
         if let Some(&(c, mid)) = NATIVES.lock().unwrap().as_ref().and_then(|m| m.get(&(info.dli_saddr as usize))) {
-            // (never class_name: a singleton class's name calls `inspect`)
-            let k = unsafe { &*(c as *mut crate::core::Class) };
-            let (owner, sep) = if k.is_singleton && crate::core::is_class(k.attached) { (unsafe { (*(k.attached as *mut crate::core::Class)).name.clone() }, ".") } else { (k.name.clone(), "#") };
-            return format!("{owner}{sep}{}", crate::core::sym_str(mid));
+            return method_label(c, mid);
         }
         let s = unsafe { std::ffi::CStr::from_ptr(info.dli_sname) }.to_string_lossy().into_owned();
         return format!("{s}+{:#x}", addr - info.dli_saddr as usize);
     }
-    format!("{addr:#x}")
+    // (Linux: a function that isn't in the dynamic symbol table) its offset in the binary, for
+    // `addr2line -f -e binary offset`, and the closest native method at or below it, which it
+    // is likely in (`~`: a guess)
+    let guess = NATIVES.lock().unwrap().as_ref().and_then(|m| m.range(..=addr).next_back().map(|(_, &(c, mid))| method_label(c, mid)));
+    let guess = guess.map(|g| format!(" (~{g})")).unwrap_or_default();
+    if !info.dli_fbase.is_null() && !info.dli_fname.is_null() {
+        let file = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy().into_owned();
+        return format!("{file}+{:#x}{guess}", addr - info.dli_fbase as usize);
+    }
+    format!("{addr:#x}{guess}")
+}
+
+fn method_label(c: usize, mid: u32) -> String {
+    // (never class_name: a singleton class's name calls `inspect`)
+    let k = unsafe { &*(c as *mut crate::core::Class) };
+    let (owner, sep) = if k.is_singleton && crate::core::is_class(k.attached) { (unsafe { (*(k.attached as *mut crate::core::Class)).name.clone() }, ".") } else { (k.name.clone(), "#") };
+    format!("{owner}{sep}{}", crate::core::sym_str(mid))
 }
 
 /// (KENNY_GC_COMPACT_STATS=2) The native methods that keep a collection from compacting: the

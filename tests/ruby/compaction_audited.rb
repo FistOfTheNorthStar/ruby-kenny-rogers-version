@@ -87,6 +87,22 @@ check("Array#reverse_each") { |gc| out = []; mk.().reverse_each { |x| gc.(); out
 check("Enumerable#sort") { |gc| e = Object.new; e.extend(Enumerable); e.define_singleton_method(:each) { |&b| %w[m k z].each { |x| b.(x * 2) } }; [e.sort { |x, y| gc.(); y <=> x }, e.min { |x, y| gc.(); x <=> y }] }
 check("Enumerable#find") { |gc| e = Object.new; e.extend(Enumerable); e.define_singleton_method(:each) { |&b| %w[n o p].each { |x| b.(x * 2) } }; [e.find { |x| gc.(); x > "nn" }, e.detect(-> { gc.(); "none" }) { |x| gc.(); x == "q" }] }
 check("Enumerable#find_index") { |gc| e = Object.new; e.extend(Enumerable); e.define_singleton_method(:each) { |&b| %w[n o p].each { |x| gc.(); b.(x * 2) } }; [e.find_index("o" * 2), e.find_index { |x| gc.(); x == "pp" }] }
+check("Hash#merge!") { |gc| h = { "a" => "1", "b" => "2" }; h.merge!({ "b" => "3" * 2, "c" => "4" }) { |k, o, n| gc.(); k + o + n }; [h, h.merge({ "a" => "5" }) { |_, o, n| gc.(); o + n }] }
+class Single
+  def initialize(s, gc) = (gc.(); @s = s * 2)
+  attr_reader :s
+  class << self
+    alias_method :build, :new
+  end
+end
+check("Class#new (alias)") { |gc| Single.build("q", gc).s }
+class Bag < Array
+  def initialize(n, gc) = (gc.(); super(n) { |i| gc.(); "b#{i}" })
+end
+class Oops < StandardError
+  def initialize(m, gc) = (gc.(); super(m * 2))
+end
+check("Array.new") { |gc| [Bag.new(2, gc), Array.new(2) { |i| gc.(); "a#{i}" }, (raise Oops.new("x", gc) rescue $!.message), Oops.exception("y", gc).message] }
 check("Symbol#match") { |gc| :hello.match(/l+/) { |m| gc.(); m[0] + "!" } }
 require "json"
 class J

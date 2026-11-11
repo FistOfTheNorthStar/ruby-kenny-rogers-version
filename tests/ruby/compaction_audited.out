@@ -46,6 +46,9 @@ Array#reverse_each: true ["gr", "fi", "el", "da", "ch", "ba", "ap"]
 Enumerable#sort: true [["zz", "mm", "kk"], "kk"]
 Enumerable#find: true ["oo", "none"]
 Enumerable#find_index: true [1, 2]
+Hash#merge!: true [{"a" => "1", "b" => "b233", "c" => "4"}, {"a" => "15", "b" => "b233", "c" => "4"}]
+Class#new (alias): true "qq"
+Array.new: true [["b0", "b1"], ["a0", "a1"], "xx", "yy"]
 Symbol#match: true "ll!"
 JSON.generate: true ["{\"a\":[\"xx\",\"y\"],\"b\":{\"c\":\"z\"}}", "[\"w\",1]", "[\"v\"]"]
 Hash#transform_values: true [{"a" => "X", "b" => "YY"}, {"a" => "xx", "b" => "yyyy"}, true]

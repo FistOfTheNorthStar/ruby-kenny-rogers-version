@@ -2083,7 +2083,7 @@ fn init_json() {
     // the stack, re-read a Hash or Array by index after each `to_json`/`to_s`/`as_json`, and
     // collect only bytes)
     for &m in &builtin {
-        unsafe { (*(m as *mut Method)).gc_transparent = true };
+        gc_transparent_method(m);
     }
     *BUILTIN_TO_JSON.get() = builtin;
     gc_transparent(state, &["generate", "_generate_no_fallback"]);

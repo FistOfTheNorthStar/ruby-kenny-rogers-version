@@ -2072,10 +2072,12 @@ fn find_super_method_uncached(klass: *mut Class, owner: *mut Class, mid: u32) ->
 }
 
 pub fn add_method(c: *mut Class, mid: u32, body: Body) -> *const Method {
+    let mut transparent = false;
     if let Body::Native(f, _, _) = &body {
         crate::stackmap::note_native(*f as usize, c, mid);
+        transparent = TRANSPARENT_FNS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(*f as usize)));
     }
-    let m = Box::into_raw(Box::new(Method { fast: 0, body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: false, attr_slot: Default::default() })) as *const Method;
+    let m = Box::into_raw(Box::new(Method { fast: 0, body, owner: c, name: mid, params: std::ptr::null(), vis: if always_private(mid) { VIS_PRIVATE } else { unsafe { (*c).default_vis } }, opt: 0, gc_transparent: transparent, attr_slot: Default::default() })) as *const Method;
     if unsafe { (*c).methods.insert(mid, m) }.is_none() {
         method_name_count(mid, true);
     }
@@ -2092,12 +2094,37 @@ pub fn add_method(c: *mut Class, mid: u32, body: Body) -> *const Method {
 }
 /// Set while `boot` defines the built-in classes and methods.
 pub static BOOTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The native functions audited as GC-transparent: a method added later with one of them as
+/// its body (an alias, a visibility change of an inherited method, `module_function`, a copy
+/// made by the runtime) is too.
+static TRANSPARENT_FNS: std::sync::Mutex<Option<rustc_hash::FxHashSet<usize>>> = std::sync::Mutex::new(None);
 /// Mark native methods as GC-transparent (see Method::gc_transparent).
 pub fn gc_transparent(c: *mut Class, names: &[&str]) {
     for n in names {
         if let Some(&m) = unsafe { (*c).methods.get(&sym(n)) } {
-            unsafe { (*(m as *mut Method)).gc_transparent = true };
+            gc_transparent_method(m);
         }
+    }
+}
+/// Mark the copies of audited native methods made before they were audited (boot copies a
+/// few methods into other classes before `stackmap::audited_natives` runs).
+pub fn mark_transparent_copies() {
+    let fns = TRANSPARENT_FNS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+    for c in crate::gc::all_classes() {
+        for (_, &m) in unsafe { (*c).methods.iter() } {
+            if let Body::Native(f, _, _) = unsafe { &(*m).body } {
+                if fns.contains(&(*f as usize)) {
+                    unsafe { (*(m as *mut Method)).gc_transparent = true };
+                }
+            }
+        }
+    }
+}
+/// Mark method `m` as GC-transparent (and its native function, for later copies).
+pub fn gc_transparent_method(m: *const Method) {
+    unsafe { (*(m as *mut Method)).gc_transparent = true };
+    if let Body::Native(f, _, _) = unsafe { &(*m).body } {
+        TRANSPARENT_FNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(*f as usize);
     }
 }
 pub fn defn(c: *mut Class, name: &str, min: i32, max: i32, f: NativeFn) {
