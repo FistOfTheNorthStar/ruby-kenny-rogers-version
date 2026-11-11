@@ -86,6 +86,7 @@ check("Hash#delete_if") { |gc| h = { "a" => 1, "bb" => 2, "ccc" => 3 }; h.delete
 check("Array#reverse_each") { |gc| out = []; mk.().reverse_each { |x| gc.(); out << x[0, 2] }; out }
 check("Enumerable#sort") { |gc| e = Object.new; e.extend(Enumerable); e.define_singleton_method(:each) { |&b| %w[m k z].each { |x| b.(x * 2) } }; [e.sort { |x, y| gc.(); y <=> x }, e.min { |x, y| gc.(); x <=> y }] }
 check("Enumerable#find") { |gc| e = Object.new; e.extend(Enumerable); e.define_singleton_method(:each) { |&b| %w[n o p].each { |x| b.(x * 2) } }; [e.find { |x| gc.(); x > "nn" }, e.detect(-> { gc.(); "none" }) { |x| gc.(); x == "q" }] }
+check("Enumerable#find_index") { |gc| e = Object.new; e.extend(Enumerable); e.define_singleton_method(:each) { |&b| %w[n o p].each { |x| gc.(); b.(x * 2) } }; [e.find_index("o" * 2), e.find_index { |x| gc.(); x == "pp" }] }
 check("Symbol#match") { |gc| :hello.match(/l+/) { |m| gc.(); m[0] + "!" } }
 require "json"
 class J

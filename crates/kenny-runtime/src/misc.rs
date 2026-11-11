@@ -1075,10 +1075,12 @@ pub fn init() {
     defn(en, "find_index", 0, 1, |s, a, b| {
         let idx = Rc::new(Cell::new(-1i64));
         let i2 = idx.clone();
-        let target = a.first().copied();
+        // (rooted: the closure lives on the heap, where a collection wouldn't see the value)
+        let target = RVec::from(a.first().copied().into_iter().collect::<Vec<V>>());
         let n = Rc::new(Cell::new(0i64));
-        match each_until(s, move |x| {
-            let hit = match target {
+        // (audited: the closure holds the block, a Proc, and an RVec)
+        match each_until_audited(s, move |x| {
+            let hit = match target.first().copied() {
                 Some(t) => {
                     let r = equal(x, t);
                     if r == UNDEF {
@@ -1111,6 +1113,7 @@ pub fn init() {
             Err(e) => e,
         }
     });
+    gc_transparent(en, &["find_index"]);
     defn(en, "first", 0, 1, |s, a, _| {
         let want = a.first().map(|x| fix(*x).max(0) as usize);
         if want == Some(0) {

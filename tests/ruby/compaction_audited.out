@@ -45,6 +45,7 @@ Hash#delete_if: true [{"a" => 1, "ccc" => 3}, {"ccc" => 3}]
 Array#reverse_each: true ["gr", "fi", "el", "da", "ch", "ba", "ap"]
 Enumerable#sort: true [["zz", "mm", "kk"], "kk"]
 Enumerable#find: true ["oo", "none"]
+Enumerable#find_index: true [1, 2]
 Symbol#match: true "ll!"
 JSON.generate: true ["{\"a\":[\"xx\",\"y\"],\"b\":{\"c\":\"z\"}}", "[\"w\",1]", "[\"v\"]"]
 Hash#transform_values: true [{"a" => "X", "b" => "YY"}, {"a" => "xx", "b" => "yyyy"}, true]

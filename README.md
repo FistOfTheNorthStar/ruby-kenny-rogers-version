@@ -454,7 +454,7 @@ CRuby's, and `Ripper#state`/`#token` are nil.
   thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
   them). In the blog example under load that is about 98 in 100 majors on macOS (none before
   precise stack maps; about 90 on Linux, measured before the latest audits); the rest skip
-  compaction (a thread in `Enumerable#find_index` with a block, say). Precise frames need frame pointers on every frame: Apple platforms keep them, and
+  compaction (a thread inside a native method not audited yet). Precise frames need frame pointers on every frame: Apple platforms keep them, and
   on Linux the runtime and the C it builds are compiled with them (`.cargo/config.toml`).
   A runtime built without them scans stacks word by word for native frames instead, which
   rarely lets a busy server compact (`KENNY_GC_PRECISE=1` forces precise frames).
