@@ -345,7 +345,9 @@ pub fn init() {
     defn(c, "transform_values", 0, 0, |s, _, b| {
         let out = new_like(s);
         for (k, v) in pairs(s) {
-            rhash(out).m.insert(HKey(k), tri!(call_block(b, &[v])));
+            // (the block runs before the insert takes a reference into `out`)
+            let nv = tri!(call_block(b, &[v]));
+            rhash(out).m.insert(HKey(k), nv);
         }
         out
     });

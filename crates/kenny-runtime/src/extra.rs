@@ -106,7 +106,8 @@ fn enum_delegate(en: *mut Class, name: &str) {
 fn copy_method(from: *mut Class, to: *mut Class, name: &str) {
     let m = find_method(from, sym(name));
     if !m.is_null() {
-        add_method(to, sym(name), clone_body(unsafe { &(*m).body }));
+        let nm = add_method(to, sym(name), clone_body(unsafe { &(*m).body }));
+        unsafe { (*(nm as *mut Method)).gc_transparent = (*m).gc_transparent };
     }
 }
 

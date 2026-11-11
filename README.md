@@ -452,9 +452,9 @@ CRuby's, and `Ripper#state`/`#token` are nil.
   here).
 - Compacting while requests run is partial: a major collection moves objects only when no
   thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
-  them). In the blog example under load that is 92 to 98 in 100 majors on macOS (none before
+  them). In the blog example under load that is about 98 in 100 majors on macOS (none before
   precise stack maps; about 90 on Linux, measured before the latest audits); the rest skip
-  compaction (a thread in `String#gsub!` with a block, say). Precise frames need frame pointers on every frame: Apple platforms keep them, and
+  compaction (a thread in `Enumerable#find_index` with a block, say). Precise frames need frame pointers on every frame: Apple platforms keep them, and
   on Linux the runtime and the C it builds are compiled with them (`.cargo/config.toml`).
   A runtime built without them scans stacks word by word for native frames instead, which
   rarely lets a busy server compact (`KENNY_GC_PRECISE=1` forces precise frames).
@@ -554,7 +554,7 @@ An uncaught exception and a failed request always print the full backtrace.
 
 ## Roadmap
 
-1. Compaction under load, the long tail: the natives still seen blocking a collection now and
-   then (`String#gsub!`/`sub!` with a block, `Symbol#slice`...)
+1. Compaction under load: measure the Linux rate again after the latest audits, and audit the
+   natives still seen now and then (`KENNY_GC_COMPACT_STATS=2`)
 2. Linux: its test outputs (errno numbers, `Fcntl` constants and libm's last digits differ
    from macOS's: 8 tests), x86-64, and a CI run there

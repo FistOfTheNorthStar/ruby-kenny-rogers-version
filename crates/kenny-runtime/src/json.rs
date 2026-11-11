@@ -2079,7 +2079,16 @@ fn init_json() {
             crate::kernel::do_include(c, m as V);
         }
     }
+    // (audited, both generators: they keep object references in locals and in the Opts on
+    // the stack, re-read a Hash or Array by index after each `to_json`/`to_s`/`as_json`, and
+    // collect only bytes)
+    for &m in &builtin {
+        unsafe { (*(m as *mut Method)).gc_transparent = true };
+    }
     *BUILTIN_TO_JSON.get() = builtin;
+    gc_transparent(state, &["generate", "_generate_no_fallback"]);
+    gc_transparent(singleton_class(state as V), &["generate", "_generate_no_fallback"]);
+    gc_transparent(singleton_class(json as V), &["generate", "pretty_generate", "fast_generate", "unparse", "pretty_unparse"]);
 }
 
 /// JSON[object, opts] (json 2.10+): parse a String, generate anything else.

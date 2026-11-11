@@ -79,5 +79,38 @@ class Ver
   def <=>(o) = (@gc.(); n <=> o.n)
 end
 check("Comparable#<") { |gc| a, b = Ver.new(1, gc), Ver.new(2, gc); [a < b, a >= b, a == Ver.new(1, gc), b.between?(a, b)] }
+check("String#gsub") { |gc| [("a-b-c" * 2).gsub(/-(.)/) { gc.(); $1.upcase + "+" }, "hello".gsub("l") { gc.(); "L" * 2 }, "abc".gsub(/[ab]/, Hash.new { |_, k| gc.(); k.upcase * 2 })] }
+check("String#sub!") { |gc| s = +"x1y2"; s.sub!(/\d/) { |d| gc.(); (d.to_i * 7).to_s }; t = +"x1y2"; t.gsub!(/\d/) { |d| gc.(); "<#{d}>" }; [s, t] }
+check("Kernel#format") { |gc| [format("%s-%p|%5s", ToS.new("f", gc), ToS.new("g", gc), ToS.new("h", gc)), "%s/%s" % [ToS.new("i", gc), ToS.new("j" * 2, gc)]] }
+check("Hash#delete_if") { |gc| h = { "a" => 1, "bb" => 2, "ccc" => 3 }; h.delete_if { |k, _| gc.(); k.size == 2 }; g = h.dup; g.select! { |k, v| gc.(); v > 1 }; [h, g] }
+check("Array#reverse_each") { |gc| out = []; mk.().reverse_each { |x| gc.(); out << x[0, 2] }; out }
+check("Enumerable#sort") { |gc| e = Object.new; e.extend(Enumerable); e.define_singleton_method(:each) { |&b| %w[m k z].each { |x| b.(x * 2) } }; [e.sort { |x, y| gc.(); y <=> x }, e.min { |x, y| gc.(); x <=> y }] }
+check("Enumerable#find") { |gc| e = Object.new; e.extend(Enumerable); e.define_singleton_method(:each) { |&b| %w[n o p].each { |x| b.(x * 2) } }; [e.find { |x| gc.(); x > "nn" }, e.detect(-> { gc.(); "none" }) { |x| gc.(); x == "q" }] }
+check("Symbol#match") { |gc| :hello.match(/l+/) { |m| gc.(); m[0] + "!" } }
+require "json"
+class J
+  def initialize(s, gc) = (@s, @gc = s, gc)
+  def to_json(*) = (@gc.(); "\"#{@s}\"")
+end
+check("JSON.generate") { |gc| [JSON.generate({ "a" => [J.new("x" * 2, gc), "y"], "b" => { "c" => J.new("z", gc) } }), JSON::State.new.generate([J.new("w", gc), 1]), [J.new("v", gc)].to_json] }
+check("Hash#transform_values") { |gc| h = { "a" => "x", "b" => "y" * 2 }; g = h.dup; g.transform_values! { |v| gc.(); v * 2 }; [h.transform_values { |v| gc.(); v.upcase }, g, h.any? { |k, v| gc.(); v.size > 1 }] }
+check("Array#drop_while") { |gc| mk.().drop_while { |x| gc.(); x < "c" } }
+require "random/formatter"
+class Fmt
+  include Random::Formatter
+  def initialize(gc) = @gc = gc
+  def bytes(n) = (@gc.(); ("\x01\xab" * n)[0, n])
+end
+check("Random::Formatter") { |gc| f = Fmt.new(gc); [f.hex(4), f.base64(3), f.random_number(10).between?(0, 9), f.alphanumeric(3).size] }
+class Made
+  def initialize(s, gc) = (gc.(); @s = s * 2)
+  attr_reader :s
+  private_class_method :new
+  def self.make(s, gc) = new(s, gc)
+end
+class Open < Made
+  public_class_method :new
+end
+check("Class#new (visibility copies)") { |gc| [Made.make("m", gc).s, Open.new("o", gc).s] }
 
 $ok.each { |name, done, r| puts "#{name}: #{done} #{r.inspect}" }

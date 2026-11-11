@@ -319,6 +319,28 @@ pub fn audited_natives() {
     gc_transparent(c.array, &["hash", "each_with_object", "flat_map", "uniq"]);
     gc_transparent(c.hash, &["delete"]);
     gc_transparent(c.comparable, &["<", "<=", ">", ">=", "==", "between?"]);
+    // the long tail (blog8 under load). sub/gsub copy the subject's bytes first and keep the
+    // receiver, Regexp and replacement Hash in locals; the bang forms then write the result
+    // into the receiver. (String#gsub is wrapped later by blockless_enumerators, which calls
+    // this method as audited.)
+    gc_transparent(c.string, &["sub", "gsub", "sub!", "gsub!"]);
+    // sprintf reads its arguments by index and keeps each one in a local (String#% roots a
+    // copy of an Array argument's elements)
+    gc_transparent(c.kernel, &["format", "sprintf", "printf"]);
+    gc_transparent(c.string, &["%"]);
+    // (filter_bang: Hash#select's loop over a rooted snapshot of the pairs)
+    gc_transparent(c.hash, &["delete_if", "keep_if", "select!", "filter!", "reject!"]);
+    // (rooted snapshots of the pairs or elements)
+    gc_transparent(c.hash, &["transform_values", "transform_values!", "any?"]);
+    gc_transparent(c.array, &["drop_while"]);
+    // (a rooted snapshot: sorted sorts one, and its merge buffer copies values it pins;
+    // sort_by_keys keeps items and keys in RVecs; best_by keeps its best pair in a local)
+    gc_transparent(c.array, &["reverse_each", "sort", "sort!", "min", "max", "minmax", "min_by", "max_by", "minmax_by", "sum"]);
+    // these only call `Rational()` / `[]` on a String made from the name
+    if let Some(t) = named("Time") {
+        gc_transparent(t, &["subsec", "to_r"]);
+    }
+    gc_transparent(c.symbol, &["slice", "[]", "=~", "match", "match?", "capitalize"]);
 }
 
 
