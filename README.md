@@ -557,4 +557,5 @@ An uncaught exception and a failed request always print the full backtrace.
 ## Roadmap
 
 1. Compaction under load: audit the natives still seen now and then (`KENNY_GC_COMPACT_STATS=2`)
-2. Linux: x86-64, and a CI run there
+2. Linux x86-64: confirm the suite on real hardware (CI's `ubuntu-24.04`; under Rosetta one test
+   fails because emulated `posix_spawn` doesn't report a missing command)
