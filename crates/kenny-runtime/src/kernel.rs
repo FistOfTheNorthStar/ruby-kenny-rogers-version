@@ -1416,7 +1416,8 @@ pub fn init() {
             if let Ok(id) = sym_arg(n) {
                 let m = find_method(s as *mut Class, id);
                 if !m.is_null() {
-                    add_method(meta, id, clone_body(unsafe { &(*m).body }));
+                    let nm = add_method(meta, id, clone_body(unsafe { &(*m).body }));
+                    unsafe { (*(nm as *mut Method)).gc_transparent = (*m).gc_transparent };
                 }
             }
         }

@@ -9,6 +9,21 @@ use std::collections::HashMap;
 fn b(v: V) -> &'static mut SVec<u8> {
     &mut rstr(v).b
 }
+/// UTF-8 bytes with their characters (see `char_lens`) in reverse order.
+fn reversed_chars(b: &[u8]) -> Vec<u8> {
+    let mut ends: Vec<usize> = char_lens(b)
+        .scan(0, |i, n| {
+            *i += n;
+            Some(*i)
+        })
+        .collect();
+    let mut out = Vec::with_capacity(b.len());
+    while let Some(e) = ends.pop() {
+        let s = ends.last().copied().unwrap_or(0);
+        out.extend_from_slice(&b[s..e]);
+    }
+    out
+}
 fn s_of(v: V) -> String {
     String::from_utf8_lossy(&rstr(v).b).into_owned()
 }
@@ -42,6 +57,16 @@ fn char_strs(v: V) -> Vec<V> {
         let b = rstr(v).b.clone();
         return b.iter().map(|c| crate::transcode::like(str_new(vec![*c]), v)).collect();
     }
+    if broken_utf8(v) {
+        let b = rstr(v).b.clone();
+        let mut i = 0;
+        return char_lens(&b)
+            .map(|n| {
+                i += n;
+                str_new(b[i - n..i].to_vec())
+            })
+            .collect();
+    }
     let ascii = hdr(v).flags & crate::compat::FL_BINARY == 0 && !same_utf8(v);
     chars(v).into_iter().map(|c| if ascii { crate::transcode::like(new_str_v(c), v) } else { new_str_v(c) }).collect()
 }
@@ -67,29 +92,26 @@ fn from_bytewise(s: &str) -> Vec<u8> {
 fn same_utf8(v: V) -> bool {
     hdr(v).flags & (crate::compat::FL_BINARY | (crate::compat::FL_BINARY << 1)) == 0
 }
-/// Characters in UTF-8 bytes (invalid bytes count one each, as `from_utf8_lossy` gives).
+/// The byte length of each character of UTF-8 bytes, counted as CRuby does in a broken
+/// String: each byte that isn't part of a valid character is a character of its own.
+pub(crate) fn char_lens(b: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    b.utf8_chunks().flat_map(|c| c.valid().chars().map(char::len_utf8).chain(std::iter::repeat_n(1, c.invalid().len())))
+}
+/// Characters in UTF-8 bytes (see `char_lens`).
 fn char_count(b: &[u8]) -> usize {
-    if b.is_ascii() { b.len() } else { String::from_utf8_lossy(b).chars().count() }
+    if b.is_ascii() { b.len() } else { char_lens(b).count() }
 }
 /// The byte offset of character `n` (the end when there are fewer).
 fn char_byte(b: &[u8], n: usize) -> usize {
     if b.is_ascii() {
         return n.min(b.len());
     }
-    let mut i = 0;
-    for _ in 0..n {
-        if i >= b.len() {
-            break;
-        }
-        let len = match b[i] {
-            0xc2..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf4 => 4,
-            _ => 1,
-        };
-        i = (i + len).min(b.len());
-    }
-    i
+    char_lens(b).take(n).sum()
+}
+/// A UTF-8 String whose bytes aren't valid UTF-8: its characters are sliced from the bytes
+/// (`char_lens`), since a conversion to `str` would replace the invalid ones.
+fn broken_utf8(v: V) -> bool {
+    same_utf8(v) && std::str::from_utf8(&rstr(v).b).is_err()
 }
 /// An Integer position argument.
 fn int_arg(v: V) -> Result<i64, V> {
@@ -100,7 +122,7 @@ fn int_arg(v: V) -> Result<i64, V> {
 }
 pub(crate) fn char_len(v: V) -> usize {
     let bytes = &rstr(v).b;
-    if ascii_only(v) || is_binary(v) { bytes.len() } else { String::from_utf8_lossy(bytes).chars().count() }
+    if ascii_only(v) || is_binary(v) { bytes.len() } else { char_count(bytes) }
 }
 /// The bytes are all ASCII (remembered for a frozen String: `FL_STR_ASCII`).
 fn ascii_only(v: V) -> bool {
@@ -190,6 +212,11 @@ fn substr(s: V, start: i64, len: i64) -> V {
     }
     if ascii_only(s) {
         return str_new(bytes[start as usize..end as usize].to_vec());
+    }
+    if broken_utf8(s) {
+        let b = char_byte(bytes, start as usize);
+        let e = b + char_byte(&bytes[b..], (end - start) as usize);
+        return str_new(bytes[b..e].to_vec());
     }
     let cs: String = String::from_utf8_lossy(bytes).chars().skip(start as usize).take((end - start) as usize).collect();
     new_str_v(cs)
@@ -648,7 +675,8 @@ pub fn init() {
         r
     });
     defn(c, "%", 1, 1, |s, a, _| {
-        let args = if is_ary(a[0]) { rary(a[0]).v.clone() } else { vec![a[0]] };
+        // (rooted: `to_s`/`inspect` run Ruby code, a collection may move the elements)
+        let args = crate::gc::RVec::from(if is_ary(a[0]) { rary(a[0]).v.clone() } else { vec![a[0]] });
         match sprintf(&rstr(s).b.clone(), &args) {
             Ok(x) => str_new(x),
             Err(e) => e,
@@ -789,12 +817,16 @@ pub fn init() {
                     let r = str_new(from_bytewise(&$f(&bytewise(&rstr(s).b))));
                     return crate::transcode::like(r, s);
                 }
+                if $name == "reverse" && broken_utf8(s) {
+                    return str_new(reversed_chars(&rstr(s).b));
+                }
                 new_str_v($f(&s_of(s)))
             });
             defn(c, $bang, 0, 1, |s, _, _| {
                 if is_binary(s) {
                     let n = from_bytewise(&$f(&bytewise(&rstr(s).b)));
-                    if n == rstr(s).b.as_slice() {
+                    // (reverse! is self even when nothing changes)
+                    if n == rstr(s).b.as_slice() && $bang != "reverse!" {
                         return QNIL;
                     }
                     return match mutate(s) {
@@ -805,8 +837,18 @@ pub fn init() {
                         Err(e) => e,
                     };
                 }
+                if $bang == "reverse!" && broken_utf8(s) {
+                    let n = reversed_chars(&rstr(s).b);
+                    return match mutate(s) {
+                        Ok(bs) => {
+                            bs.set(n);
+                            s
+                        }
+                        Err(e) => e,
+                    };
+                }
                 let n: String = $f(&s_of(s));
-                if n.as_bytes() == rstr(s).b.as_slice() {
+                if n.as_bytes() == rstr(s).b.as_slice() && $bang != "reverse!" {
                     return QNIL;
                 }
                 match mutate(s) {
@@ -1862,7 +1904,7 @@ pub fn init() {
     defn(y, "start_with?", 0, -1, |s, a, _| bool_v(a.iter().any(|p| is_str(*p) && sym_name(sym_id(s)).starts_with(&rstr(*p).b))));
     defn(y, "end_with?", 0, -1, |s, a, _| bool_v(a.iter().any(|p| is_str(*p) && sym_name(sym_id(s)).ends_with(&rstr(*p).b))));
     defn(y, "=~", 1, 1, |s, a, _| send1(str_from(&sym_str(sym_id(s))), "=~", a[0]));
-    defn(y, "match", 1, 2, |s, a, _| send(str_from(&sym_str(sym_id(s))), sym("match"), a, QNIL));
+    defn(y, "match", 1, 2, |s, a, b| send(str_from(&sym_str(sym_id(s))), sym("match"), a, b));
     defn(y, "match?", 1, 2, |s, a, _| send(str_from(&sym_str(sym_id(s))), sym("match?"), a, QNIL));
     defn(y, "empty?", 0, 0, |s, _, _| bool_v(sym_name(sym_id(s)).is_empty()));
     let _ = sym_arg;

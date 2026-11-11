@@ -2582,7 +2582,7 @@ pub extern "C" fn kn_math1(which: u64, x: f64) -> f64 {
         6 => x.ln(),
         7 => x.log2(),
         8 => x.log10(),
-        9 => x.cbrt(),
+        9 => crate::misc::cbrt(x),
         10 => x.sinh(),
         11 => x.cosh(),
         12 => x.tanh(),

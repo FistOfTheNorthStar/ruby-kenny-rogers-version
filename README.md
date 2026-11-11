@@ -452,9 +452,10 @@ CRuby's, and `Ripper#state`/`#token` are nil.
   here).
 - Compacting while requests run is partial: a major collection moves objects only when no
   thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
-  them). In the blog example under load that is 92 to 98 in 100 majors on macOS (none before
-  precise stack maps; about 90 on Linux, measured before the latest audits); the rest skip
-  compaction (a thread in `String#gsub!` with a block, say). Precise frames need frame pointers on every frame: Apple platforms keep them, and
+  them). In the blog example under load that is about 98 in 100 majors on macOS and 97 to 100
+  on Linux (aarch64; none before precise stack maps); the rest skip compaction (a thread
+  inside a native method not audited yet). Precise frames need frame pointers on every
+  frame: Apple platforms keep them, and
   on Linux the runtime and the C it builds are compiled with them (`.cargo/config.toml`).
   A runtime built without them scans stacks word by word for native frames instead, which
   rarely lets a busy server compact (`KENNY_GC_PRECISE=1` forces precise frames).
@@ -471,6 +472,8 @@ CRuby's, and `Ripper#state`/`#token` are nil.
 |---|---|
 | `tests/run.sh` | The test suite against Ruby 3.4 |
 | `tests/run.sh 4.0` | Against an installed Ruby 4.0 (a test's `.4.0.out` holds what 4.0 prints differently) |
+| | On Linux a test's `.linux.out` (or `.4.0.linux.out`) holds what CRuby prints there: other errno numbers, `Fcntl` constants and libm digits ([tools/linux/Dockerfile](tools/linux/Dockerfile) runs the suite in a container) |
+| CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) | `tests/run.sh` on Linux x86-64 and arm64 and on macOS, against Ruby 3.4 and 4.0 |
 | `tests/gems/run.sh [gem ...]` | Gems, under CRuby and Kenny |
 | `tests/server/run.sh [pattern]` | The HTTP server: a test app's binary started with different settings, driven over raw sockets by a CRuby script (~20 s) |
 | `bench/run.sh` | The benchmarks (`RUBY=/path/to/ruby`, `RUBY_OPTS=--yjit`) |
@@ -554,7 +557,4 @@ An uncaught exception and a failed request always print the full backtrace.
 
 ## Roadmap
 
-1. Compaction under load, the long tail: the natives still seen blocking a collection now and
-   then (`String#gsub!`/`sub!` with a block, `Symbol#slice`...)
-2. Linux: its test outputs (errno numbers, `Fcntl` constants and libm's last digits differ
-   from macOS's: 8 tests), x86-64, and a CI run there
+1. Compaction under load: audit the natives still seen now and then (`KENNY_GC_COMPACT_STATS=2`)
