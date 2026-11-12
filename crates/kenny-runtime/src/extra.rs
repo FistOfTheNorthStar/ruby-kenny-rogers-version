@@ -784,10 +784,12 @@ fn parse_time_string(cls: *mut Class, v: V, zone_kw: Option<V>) -> Result<V, V> 
 /// Time.utc / Time.local argument lists (including the 10-element `to_a` form).
 fn time_civil(s: V, a: &[V], z: Zone) -> V {
     let a = positional(a);
-    let (fields, usec_arg): (Vec<V>, Option<V>) = if a.len() == 10 {
-        (vec![a[5], a[4], a[3], a[2], a[1], a[0]], None)
+    // (an RVec: int_field/sec_field call `to_int`/`to_r`, and a compaction then must not
+    // move the fields still to come)
+    let (fields, usec_arg): (crate::gc::RVec, Option<V>) = if a.len() == 10 {
+        (crate::gc::RVec::from(vec![a[5], a[4], a[3], a[2], a[1], a[0]]), None)
     } else {
-        (a[..a.len().min(6)].to_vec(), a.get(6).copied())
+        (crate::gc::RVec::from(a[..a.len().min(6)].to_vec()), a.get(6).copied())
     };
     let mut f = [0i64, 1, 1, 0, 0, 0];
     let mut extra = 0i128;

@@ -2612,7 +2612,9 @@ fn compaction_mode(h: &Heap) -> CompactMode {
 /// a return address into `call_native`/`call_native_block` (see core.rs).
 fn compaction_safe() -> bool {
     let why = compaction_blocker();
-    if std::env::var_os("KENNY_GC_COMPACT_STATS").is_some_and(|v| v == "2") {
+    // (only for the collections it blocks: the report stops after 200, and a process under
+    // load runs more majors than that)
+    if why.is_some() && std::env::var_os("KENNY_GC_COMPACT_STATS").is_some_and(|v| v == "2") {
         crate::stackmap::native_report(&all_stacks());
     }
     if let Some(why) = why {

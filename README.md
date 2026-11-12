@@ -454,10 +454,10 @@ CRuby's, and `Ripper#state`/`#token` are nil.
   here).
 - Compacting while requests run is partial: a major collection moves objects only when no
   thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
-  them). In the blog example under load on macOS that is 105 of 105 majors on its pages and
-  642 of 642 while it also creates and updates posts and comments, and 97 to 100 in 100 on
-  Linux (aarch64; none before precise stack maps); the rest skip compaction (a thread
-  inside a native method not audited yet). Precise frames need frame pointers on every
+  them). In the blog example under load that is every major so far: on macOS 102 of 102 on
+  its pages and 638 of 638 while it also creates and updates posts and comments, on Linux
+  (aarch64) 77 of 77 and 667 of 667 (none before precise stack maps). A method not audited
+  yet still makes a collection skip compaction. Precise frames need frame pointers on every
   frame: Apple platforms keep them, and
   on Linux the runtime and the C it builds are compiled with them (`.cargo/config.toml`).
   A runtime built without them scans stacks word by word for native frames instead, which
