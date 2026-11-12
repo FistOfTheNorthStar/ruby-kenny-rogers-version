@@ -99,7 +99,28 @@ fn db_of(v: V) -> &'static mut Db {
         return d;
     }
     ivar_set(v, sym("@__db"), wrap(Db { db: std::ptr::null_mut(), self_v: v, exc: false, busy_ms: 0, busy_since: None, ruby_cb: false, stmt_timeout_ms: 0, stmt_deadline: None, discarded: false }, free_db));
+    keep_in_place(v, v);
     data_of::<Db>(v, "@__db").unwrap()
+}
+/// Keep `x` where it is while the Database `db` lives: SQLite's callbacks reach it through a
+/// pointer the collector can neither see nor rewrite (`Db::self_v`, an aggregator, its live
+/// instances, a collation's comparer), so a compacting collection must not move it. (What a
+/// Data object's `roots` hold stays put; ivars and Arrays alone keep it alive, not in place.)
+fn keep_in_place(db: V, x: V) {
+    let w = ivar_get(db, sym("@__db"));
+    if is_heap(x) && is_kind(w, Kind::Data) {
+        unsafe { (*(w as *mut RData)).roots.push(x) };
+        crate::gc::wb_obj(w);
+    }
+}
+fn release_in_place(db: V, x: V) {
+    let w = ivar_get(db, sym("@__db"));
+    if is_kind(w, Kind::Data) {
+        let roots = unsafe { &mut (*(w as *mut RData)).roots };
+        if let Some(i) = roots.iter().rposition(|&r| r == x) {
+            roots.swap_remove(i);
+        }
+    }
 }
 fn stmt_of(v: V) -> &'static mut Stmt {
     if let Some(s) = data_of::<Stmt>(v, "@__st") {
@@ -339,6 +360,9 @@ struct FuncData {
 }
 
 unsafe extern "C" fn func_cb(ctx: *mut ffi::sqlite3_context, argc: c_int, argv: *mut *mut ffi::sqlite3_value) {
+    // (SQLite holds the connection mutex while a callback runs, and Ruby code may switch
+    // threads: see thread::stay_here; the same in every callback below that calls Ruby)
+    let _stay = crate::thread::stay_here();
     unsafe {
         let fd = &*(ffi::sqlite3_user_data(ctx) as *const FuncData);
         let d = &mut *fd.db;
@@ -395,12 +419,14 @@ unsafe fn agg_instance(ctx: *mut ffi::sqlite3_context) -> Option<V> {
                 ary_new(vec![inst, QFALSE])
             };
             rary(ad.instances).v.push(rec);
+            keep_in_place(d.self_v, rec);
             *slot = rec;
         }
         Some(*slot)
     }
 }
 unsafe extern "C" fn agg_step(ctx: *mut ffi::sqlite3_context, argc: c_int, argv: *mut *mut ffi::sqlite3_value) {
+    let _stay = crate::thread::stay_here();
     unsafe {
         let Some(rec) = agg_instance(ctx) else { return };
         let ad = &*(ffi::sqlite3_user_data(ctx) as *const AggData);
@@ -420,6 +446,7 @@ unsafe extern "C" fn agg_step(ctx: *mut ffi::sqlite3_context, argc: c_int, argv:
     }
 }
 unsafe extern "C" fn agg_final(ctx: *mut ffi::sqlite3_context) {
+    let _stay = crate::thread::stay_here();
     unsafe {
         let ad = &*(ffi::sqlite3_user_data(ctx) as *const AggData);
         let d = &mut *ad.db;
@@ -443,10 +470,12 @@ unsafe extern "C" fn agg_final(ctx: *mut ffi::sqlite3_context) {
         if let Some(i) = inst.iter().position(|&x| x == rec) {
             inst.remove(i);
         }
+        release_in_place(d.self_v, rec);
     }
 }
 
 unsafe extern "C" fn trace_cb(p: *mut c_void, sql: *const c_char) {
+    let _stay = crate::thread::stay_here();
     unsafe {
         let d = &mut *(p as *mut Db);
         if d.exc {
@@ -460,6 +489,7 @@ unsafe extern "C" fn trace_cb(p: *mut c_void, sql: *const c_char) {
     }
 }
 unsafe extern "C" fn busy_cb(p: *mut c_void, count: c_int) -> c_int {
+    let _stay = crate::thread::stay_here();
     unsafe {
         let d = &mut *(p as *mut Db);
         if d.exc {
@@ -475,6 +505,7 @@ unsafe extern "C" fn busy_cb(p: *mut c_void, count: c_int) -> c_int {
     }
 }
 unsafe extern "C" fn auth_cb(p: *mut c_void, action: c_int, a: *const c_char, b: *const c_char, c: *const c_char, e: *const c_char) -> c_int {
+    let _stay = crate::thread::stay_here();
     unsafe {
         let d = &mut *(p as *mut Db);
         if d.exc {
@@ -514,7 +545,12 @@ unsafe extern "C" fn timeout_cb(p: *mut c_void, count: c_int) -> c_int {
     // SQLite's own schedule: 1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100 ms
     const DELAYS: [i64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
     let delay = DELAYS[(count as usize).min(DELAYS.len() - 1)].min(d.busy_ms - waited).max(1);
-    if crate::thread::sleep(Some(std::time::Duration::from_millis(delay as u64))) == UNDEF {
+    let delay = std::time::Duration::from_millis(delay as u64);
+    // (inside a query run as a blocking call this thread counts as stopped, so it may not
+    // switch threads: it leaves the blocking call while it waits. Sleeping the OS thread
+    // instead would stall the threads queued on this P, perhaps the one holding the lock.)
+    let _stay = crate::thread::stay_here();
+    if crate::gc::unblocked(|| crate::thread::sleep(Some(delay))) == UNDEF {
         d.exc = true;
         return 0;
     }
@@ -540,6 +576,7 @@ unsafe extern "C" fn stmt_timeout_cb(p: *mut c_void) -> c_int {
 }
 
 unsafe extern "C" fn coll_cb(p: *mut c_void, alen: c_int, a: *const c_void, blen: c_int, b: *const c_void) -> c_int {
+    let _stay = crate::thread::stay_here();
     unsafe {
         let cd = &*(p as *const CollData);
         let d = &mut *cd.db;
@@ -751,6 +788,8 @@ fn define_aggregator2(s: V, aggregator: V, name: V) -> V {
     let aggs = if is_ary(aggs) { aggs } else { let a = ary_new(Vec::new()); ivar_set(s, sym("@__aggregators"), a); a };
     rary(aggs).v.push(aggregator);
     rary(aggs).v.push(instances);
+    keep_in_place(s, aggregator);
+    keep_in_place(s, instances);
     d.ruby_cb = true;
     let ad = Box::into_raw(Box::new(AggData { db: d as *mut Db, klass: aggregator, instances }));
     let n = cstring(&rstr(name).b);
@@ -935,6 +974,7 @@ fn init_database(m: *mut Class) {
         let status = if a[1] == QNIL {
             unsafe { ffi::sqlite3_create_collation_v2(d.db, cs.as_ptr(), ffi::SQLITE_UTF8, std::ptr::null_mut(), None, None) }
         } else {
+            keep_in_place(s, a[1]);
             let cd = Box::into_raw(Box::new(CollData { db: d as *mut Db, cmp: a[1] }));
             unsafe { ffi::sqlite3_create_collation_v2(d.db, cs.as_ptr(), ffi::SQLITE_UTF8, cd as *mut c_void, Some(coll_cb), Some(free_colldata)) }
         };
@@ -1050,7 +1090,8 @@ fn stmt_step(s: V) -> V {
     match value {
         ffi::SQLITE_ROW => {
             let n = unsafe { ffi::sqlite3_column_count(stmt) };
-            let mut row = Vec::with_capacity(n as usize);
+            // (rooted: each column allocates, and that may collect)
+            let mut row = RVec::with_capacity(n as usize);
             for i in 0..n {
                 let v = unsafe {
                     match ffi::sqlite3_column_type(stmt, i) {
@@ -1071,7 +1112,7 @@ fn stmt_step(s: V) -> V {
                 };
                 row.push(v);
             }
-            ary_new(row)
+            ary_new(row.into())
         }
         ffi::SQLITE_DONE => {
             st.done = true;
@@ -1241,6 +1282,10 @@ fn init_statement(m: *mut Class) {
         }
     }
     defn(c, "step", 0, 0, |s, _, _| stmt_step(s));
+    // A compaction may run inside it (a callback's Ruby code, or a column's allocation
+    // collecting): the row is an RVec, the receiver and connection are in locals, and what
+    // the callbacks reach through SQLite stays in place (`keep_in_place`).
+    gc_transparent(c, &["step"]);
     defn(c, "done?", 0, 0, |s, _, _| bool_v(stmt_of(s).done));
     defn(c, "column_count", 0, 0, |s, _, _| {
         let st = open_stmt!(s);

@@ -298,7 +298,9 @@ writing to all 1,000 wakes them in 6 ms (CRuby 14 ms).
 
 File reads and writes and SQLite
 queries run as blocking calls, during which the core's waiting threads go to an idle (or
-spare) core and collections don't wait for them. No GVL: a data race can lose
+spare) core and collections don't wait for them. A thread waiting for another connection's
+write lock (`busy_timeout`, or Rails 8's `busy_handler_timeout`) lets other threads run and
+resumes on its own OS thread, which SQLite's connection mutex belongs to. No GVL: a data race can lose
 an update but never crashes the process ([docs/LANGUAGE.md](docs/LANGUAGE.md), rule 4).
 As in CRuby, a thread that reaches a constant another thread is autoloading waits until that
 file has run, and one IO object can be used by several threads at once.
@@ -452,9 +454,10 @@ CRuby's, and `Ripper#state`/`#token` are nil.
   here).
 - Compacting while requests run is partial: a major collection moves objects only when no
   thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
-  them). In the blog example under load that is about 98 in 100 majors on macOS and 97 to 100
-  on Linux (aarch64; none before precise stack maps); the rest skip compaction (a thread
-  inside a native method not audited yet). Precise frames need frame pointers on every
+  them). In the blog example under load that is every major so far: on macOS 102 of 102 on
+  its pages and 638 of 638 while it also creates and updates posts and comments, on Linux
+  (aarch64) 77 of 77 and 667 of 667 (none before precise stack maps). A method not audited
+  yet still makes a collection skip compaction. Precise frames need frame pointers on every
   frame: Apple platforms keep them, and
   on Linux the runtime and the C it builds are compiled with them (`.cargo/config.toml`).
   A runtime built without them scans stacks word by word for native frames instead, which

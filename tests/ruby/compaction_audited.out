@@ -55,3 +55,9 @@ Hash#transform_values: true [{"a" => "X", "b" => "YY"}, {"a" => "xx", "b" => "yy
 Array#drop_while: true ["cherry!", "date!", "elder!", "fig!", "grape!"]
 Random::Formatter: true ["01ab01ab", "AasB", true, 3]
 Class#new (visibility copies): true ["mm", "oo"]
+Array#each_with_index: true ["0apple!", "1banana!", "2cherry!", "3date!", "4elder!", "5fig!", "6grape!"]
+Hash#inspect: true ["{\"k\" => <vv>, <qq> => [<ww>, \"s\"]}", "{\"k\" => <vv>, <qq> => [<ww>, \"s\"]}"]
+Kernel#inspect: true "#<Holder:X @a=<aa>, @b=[\"bb\", <cc>]>"
+Integer#+ (coerce): true ["<1>abab", "<2.5><2.5>", "<1/2>r"]
+Array#index: true [3, 5, 5]
+Time.utc (Numeric#to_int): true [[4, 3, 2, 11, 3, 2024], 32400]

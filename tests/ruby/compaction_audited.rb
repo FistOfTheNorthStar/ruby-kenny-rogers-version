@@ -129,5 +129,26 @@ class Open < Made
   public_class_method :new
 end
 check("Class#new (visibility copies)") { |gc| [Made.make("m", gc).s, Open.new("o", gc).s] }
+check("Array#each_with_index") { |gc| out = []; mk.().each_with_index { |x, i| gc.(); out << "#{i}#{x}" }; out }
+class Shown
+  def initialize(s, gc) = (@s, @gc = s, gc)
+  def inspect = (@gc.(); "<#{@s * 2}>")
+end
+class Holder
+  def initialize(a, b) = (@a, @b = a, b)
+end
+check("Hash#inspect") { |gc| h = { "k" => Shown.new("v", gc), Shown.new("q", gc) => [Shown.new("w", gc), "s"] }; [h.inspect, h.to_s] }
+check("Kernel#inspect") { |gc| Holder.new(Shown.new("a", gc), ["b" * 2, Shown.new("c", gc)]).inspect.sub(/0x\h+/, "X") }
+class Coerced
+  def initialize(k, gc) = (@k, @gc = k, gc)
+  def coerce(n) = (@gc.(); ["<#{n}>", @k])
+end
+check("Integer#+ (coerce)") { |gc| [1 + Coerced.new("ab" * 2, gc), 2.5 * Coerced.new(2, gc), Rational(1, 2) + Coerced.new("r", gc)] }
+check("Array#index") { |gc| a = mk.(); [a.index { |x| gc.(); x.start_with?("d") }, a.rindex { |x| gc.(); x.size == 4 }, a.find_index("fig!")] }
+class Year < Numeric
+  def initialize(gc) = @gc = gc
+  def to_i = (@gc.(); 2024)
+end
+check("Time.utc (Numeric#to_int)") { |gc| [Time.utc(Year.new(gc), "mar" + "", "1" * 2, 2, 3, 4).to_a.first(6), Time.new(Year.new(gc), 3, 1, 0, 0, 0, "+09:00").utc_offset] }
 
 $ok.each { |name, done, r| puts "#{name}: #{done} #{r.inspect}" }

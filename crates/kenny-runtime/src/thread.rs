@@ -1404,6 +1404,31 @@ pub fn take_interrupt() -> bool {
     pst().pending_is_set()
 }
 
+/// Keeps the current thread on its OS thread until dropped. For native code that calls into
+/// Ruby while it holds a lock owned by the OS thread (SQLite's connection mutex, a recursive
+/// pthread mutex, is held while SQLite runs a callback): the Ruby code may switch to other
+/// threads (`sleep` in a busy handler), and the thread then resumes here, where the lock can
+/// be released. Unlocking it from another OS thread fails, and the mutex stays locked.
+#[must_use]
+pub struct StayHere {
+    tid: Option<usize>,
+    was: bool,
+}
+pub fn stay_here() -> StayHere {
+    let Some(tid) = (if active() { pt().current } else { None }) else {
+        return StayHere { tid: None, was: false };
+    };
+    let was = locked!(s => std::mem::replace(&mut s.threads[tid].pinned, true));
+    StayHere { tid: Some(tid), was }
+}
+impl Drop for StayHere {
+    fn drop(&mut self) {
+        if let (Some(tid), false) = (self.tid, self.was) {
+            locked!(s => s.threads[tid].pinned = false);
+        }
+    }
+}
+
 /// Kernel#sleep
 pub fn sleep(d: Option<Duration>) -> V {
     let alone = !active() || locked!(s => s.threads.len() <= 1);

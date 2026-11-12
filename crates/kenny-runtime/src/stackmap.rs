@@ -226,9 +226,12 @@ pub const FP_REG: usize = 1;
 /// Walk a frame-pointer chain from `fp` while it stays inside [lo, hi): calls `f(record,
 /// ret)` for each frame record (at `record`: the caller's frame pointer, then `ret`, the
 /// return address into the caller). Stops at the first record that isn't above the last.
+/// (A record is 8-aligned, not always 16: on AArch64 LLVM puts it wherever the frame's other
+/// saves leave room, e.g. `add x29, sp, #0x28` under a saved d8; x86-64's `push rbp` and
+/// Apple's arm64 frames happen to be 16-aligned.)
 pub fn walk(mut fp: usize, lo: usize, hi: usize, mut f: impl FnMut(usize, usize)) {
     let mut n = 0;
-    while fp >= lo && fp + 16 <= hi && fp % 16 == 0 && n < 1_000_000 {
+    while fp >= lo && fp + 16 <= hi && fp % 8 == 0 && n < 1_000_000 {
         let next = unsafe { *(fp as *const usize) };
         let ret = unsafe { *((fp + 8) as *const usize) } & 0x0000_ffff_ffff_ffff;
         f(fp, ret);
@@ -349,6 +352,28 @@ pub fn audited_natives() {
     gc_transparent(crate::core::singleton_class(c.array as crate::core::V), &["new"]);
     gc_transparent(c.array, &["initialize"]);
     gc_transparent(crate::core::singleton_class(c.exception as crate::core::V), &["exception"]);
+    // (each_with_index re-reads through its receiver like each, or goes through a redefined
+    // `each` with a closure holding only the block; inspect walks rooted snapshots of the
+    // pairs, elements or instance variables)
+    gc_transparent(c.array, &["each_with_index", "inspect", "to_s"]);
+    gc_transparent(c.hash, &["inspect", "to_s"]);
+    gc_transparent(c.kernel, &["inspect"]);
+    // (arith: a non-number operand's `coerce`, then the operator on the pair it returns;
+    // afterwards only that result, or its own arguments for the TypeError; Rails' Durations
+    // under writes)
+    let ops = ["+", "-", "*", "/", "%", "modulo", "**", "pow"];
+    gc_transparent(c.integer, &ops);
+    gc_transparent(c.float, &ops);
+    if let Some(r) = named("Rational") {
+        gc_transparent(r, &["+", "-", "*", "/", "quo"]);
+    }
+    // (index walks a rooted snapshot; Numeric#to_int is `to_i`; Time's constructors call
+    // `to_int`/`to_r`/`to_f` on their arguments, keeping the rest in an RVec)
+    gc_transparent(c.array, &["index", "find_index", "rindex"]);
+    if let Some(n) = named("Numeric") {
+        gc_transparent(n, &["to_int"]);
+    }
+    gc_transparent(crate::core::singleton_class(c.time as crate::core::V), &["new", "utc", "gm", "local", "mktime"]);
     // (and the copies of these that boot made before this ran; later ones are marked as made)
     crate::core::mark_transparent_copies();
 }
@@ -415,6 +440,25 @@ pub fn native_report(stacks: &[(usize, usize, usize)]) {
             }
             prev_ret = ret;
         });
+        // (a chain that stops short: the collector scans that stack word by word, and an old
+        // return address in a dead slot blocks it; the last frames before the break)
+        let mut tail = std::collections::VecDeque::new();
+        let mut last = 0;
+        walk(fp, lo, hi, |rec, ret| {
+            if tail.len() == 3 {
+                tail.pop_front();
+            }
+            tail.push_back(ret);
+            last = rec;
+        });
+        if names.is_empty() && chain_has(fp, lo, hi, &marks).is_none() {
+            let next = if last != 0 { unsafe { *(last as *const usize) } } else { 0 };
+            names.push(format!(
+                "(chain breaks after {}: record {last:#x} -> {next:#x}, stack {lo:#x}..{hi:#x}, {} below the top)",
+                tail.iter().map(|&r| symbol(r)).collect::<Vec<_>>().join(" < "),
+                hi.saturating_sub(last)
+            ));
+        }
         eprintln!("[gc] stack natives: {}", names.join(" | "));
     }
 }
