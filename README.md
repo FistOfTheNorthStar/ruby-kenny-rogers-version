@@ -560,4 +560,11 @@ An uncaught exception and a failed request always print the full backtrace.
 
 ## Roadmap
 
-1. Compaction under load: audit the natives still seen now and then (`KENNY_GC_COMPACT_STATS=2`)
+1. Memory on many cores: serving on 12 takes about 1.7x the memory of one, since each core
+   has its own young-generation space; bring it closer to one core's without the throughput
+   `KENNY_GC_YOUNG_SCALE=1` gives up
+2. Development tools: calling `byebug` (its core is a C extension), and Action Cable's redis
+   adapter tested against a running Redis
+3. Sass: source maps, and sassc-rails' ERB (`.scss.erb`) and glob (`@import "dir/*"`) imports
+4. Compaction without frame pointers: a runtime built without them scans native frames word by
+   word and rarely compacts a busy server
