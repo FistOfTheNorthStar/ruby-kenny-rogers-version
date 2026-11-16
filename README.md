@@ -250,7 +250,11 @@ refinements, `redo`/`retry`, `Rational`, and keyword arguments on methods and bl
 
 Generational, and compacting when it pays. Most collections are
 minor: they mark only objects allocated since the last one, plus what write barriers recorded
-(stores into old Arrays, Hashes, objects, closure environments and class tables). Each OS
+(stores into old Arrays, Hashes, objects, closure environments and class tables). A young
+object becomes old once it has survived two minor collections, so the objects of requests in
+flight during one (most of them gone by the next) don't fill the old generation: in the blog
+example on 12 cores a minor collection promotes ~100 objects instead of ~6,800, and major
+collections are about 8 times rarer. Each OS
 thread allocates from its own 64 KB pages of fixed-size slots; a collection stops all
 threads, scans their stacks with their help, sweeps in parallel, and leaves most freeing
 (young pages, dead buffers) to a background thread after the pause. A minor pause in the
@@ -465,8 +469,10 @@ CRuby's, and `Ripper#state`/`#token` are nil.
   on Linux the runtime and the C it builds are compiled with them (`.cargo/config.toml`).
   A runtime built without them scans stacks word by word for native frames instead, which
   rarely lets a busy server compact (`KENNY_GC_PRECISE=1` forces precise frames).
-- Memory: serving on 12 cores takes about 1.7x the memory of one (each core has its own
-  young-generation space, `KENNY_GC_YOUNG_SCALE=1` trades some throughput for ~1.3x); still
+- Memory: serving on 12 cores takes about 1.6x the memory of one (the blog on macOS: ~219 MB,
+  one core ~139 MB). The young generation grows with the number of cores (up to 4 times, so
+  that the pauses that stop every core are fewer), and so does what the allocator keeps per
+  thread; `KENNY_GC_YOUNG_SCALE=1` brings it to ~1.3x for 10-15% fewer requests served. Still
   far less than 12 Puma workers. On Linux (aarch64, 12 cores) the blog peaks at ~350 MB with
   mimalloc, the default, and ~255 MB with glibc's malloc (`KENNY_MALLOC=system`), which serves
   about 30% fewer requests; one core takes ~190 MB.
@@ -529,6 +535,7 @@ Environment variables read by `kenny build` or by compiled programs.
 | `KENNY_GC_MALLOC_LIMIT` | MB malloc'd for object contents since the last collection that starts a new one (default 32) |
 | `KENNY_GC_YOUNG_SCALE` | Caps how much the young generation grows with the number of cores (default 4; less memory, more pauses) |
 | `KENNY_GC_GENERATIONAL=0` | Turn minor collections off |
+| `KENNY_GC_AGING=0` | Promote young objects after one minor collection instead of two |
 | `KENNY_GC_COMPACT` | `0` never moves objects, `always` tries at every major collection |
 | `KENNY_GC_PRECISE` | `0` scans compiled frames conservatively (pinning what they hold), `1` precisely where that is not the default |
 | `KENNY_MALLOC` | `auto` / `system` / `mimalloc`: the allocator behind Rust allocations. On macOS `auto` (the default) uses mimalloc while one core runs Ruby code and the system allocator once several do (it keeps far less memory resident when threads free each other's objects); elsewhere mimalloc, which once several cores run Ruby code purges freed pages at once and has each core tidy its heap after every major collection (`KENNY_MI_TRIM=0` doesn't: ~470 MB instead of ~350 for the blog on Linux) |
