@@ -439,7 +439,6 @@ impl KMap {
     /// `insert`, the key kept being `new_key(k)` when `k` is not in the map yet (Hash#[]=
     /// copies a String key only then). `new_key` may allocate: it runs before the lock.
     pub fn insert_with(&mut self, k: HKey, v: V, new_key: impl Fn(V) -> V) -> Option<V> {
-        self.wb();
         let orig = k.0;
         let h = self.kh(orig);
         loop {
@@ -452,6 +451,11 @@ impl KMap {
                 self.unlock();
                 continue;
             }
+            // The write barrier, now that no collection can come before the store: hashing
+            // and comparing the key can run Ruby code (`hash`, `eql?`), and a minor collection
+            // there may promote the hash or forget it was remembered, while it keeps `v` and a
+            // new key young (aging). A barrier before those calls then left them unseen.
+            self.wb();
             match found {
                 Some(i) => {
                     let e = unsafe { (*t).entry(i) };
@@ -583,9 +587,10 @@ impl KMap {
     }
     /// Pointer to the value slot of `k` (which must be present).
     fn slot_of(&self, k: V) -> Option<&mut V> {
-        self.wb();
         let t = self.table()?;
         let i = t.find(self.kh(k), k, self.is_ident())?;
+        // (after the lookup, which may run Ruby code: see `insert_with`)
+        self.wb();
         Some(unsafe { &mut *(t.entry(i).val.as_ptr() as *mut V) })
     }
 }

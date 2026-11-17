@@ -32,3 +32,33 @@ xs = (0...60).map { |i| Key.new(i % 25) }
 ys = (0...60).map { |i| Key.new(i % 10) }
 puts (xs & ys).size, (xs | ys).size, (xs - ys).size, xs.intersection(ys).size, xs.union(ys).size, xs.difference(ys).size, xs.intersect?(ys)
 puts [[Key.new(1), Key.new(14)], [Key.new(1), Key.new(14)]].uniq.size
+
+# Hash#[]= on an old hash whose key's #hash runs a minor collection (Rails' query cache: its
+# keys hold binds with their own #hash): the new key and value must stay reachable.
+class MinorKey
+  attr_reader :n
+  def initialize(n) = @n = n
+  def hash
+    GC.start(full_mark: false)
+    @n.hash
+  end
+  def eql?(o) = o.is_a?(MinorKey) && o.n == n
+end
+# (in methods of their own: no stack slot of the loop keeps the new key or value)
+def put(cache, i)
+  cache[MinorKey.new(i)] = "value #{i}"
+  nil
+end
+def churn(n) = n.times { |j| "junk #{j}" * 2 }
+cache = {}
+GC.start
+ok = (0...20).map do |i|
+  put(cache, i)
+  churn(100)
+  GC.start(full_mark: false)
+  churn(5000)
+  GC.start(full_mark: false)
+  churn(5000)
+  cache.all? { |k, v| v == "value #{k.n}" }
+end
+puts ok.all?, cache.size
