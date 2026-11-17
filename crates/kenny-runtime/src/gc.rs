@@ -573,17 +573,55 @@ pub fn is_object(w: usize) -> bool {
     }
     let base = w & !(PAGE - 1);
     match page_at(h, base) {
-        Some(pi) => {
-            let pg = &h.pages[pi];
-            let off = w - base;
-            if off % pg.slot != 0 {
-                return false;
-            }
-            let i = off / pg.slot;
-            i < pg.nslots && pg.alloc[i / 64] & (1 << (i % 64)) != 0
-        }
+        Some(pi) => slot_live(&h.pages[pi], w - base),
         None => false,
     }
+}
+/// Does a live object start `off` bytes into this page?
+#[inline(always)]
+fn slot_live(pg: &Page, off: usize) -> bool {
+    // (the size classes' divisions are by constants: multiplications, not divisions)
+    let (i, rem) = match pg.slot {
+        s if s == SIZE_CLASSES[0] => (off / SIZE_CLASSES[0], off % SIZE_CLASSES[0]),
+        s if s == SIZE_CLASSES[1] => (off / SIZE_CLASSES[1], off % SIZE_CLASSES[1]),
+        s if s == SIZE_CLASSES[2] => (off / SIZE_CLASSES[2], off % SIZE_CLASSES[2]),
+        s if s == SIZE_CLASSES[3] => (off / SIZE_CLASSES[3], off % SIZE_CLASSES[3]),
+        s => (off / s, off % s),
+    };
+    rem == 0 && i < pg.nslots && pg.alloc[i / 64] & (1 << (i % 64)) != 0
+}
+/// The heap object a stack word refers to: one starting at `w`, or a GC-heap environment
+/// whose data starts at `w` (what compiled code holds). One page lookup for both.
+#[inline]
+fn stack_object(w: usize) -> Option<V> {
+    // (objects are 16-aligned: neither can be one otherwise)
+    if w & 15 != 0 {
+        return None;
+    }
+    let h = heap();
+    if w < h.page_lo || w >= h.page_hi + 16 {
+        return None;
+    }
+    let base = w & !(PAGE - 1);
+    let off = w - base;
+    let env_at = |p: usize| (hdr(p as V).kind == Kind::Env).then_some(p as V);
+    if w < h.page_hi {
+        match page_at(h, base) {
+            Some(pi) => {
+                let pg = &h.pages[pi];
+                if slot_live(pg, off) {
+                    return Some(w as V);
+                }
+                if off >= 16 {
+                    return if slot_live(pg, off - 16) { env_at(w - 16) } else { None };
+                }
+            }
+            None if off >= 16 => return None,
+            None => {}
+        }
+    }
+    // at a page's start (or just past the last page): w - 16 is on the page before
+    if is_object(w - 16) { env_at(w - 16) } else { None }
 }
 // ---------- malloc pressure ----------
 //
@@ -1026,6 +1064,8 @@ pub fn collect_now() {
 static COLLECTING: AtomicBool = AtomicBool::new(false);
 /// Total time spent waiting for other threads to stop (KENNY_GC_STATS).
 static STOP_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The same for the last collection (KENNY_GC_STATS=2).
+static LAST_STOP_NANOS: AtomicU64 = AtomicU64::new(0);
 
 /// The Ps, while the collector holds the ALL_PS lock (only the collector reads it).
 static GC_PS: G<Vec<usize>> = G::new(Vec::new());
@@ -1075,7 +1115,9 @@ fn stop_the_world_collect() {
             std::thread::yield_now();
         }
     }
-    STOP_NANOS.fetch_add(t_stop.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let stop = t_stop.elapsed().as_nanos() as u64;
+    STOP_NANOS.fetch_add(stop, Ordering::Relaxed);
+    LAST_STOP_NANOS.store(stop, Ordering::Relaxed);
     STOPS.fetch_add(1, Ordering::SeqCst);
     if KN_GC_PENDING.load(Ordering::Relaxed) & 1 != 0 {
         GC_TOP.store(approx_sp_here(), Ordering::Relaxed);
@@ -1223,7 +1265,7 @@ fn scan_candidate(f: &ScanFilter, w: usize) -> bool {
     if w & 7 != 0 || w < 4096 {
         return false;
     }
-    if w >= f.page_lo && w < f.page_hi + 16 && (f.compacting || is_object(w) || is_object(w - 16)) {
+    if w >= f.page_lo && w < f.page_hi + 16 && (f.compacting || stack_object(w).is_some()) {
         return true;
     }
     (maybe_env(w) && heap().envs.contains_key(&w)) || (f.classes && heap().class_set.contains(&w))
@@ -1705,20 +1747,34 @@ pub fn throw_values(t: Throw, out: &mut Vec<V>) {
 
 // ---------- marking ----------
 
+/// Retired buffers are found by 4 KB granule (`Marker::retired_tab`)...
+const GRANULE_SHIFT: u32 = 12;
+/// ...except larger ones (rare), checked one by one.
+const BIG_RETIRED: usize = 64 << GRANULE_SHIFT;
+#[inline]
+fn granule_slot(g: usize, bits: u32) -> usize {
+    (g.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - bits)) as usize
+}
+
 struct Marker {
     stack: Vec<V>,
     envs: Vec<usize>,
     marked_envs: FxHashSet<usize>,
     seen_classes: FxHashSet<usize>,
-    /// Retired buffers (start, bytes, align), sorted; `keep[i]` once a stack word points into one.
+    /// Retired buffers (start, bytes, align); `keep[i]` once a stack word points into one.
     retired: Vec<(usize, usize, usize)>,
     keep: Vec<bool>,
     retired_lo: usize,
     retired_hi: usize,
-    /// retired[buckets[b]..] start at or after retired_lo + (b << retired_shift): narrows the
-    /// search for the buffer a stack word points into to one or two buckets
-    retired_buckets: Vec<u32>,
-    retired_shift: u32,
+    /// The buffers by 4 KB granule, a hash table: those overlapping granule g are among
+    /// `retired_idx[retired_tab[s]..retired_tab[s + 1]]`, s = `granule_slot(g)` (buffers of
+    /// other granules may share the slot). Buffers too large to list per granule are in
+    /// `retired_big`. (Sorting them instead took a third of a minor collection's pause: the
+    /// blog on 12 cores retires ~17,000 buffers between two.)
+    retired_tab: Vec<u32>,
+    retired_idx: Vec<u32>,
+    retired_bits: u32,
+    retired_big: Vec<u32>,
     /// KENNY_GC_VERIFY: a full traversal (by its own visited set) that reports reachable
     /// objects the minor collection left unmarked.
     verify: Option<FxHashSet<usize>>,
@@ -1772,24 +1828,49 @@ enum Parent {
 }
 
 impl Marker {
-    fn new(retired: Vec<(usize, usize, usize)>, keep: Vec<bool>, retired_lo: usize, retired_hi: usize) -> Self {
-        const NB: usize = 1 << 14;
-        let span = retired_hi.saturating_sub(retired_lo) + 1;
-        let retired_shift = (usize::BITS - (span / NB).leading_zeros()).min(63);
-        let mut retired_buckets = Vec::new();
+    fn new(retired: Vec<(usize, usize, usize)>, keep: Vec<bool>) -> Self {
+        // (a counting sort by slot: one pass counts, the next places each buffer, leaving
+        // retired_tab[s] at the start of slot s)
+        let retired_bits = retired.len().next_power_of_two().max(2).trailing_zeros();
+        let nslots = 1usize << retired_bits;
+        let granules = |r: &(usize, usize, usize)| (r.0 >> GRANULE_SHIFT)..=((r.0 + r.1) >> GRANULE_SHIFT);
+        let (mut retired_lo, mut retired_hi) = (usize::MAX, 0);
+        let mut retired_tab = Vec::new();
+        let mut retired_idx = Vec::new();
+        let mut retired_big = Vec::new();
         if !retired.is_empty() {
-            let nb = (span >> retired_shift) + 2;
-            retired_buckets = vec![0u32; nb];
-            let mut i = 0usize;
-            for (b, slot) in retired_buckets.iter_mut().enumerate() {
-                let start = retired_lo.saturating_add(b << retired_shift);
-                while i < retired.len() && retired[i].0 < start {
-                    i += 1;
+            retired_tab = vec![0u32; nslots + 1];
+            let mut total = 0u32;
+            for (i, r) in retired.iter().enumerate() {
+                retired_lo = retired_lo.min(r.0);
+                retired_hi = retired_hi.max(r.0 + r.1);
+                if r.1 > BIG_RETIRED {
+                    retired_big.push(i as u32);
+                    continue;
                 }
-                *slot = i as u32;
+                for g in granules(r) {
+                    retired_tab[granule_slot(g, retired_bits)] += 1;
+                    total += 1;
+                }
+            }
+            let mut end = 0u32;
+            for t in retired_tab[..nslots].iter_mut() {
+                end += *t;
+                *t = end;
+            }
+            retired_tab[nslots] = total;
+            retired_idx = vec![0u32; total as usize];
+            for (i, r) in retired.iter().enumerate() {
+                if r.1 <= BIG_RETIRED {
+                    for g in granules(r) {
+                        let t = &mut retired_tab[granule_slot(g, retired_bits)];
+                        *t -= 1;
+                        retired_idx[*t as usize] = i as u32;
+                    }
+                }
             }
         }
-        Marker { stack: Vec::new(), envs: Vec::new(), marked_envs: FxHashSet::default(), seen_classes: FxHashSet::default(), retired, keep, retired_lo, retired_hi, retired_buckets, retired_shift, verify: None, verify_fail: 0, newly_marked: 0, cur: 0, parents: FxHashMap::default(), minor: false, major: false, code: Vec::new(), code_lo: usize::MAX, code_hi: 0, code_hit: Vec::new(), compacting: false, pinning: true, aging: false, parent: Parent::Root, entry_hit: false, survivors: Vec::new(), rem_next: Vec::new(), retrace: Vec::new(), retrace_seen: FxHashSet::default() }
+        Marker { stack: Vec::new(), envs: Vec::new(), marked_envs: FxHashSet::default(), seen_classes: FxHashSet::default(), retired, keep, retired_lo, retired_hi, retired_tab, retired_idx, retired_bits, retired_big, verify: None, verify_fail: 0, newly_marked: 0, cur: 0, parents: FxHashMap::default(), minor: false, major: false, code: Vec::new(), code_lo: usize::MAX, code_hi: 0, code_hit: Vec::new(), compacting: false, pinning: true, aging: false, parent: Parent::Root, entry_hit: false, survivors: Vec::new(), rem_next: Vec::new(), retrace: Vec::new(), retrace_seen: FxHashSet::default() }
     }
     #[inline]
     fn value(&mut self, v: V) {
@@ -1797,56 +1878,61 @@ impl Marker {
             return;
         }
         if is_object(v as usize) {
-            if let Some(seen) = &mut self.verify {
-                if seen.insert(v as usize) {
-                    self.parents.insert(v as usize, self.cur);
-                    if hdr(v).flags & FL_MARK == 0 {
-                        self.verify_fail += 1;
-                        if self.verify_fail <= 5 {
-                            eprintln!("[gc verify] reachable object {:#x} ({:?}, class {}) was not marked by the minor collection; reached via:", v, hdr(v).kind, class_name(hdr(v).klass));
-                            let mut p = self.cur;
-                            let mut n = 0;
-                            while p >= 4096 && n < 8 {
-                                let marked = hdr(p as V).flags & FL_MARK != 0;
-                                let extra = match hdr(p as V).kind {
-                                    Kind::Array => format!(" svec_flags={:#x}", rary(p as V).v.capacity()),
-                                    Kind::Hash => format!(" kmap_gen={} remembered_this_gc={}", rhash(p as V).m.gen_bits(), DBG_REMEMBERED.raw().contains(&(&rhash(p as V).m as *const _ as usize))),
-                                    _ => String::new(),
-                                };
-                                eprintln!("    {:#x} {:?} {} marked={}{}", p, hdr(p as V).kind, class_name(hdr(p as V).klass), marked, extra);
-                                p = self.parents.get(&p).copied().unwrap_or(0);
-                                n += 1;
-                            }
-                            eprintln!("    root kind {}", p);
-                        }
-                    }
-                    self.stack.push(v);
-                }
-                return;
-            }
-            let hd = hdr(v);
-            if self.compacting && self.pinning {
-                hd.flags |= FL_PIN;
-            }
-            if hd.flags & FL_MARK == 0 {
-                if self.aging {
-                    if hd.flags & FL_SURVIVOR != 0 {
-                        // survived a second minor collection: old now
-                        hd.flags &= !FL_SURVIVOR;
-                    } else {
-                        hd.flags |= FL_SURVIVOR;
-                        self.survivors.push(v as usize);
-                    }
-                }
-                hd.flags |= FL_MARK;
-                self.newly_marked += 1;
-                self.stack.push(v);
-            }
-            if self.aging && hd.flags & FL_SURVIVOR != 0 && !matches!(self.parent, Parent::Root) {
-                self.old_parent_hit();
-            }
+            self.object(v);
         } else if is_kind_unchecked_class(v) {
             self.class(v as *mut Class);
+        }
+    }
+    /// A live heap object (`is_object`).
+    #[inline]
+    fn object(&mut self, v: V) {
+        if let Some(seen) = &mut self.verify {
+            if seen.insert(v as usize) {
+                self.parents.insert(v as usize, self.cur);
+                if hdr(v).flags & FL_MARK == 0 {
+                    self.verify_fail += 1;
+                    if self.verify_fail <= 5 {
+                        eprintln!("[gc verify] reachable object {:#x} ({:?}, class {}) was not marked by the minor collection; reached via:", v, hdr(v).kind, class_name(hdr(v).klass));
+                        let mut p = self.cur;
+                        let mut n = 0;
+                        while p >= 4096 && n < 8 {
+                            let marked = hdr(p as V).flags & FL_MARK != 0;
+                            let extra = match hdr(p as V).kind {
+                                Kind::Array => format!(" svec_flags={:#x}", rary(p as V).v.capacity()),
+                                Kind::Hash => format!(" kmap_gen={} remembered_this_gc={}", rhash(p as V).m.gen_bits(), DBG_REMEMBERED.raw().contains(&(&rhash(p as V).m as *const _ as usize))),
+                                _ => String::new(),
+                            };
+                            eprintln!("    {:#x} {:?} {} marked={}{}", p, hdr(p as V).kind, class_name(hdr(p as V).klass), marked, extra);
+                            p = self.parents.get(&p).copied().unwrap_or(0);
+                            n += 1;
+                        }
+                        eprintln!("    root kind {}", p);
+                    }
+                }
+                self.stack.push(v);
+            }
+            return;
+        }
+        let hd = hdr(v);
+        if self.compacting && self.pinning {
+            hd.flags |= FL_PIN;
+        }
+        if hd.flags & FL_MARK == 0 {
+            if self.aging {
+                if hd.flags & FL_SURVIVOR != 0 {
+                    // survived a second minor collection: old now
+                    hd.flags &= !FL_SURVIVOR;
+                } else {
+                    hd.flags |= FL_SURVIVOR;
+                    self.survivors.push(v as usize);
+                }
+            }
+            hd.flags |= FL_MARK;
+            self.newly_marked += 1;
+            self.stack.push(v);
+        }
+        if self.aging && hd.flags & FL_SURVIVOR != 0 && !matches!(self.parent, Parent::Root) {
+            self.old_parent_hit();
         }
     }
     /// An old object, remembered container or class references an object kept young: the
@@ -1873,7 +1959,8 @@ impl Marker {
     /// A word that might be a pointer (stack / data section).
     #[inline]
     fn word(&mut self, w: usize) {
-        if !self.retired.is_empty() {
+        // (no retired buffers: lo > hi)
+        if w >= self.retired_lo && w <= self.retired_hi {
             self.retired_word(w);
         }
         if w >= self.code_lo && w < self.code_hi {
@@ -1882,13 +1969,8 @@ impl Marker {
         if w & 7 != 0 || w < 4096 {
             return;
         }
-        if is_object(w) {
-            self.value(w as V);
-        } else if is_object(w - 16) {
-            // the data of a GC-heap environment (what compiled code holds)
-            if hdr((w - 16) as V).kind == Kind::Env {
-                self.value((w - 16) as V);
-            }
+        if let Some(v) = stack_object(w) {
+            self.object(v);
         } else if maybe_env(w) && heap().envs.contains_key(&w) {
             self.env(w);
         } else if self.major && heap().class_set.contains(&w) {
@@ -1904,18 +1986,12 @@ impl Marker {
     /// still be reading it.
     #[inline(never)]
     fn retired_word(&mut self, w: usize) {
-        if w < self.retired_lo || w > self.retired_hi {
-            return;
-        }
-        // the last buffer starting at or before w starts in w's bucket or an earlier one
-        let b = (w - self.retired_lo) >> self.retired_shift;
-        let lo = (self.retired_buckets[b] as usize).saturating_sub(1);
-        let hi = (self.retired_buckets[b + 1] as usize).max(lo);
-        let i = lo + self.retired[lo..hi].partition_point(|r| r.0 <= w);
-        if i > 0 {
-            let (start, bytes, _) = self.retired[i - 1];
-            if w <= start + bytes {
-                self.keep[i - 1] = true;
+        let s = granule_slot(w >> GRANULE_SHIFT, self.retired_bits);
+        let (lo, hi) = (self.retired_tab[s] as usize, self.retired_tab[s + 1] as usize);
+        for &i in self.retired_idx[lo..hi].iter().chain(self.retired_big.iter()) {
+            let (start, bytes, _) = self.retired[i as usize];
+            if w >= start && w <= start + bytes {
+                self.keep[i as usize] = true;
             }
         }
     }
@@ -2263,14 +2339,26 @@ fn collect_locked() {
         return;
     }
     IN_COLLECT.store(true, Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
     let bg_guard = bg_sweep_pause();
     // roots dropped on another P since the last collection: forget them (and free them)
-    for (owner, p) in std::mem::take(&mut *ORPHAN_ROOTS.lock().unwrap_or_else(|e| e.into_inner())) {
-        unregister_root(owner as *mut PHeap, p as *const Vec<V>);
-        drop(unsafe { Box::from_raw(p as *mut Vec<V>) });
+    // (by owner, in one pass over its list; freed after the pause: the blog on 12 cores drops
+    // ~1,000 between two minor collections, which took ~0.1 ms of each pause one by one)
+    let orphans = std::mem::take(&mut *ORPHAN_ROOTS.lock().unwrap_or_else(|e| e.into_inner()));
+    if !orphans.is_empty() {
+        let mut by_owner: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
+        for (owner, p) in orphans {
+            by_owner.entry(owner).or_default().insert(p);
+        }
+        let mut boxes = Vec::new();
+        for (owner, dead) in by_owner {
+            unsafe { &mut (*(owner as *mut PHeap)).roots }.retain(|r| !dead.contains(&(*r as usize)));
+            // (each a Box of an emptied Vec: `RVec::drop`)
+            boxes.extend(dead.into_iter().map(|p| (p, std::mem::size_of::<Vec<V>>(), std::mem::align_of::<Vec<V>>())));
+        }
+        send_garbage(Garbage::Buffers(boxes));
     }
     KN_GC_PENDING.fetch_and(!1, Ordering::Relaxed);
-    let t0 = std::time::Instant::now();
     // every thread's environments created since the last collection join the shared list
     // (they are the young ones)
     let mut young_envs: FxHashSet<usize> = FxHashSet::default();
@@ -2333,17 +2421,13 @@ fn collect_locked() {
         let ph = unsafe { &mut (*(p as *mut PState)).heap };
         retired.append(&mut ph.retired);
     }
-    retired.sort_unstable();
     let n_retired = (retired.len(), retired.iter().map(|r| r.1).sum::<usize>() >> 10);
     let keep = vec![false; retired.len()];
-    let (retired_lo, retired_hi) = match (retired.first(), retired.iter().map(|r| r.0 + r.1).max()) {
-        (Some(f), Some(h)) => (f.0, h),
-        _ => (usize::MAX, 0),
-    };
-    let mut m = Marker::new(retired, keep, retired_lo, retired_hi);
+    let mut m = Marker::new(retired, keep);
 
     let mut lap = std::time::Instant::now();
-    let mut phases: Vec<(&str, f64)> = Vec::new();
+    // (what was done since the pause began: the threads' lists gathered, the old young again)
+    let mut phases: Vec<(&str, f64)> = vec![("prep", t0.elapsed().as_secs_f64() * 1e3)];
     let mut phase = |name: &'static str, lap: &mut std::time::Instant| {
         phases.push((name, lap.elapsed().as_secs_f64() * 1e3));
         *lap = std::time::Instant::now();
@@ -2637,9 +2721,10 @@ fn collect_locked() {
     if *STATS_EVERY.get() {
         let txt: Vec<String> = phases.iter().map(|(n, t)| format!("{n}={t:.2}")).collect();
         eprintln!(
-            "[gc] {} phases ms: {} (scanned_words={} retired={:?} (n, KB) data_marked={} malloc_envs={}/{} classes={} (freed {}) region_words={} remembered={} promoted={} aged={} swept_pages={}/{} freed={} lazily_freed={} helped={}/{})",
+            "[gc] {} phases ms: {} (stop={:.2} scanned_words={} retired={:?} (n, KB) data_marked={} malloc_envs={}/{} classes={} (freed {}) region_words={} remembered={} promoted={} aged={} swept_pages={}/{} freed={} lazily_freed={} helped={}/{})",
             if major { "major" } else { "minor" },
             txt.join(" "),
+            LAST_STOP_NANOS.swap(0, Ordering::Relaxed) as f64 / 1e6,
             SCANNED_WORDS.swap(0, Ordering::Relaxed),
             n_retired,
             DBG_NDATA.load(std::sync::atomic::Ordering::Relaxed),
@@ -3432,7 +3517,7 @@ fn clear_marks(h: &mut Heap) {
 /// a major collection, with its own visited set) and abort if a reachable object is
 /// unmarked, i.e. the write barrier missed a store.
 fn verify_minor(h: &mut Heap) {
-    let mut v = Marker::new(Vec::new(), Vec::new(), usize::MAX, 0);
+    let mut v = Marker::new(Vec::new(), Vec::new());
     v.verify = Some(FxHashSet::default());
     mark_roots(&mut v, h, true);
     scan_with_registers(&mut v);
