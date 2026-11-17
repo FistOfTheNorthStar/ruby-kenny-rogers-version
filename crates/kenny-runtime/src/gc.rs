@@ -153,6 +153,8 @@ pub struct PHeap {
     pub stack_base: usize,
     /// RUNNING, PARKED (stopped for a collection) or IDLE (waiting, not touching the heap).
     pub status: AtomicU8,
+    /// The OS thread, for waking it when parked (set when it first parks).
+    pub waker: std::sync::OnceLock<std::thread::Thread>,
     /// While parked or idle: where its stack ends, and its callee-saved registers.
     pub saved_sp: usize,
     pub regs: [usize; 16],
@@ -177,6 +179,7 @@ impl PHeap {
             saved_throws: SavedThrows::default(),
             stack_base: 0,
             status: AtomicU8::new(RUNNING),
+            waker: std::sync::OnceLock::new(),
             saved_sp: 0,
             regs: [0; 16],
             retired: Vec::new(),
@@ -1068,7 +1071,6 @@ fn lock_ps() -> std::sync::MutexGuard<'static, Vec<usize>> {
     *GC_PS.get() = g.clone();
     g
 }
-static STW_EPOCH: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
 /// How many times every other OS thread running Ruby code has stopped: a point after which
 /// none of them still holds a value it read before (abi.rs `kn_static_fill` waits for one
 /// before refilling a slot it cleared). Counted while they are stopped.
@@ -1076,7 +1078,19 @@ static STOPS: AtomicU64 = AtomicU64::new(0);
 pub fn stops() -> u64 {
     STOPS.load(Ordering::SeqCst)
 }
-static STW_CV: std::sync::Condvar = std::sync::Condvar::new();
+/// Wake the threads parked for this collection (to help with it, or to go on after it), each
+/// with its own wake-up: with a condition variable they took its mutex one after another
+/// when the collection ended, the last ~0.3 ms later (macOS, 12 cores).
+fn wake_parked() {
+    for &p in gc_ps().iter() {
+        let ph = unsafe { &(*(p as *const PState)).heap };
+        if ph.status.load(Ordering::SeqCst) == PARKED {
+            if let Some(t) = ph.waker.get() {
+                t.unpark();
+            }
+        }
+    }
+}
 
 /// At a safepoint with a collection due: become the collector (stop every other thread,
 /// collect, restart them) or, if another thread is collecting, stop until it is done.
@@ -1114,12 +1128,12 @@ fn stop_the_world_collect() {
         GC_TOP.store(approx_sp_here(), Ordering::Relaxed);
         collect_locked();
     }
-    drop(ps_guard);
-    let mut e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
-    *e += 1;
     KN_GC_PENDING.fetch_and(!STW_BIT, Ordering::SeqCst);
-    COLLECTING.store(false, Ordering::Release);
-    STW_CV.notify_all();
+    COLLECTING.store(false, Ordering::SeqCst);
+    // (a thread that parks from now on sees the flags clear; one parked before is woken, the
+    // list still valid while the lock is held)
+    wake_parked();
+    drop(ps_guard);
 }
 
 // ---------- parallel stack scanning ----------
@@ -1264,7 +1278,7 @@ fn scan_ranges_parallel(m: &mut Marker, ranges: &[(usize, usize)]) {
     SCAN_PENDING.store(chunks.len(), Ordering::SeqCst);
     publish_job(&SCAN_CLAIM, chunks.len());
     SCAN_ACTIVE.store(true, Ordering::SeqCst);
-    STW_CV.notify_all();
+    wake_parked();
     scan_help();
     let mut spins = 0u32;
     while SCAN_PENDING.load(Ordering::Acquire) != 0 {
@@ -1370,30 +1384,19 @@ fn park() {
     let ph = &mut crate::core::pst().heap;
     spill_registers(&mut ph.regs);
     ph.saved_sp = approx_sp_here();
+    ph.waker.get_or_init(std::thread::current);
     loop {
     ph.status.store(PARKED, Ordering::SeqCst);
-    {
-        let mut e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
-        while KN_GC_PENDING.load(Ordering::SeqCst) & STW_BIT != 0 || COLLECTING.load(Ordering::SeqCst) {
-            if SCAN_ACTIVE.load(Ordering::Acquire) {
-                drop(e);
-                let worked = scan_help();
-                e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
-                if worked {
-                    continue;
-                }
-            }
-            if SWEEP_ACTIVE.load(Ordering::Acquire) {
-                drop(e);
-                let worked = sweep_help();
-                e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
-                if worked {
-                    continue;
-                }
-            }
-            let (g, _) = STW_CV.wait_timeout(e, std::time::Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
-            e = g;
+    // (`wake_parked` wakes us once the flags change or a job is up; a wake-up that comes
+    // before we sleep makes the sleep return at once)
+    while KN_GC_PENDING.load(Ordering::SeqCst) & STW_BIT != 0 || COLLECTING.load(Ordering::SeqCst) {
+        if SCAN_ACTIVE.load(Ordering::Acquire) && scan_help() {
+            continue;
         }
+        if SWEEP_ACTIVE.load(Ordering::Acquire) && sweep_help() {
+            continue;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(1));
     }
     ph.status.store(RUNNING, Ordering::SeqCst);
     // A new collection may have started between the check above and announcing RUNNING, and
@@ -2540,7 +2543,7 @@ fn collect_locked() {
         SWEEP_HELPED.store(0, Ordering::Relaxed);
         publish_job(&SWEEP_CLAIM, n.div_ceil(SWEEP_CHUNK));
         SWEEP_ACTIVE.store(true, Ordering::SeqCst);
-        STW_CV.notify_all();
+        wake_parked();
         let _ = sweep_help();
         let mut spins = 0u32;
         while SWEEP_PENDING.load(Ordering::Acquire) != 0 {
