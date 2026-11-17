@@ -1002,6 +1002,15 @@ fn compact_now_mode(request: u8) -> Option<(usize, usize)> {
     heap().last_compact.take()
 }
 
+/// GC.start(full_mark: false): a minor collection now (a major one if one is due anyway).
+pub fn collect_minor_now() {
+    if crate::mt::multi() {
+        KN_GC_PENDING.fetch_or(1, Ordering::SeqCst);
+        stop_the_world_collect();
+    } else {
+        collect();
+    }
+}
 pub fn collect_now() {
     heap().force_major = true;
     if crate::mt::multi() {
