@@ -469,7 +469,8 @@ CRuby's, and `Ripper#state`/`#token` are nil.
 - Memory: serving on 12 cores takes about 1.6x the memory of one (the blog on macOS: ~219 MB,
   one core ~139 MB). The young generation grows with the number of cores (up to 4 times, so
   that the pauses that stop every core are fewer), and so does what the allocator keeps per
-  thread; `KENNY_GC_YOUNG_SCALE=1` brings it to ~1.3x for 10-15% fewer requests served. Still
+  thread; `KENNY_GC_YOUNG_SCALE=2` brings it to ~200 MB for ~10% fewer requests served, and
+  `KENNY_GC_YOUNG_SCALE=1` to ~1.3x for 10-15% fewer. Still
   far less than 12 Puma workers. On Linux (aarch64, 12 cores) the blog peaks at ~350 MB with
   mimalloc, the default, and ~255 MB with glibc's malloc (`KENNY_MALLOC=system`), which serves
   about 30% fewer requests; one core takes ~190 MB.
