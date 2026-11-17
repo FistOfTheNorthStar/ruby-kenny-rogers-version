@@ -1801,8 +1801,13 @@ pub fn init() {
     // ---- GC ----
     let gc = new_module("GC");
     set_global_const("GC", gc as V);
-    defs(gc, "start", 0, 1, |_, _, _| {
-        crate::gc::collect_now();
+    defs(gc, "start", 0, 1, |_, a, _| {
+        // GC.start(full_mark: false): a minor collection
+        let full = match a.last() {
+            Some(&h) if is_hash(h) => rhash(h).m.get(&HKey(mksym(sym("full_mark")))).is_none_or(|&v| truthy(v)),
+            _ => true,
+        };
+        if full { crate::gc::collect_now() } else { crate::gc::collect_minor_now() }
         QNIL
     });
     defs(gc, "enable", 0, 0, |_, _, _| {
