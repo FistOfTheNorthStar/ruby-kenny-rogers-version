@@ -61,9 +61,13 @@ const OVERLAY: &[(&str, &str)] = &[
     ("bundler/setup.rb", include_str!("../../../lib/kenny/bundler/setup.rb")),
     ("bootsnap/setup.rb", include_str!("../../../lib/kenny/bootsnap/setup.rb")),
     ("ffi.rb", include_str!("../../../lib/kenny/ffi.rb")),
+    // (libpsl through FFI, called as it loads: Discourse) on the public_suffix gem
+    ("mini_suffix.rb", include_str!("../../../lib/kenny/mini_suffix.rb")),
     // the asset pipeline's compilers on the runtime's Sass compiler and JavaScript engine
     ("sassc.rb", include_str!("../../../lib/kenny/sassc.rb")),
     ("execjs.rb", include_str!("../../../lib/kenny/execjs.rb")),
+    // (V8 in a C++ extension: Discourse) on the same JavaScript engine
+    ("mini_racer.rb", include_str!("../../../lib/kenny/mini_racer.rb")),
     ("kenny/assets_precompile.rb", include_str!("../../../lib/kenny/kenny/assets_precompile.rb")),
     ("socket.rb", include_str!("../../../lib/kenny/socket.rb")),
     ("coverage.rb", include_str!("../../../lib/kenny/coverage.rb")),
@@ -356,6 +360,14 @@ fn compile_options(o: &Opts, overlay: &Path) -> Result<(kenny_compiler::Options,
     if let Some(dym) = stdlib.as_ref().map(|d| d.join("did_you_mean.rb")).filter(|p| p.is_file()) {
         embed_files.push(dym);
     }
+    // An overlay file that stands in for a gem's file is compiled in whenever that gem is: the
+    // gem's own file is (its directory is embedded), and a `require` the compiler can't see
+    // (`Bundler.require`'s) would otherwise find only that one (mini_suffix in Discourse)
+    for (name, _) in OVERLAY {
+        if name.ends_with(".rb") && gem_paths.iter().any(|d| d.join(name).is_file()) {
+            embed_files.push(overlay.join(name));
+        }
+    }
     let mut load_paths = vec![overlay.to_path_buf()];
     load_paths.extend(gem_paths);
     load_paths.extend(stdlib.clone());
@@ -451,7 +463,7 @@ fn build(o: &Opts, out: &Path) -> Result<bool, String> {
     result.map(|_| assets)
 }
 
-/// Whether the program uses the sassc or execjs gem (the Rails asset pipeline): then the
+/// Whether the program uses the sassc, execjs or mini_racer gem (the Rails asset pipeline): then the
 /// runtime's Sass compiler and JavaScript engine are linked in (`require "kenny_assets"`).
 /// KENNY_ASSETS=1 / 0 forces it either way.
 fn needs_assets(opts: &kenny_compiler::Options) -> bool {
@@ -462,7 +474,7 @@ fn needs_assets(opts: &kenny_compiler::Options) -> bool {
         let gem = if p.file_name().is_some_and(|n| n == "lib") { p.parent() } else { Some(p.as_path()) };
         gem.and_then(|g| g.file_name()).and_then(|n| n.to_str()).is_some_and(|n| {
             let name = n.rsplit_once('-').map_or(n, |(name, _)| name);
-            name == "sassc" || name == "execjs"
+            name == "sassc" || name == "execjs" || name == "mini_racer"
         })
     })
 }

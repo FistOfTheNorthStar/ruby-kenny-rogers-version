@@ -116,15 +116,8 @@ pub fn dup(v: V, keep_frozen: bool) -> V {
     gen_ivar_copy(v, r);
     // clone copies the singleton class too (its methods, modules, instance variables and
     // constants): rspec's DSL matchers are cloned when composed (`include(k => matcher)`)
-    let meta = hdr(v).klass;
-    if keep_frozen && !meta.is_null() && unsafe { (*meta).is_singleton && (*meta).attached == v } {
-        let dm = singleton_class(r);
-        copy_singleton_methods(meta, dm);
-        unsafe {
-            (*dm).civars = (*meta).civars.clone();
-            (*dm).consts = (*meta).consts.clone();
-        }
-        bump_serial();
+    if keep_frozen {
+        copy_singleton(v, r);
     }
     // dup calls initialize_dup, clone initialize_clone; both default to initialize_copy
     // (Kernel's are no-ops: skipped; a native class's own, Random's say, is called)
@@ -226,8 +219,8 @@ pub fn do_include(target: *mut Class, m: V) -> V {
 
 /// Runtime compiler for `eval`-family calls (installed by the JIT-enabled runtime).
 /// Arguments: source, mode (0 = eval/instance_eval, 1 = class_eval), self, the caller's
-/// locals ([name Symbol, value, ...] or nil), and the file and first line the source is said
-/// to come from (eval's `file`, `line` arguments).
+/// locals ([name Symbol, value, ...] or nil), the file and first line the source is said
+/// to come from (eval's `file`, `line` arguments), and the label of its frames in backtraces.
 pub static EVAL_HOOK: G<Option<fn(&[u8], u8, V, V, Option<&str>, i64) -> V>> = G::new(None);
 
 /// Eval `src`, seeing the locals its compiled call site handed over for it (kn_eval_locals).
@@ -238,19 +231,33 @@ pub fn eval_string(src: V, mode: u8, self_: V) -> V {
 /// eval_string with eval's `file` and `line` arguments (nil: not given).
 pub fn eval_string_at(src: V, mode: u8, self_: V, file: V, line: V) -> V {
     let p = pst();
-    let locals = if p.eval_src == src && src != QNIL { p.eval_locals } else { QNIL };
+    let same = p.eval_src == src && src != QNIL;
+    let locals = if same { p.eval_locals } else { QNIL };
+    let cref = if same && mode == 0 { p.eval_cref } else { QNIL };
     p.eval_locals = QNIL;
     p.eval_src = QNIL;
-    eval_string_l(src, mode, self_, locals, file, line)
+    p.eval_cref = QNIL;
+    // (for the unit's top scope: kn_eval_cref_into; nothing runs Ruby code before it)
+    p.eval_cref_run = cref;
+    let r = eval_string_l(src, mode, self_, locals, file, line);
+    pst().eval_cref_run = QNIL;
+    r
 }
 
 /// Eval `src` with these locals ([name Symbol, value, ...] or nil).
+/// Without a `file`, it is named after the call, "(eval at f:l)", as in CRuby.
 pub fn eval_string_l(src: V, mode: u8, self_: V, locals: V, file: V, line: V) -> V {
     if !is_str(src) {
         return type_error(&format!("no implicit conversion of {} into String", class_name(real_class(src))));
     }
-    let file = if is_str(file) { Some(String::from_utf8_lossy(&rstr(file).b).into_owned()) } else { None };
+    let here = crate::backtrace::innermost().and_then(crate::backtrace::symbolize);
+    let file = if is_str(file) { Some(String::from_utf8_lossy(&rstr(file).b).into_owned()) } else { here.map(|h| format!("(eval at {}:{})", h.0, h.1)) };
     let line = if is_fix(line) { fix(line) } else { 1 };
+    // RubyGems' Kernel#require (rubygems.rb evals this file): it looks for gems at run time, and
+    // a binary's gems were resolved at build time. The rest of RubyGems works without it.
+    if file.as_deref().is_some_and(|f| f.starts_with("<internal:") && f.ends_with("/rubygems/core_ext/kernel_require.rb>")) {
+        return QNIL;
+    }
     match *EVAL_HOOK.get() {
         Some(f) => f(&rstr(src).b.clone(), mode, self_, locals, file.as_deref(), line),
         None => raise(
@@ -1075,7 +1082,11 @@ pub fn init() {
             _ => QNIL,
         };
         if fr == QFALSE {
-            return dup(s, false);
+            let r = tri!(dup(s, false));
+            if r != s && kind(s) != Some(Kind::Class) {
+                copy_singleton(s, r);
+            }
+            return r;
         }
         let r = dup(s, true);
         if fr == QTRUE && is_heap(r) {
@@ -1094,7 +1105,13 @@ pub fn init() {
         tri!(check_singleton_ok(s));
         let sc = singleton_class(s);
         for &m in a.iter().rev() {
-            tri!(do_include(sc, m));
+            // (a module's own extend_object does the extending through `super`: RDF's
+            // Repository::Implementation sets the object up there)
+            if is_user_method(m, "extend_object") {
+                tri!(send(m, sym("extend_object"), &[s], QNIL));
+            } else {
+                tri!(do_include(sc, m));
+            }
             if is_user_method(m, "extended") {
                 tri!(send(m, sym("extended"), &[s], QNIL));
             }
@@ -1114,12 +1131,30 @@ pub fn init() {
         add_method(singleton_class(s), id, Body::Proc(body));
         mksym(id)
     });
-    defn(k, "singleton_methods", 0, 1, |s, _, _| {
+    defn(k, "singleton_methods", 0, 1, |s, a, _| {
         let sc = class_of(s);
         if unsafe { !(*sc).is_singleton } {
             return ary_new(vec![]);
         }
-        ary_new(unsafe { (*sc).methods.keys().map(|&id| mksym(id)).collect() })
+        // the public and protected methods of the singleton class; with `all` (the default)
+        // also those of the modules in it (`extend`) and, for a class, of its superclasses'
+        // singleton classes: the chain up to the first ordinary class
+        let all = a.first().is_none_or(|&v| truthy(v));
+        let chain = if all { ancestors(sc) } else { vec![sc] };
+        let (mut seen, mut out) = (std::collections::HashSet::new(), Vec::new());
+        for k in chain {
+            let kk = unsafe { &*k };
+            if !kk.is_singleton && !kk.is_module {
+                break;
+            }
+            for (&id, &m) in kk.methods.iter() {
+                // (a name shadowed by a nearer private or undefined method isn't listed)
+                if seen.insert(id) && unsafe { (*m).vis != VIS_PRIVATE && !matches!((*m).body, Body::Undefined) } {
+                    out.push(mksym(id));
+                }
+            }
+        }
+        ary_new(out)
     });
     defn(k, "instance_eval", 0, 3, |s, a, b| {
         if !is_proc(b) {
@@ -1944,6 +1979,22 @@ fn dup_module(v: V) -> V {
     }
     bump_serial();
     c as V
+}
+
+/// Gives `to` a copy of `from`'s singleton class, if it has one (`clone`, also with
+/// `freeze: false`).
+fn copy_singleton(from: V, to: V) {
+    let meta = hdr(from).klass;
+    if meta.is_null() || unsafe { !(*meta).is_singleton || (*meta).attached != from } {
+        return;
+    }
+    let dm = singleton_class(to);
+    copy_singleton_methods(meta, dm);
+    unsafe {
+        (*dm).civars = (*meta).civars.clone();
+        (*dm).consts = (*meta).consts.clone();
+    }
+    bump_serial();
 }
 
 /// The methods and modules of singleton class `meta` copied into singleton class `dm`

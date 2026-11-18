@@ -1,0 +1,12 @@
+["eval_frames.rb:5):1:in 'Object#in_method'"]
+["eval_frames.rb:11):1:in '<main>'"]
+["eval_frames.rb:16):1:in 'block in <main>'"]
+["eval_frames.rb:21):1:in 'K#m'"]
+["eval_frames.rb:22):1:in 'K.c'"]
+"(given):7:in 'Object#bound'"
+"(given):7:in '<main>'"
+"(file):3:in '<main>'"
+"(eval at eval_frames.rb:47)"
+1
+"named"
+"Object#label_of"

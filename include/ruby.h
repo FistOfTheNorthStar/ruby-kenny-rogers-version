@@ -475,6 +475,7 @@ unsigned int rb_enc_codepoint_len(const char *p, const char *e, int *len, rb_enc
 int rb_enc_uint_chr(unsigned int code, rb_encoding *enc);
 VALUE rb_enc_str_new(const char *p, long len, rb_encoding *enc);
 VALUE rb_enc_str_new_cstr(const char *p, rb_encoding *enc);
+VALUE rb_external_str_new_with_enc(const char *p, long len, rb_encoding *enc);
 #define rb_enc_str_new_static rb_enc_str_new
 VALUE rb_enc_interned_str(const char *p, long len, rb_encoding *enc);
 VALUE rb_enc_interned_str_cstr(const char *p, rb_encoding *enc);
@@ -939,6 +940,14 @@ void rb_set_errinfo(VALUE e);
 VALUE rb_protect(VALUE (*func)(VALUE), VALUE arg, int *state);
 VALUE rb_ensure(VALUE (*b_proc)(VALUE), VALUE data1, VALUE (*e_proc)(VALUE), VALUE data2);
 VALUE rb_rescue(VALUE (*b_proc)(VALUE), VALUE data1, VALUE (*r_proc)(VALUE, VALUE), VALUE data2);
+#ifdef __cplusplus
+}
+/* (C++ callers cast their functions to the old ANYARGS type) */
+static inline VALUE rb_rescue(VALUE (*f)(...), VALUE a, VALUE (*r)(...), VALUE b) {
+  return rb_rescue((VALUE (*)(VALUE))f, a, (VALUE (*)(VALUE, VALUE))r, b);
+}
+extern "C" {
+#endif
 VALUE rb_rescue2(VALUE (*b_proc)(VALUE), VALUE data1, VALUE (*r_proc)(VALUE, VALUE), VALUE data2, ...);
 #define ruby_verbose (*rb_ruby_verbose_ptr())
 #define ruby_debug (*rb_ruby_debug_ptr())
@@ -1024,6 +1033,9 @@ void ruby_xfree(void *p);
 #define ALLOCV(v, n) ((v) = 0, __builtin_alloca(n))
 #define ALLOCV_N(type, v, n) ((v) = 0, (type *)__builtin_alloca(sizeof(type) * (n)))
 #define ALLOCV_END(v) ((void)(v))
+#define RB_ALLOCV(v, n) ALLOCV(v, n)
+#define RB_ALLOCV_N(type, v, n) ALLOCV_N(type, v, n)
+#define RB_ALLOCV_END(v) ALLOCV_END(v)
 #define MEMCPY(p1, p2, type, n) memcpy((p1), (p2), sizeof(type) * (size_t)(n))
 #define MEMMOVE(p1, p2, type, n) memmove((p1), (p2), sizeof(type) * (size_t)(n))
 #define MEMZERO(p, type, n) memset((p), 0, sizeof(type) * (size_t)(n))
@@ -1071,6 +1083,72 @@ int rb_during_gc(void);
 #define OBJ_WRITE(a, slot, b) RB_OBJ_WRITE(a, slot, b)
 #define OBJ_WRITTEN(a, oldv, b) RB_OBJ_WRITTEN(a, oldv, b)
 
+/* st_table: CRuby's hash table for C data (an insertion-ordered table) */
+struct st_hash_type {
+  int (*compare)(st_data_t, st_data_t);
+  st_index_t (*hash)(st_data_t);
+};
+typedef struct st_table {
+  const struct st_hash_type *type;
+  st_index_t num_entries;
+  /* (private) */
+  struct kn_st_entry *entries;
+  st_index_t ent_used, ent_cap;
+  int32_t *bins;
+  st_index_t bin_cap;
+  int iterating;
+} st_table;
+typedef int st_foreach_callback_func(st_data_t, st_data_t, st_data_t);
+typedef int st_update_callback_func(st_data_t *key, st_data_t *value, st_data_t arg, int existing);
+st_table *st_init_table(const struct st_hash_type *type);
+st_table *st_init_table_with_size(const struct st_hash_type *type, st_index_t size);
+st_table *st_init_numtable(void);
+st_table *st_init_numtable_with_size(st_index_t size);
+st_table *st_init_strtable(void);
+st_table *st_init_strtable_with_size(st_index_t size);
+st_table *st_init_strcasetable(void);
+st_table *st_init_strcasetable_with_size(st_index_t size);
+void st_free_table(st_table *t);
+void st_clear(st_table *t);
+void st_cleanup_safe(st_table *t, st_data_t never);
+st_table *st_copy(st_table *t);
+size_t st_memsize(const st_table *t);
+int st_insert(st_table *t, st_data_t key, st_data_t value);
+int st_insert2(st_table *t, st_data_t key, st_data_t value, st_data_t (*func)(st_data_t));
+void st_add_direct(st_table *t, st_data_t key, st_data_t value);
+int st_lookup(st_table *t, st_data_t key, st_data_t *value);
+int st_get_key(st_table *t, st_data_t key, st_data_t *result);
+int st_delete(st_table *t, st_data_t *key, st_data_t *value);
+int st_shift(st_table *t, st_data_t *key, st_data_t *value);
+int st_update(st_table *t, st_data_t key, st_update_callback_func *func, st_data_t arg);
+int st_foreach(st_table *t, st_foreach_callback_func *func, st_data_t arg);
+int st_foreach_safe(st_table *t, st_foreach_callback_func *func, st_data_t arg);
+int st_foreach_check(st_table *t, st_foreach_callback_func *func, st_data_t arg, st_data_t never);
+st_index_t st_keys(st_table *t, st_data_t *keys, st_index_t size);
+st_index_t st_values(st_table *t, st_data_t *values, st_index_t size);
+int st_numcmp(st_data_t a, st_data_t b);
+st_index_t st_numhash(st_data_t n);
+int st_locale_insensitive_strcasecmp(const char *a, const char *b);
+int st_locale_insensitive_strncasecmp(const char *a, const char *b, size_t n);
+#define STRCASECMP(a, b) st_locale_insensitive_strcasecmp((a), (b))
+#define STRNCASECMP(a, b, n) st_locale_insensitive_strncasecmp((a), (b), (n))
+
+/* select(2) on any number of descriptors, as a Ruby thread */
+#include <sys/select.h>
+typedef struct { int maxfd; fd_set *fdset; } rb_fdset_t;
+void rb_fd_init(rb_fdset_t *set);
+void rb_fd_term(rb_fdset_t *set);
+void rb_fd_zero(rb_fdset_t *set);
+void rb_fd_set(int fd, rb_fdset_t *set);
+void rb_fd_clr(int fd, rb_fdset_t *set);
+int rb_fd_isset(int fd, const rb_fdset_t *set);
+void rb_fd_copy(rb_fdset_t *dst, const fd_set *src, int max);
+void rb_fd_dup(rb_fdset_t *dst, const rb_fdset_t *src);
+#define rb_fd_ptr(set) ((set)->fdset)
+#define rb_fd_max(set) ((set)->maxfd)
+int rb_fd_select(int n, rb_fdset_t *r, rb_fdset_t *w, rb_fdset_t *e, struct timeval *timeout);
+int rb_thread_fd_select(int n, rb_fdset_t *r, rb_fdset_t *w, rb_fdset_t *e, struct timeval *timeout);
+
 /* threads (Kenny runs C extension code like any native method; no GVL to release) */
 void *rb_thread_call_without_gvl(void *(*func)(void *), void *data1, void (*ubf)(void *), void *data2);
 int ruby_thread_has_gvl_p(void);
@@ -1083,6 +1161,8 @@ VALUE rb_thread_current(void);
 VALUE rb_thread_main(void);
 void rb_thread_schedule(void);
 void rb_thread_check_ints(void);
+int rb_thread_alone(void);
+VALUE rb_ary_aref(int argc, const VALUE *argv, VALUE ary);
 int rb_thread_interrupted(VALUE th);
 VALUE rb_thread_local_aref(VALUE th, ID id);
 VALUE rb_thread_local_aset(VALUE th, ID id, VALUE v);
@@ -1110,6 +1190,12 @@ VALUE rb_sym_to_s(VALUE sym);
 void rb_copy_generic_ivar(VALUE clone, VALUE obj);
 /* waiting on an IO (rb_io_wait: the events ready, or false on timeout) */
 enum rb_io_event { RUBY_IO_READABLE = 1, RUBY_IO_PRIORITY = 2, RUBY_IO_WRITABLE = 4 };
+#define RB_WAITFD_IN 1
+#define RB_WAITFD_PRI 2
+#define RB_WAITFD_OUT 4
+int rb_wait_for_single_fd(int fd, int events, struct timeval *timeout);
+int rb_thread_wait_fd(int fd);
+int rb_thread_fd_writable(int fd);
 VALUE rb_io_wait(VALUE io, VALUE events, VALUE timeout);
 void rb_ivar_foreach(VALUE obj, int (*func)(ID key, VALUE val, st_data_t arg), st_data_t arg);
 st_index_t rb_ivar_count(VALUE obj);

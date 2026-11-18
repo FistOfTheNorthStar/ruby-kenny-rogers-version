@@ -643,6 +643,9 @@ impl<M: Module> Compiler<M> {
             }
             Node::GlobalVariableReadNode { .. } => {
                 let n = node.as_global_variable_read_node().unwrap();
+                if matches!(n.name().as_slice(), b"$LOAD_PATH" | b"$:" | b"$-I") && !self.in_dependency() {
+                    self.reads_load_path = true;
+                }
                 let s = self.sym_val(fx, n.name().as_slice());
                 self.call(fx, "kn_gvar_get", &[s])
             }

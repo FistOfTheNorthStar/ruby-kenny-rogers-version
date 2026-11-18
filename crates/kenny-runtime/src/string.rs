@@ -586,18 +586,33 @@ pub fn init() {
         }
         let bytes = a.first().filter(|x| is_str(**x)).map(|x| rstr(*x).b.clone()).unwrap_or_default();
         let n = str_new(bytes);
-        if let Some(&x) = a.first().filter(|x| is_str(**x)) {
-            copy_enc(n, x);
-        }
+        tri!(init_enc(n, a));
         n
     });
     defn(c, "initialize", 0, 3, |s, a, _| {
         if let Some(&x) = a.first().filter(|x| is_str(**x)) {
             b(s).set(rstr(x).b.clone());
-            copy_enc(s, x);
         }
+        tri!(init_enc(s, a));
         s
     });
+    /// The encoding `String.new(str, encoding:)` gives: `encoding:`, else str's, else (no
+    /// str) BINARY, as in CRuby (Mastodon reads a response body into
+    /// `String.new(encoding: Encoding::BINARY)`).
+    fn init_enc(n: V, a: &[V]) -> V {
+        let src = a.first().copied().filter(|&x| is_str(x));
+        match crate::kernel::kw_arg(a, "encoding").filter(|&e| e != QNIL) {
+            Some(e) => match crate::transcode::enc_arg(e) {
+                Ok(enc) => crate::transcode::set_enc(n, enc),
+                Err(name) => return arg_error(&format!("unknown encoding name - {name}")),
+            },
+            None => match src {
+                Some(x) => copy_enc(n, x),
+                None => crate::transcode::set_enc(n, crate::transcode::BINARY),
+            },
+        }
+        n
+    }
     /// `String.new(str)` keeps str's encoding
     fn copy_enc(dst: V, src: V) {
         let enc = crate::compat::FL_BINARY | (crate::compat::FL_BINARY << 1);
@@ -738,13 +753,32 @@ pub fn init() {
         }
         s
     });
+    // (`prepend` and `insert` take the argument's encoding as `<<` does: an empty binary
+    // `String.new` buffer becomes UTF-8)
+    fn piece_enc(s: V, x: V, o: &[u8]) -> Result<Option<crate::transcode::Enc>, V> {
+        let xe = if is_str(x) { crate::transcode::enc_of(x) } else { crate::transcode::UTF8 };
+        crate::transcode::concat_enc(s, o, xe)
+    }
     defn(c, "prepend", 0, -1, |s, a, _| {
+        if let Err(e) = mutate(s) {
+            return e;
+        }
         let mut pre = Vec::new();
+        let mut ne = None;
         for &x in a {
             match want_str(x) {
-                Ok(o) => pre.extend(o),
+                Ok(o) => {
+                    match piece_enc(s, x, &o) {
+                        Ok(e) => ne = e.or(ne),
+                        Err(e) => return e,
+                    }
+                    pre.extend(o)
+                }
                 Err(e) => return e,
             }
+        }
+        if let Some(ne) = ne {
+            crate::transcode::set_enc(s, ne);
         }
         match mutate(s) {
             Ok(bs) => {
@@ -755,9 +789,13 @@ pub fn init() {
             Err(e) => e,
         }
     });
+    // (the receiver takes the argument's encoding)
     defn(c, "replace", 1, 1, |s, a, _| match (want_str(a[0]), mutate(s)) {
         (Ok(o), Ok(bs)) => {
             bs.set(o);
+            if is_str(a[0]) {
+                crate::transcode::like(s, a[0]);
+            }
             s
         }
         (Err(e), _) | (_, Err(e)) => e,
@@ -774,6 +812,10 @@ pub fn init() {
             Ok(o) => o,
             Err(e) => return e,
         };
+        let ne = match piece_enc(s, a[1], &o) {
+            Ok(e) => e,
+            Err(e) => return e,
+        };
         let mut cs = chars(s);
         let n = cs.len() as i64;
         let i = fix(a[0]);
@@ -785,6 +827,9 @@ pub fn init() {
         match mutate(s) {
             Ok(bs) => {
                 bs.set(cs.concat().into_bytes());
+                if let Some(ne) = ne {
+                    crate::transcode::set_enc(s, ne);
+                }
                 s
             }
             Err(e) => e,
@@ -796,19 +841,8 @@ pub fn init() {
     defn(c, "empty?", 0, 0, |s, _, _| bool_v(rstr(s).b.is_empty()));
     // (a chilled literal too: CRuby 3.4 copies it)
     defn(c, "+@", 0, 0, |s, _, _| if hdr(s).flags & (FL_FROZEN | FL_CHILLED) != 0 { str_copy(s) } else { s });
-    defn(c, "-@", 0, 0, |s, _, _| {
-        if is_frozen(s) {
-            return s;
-        }
-        let n = str_new(rstr(s).b.clone());
-        hdr(n).flags |= FL_FROZEN;
-        n
-    });
-    defn(c, "dedup", 0, 0, |s, _, _| {
-        let n = str_new(rstr(s).b.clone());
-        hdr(n).flags |= FL_FROZEN;
-        n
-    });
+    defn(c, "-@", 0, 0, |s, _, _| str_dedup(s));
+    defn(c, "dedup", 0, 0, |s, _, _| str_dedup(s));
     // (a binary or Windows-1252 ... string: byte by byte, its bytes >= 0x80 left as they are)
     macro_rules! map_str {
         ($name:expr, $bang:expr, $f:expr) => {
@@ -1920,4 +1954,24 @@ pub fn str_equal(s: V, o: V) -> V {
         return if r == UNDEF { UNDEF } else { bool_v(truthy(r)) };
     }
     QFALSE
+}
+
+/// `String#-@` / `dedup`: a frozen String with the same contents, the frozen literal when
+/// the program has one (CRuby's are one object). Only a plain UTF-8 String without
+/// instance variables can be the literal; otherwise: itself if frozen, else a frozen copy.
+/// (Not every String it is called on is kept: CRuby's table is weak, this one isn't.)
+fn str_dedup(s: V) -> V {
+    let plain = hdr(s).klass == rt().c.string && crate::transcode::enc_of(s) == crate::transcode::UTF8 && gen_ivar_list(s).is_empty();
+    if plain {
+        if let Some(v) = crate::abi::interned_lookup(&rstr(s).b) {
+            return v;
+        }
+    }
+    if is_frozen(s) {
+        return s;
+    }
+    let n = str_copy(s);
+    crate::transcode::set_enc(n, crate::transcode::enc_of(s));
+    hdr(n).flags |= FL_FROZEN;
+    n
 }

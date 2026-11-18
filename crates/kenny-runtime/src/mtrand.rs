@@ -310,6 +310,18 @@ fn rand_value(g: &Gen, arg: V, strict: bool) -> V {
 /// is `b - a`; a Float span picks a Float offset in [0, span], any other that converts with
 /// `to_int` (Integer, Rational, ...) an Integer one, another Numeric a Float one; the result
 /// is `a + offset`. Ends without `-` raise TypeError as CRuby's fallback to `to_int` does.
+/// Whether `v.to_int` works, as CRuby's rb_check_to_int finds out: through `respond_to?`, so an
+/// object that answers it by `respond_to_missing?` counts (ActiveSupport::Duration).
+fn responds_to_int(v: V) -> Result<bool, V> {
+    if respond_to(v, sym("to_int")) {
+        return Ok(true);
+    }
+    let r = send(v, sym("respond_to?"), &[mksym(sym("to_int"))], QNIL);
+    if r == UNDEF {
+        return Err(r);
+    }
+    Ok(r != QNIL && r != QFALSE)
+}
 fn rand_other_range(g: &Gen, lo: V, hi: V, excl: bool, strict: bool, arg: V) -> V {
     if lo == QNIL || hi == QNIL {
         return if strict { invalid(arg) } else { QNIL };
@@ -329,7 +341,10 @@ fn rand_other_range(g: &Gen, lo: V, hi: V, excl: bool, strict: bool, arg: V) -> 
     };
     let off = if is_float(span) {
         float_off(float_val(span))
-    } else if int_big(span).is_some() || respond_to(span, sym("to_int")) {
+    } else if int_big(span).is_some() || match responds_to_int(span) {
+        Ok(b) => b,
+        Err(e) => return e,
+    } {
         let n = if int_big(span).is_some() { span } else { tri!(send(span, sym("to_int"), &[], QNIL)) };
         let Some(n) = int_big(n) else { return type_error("can't convert to Integer") };
         let n: BigInt = n - BigInt::from(if excl { 1 } else { 0 });

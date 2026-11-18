@@ -409,8 +409,67 @@ fn relax_flow_indentation(src: &str) -> Option<String> {
     changed.then_some(text)
 }
 
+const QUOTED_INDENT: &str = "invalid indentation in quoted scalar";
+
+/// `src` with the continuation lines of the quoted scalar that starts at character `at`
+/// (column `col`) indented past it, or None. saphyr requires those lines to be indented
+/// more than the enclosing block; libyaml (so Psych) doesn't check, and Rails apps' locale
+/// files rely on it (Discourse's `key: "...\n  <p>...</p>"`). Leading whitespace on such a
+/// line isn't part of the value, so adding some doesn't change it.
+fn relax_quoted_indent(src: &str, at: usize, col: usize) -> Option<String> {
+    let chars: Vec<char> = src.chars().collect();
+    let q = *chars.get(at)?;
+    if q != '"' && q != '\'' {
+        return None;
+    }
+    let mut out: String = chars[..=at].iter().collect();
+    let mut i = at + 1;
+    let mut changed = false;
+    while i < chars.len() {
+        let c = chars[i];
+        out.push(c);
+        i += 1;
+        if q == '"' && c == '\\' {
+            if let Some(&n) = chars.get(i) {
+                if n != '\n' {
+                    out.push(n);
+                    i += 1;
+                    continue;
+                }
+            }
+        } else if c == q {
+            if q == '\'' && chars.get(i) == Some(&'\'') {
+                out.push('\'');
+                i += 1;
+                continue;
+            }
+            out.extend(&chars[i..]);
+            return changed.then_some(out);
+        }
+        if c == '\n' {
+            out.extend(std::iter::repeat_n(' ', col + 1));
+            changed = true;
+        }
+    }
+    None
+}
+
 /// Parse a stream into documents (root node indices into `nodes`).
 fn parse_stream(src: &str, first_only: bool, nodes: &mut Vec<Node>) -> Result<Vec<usize>, PErr> {
+    let base = nodes.len();
+    match parse_stream1(src, first_only, nodes) {
+        Err(e) if e.problem == QUOTED_INDENT => match relax_quoted_indent(src, e.offset, e.col - 1) {
+            Some(fixed) => {
+                nodes.truncate(base);
+                parse_stream(&fixed, first_only, nodes)
+            }
+            None => Err(e),
+        },
+        r => r,
+    }
+}
+
+fn parse_stream1(src: &str, first_only: bool, nodes: &mut Vec<Node>) -> Result<Vec<usize>, PErr> {
     let mut p = Parser::new_from_str(src);
     let mut docs = Vec::new();
     // stack of open collections: (node index)
@@ -587,6 +646,29 @@ impl Loader<'_> {
                             ck(send1(list, "push", v))?;
                         }
                         Ok(list)
+                    }
+                    // an ordered map (ActiveSupport::OrderedHash dumps as one): a Psych::Omap of
+                    // each item's (one-pair) map, as Psych's ToRuby (not class-checked there either)
+                    Some("!omap" | "tag:yaml.org,2002:omap") => {
+                        // (Psych::Omap is autoloaded: const_get loads it)
+                        let h = match path2class("Psych") {
+                            Some(m) => {
+                                let k = ck(send(m, sym("const_get"), &[mksym(sym("Omap"))], QNIL))?;
+                                ck(send0(k, "allocate"))?
+                            }
+                            None => hash_new(),
+                        };
+                        self.register(idx, h);
+                        for c in ch {
+                            let kv = match &self.nodes[c].k {
+                                NK::Map(m) if !m.is_empty() => (m[0], m[m.len() - 1]),
+                                _ => (c, c),
+                            };
+                            let k = self.accept(kv.0)?;
+                            let v = self.accept(kv.1)?;
+                            self.hash_store(h, k, v)?;
+                        }
+                        Ok(h)
                     }
                     _ => {
                         let list = ary_new(Vec::new());
@@ -2562,6 +2644,17 @@ fn kn_events(src: V, path: V) -> V {
             text = t;
         }
     }
+    loop {
+        match events_of(&text, path) {
+            Ok(v) => return v,
+            Err(fixed) => text = fixed,
+        }
+    }
+}
+
+/// (Err: the source to parse again, see relax_quoted_indent)
+fn events_of(text: &str, path: V) -> Result<V, String> {
+    let text = text.to_string();
     let chars: Vec<char> = text.chars().collect();
     let mut line_starts = vec![0usize];
     for (i, c) in chars.iter().enumerate() {
@@ -2601,6 +2694,11 @@ fn kn_events(src: V, path: V) -> V {
                     Some((ctx, prob)) if ctx.starts_with("while ") => (prob.to_string(), Some(ctx.to_string())),
                     _ => (info, None),
                 };
+                if problem == QUOTED_INDENT {
+                    if let Some(fixed) = relax_quoted_indent(&text, mk.index(), mk.col()) {
+                        return Err(fixed);
+                    }
+                }
                 err = ary_new(vec![
                     path,
                     mkfix(mk.line() as i64),
@@ -2706,7 +2804,7 @@ fn kn_events(src: V, path: V) -> V {
             }
         }
     }
-    ary_new(vec![out, err])
+    Ok(ary_new(vec![out, err]))
 }
 
 /// Registers the native half of Psych, loaded by `require "kenny/psych.so"` in lib/kenny/psych.rb.

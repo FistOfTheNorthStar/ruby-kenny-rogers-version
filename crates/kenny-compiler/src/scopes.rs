@@ -470,6 +470,13 @@ impl<M: Module> Compiler<M> {
                 };
                 b.def_var(tag_v, tag);
             }
+            // an eval'd string's top scope: the class the eval runs in (kn_eval_cref_into)
+            if spec.kind == ScopeKind::Top && self.eval_unit && !self.file_unit {
+                let p = b.ins().iadd_imm_s(caches, (spec.cref_slot * 8) as i64);
+                let id = self.rt_id("kn_eval_cref_into");
+                let f = self.module.declare_func_in_func(id, b.func);
+                b.ins().call(f, &[p]);
+            }
             if spec.kind == ScopeKind::Class {
                 let s = b.use_var(self_v);
                 let p = b.ins().iadd_imm_s(caches, (spec.cref_slot * 8) as i64);
@@ -1122,8 +1129,7 @@ impl<M: Module> Compiler<M> {
 
         let maxpos = if has_rest { -1 } else { (nreq + nopt + npost) as i64 };
         let consume = kwrest.as_ref().is_some_and(|k| k.as_keyword_rest_parameter_node().is_some());
-        let known = if consume { None } else { Some(Self::keyword_names(&kws)) };
-        let kwh = if has_kw { Some(self.extract_kwhash(fx, nreq + npost, maxpos, nreq + npost, consume, known.as_deref())) } else { None };
+        let kwh = if has_kw { Some(self.extract_kwhash(fx, nreq + npost, maxpos, consume)) } else { None };
 
         self.arity_check(fx, (nreq + npost) as i64, if has_rest { -1 } else { (nreq + nopt + npost) as i64 });
 
@@ -1203,13 +1209,11 @@ impl<M: Module> Compiler<M> {
 
 
     /// Take the trailing keyword-hash argument (if any) off the positional arguments.
-    /// `maxpos`: positional capacity (-1 with a rest param); `nreq2`: required positionals,
-    /// for the trailing-Hash keyword rule applied to code from dependencies (see kn_take_kwhash2).
+    /// `maxpos`: positional capacity (-1 with a rest param). A plain Hash stays positional, as
+    /// in CRuby (also in gems and eval'd code: Minitest::Mock's `method_missing(*args, **kw)`).
     /// `consume`: a copy whose keys `bind_keywords` removes (for a `**rest` parameter);
     /// otherwise the caller's hash itself, read only, or nil when none was passed.
-    /// `known`: the keyword names when there is no `**rest` (a dependency's trailing Hash with
-    /// other keys stays positional when it fits, see kn_take_kwhash3).
-    fn extract_kwhash(&mut self, fx: &mut Fx, npos_required: usize, maxpos: i64, nreq2: usize, consume: bool, known: Option<&[Vec<u8>]>) -> Value {
+    fn extract_kwhash(&mut self, fx: &mut Fx, npos_required: usize, maxpos: i64, consume: bool) -> Value {
         let argc = fx.b.use_var(fx.argc_v);
         let enough = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, argc, npos_required as i64);
         let check = fx.b.create_block();
@@ -1221,19 +1225,7 @@ impl<M: Module> Compiler<M> {
         fx.b.switch_to_block(check);
         let last_i = fx.b.ins().iadd_imm_s(argc, -1);
         let last = self.arg_at(fx, last_i);
-        let is_kw = if let (true, Some(known)) = (self.in_dependency() || self.eval_unit, known) {
-            let argc = fx.b.use_var(fx.argc_v);
-            let nr = self.iconst(fx, nreq2 as i64);
-            let mp = self.iconst(fx, maxpos);
-            let syms: Vec<Value> = known.iter().map(|k| self.sym_val(fx, k)).collect();
-            let buf = self.args_buf(fx, &syms);
-            let nk = self.iconst(fx, syms.len() as i64);
-            self.call(fx, "kn_take_kwhash3", &[last, argc, nr, mp, buf, nk])
-        } else if self.in_dependency() || self.eval_unit {
-            let argc = fx.b.use_var(fx.argc_v);
-            let nr = self.iconst(fx, nreq2 as i64);
-            self.call(fx, "kn_take_kwhash2", &[last, argc, nr])
-        } else if maxpos >= 0 {
+        let is_kw = if maxpos >= 0 {
             let argc = fx.b.use_var(fx.argc_v);
             let mp = self.iconst(fx, maxpos);
             self.call(fx, "kn_take_kwhash", &[last, argc, mp])
@@ -1253,20 +1245,6 @@ impl<M: Module> Compiler<M> {
         fx.b.ins().jump(done, &[h.into()]);
         fx.b.switch_to_block(done);
         fx.b.block_params(done)[0]
-    }
-
-    /// The names of keyword parameters (without the `:`).
-    fn keyword_names(kws: &[Node]) -> Vec<Vec<u8>> {
-        kws.iter()
-            .filter_map(|k| {
-                let name = if let Some(r) = k.as_required_keyword_parameter_node() {
-                    r.name().as_slice().to_vec()
-                } else {
-                    k.as_optional_keyword_parameter_node()?.name().as_slice().to_vec()
-                };
-                Some(name.strip_suffix(b":").unwrap_or(&name).to_vec())
-            })
-            .collect()
     }
 
     fn bind_keywords(&mut self, fx: &mut Fx, h: Value, kws: &[Node], kwrest: Option<&Node>) {
@@ -1413,8 +1391,7 @@ impl<M: Module> Compiler<M> {
         let (nreq, nopt, npost) = (reqs.len(), opts.len(), posts.len());
         let has_kw = !kws.is_empty() || kwrest.as_ref().is_some_and(|k| k.as_keyword_rest_parameter_node().is_some());
         let consume = kwrest.as_ref().is_some_and(|k| k.as_keyword_rest_parameter_node().is_some());
-        let known = if consume { None } else { Some(Self::keyword_names(&kws)) };
-        let kwh = if has_kw { Some(self.extract_kwhash(fx, 0, -1, nreq + npost, consume, known.as_deref())) } else { None };
+        let kwh = if has_kw { Some(self.extract_kwhash(fx, 0, -1, consume)) } else { None };
         let has_rest = rest.is_some();
         let implicit_rest = rest.as_ref().is_some_and(|r| r.as_implicit_rest_node().is_some());
         if !has_rest && npost == 0 {

@@ -1033,6 +1033,10 @@ pub struct PState {
     /// compiled call site just before the call (see kernel::eval_string).
     pub eval_locals: V,
     pub eval_src: V,
+    /// The class body an `eval` call site is lexically in (for `eval_src`, kn_eval_cref),
+    /// and that of the eval about to run (taken by its unit's top scope, kn_eval_cref_into).
+    pub eval_cref: V,
+    pub eval_cref_run: V,
     pub stack_limit: usize,
     /// `class`/`module` bodies and `class_eval` blocks being run (the default definee).
     pub definee: Vec<*mut Class>,
@@ -1044,6 +1048,8 @@ pub struct PState {
     /// Methods running through an alias that `Body::Aliased` stands for: (the method's own
     /// name, the alias, the receiver, the stack pointer at the call), innermost last (`kn_callee`).
     pub callee: Vec<(u32, u32, V, usize)>,
+    /// The running thread's or fiber's C extension state.
+    pub c_context: crate::capi::CContext,
     /// Methods running through `super` from a module that appears more than once in the
     /// receiver's ancestors: (receiver, name, ancestor index it was found at), so a further
     /// `super` goes on from that copy (`find_super_method_at`)
@@ -1078,7 +1084,7 @@ thread_local! {
 }
 /// Every P's state (for the GC). A collection holds this lock from start to end, so a P
 /// that is starting up waits instead of joining the list halfway through one.
-pub static ALL_PS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+pub static ALL_PS: crate::mt::ForkLock<Vec<usize>> = crate::mt::ForkLock::new(Vec::new());
 
 /// This P's state. A Ruby thread can move to another P whenever it calls into Ruby or
 /// blocks (thread.rs), so never keep the result across such a call; and the lookup must
@@ -1147,11 +1153,14 @@ pub fn new_pstate() -> *mut PState {
         last_match: QNIL,
         eval_locals: QNIL,
         eval_src: QNIL,
+        eval_cref: QNIL,
+        eval_cref_run: QNIL,
         stack_limit: 0,
         definee: Vec::new(),
         dm_stack: Vec::new(),
         eval_ctx: Vec::new(),
         callee: Vec::new(),
+        c_context: crate::capi::CContext::new(),
         super_at: Vec::new(),
         current_block: Vec::new(),
         mcache: HashMap::default(),
@@ -2448,7 +2457,10 @@ pub fn ivar_set(v: V, id: u32, val: V) -> V {
             let o = obj(v);
             let i = ivar_index_for(o.shape, id) as usize;
             if o.ivars.len() <= i {
-                o.ivars.resize(i + 1, QNIL);
+                // (the slots in between are unset, not nil: `defined?(@x)` is false for them.
+                // An object made before its class had them grows here: ActiveRecord's reflections,
+                // whose `@inverse_name` memo read as computed (nil) once a later ivar was set)
+                o.ivars.resize(i + 1, UNDEF);
             }
             o.ivars[i] = val;
         }

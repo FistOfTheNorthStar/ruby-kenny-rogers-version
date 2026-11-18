@@ -1,0 +1,5 @@
+source "https://rubygems.org"
+
+gem "rinku"
+# (both vendor Sundown's buffer.c: the same C symbols, in one binary)
+gem "redcarpet"

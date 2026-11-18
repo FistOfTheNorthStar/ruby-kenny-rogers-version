@@ -50,6 +50,7 @@ fn onig_options(opts: u32) -> RegexOptions {
     }
     o
 }
+
 pub const OPT_I: u32 = 1;
 pub const OPT_X: u32 = 2;
 pub const OPT_M: u32 = 4;
@@ -1411,6 +1412,56 @@ pub fn init() {
         let b = tri!(send(s, sym("begin"), a, QNIL));
         let e = tri!(send(s, sym("end"), a, QNIL));
         ary_new(vec![b, e])
+    });
+    /// The group `k` names, as the methods that refuse a group that doesn't exist want it.
+    fn checked_group(s: V, k: V) -> Result<usize, V> {
+        let n = md_pos(s).len() / 2;
+        let k = if kind(k) == Some(Kind::Float) { mkfix(float_val(k) as i64) } else { k };
+        if is_fix(k) {
+            let i = fix(k);
+            if i < 0 || i as usize >= n {
+                return Err(raise(rt().c.index_error, &format!("index {i} out of matches")));
+            }
+            return Ok(i as usize);
+        }
+        if !is_sym(k) && !is_str(k) {
+            return Err(type_error("no implicit conversion into Integer"));
+        }
+        group_index(s, k).ok_or_else(|| {
+            let name = if is_sym(k) { sym_str(sym_id(k)) } else { String::from_utf8_lossy(&rstr(k).b).into_owned() };
+            raise(rt().c.index_error, &format!("undefined group name reference: {name}"))
+        })
+    }
+    /// The byte offsets of a group that took part in the match.
+    fn byte_range(s: V, i: usize) -> Option<(i64, i64)> {
+        let p = md_pos(s);
+        (p[i * 2] >= 0).then(|| (p[i * 2] as i64, p[i * 2 + 1] as i64))
+    }
+    defn(md, "match", 1, 1, |s, a, _| match checked_group(s, a[0]) {
+        Ok(i) => md_group(s, i),
+        Err(e) => e,
+    });
+    defn(md, "match_length", 1, 1, |s, a, _| match checked_group(s, a[0]) {
+        Ok(i) => match byte_range(s, i) {
+            Some((b, e)) => mkfix(md_char_index(s, e as usize) as i64 - md_char_index(s, b as usize) as i64),
+            None => QNIL,
+        },
+        Err(e) => e,
+    });
+    defn(md, "byteoffset", 1, 1, |s, a, _| match checked_group(s, a[0]) {
+        Ok(i) => match byte_range(s, i) {
+            Some((b, e)) => ary_new(vec![mkfix(b), mkfix(e)]),
+            None => ary_new(vec![QNIL, QNIL]),
+        },
+        Err(e) => e,
+    });
+    defn(md, "bytebegin", 1, 1, |s, a, _| match checked_group(s, a[0]) {
+        Ok(i) => byte_range(s, i).map_or(QNIL, |r| mkfix(r.0)),
+        Err(e) => e,
+    });
+    defn(md, "byteend", 1, 1, |s, a, _| match checked_group(s, a[0]) {
+        Ok(i) => byte_range(s, i).map_or(QNIL, |r| mkfix(r.1)),
+        Err(e) => e,
     });
     defn(md, "size", 0, 0, |s, _, _| mkfix(md_pos(s).len() as i64 / 2));
     defn(md, "length", 0, 0, |s, _, _| mkfix(md_pos(s).len() as i64 / 2));

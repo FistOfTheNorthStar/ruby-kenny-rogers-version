@@ -68,6 +68,10 @@ pub unsafe extern "C" fn kn_start(
     caches: *mut V,
     cache_words: u64,
 ) -> i32 {
+    // SIGPIPE ignored, as CRuby does: a write to a closed pipe or socket raises Errno::EPIPE
+    // instead of killing the process (ActiveSupport's tests). (Spawned and exec'd programs
+    // get the default back: std's Command resets it.)
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     let args: Vec<String> = (0..argc as usize)
         .map(|i| unsafe { CStr::from_ptr(*argv.add(i)).to_string_lossy().into_owned() })
         .collect();
@@ -441,25 +445,47 @@ pub unsafe extern "C" fn kn_str_lit(slot: *mut V, ptr: *const u8, len: u64) -> V
     if *s != 0 {
         return *s;
     }
-    // (its bytes live as long as it does, the whole run: `dup` and `+@` share them)
-    let b: &'static [u8] = Box::leak(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec().into_boxed_slice());
-    let v = unsafe { str_shared(b.as_ptr(), b.len()) };
-    hdr(v).flags |= FL_FROZEN;
-    crate::gc::pin(v);
+    let v = interned_lit(unsafe { std::slice::from_raw_parts(ptr, len as usize) });
     *s = v;
     v
 }
-/// `kn_str_lit` in eval'd code, which may be freed (and its literals collected): the String
-/// has bytes of its own.
+
+/// The frozen literals, by their bytes. As in CRuby (its fstring table), literals with the
+/// same contents are one String: specs compare them by identity (`be "a"`), and `-"a".dup`
+/// is the literal. (All are UTF-8; they are pinned and live for the whole run.)
+static LITERALS: std::sync::Mutex<Option<rustc_hash::FxHashMap<&'static [u8], V>>> = std::sync::Mutex::new(None);
+
+fn interned_lit(bytes: &[u8]) -> V {
+    if let Some(v) = interned_lookup(bytes) {
+        return v;
+    }
+    // (made outside the lock: allocating may stop for a collection)
+    // (its bytes live as long as it does, the whole run: `dup` and `+@` share them)
+    let b: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
+    let v = unsafe { str_shared(b.as_ptr(), b.len()) };
+    hdr(v).flags |= FL_FROZEN;
+    // (not `pin`: an evicted eval unit unpins what its caches hold, and this literal may be
+    // compiled code's too. Collected, its memory became an Array: webmock's
+    // `HTTP::VERSION < "1.0.0"` failed and then crashed in Mastodon's spec run)
+    crate::gc::pin_forever(v);
+    // (another thread may have made the same literal meanwhile: one of the two is kept)
+    *LITERALS.lock().unwrap().get_or_insert_with(Default::default).entry(b).or_insert(v)
+}
+
+/// The frozen literal with these bytes, if the program has made one.
+pub fn interned_lookup(bytes: &[u8]) -> Option<V> {
+    LITERALS.lock().unwrap().as_ref().and_then(|m| m.get(bytes).copied())
+}
+/// `kn_str_lit` in eval'd code (and files loaded at run time: specs): the same interned
+/// literal, which outlives the unit (its bytes are copied). Eval'd code that keeps making
+/// new literals keeps them all, as distinct literal contents are kept for the whole run.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kn_str_lit_eval(slot: *mut V, ptr: *const u8, len: u64) -> V {
     let s = unsafe { &mut *slot };
     if *s != 0 {
         return *s;
     }
-    let v = str_new(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec());
-    hdr(v).flags |= FL_FROZEN;
-    crate::gc::pin(v);
+    let v = interned_lit(unsafe { std::slice::from_raw_parts(ptr, len as usize) });
     *s = v;
     v
 }
@@ -1101,7 +1127,10 @@ pub unsafe extern "C" fn kn_ivar_set(self_: V, id: V, val: V, cache: *mut IvCach
             }
         };
         if o.ivars.len() <= i {
-            o.ivars.resize(i + 1, QNIL);
+            // (the slots in between are unset, not nil: `defined?(@x)` is false for them.
+            // An object made before its class had them grows here: ActiveRecord's reflections,
+            // whose `@inverse_name` memo read as computed (nil) once a later ivar was set)
+            o.ivars.resize(i + 1, UNDEF);
         }
         o.ivars[i] = val;
         return val;
@@ -1372,6 +1401,16 @@ fn lexical_chain(crefp: *const [V; 2]) -> Vec<*mut Class> {
         p = next as *const [V; 2];
     }
     out
+}
+
+/// `Module.nesting` in an eval'd string: its static part `a`, then the lexical chain of the
+/// unit's top cref slot (the class the eval runs in, kn_eval_cref_into).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_nesting_tail(a: V, crefp: *const [V; 2]) -> V {
+    for k in lexical_chain(crefp) {
+        rary(a).v.push(k as V);
+    }
+    a
 }
 
 /// Bare constant read `Foo` with the full lexical scope (per-site cache like kn_const_get_c).
@@ -2071,35 +2110,6 @@ pub extern "C" fn kn_take_kwhash(v: V, argc: u64, maxpos: i64) -> u64 {
         return 0;
     }
     (hdr(v).flags & FL_KWHASH != 0 || (maxpos >= 0 && argc as i64 > maxpos)) as u64
-}
-/// Trailing-Hash keywords, used for methods and blocks defined in dependencies (older gems pass
-/// options this way): a trailing positional Hash with Symbol keys becomes the
-/// keywords when it isn't needed for a required positional (`t.string :key, opts` calling
-/// `def string(*args, **options)`).
-#[unsafe(no_mangle)]
-pub extern "C" fn kn_take_kwhash2(v: V, argc: u64, nreq: u64) -> u64 {
-    if !is_hash(v) {
-        return 0;
-    }
-    if hdr(v).flags & FL_KWHASH != 0 {
-        return 1;
-    }
-    (argc > nreq && rhash(v).m.keys().all(|k| is_sym(k.0))) as u64
-}
-/// `kn_take_kwhash2` for a method or block that takes only the `n` keywords at `keys` (no
-/// `**rest`): a trailing Hash (not passed as keywords) with a key it doesn't take stays a
-/// positional argument when there is room for one (`maxpos` < 0: a rest parameter), as in
-/// Ruby 3 (`def schema(props = {}, required: [])` called as `schema({type: ...})`).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn kn_take_kwhash3(v: V, argc: u64, nreq: u64, maxpos: i64, keys: *const V, n: u64) -> u64 {
-    if kn_take_kwhash2(v, argc, nreq) == 0 {
-        return 0;
-    }
-    if hdr(v).flags & FL_KWHASH != 0 || (maxpos >= 0 && argc as i64 > maxpos) {
-        return 1;
-    }
-    let known = if n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(keys, n as usize) } };
-    rhash(v).m.keys().all(|k| known.contains(&k.0)) as u64
 }
 /// Copy of the keyword hash so keys can be consumed.
 #[unsafe(no_mangle)]

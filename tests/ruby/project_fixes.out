@@ -14,7 +14,7 @@ true
 nil
 false
 nil
-[3, 4, 4, 1, 2]
+[3, 4, true, 1, 2]
 false
 false
 [#<Encoding:BINARY (ASCII-8BIT)>, 7, 7]
@@ -67,3 +67,201 @@ true
 :bar
 #<Encoding:BINARY (ASCII-8BIT)>
 7
+Errno::ECONNREFUSED
+Errno::ECONNREFUSED
+"Connection refused - x"
+"Connection refused"
+Errno::ECONNREFUSED
+SystemCallError
+nil
+true
+SystemCallError
+true
+"Connection refused @ func - x"
+true
+"No such file or directory"
+"No such file or directory - a"
+"No such file or directory @ b - a"
+2
+"héé"
+"hé"
+"hé"
+"hé"
+3
+2
+2
+[6, 11]
+[6, 9]
+[6, 9]
+6
+11
+6
+9
+6
+9
+IndexError: index 9 out of matches
+IndexError: index -1 out of matches
+IndexError: undefined group name reference: nope
+IndexError: undefined group name reference: nope
+32
+8
+5
+true
+LazyDur
+true
+3600
+12
+30
+11
+String
+1
+3600
+3600
+:mod
+:a
+[:a, :from_mod]
+:mod
+false
+false
+[:pro, :x, :y]
+[:y]
+[:new, :try_convert]
+#<Encoding:BINARY (ASCII-8BIT)>
+#<Encoding:BINARY (ASCII-8BIT)>
+#<Encoding:UTF-8>
+#<Encoding:BINARY (ASCII-8BIT)>
+#<Encoding:UTF-8>
+#<Encoding:BINARY (ASCII-8BIT)>
+#<Encoding:BINARY (ASCII-8BIT)>
+#<Encoding:BINARY (ASCII-8BIT)>
+#<Encoding:UTF-8>
+#<Encoding:US-ASCII>
+#<Encoding:UTF-8>
+Encoding::CompatibilityError
+"unknown encoding name - nope"
+#<Encoding:BINARY (ASCII-8BIT)>
+[233]
+false
+[:@a, :@late]
+:computed
+[:@a, :@late]
+:computed
+true
+false
+true
+true
+false
+true
+nil
+0
+["a", "_1"]
+0
+0
+0
+0
+"\\w+"
+"bob.x@ex.com"
+nil
+nil
+nil
+0
+0
+["a b"]
+nil
+"****ß*"
+" https"
+0
+0
+0
+nil
+5
+5500
+500000000
+500000000
+740494506
+250
+(1/4)
+740494506
+(370247253/500000000)
+740494506
+500000000
+740494
+(370247/500000)
+500000000
+500000
+"2027-01-15"
+18000
+10
+0
+0
+#<Encoding:UTF-8>
+true
+#<Encoding:UTF-8>
+#<Encoding:UTF-8>
+"aéb"
+#<Encoding:UTF-8>
+#<Encoding:UTF-8>
+[]
+Class
+[]
+[:pv]
+VisSub
+1
+IOError
+"IO::TimeoutError"
+"late"
+ClosedQueueError
+1
+nil
+Errno::EPIPE
+"y\ny"
+[{a: 1, b: [2]}, Psych::Omap]
+{"a" => {"b" => "x y", "c" => "p q", "d" => "mn"}}
+{"a" => {"b" => "x y"}}
+["a"]
+"b"
+{1 => 2, 3 => nil}
+#<ArgumentError: invalid number of elements (3 for 1..2)>
+#<ArgumentError: wrong element type Integer at 0 (expected array)>
+["a", "b", "c"]
+1
+#<TypeError: can't convert FlatAry to Array (FlatAry#to_ary gives Integer)>
+2005-10-30 01:00:00 -0500
+2005-04-03 03:30:00 -0400
+1950-06-01 00:00:00 -0400
+2005-10-30 01:30:00 -0400
+2005-10-30 01:30:00 -0500
+2005-10-30 00:00:00 -0400
+true
+2024-10-27 03:30:00 +0200
+2024-03-31 04:30:00 +0300
+2024-10-27 03:30:00 +0200
+true
+true
+"11"
+5
+3
+[[:a, 1], [:b, 2], [:c, 3]]
+[[:z, 9]]
+[[:a, 1], [:b, 2], [:c, 3]]
+1
+#<TypeError: no implicit conversion of nil into Hash>
+#<TypeError: no implicit conversion of nil into Hash>
+{b: 1}
+ArgumentError
+"00:00:00.100000000"
+{one: "x",
+ "two" => 2,
+ "a b": 3,
+ "+": 4}
+true
+true
+false
+true
+true
+false
+["mon out of range", "argument out of range", "argument out of range", "hour out of range", "argument out of range"]
+"FXT +0100"
+true
+true
+"01:01 FXT"

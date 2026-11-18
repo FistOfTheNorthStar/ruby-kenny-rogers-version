@@ -1,0 +1,1 @@
+RF_THING = :loaded

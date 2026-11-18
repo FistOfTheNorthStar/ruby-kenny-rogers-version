@@ -1,0 +1,15 @@
+:a_seen
+1
+:loaded
+false
+true
+false
+1
+hook base64
+"eA=="
+hook base64
+false
+hook rf_thing
+"own base64"
+true
+[:ran, :ran]

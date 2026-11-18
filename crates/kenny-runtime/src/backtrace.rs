@@ -150,6 +150,15 @@ fn frame_pointer() -> usize {
     fp
 }
 
+/// The low bound of the walk: `lo` is the address of a local in the walker's frame, which
+/// may lie above the frame's own record (aarch64 often keeps x29/x30 at the bottom of the
+/// frame), and then the walk stopped at once (Linux: eval had no "(eval at f:l)" or label).
+/// The frame pointer counts when it is just below.
+#[inline(always)]
+fn frame_low(lo: usize, fp: usize) -> usize {
+    if fp < lo && lo - fp <= 4096 { fp } else { lo }
+}
+
 /// Return addresses of the compiled-code frames on the current stack, innermost first.
 #[inline(never)]
 pub fn capture() -> Vec<usize> {
@@ -167,6 +176,7 @@ pub fn capture() -> Vec<usize> {
         return out;
     }
     let mut fp = frame_pointer();
+    let lo = frame_low(lo, fp);
     let mut n = 0;
     // (each entry's frame pointer, and whether one is an eval unit's)
     let mut fps = Vec::new();
@@ -330,6 +340,7 @@ pub fn caller_label() -> Option<String> {
 
 /// The return address of the innermost Ruby frame on the stack (for `symbolize`), cheaply:
 /// the walk stops there.
+#[inline(never)]
 pub fn innermost() -> Option<usize> {
     if !TABLE.read().unwrap().sorted {
         let mut w = TABLE.write().unwrap();
@@ -345,6 +356,7 @@ pub fn innermost() -> Option<usize> {
     // (the frame pointer before the stack bounds: current_stack's `lo` is its own frame's)
     let mut fp = frame_pointer();
     let (lo, hi) = crate::thread::current_stack()?;
+    let lo = frame_low(lo, fp);
     let mut n = 0;
     while fp >= lo && fp + 16 <= hi && fp % 8 == 0 && n < 100_000 {
         let next = unsafe { *(fp as *const usize) };

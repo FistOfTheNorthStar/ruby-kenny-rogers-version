@@ -140,6 +140,7 @@ struct GThread {
     dm_stack: Vec<*const Method>,
     eval_ctx: Vec<(usize, String)>,
     callee: Vec<(u32, u32, V, usize)>,
+    c_context: crate::capi::CContext,
     super_at: Vec<(V, u32, usize)>,
     current_block: Vec<V>,
     saved_throws: crate::gc::SavedThrows,
@@ -155,6 +156,7 @@ struct GThread {
 }
 
 struct GFiber {
+    c_context: crate::capi::CContext,
     co: Option<FiberCo>,
     yielder: *const Yielder<V, V>,
     ctx: usize,
@@ -409,6 +411,7 @@ fn save_state(t: &mut GThread) {
     t.dm_stack = std::mem::take(&mut p.dm_stack);
     t.eval_ctx = std::mem::take(&mut p.eval_ctx);
     t.callee = std::mem::take(&mut p.callee);
+    t.c_context = std::mem::take(&mut p.c_context);
     t.super_at = std::mem::take(&mut p.super_at);
     t.current_block = std::mem::take(&mut p.current_block);
     t.saved_throws = std::mem::take(&mut p.heap.saved_throws);
@@ -423,6 +426,7 @@ fn restore_state(t: &mut GThread) {
     p.dm_stack = std::mem::take(&mut t.dm_stack);
     p.eval_ctx = std::mem::take(&mut t.eval_ctx);
     p.callee = std::mem::take(&mut t.callee);
+    p.c_context = std::mem::take(&mut t.c_context);
     p.super_at = std::mem::take(&mut t.super_at);
     p.current_block = std::mem::take(&mut t.current_block);
     p.heap.saved_throws = std::mem::take(&mut t.saved_throws);
@@ -563,6 +567,7 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
             dm_stack: Vec::new(),
             eval_ctx: Vec::new(),
             callee: Vec::new(),
+            c_context: Default::default(),
             super_at: Vec::new(),
             current_block: Vec::new(),
             interrupt: None,
@@ -594,6 +599,69 @@ fn spawn_raw(f: Box<dyn FnOnce(usize) -> V>, stack_size: usize, on: Option<usize
         start_timer();
     }
     tid
+}
+
+/// In the child of `fork`, where only the forking OS thread (this P) came along: as in CRuby,
+/// the other threads are dead (`alive?` false, gone from Thread.list, a `join` returns: DRb's
+/// `stop_service` in a forked worker joins its server thread, ActiveSupport's parallel
+/// tests); the other Ps start again (new OS threads) when given a thread, and so does the
+/// timer. Their state (stacks, coroutines) stays as it was, never run or freed.
+pub fn after_fork_child() {
+    if sraw().is_none() {
+        return;
+    }
+    let me_p = pt().idx;
+    let cur = pt().current;
+    let live = locked!(s => {
+        for i in 0..s.threads.len() {
+            if Some(i) == cur || s.threads[i].state == St::Done {
+                continue;
+            }
+            let t = &mut s.threads[i];
+            t.state = St::Done;
+            t.value = QNIL;
+            t.wake_at = None;
+            // (not dropped: unwinding a suspended coroutine would run its frames)
+            if let Some(co) = t.co.take() {
+                std::mem::forget(co);
+            }
+            let c = t.ctx;
+            s.ctxs[c].live = false;
+            s.ctxs[c].running = false;
+        }
+        let alive = |s: &Sched, tid: usize| s.threads.get(tid).is_some_and(|t| t.state != St::Done);
+        for k in 0..s.ps.len() {
+            let runq: VecDeque<usize> = s.ps[k].runq.iter().copied().filter(|&t| alive(s, t)).collect();
+            let sleepers: Vec<usize> = s.ps[k].sleepers.iter().copied().filter(|&t| alive(s, t)).collect();
+            let n = (0..s.threads.len()).filter(|&t| alive(s, t) && s.threads[t].p == k).count();
+            let p = &mut s.ps[k];
+            p.runq = runq;
+            p.sleepers = sleepers;
+            p.nthreads = n;
+            P_NTHREADS[k].store(n, Ordering::Relaxed);
+            P_RUNQ[k].store(p.runq.len(), Ordering::Relaxed);
+            if k != me_p {
+                p.started = false;
+                p.idle = false;
+                p.parker = Arc::new(Parker::new(k));
+            }
+        }
+        let keys: Vec<usize> = s.waiters.keys().copied().collect();
+        for key in keys {
+            let q: VecDeque<usize> = s.waiters[&key].iter().copied().filter(|&t| alive(s, t)).collect();
+            if q.is_empty() {
+                s.waiters.remove(&key);
+            } else {
+                s.waiters.insert(key, q);
+            }
+        }
+        s.timer_started = false;
+        (0..s.threads.len()).filter(|&t| alive(s, t)).count()
+    });
+    // (the timer runs once a second thread exists: one may still, the main thread and this one)
+    if live > 1 {
+        start_timer();
+    }
 }
 
 /// Start P `idx`: an OS thread with its own interpreter state running its loop.
@@ -1604,7 +1672,7 @@ pub fn fiber_new(blk: V) -> V {
             let args = RVec::from(args);
             call_block(blk, &args)
         });
-        s.fibers.push(Box::new(GFiber { co: Some(co), yielder: std::ptr::null(), ctx, started: false, done: false, resumer_ctx: 0, obj: o }));
+        s.fibers.push(Box::new(GFiber { c_context: Default::default(), co: Some(co), yielder: std::ptr::null(), ctx, started: false, done: false, resumer_ctx: 0, obj: o }));
         fid
     });
     ivar_set(o, sym("@__fid"), mkfix(fid as i64));
@@ -1658,7 +1726,10 @@ pub fn fiber_resume(fv: V, args: &[V]) -> V {
     let ctx = f.ctx;
     enter_ctx(ctx);
     let mut co = f.co.take().unwrap();
+    // (the fiber's C frames are on its own stack)
+    let resumer_c = std::mem::replace(&mut pst().c_context, std::mem::take(&mut f.c_context));
     let res = co.resume(input);
+    let fiber_c = std::mem::replace(&mut pst().c_context, resumer_c);
     // Back on the resumer's stack: say so before anything that can stop for a collection
     // (taking a lock can): the GC scans this P's stack from here up to `stack_base`.
     pst().heap.stack_base = outer_base;
@@ -1666,6 +1737,7 @@ pub fn fiber_resume(fv: V, args: &[V]) -> V {
     pt().running_ctx = Some(outer);
     pt().fiber_stack.pop();
     let f = unsafe { &mut *fiber_ptr(fid) };
+    f.c_context = fiber_c;
     match res {
         CoroutineResult::Yield(v) => {
             f.co = Some(co);
@@ -2189,12 +2261,12 @@ pub fn init() {
         QNIL
     });
     fn push(s: V, v: V) -> V {
-        if truthy(ivar_get(s, sym("@__closed"))) {
-            let c = const_lookup(rt().c.object, sym("ClosedQueueError")).unwrap();
-            return raise(c as *mut Class, "queue closed");
-        }
-        // SizedQueue: wait for room
+        // SizedQueue: wait for room (a push waiting when the queue is closed raises too)
         loop {
+            if truthy(ivar_get(s, sym("@__closed"))) {
+                let c = const_lookup(rt().c.object, sym("ClosedQueueError")).unwrap();
+                return raise(c as *mut Class, "queue closed");
+            }
             let max = ivar_get(s, sym("@__max"));
             let room = ivar_get(s, sym("@__room"));
             let r = locked!(st => {
@@ -2298,6 +2370,11 @@ pub fn init() {
         ivar_set(s, sym("@__closed"), QTRUE);
         if active() {
             wake_all(s);
+            // (and the pushes waiting for room in a SizedQueue)
+            let room = ivar_get(s, sym("@__room"));
+            if room != QNIL {
+                wake_all(room);
+            }
         }
         s
     });

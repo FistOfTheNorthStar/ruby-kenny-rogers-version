@@ -125,6 +125,14 @@ fn set_vis(c: *mut Class, names: &[u32], vis: u8) -> V {
                         &format!("undefined method '{}' for {} '{}'", sym_str(id), if unsafe { (*c).is_module } { "module" } else { "class" }, class_name(c)),
                     );
                 }
+                // (an inherited method that already has it: nothing, as CRuby's
+                // rb_export_method. rspec-mocks' reset of `allow(K).to receive(:new)` does
+                // `public :new` on K's singleton class, which then kept a copy of Class#new;
+                // stubbing and resetting it again left Mastodon's
+                // `FollowMigrationService.new.call` running FollowService#call)
+                if unsafe { (*m).vis } == vis {
+                    continue;
+                }
                 let body = crate::kernel::clone_body(unsafe { &(*m).body });
                 let nm = add_method(c, id, body);
                 unsafe {

@@ -328,3 +328,12 @@ d.decorate!
 p d.at("b").shout
 s = Nokogiri::Slop("<html><body><p class='c'>t</p></body></html>")
 p s.html.body.p.text, s.html.body.p["class"]
+
+# gumbo's limits raise ArgumentError (Mastodon's trends preview rescues it)
+many = (1..800).map { |x| "attr-#{x}" }.join(" ")
+p((Nokogiri::HTML5("<html><body #{many}><p>text</p></body></html>") rescue [$!.class, $!.message]))
+p Nokogiri::HTML5("<p #{(1..400).map { |x| "a#{x}" }.join(" ")}>x</p>").at_css("p").attributes.size
+p Nokogiri::HTML5("<p #{many}>x</p>", max_attributes: -1).at_css("p").attributes.size
+p((Nokogiri::HTML5("<div>" * 450 + "x") rescue [$!.class, $!.message]))
+p Nokogiri::HTML5("<div>" * 398 + "x").css("div").size
+p((Nokogiri::HTML5.fragment("<p #{many}>x</p>") rescue [$!.class, $!.message]))

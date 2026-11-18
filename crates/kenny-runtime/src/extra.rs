@@ -16,7 +16,7 @@ use num_traits::{ToPrimitive, Zero};
 
 // ---------- small helpers ----------
 
-fn cname(v: V) -> String {
+pub(crate) fn cname(v: V) -> String {
     match v {
         QNIL => "nil".into(),
         QTRUE => "true".into(),
@@ -695,12 +695,23 @@ fn sec_field(v: V) -> Result<(i64, i128), V> {
             }
         }
     }
+    // a Rational (DateTime#to_time and ActiveSupport pass `sec + sec_fraction`) or another
+    // exact number: its fraction exactly
+    if crate::rational::is_rational(v) || (is_heap(v) && !is_str(v) && !is_big(v) && respond_to(v, sym("to_r"))) {
+        let ns = exact_ns(v)?;
+        return Ok((ns.div_euclid(NS) as i64, ns.rem_euclid(NS)));
+    }
     Ok((int_field(v, "sec")?, 0))
 }
 
 /// Build a time from civil fields in the given zone.
-fn time_from_fields(cls: *mut Class, f: [i64; 6], extra_ns: i128, z: Zone) -> Result<V, V> {
+fn time_from_fields(cls: *mut Class, f: [i64; 6], extra_ns: i128, z: Zone, isdst: Option<bool>) -> Result<V, V> {
     let [year, mon, day, hour, min, sec] = f;
+    // (as CRuby, which first reads each into a bit field, obj2ubits: one that doesn't fit is
+    // "argument out of range", one that fits but is invalid gets the field's message)
+    if [(mon, 4), (day, 5), (hour, 5), (min, 6), (sec, 6)].iter().any(|&(v, bits)| v < 0 || v >= 1 << bits) {
+        return Err(arg_error("argument out of range"));
+    }
     if !(1..=12).contains(&mon) {
         return Err(arg_error("mon out of range"));
     }
@@ -729,10 +740,45 @@ fn time_from_fields(cls: *mut Class, f: [i64; 6], extra_ns: i128, z: Zone) -> Re
             tm.tm_min = min as i32;
             tm.tm_sec = sec as i32;
             tm.tm_isdst = -1;
-            unsafe { mktime(&mut tm) }
+            let t = unsafe { mktime(&mut tm) };
+            local_wall_secs_dst(wall, t, isdst)
         }
     };
     Ok(time_make(cls, secs as i128 * NS + extra_ns, z))
+}
+
+/// The time of local wall-clock time `wall` (seconds as if UTC) as CRuby picks it, given
+/// mktime's answer `t`: of a time that happens twice (when the clocks go back) the later,
+/// and one skipped (when they go forward) at the offset before the change, so 02:30 is
+/// 03:30 (mktime's choice for an ambiguous time is the system's: macOS takes the earlier).
+pub(crate) fn local_wall_secs(wall: i64, t: i64) -> i64 {
+    local_wall_secs_dst(wall, t, None)
+}
+/// (`isdst`: of an ambiguous time, the instant in (true) or out of daylight saving time)
+fn local_wall_secs_dst(wall: i64, t: i64, isdst: Option<bool>) -> i64 {
+    let lt = |secs: i64| -> (i64, bool) {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let x = secs as libc::time_t;
+        unsafe { libc::localtime_r(&x, &mut tm) };
+        (tm.tm_gmtoff as i64, tm.tm_isdst > 0)
+    };
+    let before = lt(wall - 2 * 86400).0;
+    let mut best: Option<i64> = None;
+    let mut wanted: Option<i64> = None;
+    for o in [before, lt(wall + 2 * 86400).0, lt(t).0] {
+        let c = wall - o;
+        let (off, dst) = lt(c);
+        if c + off != wall {
+            continue;
+        }
+        if best.is_none_or(|b| c > b) {
+            best = Some(c);
+        }
+        if isdst == Some(dst) {
+            wanted = Some(c);
+        }
+    }
+    wanted.or(best).unwrap_or(wall - before)
 }
 
 /// `Time.new("2000-01-02 03:04:05.5 +09:00")`
@@ -778,7 +824,7 @@ fn parse_time_string(cls: *mut Class, v: V, zone_kw: Option<V>) -> Result<V, V> 
             None => Zone::Local,
         }
     };
-    time_from_fields(cls, [year, mon, day, h, mi, sec], ns, z)
+    time_from_fields(cls, [year, mon, day, h, mi, sec], ns, z, None)
 }
 
 /// Time.utc / Time.local argument lists (including the 10-element `to_a` form).
@@ -807,10 +853,12 @@ fn time_civil(s: V, a: &[V], z: Zone) -> V {
         }
     }
     if let Some(u) = usec_arg {
-        let us = tryr!(float_arg(u));
-        extra += (us * 1000.0).round() as i128;
+        // (microseconds, exactly for a Rational: `Time.utc(y, m, d, h, mi, s, 740494.506r)`)
+        extra += tryr!(exact_ns(u)) / 1_000_000;
     }
-    tryr!(time_from_fields(time_cls(s), f, extra, z))
+    // (the ten-argument form's isdst: which of an ambiguous time's two instants)
+    let isdst = if a.len() == 10 && a[8] != QNIL { Some(truthy(a[8])) } else { None };
+    tryr!(time_from_fields(time_cls(s), f, extra, z, isdst))
 }
 
 fn subsec_str(ns: i128) -> String {
@@ -916,6 +964,20 @@ fn exact_ns(x: V) -> Result<i128, V> {
         _ => Err(err()),
     }
 }
+/// A timezone object (TZInfo::Timezone, ActiveSupport::TimeZone): what CRuby accepts for a
+/// zone besides offsets and names.
+fn is_zone_obj(v: V) -> bool {
+    is_heap(v) && !is_str(v) && !is_time(v) && (respond_to(v, sym("local_to_utc")) || respond_to(v, sym("utc_to_local")))
+}
+/// A UTC copy of Time `t` (what a timezone object's `abbr` is given).
+pub(crate) fn time_utc_copy(t: V) -> V {
+    time_make(real_class(t), time_ns(t), Zone::Utc)
+}
+/// The time `ns` in the zone of timezone object `z` (as `localtime(z)`).
+fn time_in_zone_obj(cls: *mut Class, ns: i128, z: V) -> V {
+    let t = time_make(cls, ns, Zone::Utc);
+    send(t, sym("localtime"), &[z], QNIL)
+}
 fn time_at(s: V, a: &[V]) -> V {
     let zone_kw = kwarg(a, "in");
     let a = positional(a);
@@ -946,6 +1008,9 @@ fn time_at(s: V, a: &[V]) -> V {
         ns += (f * mult).round() as i128;
     }
     if let Some(zv) = zone_kw {
+        if is_zone_obj(zv) {
+            return time_in_zone_obj(time_cls(s), ns, zv);
+        }
         z = tryr!(parse_zone(zv));
     }
     time_make(time_cls(s), ns, z)
@@ -2602,6 +2667,9 @@ pub fn init() {
     // ===== Time =====
     let tm = c.time;
     defs(tm, "now", 0, 1, |s, a, _| {
+        if let Some(zv) = kwarg(a, "in").filter(|&v| is_zone_obj(v)) {
+            return time_in_zone_obj(time_cls(s), now_ns(), zv);
+        }
         let z = match kwarg(a, "in") {
             Some(v) => tryr!(parse_zone(v)),
             None => Zone::Local,
@@ -2614,6 +2682,9 @@ pub fn init() {
         let a = positional(a);
         let cls = time_cls(s);
         if a.is_empty() {
+            if let Some(zv) = zone_kw.filter(|&v| is_zone_obj(v)) {
+                return time_in_zone_obj(cls, now_ns(), zv);
+            }
             let z = match zone_kw {
                 Some(v) => tryr!(parse_zone(v)),
                 None => Zone::Local,
@@ -2623,7 +2694,29 @@ pub fn init() {
         if a.len() == 1 && is_str(a[0]) {
             return tryr!(parse_time_string(cls, a[0], zone_kw));
         }
-        let z = match a.get(6).copied().or(zone_kw) {
+        let zv = a.get(6).copied().or(zone_kw);
+        // a timezone object: the wall clock time, read as UTC, through its local_to_utc
+        if let Some(zv) = zv.filter(|&v| is_zone_obj(v) && respond_to(v, sym("local_to_utc"))) {
+            let wall = time_civil(s, &a[..a.len().min(6)], Zone::Utc);
+            if wall == UNDEF {
+                return wall;
+            }
+            let u = send1(zv, "local_to_utc", wall);
+            if u == UNDEF {
+                return u;
+            }
+            let uns = if is_time(u) {
+                time_ns(u)
+            } else {
+                let i = tri!(send0(u, "to_i"));
+                tryr!(exact_ns(i))
+            };
+            let off = (time_ns(wall) - uns).div_euclid(NS) as i64;
+            let t = time_make(cls, uns, Zone::Off(off));
+            ivar_set(t, sym("@__zobj"), zv);
+            return t;
+        }
+        let z = match zv {
             Some(v) => tryr!(parse_zone(v)),
             None => Zone::Local,
         };
@@ -2672,7 +2765,7 @@ pub fn init() {
             Ok(n) => n,
             Err(e) => return e,
         };
-        time_make(real_class(s), time_ns(s) + d, zone_of(s))
+        shifted(s, time_ns(s) + d)
     });
     defn(tm, "-", 1, 1, |s, a, _| {
         let x = a[0];
@@ -2684,9 +2777,19 @@ pub fn init() {
             Ok(n) => n,
             Err(e) => return e,
         };
-        time_make(real_class(s), time_ns(s) - d, zone_of(s))
+        shifted(s, time_ns(s) - d)
     });
-    defn(tm, "succ", 0, 0, |s, _, _| time_make(real_class(s), time_ns(s) + NS, zone_of(s)));
+    defn(tm, "succ", 0, 0, |s, _, _| shifted(s, time_ns(s) + NS));
+    // s moved to `ns`, in its zone: a timezone object's at that time (its offset can differ)
+    fn shifted(s: V, ns: i128) -> V {
+        if matches!(zone_of(s), Zone::Off(_)) {
+            let z = ivar_get(s, sym("@__zobj"));
+            if z != QNIL {
+                return time_in_zone_obj(real_class(s), ns, z);
+            }
+        }
+        time_make(real_class(s), ns, zone_of(s))
+    }
     // with a non-Time: the inverse of `other <=> self` (rb_invcmp; ActiveSupport's
     // TimeWithZone)
     fn time_invcmp(s: V, o: V) -> V {
@@ -2714,6 +2817,15 @@ pub fn init() {
         mkfix(time_ns(s).cmp(&time_ns(a[0])) as i64)
     });
     defn(tm, "==", 1, 1, |s, a, _| {
+        // CRuby's Time has no `==` of its own: Comparable's, through `<=>`, which ActiveSupport
+        // redefines (a Time then equals a DateTime, or a String it parses to the same time)
+        if crate::kernel::is_user_method(s, "<=>") {
+            if s == a[0] {
+                return QTRUE;
+            }
+            let c = tri!(send1(s, "<=>", a[0]));
+            return bool_v(c != QNIL && truthy(tri!(send1(c, "==", mkfix(0)))));
+        }
         if is_time(a[0]) {
             return bool_v(time_ns(s) == time_ns(a[0]));
         }

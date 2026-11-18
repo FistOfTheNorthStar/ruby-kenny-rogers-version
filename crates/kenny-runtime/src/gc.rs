@@ -476,7 +476,7 @@ static LAZY_FREED: AtomicUsize = AtomicUsize::new(0);
 static BG_LIST: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 static BG_CV: std::sync::Condvar = std::sync::Condvar::new();
 /// Held by the sweeper while it sweeps a page, and by the collector for a whole collection.
-static BG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static BG_LOCK: crate::mt::ForkLock<()> = crate::mt::ForkLock::new(());
 static BG_STARTED: AtomicBool = AtomicBool::new(false);
 static BG_FREED: AtomicUsize = AtomicUsize::new(0);
 
@@ -798,6 +798,15 @@ pub fn pin(v: V) {
         PINNED.get().push(v);
     }
 }
+/// Objects that live for the rest of the program and that freeing an eval unit must not
+/// unpin though its caches hold them: the interned frozen literals, which compiled code and
+/// eval'd code share.
+static PERMANENT: crate::mt::L<Vec<V>> = crate::mt::L::new(Vec::new());
+pub fn pin_forever(v: V) {
+    if is_heap(v) {
+        PERMANENT.get().push(v);
+    }
+}
 /// Scan compiled code's cache regions conservatively too (KENNY_GC_SCAN_REGIONS=1; for
 /// checking that every object in them is pinned).
 fn scan_regions() -> bool {
@@ -999,7 +1008,7 @@ fn lock_ps() -> std::sync::MutexGuard<'static, Vec<usize>> {
     *GC_PS.get() = g.clone();
     g
 }
-static STW_EPOCH: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+static STW_EPOCH: crate::mt::ForkLock<u64> = crate::mt::ForkLock::new(0);
 /// How many times every other OS thread running Ruby code has stopped: a point after which
 /// none of them still holds a value it read before (abi.rs `kn_static_fill` waits for one
 /// before refilling a slot it cleared). Counted while they are stopped.
@@ -1049,6 +1058,65 @@ fn stop_the_world_collect() {
     KN_GC_PENDING.fetch_and(!STW_BIT, Ordering::SeqCst);
     COLLECTING.store(false, Ordering::Release);
     STW_CV.notify_all();
+}
+
+/// Forks this process is down from (the child's threads and channels are its own).
+static FORKS: AtomicUsize = AtomicUsize::new(0);
+
+/// `fork(2)` with the world stopped: every other P parked at a safepoint (where it holds no
+/// runtime lock) and the sweeper paused, so the child doesn't start with a lock that a thread
+/// that didn't come along held. In the child those Ps stay stopped for the GC (their stacks
+/// are still there to scan), and the sweeper starts again with the next sweep.
+pub fn fork_world_stopped() -> libc::pid_t {
+    let multi = crate::mt::multi();
+    let mut ps_guard = None;
+    if multi {
+        while COLLECTING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            park();
+        }
+        KN_GC_PENDING.fetch_or(STW_BIT, Ordering::SeqCst);
+        ps_guard = Some(lock_ps());
+        let me = &crate::core::pst().heap as *const PHeap;
+        while !gc_ps().iter().all(|&p| {
+            let ph = unsafe { &(*(p as *const PState)).heap };
+            std::ptr::eq(ph, me) || ph.status.load(Ordering::SeqCst) != RUNNING
+        }) {
+            std::thread::yield_now();
+        }
+    }
+    let bg = bg_sweep_pause();
+    // (the parked threads take this one now and then while they wait)
+    let epoch = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        FORKS.fetch_add(1, Ordering::Relaxed);
+        BG_STARTED.store(false, Ordering::Release);
+        // (the locks are the parent's thread's: made again, unlocked, with what they hold)
+        let n = *epoch;
+        std::mem::forget(epoch);
+        std::mem::forget(bg);
+        unsafe {
+            STW_EPOCH.reset(n);
+            BG_LOCK.reset(());
+        }
+        if let Some(g) = ps_guard.take() {
+            let ps = g.clone();
+            std::mem::forget(g);
+            unsafe { crate::core::ALL_PS.reset(ps) };
+        }
+    } else {
+        drop(epoch);
+        drop(bg);
+    }
+    if multi {
+        drop(ps_guard);
+        let mut e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
+        *e += 1;
+        KN_GC_PENDING.fetch_and(!STW_BIT, Ordering::SeqCst);
+        COLLECTING.store(false, Ordering::Release);
+        STW_CV.notify_all();
+    }
+    pid
 }
 
 // ---------- parallel stack scanning ----------
@@ -2445,9 +2513,17 @@ enum Garbage {
     Buffers(Vec<(usize, usize, usize)>),
 }
 fn send_garbage(g: Garbage) {
-    static TX: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Garbage>>> = std::sync::OnceLock::new();
-    let tx = TX.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Garbage>();
+    // (per process: in the child of `fork` the parent's freeing thread is gone, and waking it
+    // through the old channel traps on macOS, so the child starts a channel and thread of its
+    // own; the old sender is forgotten, not dropped, which would wake it too)
+    static TX: crate::mt::ForkLock<Option<(usize, std::sync::mpsc::Sender<Garbage>)>> = crate::mt::ForkLock::new(None);
+    let mut tx = TX.lock().unwrap_or_else(|e| e.into_inner());
+    let forks = FORKS.load(Ordering::Relaxed);
+    if tx.as_ref().is_none_or(|(g0, _)| *g0 != forks) {
+        if let Some(old) = tx.take() {
+            std::mem::forget(old);
+        }
+        let (s, rx) = std::sync::mpsc::channel::<Garbage>();
         std::thread::Builder::new()
             .name("kenny-gc-free".into())
             .spawn(move || {
@@ -2467,9 +2543,9 @@ fn send_garbage(g: Garbage) {
                 }
             })
             .expect("gc free thread");
-        std::sync::Mutex::new(tx)
-    });
-    let _ = tx.lock().unwrap_or_else(|e| e.into_inner()).send(g);
+        *tx = Some((forks, s));
+    }
+    let _ = tx.as_ref().unwrap().1.send(g);
 }
 /// Free a malloc'd environment (`kn_env_new`: a header, then [parent, blk, slots...]).
 fn free_malloc_env(p: usize, n: u32) {
@@ -2508,6 +2584,8 @@ fn mark_roots(m: &mut Marker, h: &mut Heap, all_classes: bool) {
         m.value(p.last_match);
         m.value(p.eval_locals);
         m.value(p.eval_src);
+        m.value(p.eval_cref);
+        m.value(p.eval_cref_run);
         match p.pending {
             Throw::Raise(e) => m.value(e),
             Throw::Break { val, .. } | Throw::Return { val, .. } | Throw::StopLoop(val) => m.value(val),
@@ -2558,7 +2636,7 @@ fn mark_roots(m: &mut Marker, h: &mut Heap, all_classes: bool) {
         m.value(v);
     }
     m.cur = 16;
-    for &v in PINNED.raw().iter() {
+    for &v in PINNED.raw().iter().chain(PERMANENT.raw().iter()) {
         m.value(v);
     }
     m.cur = 0;

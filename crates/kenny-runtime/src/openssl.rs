@@ -1347,6 +1347,8 @@ pub fn init() {
 
     let random = const_lookup(rt().c.object, sym("Random")).unwrap() as *mut Class;
     let f = module_under(random, "Formatter");
+    // (as random.c: Random.hex, Random.uuid ... too)
+    let _ = send(random as V, sym("extend"), &[f as V], QNIL);
     defn(f, "random_bytes", 0, 1, |s, a, _| {
         let n = get!(opt_len(a));
         bin(get!(fmt_bytes(s, n)))

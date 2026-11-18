@@ -260,14 +260,29 @@ class PP < PrettyPrint
       group(1, '{', '}') {
         seplist(obj, nil, :each_pair) {|k, v|
           group {
-            pp k
-            text '=>'
-            group(1) {
-              breakable ''
-              pp v
-            }
+            pp_hash_pair k, v
           }
         }
+      }
+    end
+
+    # A pretty print for a pair of Hash (Ruby 3.4's: `key: value` for a Symbol key)
+    def pp_hash_pair(k, v)
+      if Symbol === k
+        sym_s = k.inspect
+        if sym_s[1].match?(/["$@!]/) || sym_s[-1].match?(/[%&*+\-\/<=>@\]^`|~]/)
+          text "#{k.to_s.inspect}:"
+        else
+          text "#{k}:"
+        end
+      else
+        pp k
+        text ' '
+        text '=>'
+      end
+      group(1) {
+        breakable
+        pp v
       }
     end
   end

@@ -192,3 +192,26 @@ impl<T> std::ops::DerefMut for LGuard<'_, T> {
         unsafe { &mut *self.l.v.get() }
     }
 }
+
+/// A std `Mutex` that the child of `fork` can make again: a lock the forking thread holds
+/// across `fork(2)` belongs to a thread of the parent, and on macOS unlocking it in the child
+/// aborts (SIGTRAP). Used as a `Mutex` (it derefs to one).
+pub struct ForkLock<T>(std::cell::UnsafeCell<std::sync::Mutex<T>>);
+unsafe impl<T: Send> Sync for ForkLock<T> {}
+impl<T> ForkLock<T> {
+    pub const fn new(v: T) -> Self {
+        ForkLock(std::cell::UnsafeCell::new(std::sync::Mutex::new(v)))
+    }
+    /// (in the child of `fork`, the only thread) Make the lock again, unlocked, holding `v`;
+    /// its guard from before the fork must be forgotten, not dropped. The old value is not
+    /// dropped either.
+    pub unsafe fn reset(&self, v: T) {
+        unsafe { std::ptr::write(self.0.get(), std::sync::Mutex::new(v)) };
+    }
+}
+impl<T> std::ops::Deref for ForkLock<T> {
+    type Target = std::sync::Mutex<T>;
+    fn deref(&self) -> &std::sync::Mutex<T> {
+        unsafe { &*self.0.get() }
+    }
+}

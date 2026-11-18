@@ -280,6 +280,11 @@ pub struct Compiler<M: Module> {
     pub(crate) bmethod_next: bool,
     /// Compiling a define_method body (or a block in one): its `__method__` is the runtime's
     pub(crate) in_bmethod: bool,
+    /// The program's own code reads `$LOAD_PATH`, and has a literal `require` the build
+    /// couldn't resolve: that may name a directory added at runtime, so it needs the runtime
+    /// compiler.
+    pub(crate) reads_load_path: bool,
+    pub(crate) unresolved_require: bool,
     /// (file, offset) of the `def`s whose bodies are being compiled
     pub(crate) def_stack: Vec<(PathBuf, usize)>,
     /// (file, offset) of a compiled `def` -> the cache slot of its constant scope (cref)
@@ -473,8 +478,6 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_is_kwhash", &[I64], &[I64]),
     ("kn_ary_push_kw", &[I64, I64], &[I64]),
     ("kn_take_kwhash", &[I64, I64, I64], &[I64]),
-    ("kn_take_kwhash2", &[I64, I64, I64], &[I64]),
-    ("kn_take_kwhash3", &[I64, I64, I64, I64, I64, I64], &[I64]),
     ("kn_kw_dup", &[I64], &[I64]),
     ("kn_kw_take", &[I64, I64], &[I64]),
     ("kn_kw_get", &[I64, I64], &[I64]),
@@ -539,6 +542,9 @@ pub const RUNTIME: &[(&str, &[ir::Type], &[ir::Type])] = &[
     ("kn_binding_new_l", &[I64, I64], &[I64]),
     ("kn_proc_set_locals", &[I64, I64], &[I64]),
     ("kn_eval_locals", &[I64, I64], &[I64]),
+    ("kn_eval_cref", &[I64, I64], &[I64]),
+    ("kn_eval_cref_into", &[I64], &[I64]),
+    ("kn_nesting_tail", &[I64, I64], &[I64]),
     ("kn_register_file", &[I64, I64, I64, I64, I64], &[]),
     ("kn_register_debug", &[I64, I64, I64, I64], &[]),
     ("kn_register_stackmaps", &[I64, I64, I64], &[]),
@@ -704,7 +710,12 @@ pub(crate) fn host_isa(pic: bool) -> Result<std::sync::Arc<dyn isa::TargetIsa>, 
 
 impl Compiler<ObjectModule> {
     fn new_object(path: &Path, src: &[u8]) -> Result<Self, String> {
-        let ob = ObjectBuilder::new(host_isa(true)?, "kenny_program", cranelift_module::default_libcall_names()).map_err(|e| e.to_string())?;
+        #[allow(unused_mut)]
+        let mut ob = ObjectBuilder::new(host_isa(true)?, "kenny_program", cranelift_module::default_libcall_names()).map_err(|e| e.to_string())?;
+        // arm64 branches reach 128 MB, and GNU ld adds stubs for further ones only between
+        // sections: a large application's code can't be one section (Discourse)
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        ob.per_function_section(true);
         Self::with_module(ObjectModule::new(ob), path, src)
     }
 }
@@ -741,6 +752,8 @@ impl<M: Module> Compiler<M> {
             yield_targets: Vec::new(),
             bmethod_next: false,
             in_bmethod: false,
+            reads_load_path: false,
+            unresolved_require: false,
             def_stack: Vec::new(),
             def_cref: HashMap::new(),
             class_getters: HashMap::new(),
@@ -797,7 +810,7 @@ impl<M: Module> Compiler<M> {
 
 impl Compiler<ObjectModule> {
     fn finish(mut self, toplevel: FuncId) -> Result<Output, String> {
-        let needs_jit = self.needs_jit;
+        let needs_jit = self.needs_jit || (self.reads_load_path && self.unresolved_require);
         let warnings = std::mem::take(&mut self.warnings);
         let files: Vec<PathBuf> = self.loaded.keys().cloned().collect();
         let e = |x: cranelift_module::ModuleError| x.to_string();

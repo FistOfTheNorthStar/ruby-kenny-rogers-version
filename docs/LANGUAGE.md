@@ -26,8 +26,8 @@ Kenny compiles Ruby ahead of time to a single native binary, like Go.
 | `ObjectSpace.each_object` (except for `Class`/`Module`), `ObjectSpace._id2ref` | Heap doesn't need to be walkable; GC can move objects. Classes are tracked anyway, so `each_object(Class)` works |
 | `TracePoint`, `set_trace_func` | No hooks on every call/line (a debug build flag replaces them) |
 | String encodings other than UTF-8, ASCII-8BIT (binary), US-ASCII | Strings skip per-operation encoding checks. CRuby's other encodings exist as `Encoding` objects (every constant, `Encoding.find`, `list`, `aliases`, `dummy?`) so code that compares against them or looks them up runs. `String#encode` converts between UTF-8, UTF-16/32 (LE, BE, with a BOM), US-ASCII, binary, ISO-8859-1 and Windows-1252 (ASCII-only text to and from any ASCII-compatible encoding; other text raises `NotImplementedError`). A String in one of those other encodings (from `encode` or `force_encoding`) reports it from `encoding`, `encode` and `valid_encoding?`, but its other methods see bytes, as a binary String's do (`length` of a UTF-16 String is its byte count) |
-| `require` / `autoload` of a library by name (searched on `$LOAD_PATH`) that wasn't compiled in | Whole program is compiled together. `load` of a file, and `require` of an absolute path, that is new or changed since the build are compiled at runtime by the embedded JIT (Rails' code reloading in development) |
-| Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in: those of the gems in Gemfile.lock, and `--ext dir`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError`. As with the ffi gem, `ffi_lib` raises `LoadError` when the library isn't installed. The `sassc` gem (libsass through FFI) is replaced by a native Sass compiler |
+| `require` / `autoload` of a library by name (searched on `$LOAD_PATH`) that wasn't compiled in | Whole program is compiled together. `load` of a file, `require` of an absolute path, and `require` through a `$LOAD_PATH` directory the program added (when it mentions `$LOAD_PATH` and a literal `require` wasn't found at build time), that is new or changed since the build are compiled at runtime by the embedded JIT (Rails' code reloading in development) |
+| Calling C functions through FFI (`ffi` gem) | A Kenny binary doesn't load shared libraries (C extensions are compiled in: those of the gems in Gemfile.lock, and `--ext dir`). FFI declarations still work, so a gem that binds a C library loads; calling a bound function raises `NotImplementedError`. As with the ffi gem, `ffi_lib` raises `LoadError` when the library isn't installed. The `sassc` gem (libsass through FFI) is replaced by a native Sass compiler. So are two C extensions that embed a library a Kenny binary can't link: `mini_racer` (V8) runs on the JavaScript engine ExecJS uses (QuickJS), where an `attach`ed function throws when called (JavaScript can't call back into Ruby) and `timeout:`/`max_memory:` aren't enforced; `mini_suffix` (libpsl) runs on the `public_suffix` gem |
 | `Thread#raise` / `Thread#kill` landing at arbitrary instructions | Delivered only at safe points (calls, loop back-edges, IO) |
 | `RubyVM::*`, `Ractor`, `$;`, `$,`, `callcc`, flip-flop, `END` | CRuby internals, superseded, or deprecated (`BEGIN` works; use `at_exit` for `END`). `RubyVM` itself is an empty module, for gems that ask it about YJIT |
 
@@ -65,7 +65,8 @@ loaded after `setup`, as in CRuby. The differences:
 
 - **String literals are chilled, as in Ruby 3.4 and 4.0, except where nothing can tell.** With
   `# frozen_string_literal: true` a literal is one frozen String for the whole run (no
-  allocation); with `false`, a new String each time. Without the comment it is *chilled*: a new
+  allocation), and, as in CRuby, literals with the same contents (also in other files and in
+  eval'd code) are the same String, which `-str` and `str.dedup` return; with `false`, a new String each time. Without the comment it is *chilled*: a new
   String each time, not frozen (`"a".equal?("a")` and `"a".frozen?` are false), and its first
   change warns under `Warning[:deprecated] = true` (as CRuby does). A chilled String shares the
   literal's bytes until it is changed, so it costs one small object. Where the compiler sees that
@@ -149,6 +150,10 @@ No GVL. No new concurrency API. The existing ones become lightweight:
 - **`Mutex`, `Queue`, `SizedQueue`, `ConditionVariable`, `Monitor`** work as documented, backed by
   the scheduler (parking, not OS blocking).
 - **`Fiber`** keeps its Ruby semantics (`Enumerator#next` etc.).
+- **`fork`** works with threads running: the other threads stop at a safe point first (as for
+  a GC), and the child has only the thread that forked, as in CRuby. `Process._fork` is what
+  `fork` calls, so a gem can hook it (ActiveSupport's ForkTracker, Discourse). Unlike CRuby, a
+  `Mutex` held by one of the threads that didn't survive stays locked in the child.
 - **Memory safety under races:** a data race in Ruby code can give wrong answers but never crash
   the process. Readers of Arrays, Hashes, Strings, instance variables and class tables never
   lock; writers take a per-object spin lock, only once more than one OS thread runs Ruby code.

@@ -79,7 +79,15 @@ module Bundler
     def setup(*groups)
       return self if @setup
       @setup = true
-      gem_dirs = specs.map { |s| File.dirname(File.dirname(s.full_gem_path)) unless s.full_gem_path.empty? }
+      # (installed gems' directories, <dir>/gems/<name-version>: not those of path gems (a Rails
+      # checkout's `gemspec`) or git gems, as Bundler's; a parent of the app's directory there made
+      # ActiveSupport::FileUpdateChecker skip the app's files as gem files)
+      gem_dirs = specs.map do |s|
+        p = s.full_gem_path
+        next if p.empty? || File.basename(File.dirname(p)) != "gems"
+        d = File.dirname(File.dirname(p))
+        d unless File.basename(d) == "bundler"
+      end
       Gem.path = (gem_dirs.compact.uniq - ["."]).freeze
       specs.each do |s|
         Gem.loaded_specs[s.name] = s

@@ -1,6 +1,6 @@
 //! Bundler projects: when the entry file has a `Gemfile.lock` next to it (or in a parent
 //! directory), `kenny build` resolves the locked gems itself — from the lock file and the
-//! installed gem directories (GEM_HOME / GEM_PATH, the system Ruby's `Gem.path`, ~/.gem, rvm,
+//! installed gem directories (BUNDLE_PATH, GEM_HOME / GEM_PATH, the system Ruby's `Gem.path`, ~/.gem, rvm,
 //! rbenv) — so no `-I` flags are needed. The Gemfile's groups, `require:` options and
 //! platforms are captured into a generated `kenny/bundle.rb`, which Kenny's `bundler` overlay
 //! (lib/kenny/bundler.rb) uses for `require "bundler/setup"` and `Bundler.require(*groups)`.
@@ -147,7 +147,20 @@ pub fn resolve(lockfile: &Path) -> Result<Bundle, String> {
         m.entry(s.name.as_str()).or_default().push(s);
         m
     });
-    let gem_dirs = gem_dirs();
+    let mut gem_dirs = gem_dirs();
+    // `bundle install` into BUNDLE_PATH (env or `.bundle/config`, relative to the app):
+    // `<path>/ruby/<ABI version>`, ahead of the others as for Bundler
+    if let Some(bp) = std::env::var("BUNDLE_PATH").ok().or_else(|| bundle_config(&root, "BUNDLE_PATH")).filter(|p| !p.is_empty()) {
+        let bp = root.join(bp);
+        if let Ok(rd) = std::fs::read_dir(bp.join("ruby")) {
+            let mut v: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|d| d.join("gems").is_dir()).collect();
+            v.sort();
+            for d in v.into_iter().rev() {
+                gem_dirs.retain(|x| x != &d);
+                gem_dirs.insert(0, d);
+            }
+        }
+    }
     let mut order: Vec<&str> = Vec::new();
     let mut visited: HashSet<&str> = HashSet::new();
     fn visit<'a>(n: &'a str, by_name: &HashMap<&str, Vec<&'a Spec>>, visited: &mut HashSet<&'a str>, order: &mut Vec<&'a str>) {
@@ -204,6 +217,9 @@ pub fn resolve(lockfile: &Path) -> Result<Bundle, String> {
             }
             // a default gem: its files are part of the standard library
             Some((s, Located::Default)) => spec_rows.push((s.name.clone(), s.version.clone(), PathBuf::new(), vec![])),
+            // only source builds use it: a precompiled nokogiri, locked for the `ruby` platform
+            // with this dependency, was installed without it
+            None if *name == "mini_portile2" => {}
             None => missing.push(format!("{} ({})", name, candidates[0].version)),
         }
     }
@@ -300,15 +316,18 @@ fn platform_ok(platforms: &[String]) -> bool {
         })
 }
 
+/// A setting of the app's `.bundle/config`.
+fn bundle_config(root: &Path, key: &str) -> Option<String> {
+    let config = std::fs::read_to_string(root.join(".bundle/config")).ok()?;
+    config.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        (k.trim() == key).then(|| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+    })
+}
+
 fn group_settings(root: &Path) -> (Vec<String>, Vec<String>) {
     let split = |s: &str| s.split([':', ' ', ',']).filter(|x| !x.is_empty()).map(|x| x.to_string()).collect::<Vec<_>>();
-    let config = std::fs::read_to_string(root.join(".bundle/config")).unwrap_or_default();
-    let from_config = |key: &str| {
-        config.lines().find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            (k.trim() == key).then(|| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
-        })
-    };
+    let from_config = |key: &str| bundle_config(root, key);
     let without = std::env::var("BUNDLE_WITHOUT").ok().or_else(|| from_config("BUNDLE_WITHOUT")).unwrap_or_else(|| "development:test".into());
     let with = std::env::var("BUNDLE_WITH").ok().or_else(|| from_config("BUNDLE_WITH")).unwrap_or_default();
     (split(&without), split(&with))
