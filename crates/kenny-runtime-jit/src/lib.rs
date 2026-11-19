@@ -88,8 +88,6 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_is_kwhash", kenny_runtime::abi::kn_is_kwhash as *const u8),
         ("kn_ary_push_kw", kenny_runtime::abi::kn_ary_push_kw as *const u8),
         ("kn_take_kwhash", kenny_runtime::abi::kn_take_kwhash as *const u8),
-        ("kn_take_kwhash2", kenny_runtime::abi::kn_take_kwhash2 as *const u8),
-        ("kn_take_kwhash3", kenny_runtime::abi::kn_take_kwhash3 as *const u8),
         ("kn_kw_dup", kenny_runtime::abi::kn_kw_dup as *const u8),
         ("kn_kw_take", kenny_runtime::abi::kn_kw_take as *const u8),
         ("kn_kw_get", kenny_runtime::abi::kn_kw_get as *const u8),
@@ -127,7 +125,6 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_match_named", kenny_runtime::regex::kn_match_named as *const u8),
         ("kn_last_match", kenny_runtime::regex::kn_last_match as *const u8),
         ("kn_match_save", kenny_runtime::regex::kn_match_save as *const u8),
-        ("kn_eval_scope", kenny_runtime::compat::kn_eval_scope as *const u8),
         ("kn_dm_name", kenny_runtime::regex::kn_dm_name as *const u8),
         ("kn_dm_name_for", kenny_runtime::regex::kn_dm_name_for as *const u8),
         ("kn_callee", kenny_runtime::core::kn_callee as *const u8),
@@ -150,11 +147,15 @@ fn symbols() -> Vec<(&'static str, *const u8)> {
         ("kn_super_blk", kenny_runtime::abi::kn_super_blk as *const u8),
         ("kn_clear_pending", kenny_runtime::compat::kn_clear_pending as *const u8),
         ("kn_set_lexical_parent", kenny_runtime::compat::kn_set_lexical_parent as *const u8),
+        ("kn_eval_scope", kenny_runtime::compat::kn_eval_scope as *const u8),
         ("kn_rational_lit", kenny_runtime::rational::kn_rational_lit as *const u8),
         ("kn_binding_new", kenny_runtime::compat::kn_binding_new as *const u8),
         ("kn_binding_new_l", kenny_runtime::compat::kn_binding_new_l as *const u8),
         ("kn_proc_set_locals", kenny_runtime::compat::kn_proc_set_locals as *const u8),
         ("kn_eval_locals", kenny_runtime::compat::kn_eval_locals as *const u8),
+        ("kn_eval_cref", kenny_runtime::compat::kn_eval_cref as *const u8),
+        ("kn_eval_cref_into", kenny_runtime::compat::kn_eval_cref_into as *const u8),
+        ("kn_nesting_tail", kenny_runtime::abi::kn_nesting_tail as *const u8),
         ("kn_register_file", kenny_runtime::compat::kn_register_file as *const u8),
         ("kn_register_debug", kenny_runtime::backtrace::kn_register_debug as *const u8),
         ("kn_register_stackmaps", kenny_runtime::stackmap::kn_register_stackmaps as *const u8),
@@ -331,6 +332,10 @@ fn leading_comments(src: &[u8]) -> usize {
 
 fn eval_hook(src: &[u8], mode: u8, self_: V, locals: V, file: Option<&str>, line: i64) -> V {
     let m = if mode == 1 { EvalMode::ClassEval } else { EvalMode::Eval };
+    // (the class the eval runs in, kn_eval_cref: a unit per class, as the methods it defines
+    // keep the unit's cref)
+    let cref = kenny_runtime::core::pst().eval_cref_run;
+    let cref_key = if cref == QNIL { String::new() } else { format!("{cref:x}") };
     // the caller's locals: the source starts with `a, b, = __kenny_evl;` (on its first line,
     // so line numbers stay), and their values come in as the unit's argument
     let (names, vals): (Vec<V>, Vec<V>) = if is_ary(locals) {
@@ -346,6 +351,8 @@ fn eval_hook(src: &[u8], mode: u8, self_: V, locals: V, file: Option<&str>, line
         let mut key = src.to_vec();
         key.extend_from_slice(b"\0");
         key.extend_from_slice(file.as_bytes());
+        key.extend_from_slice(b"\0");
+        key.extend_from_slice(cref_key.as_bytes());
         return match compiled((mode, key), src, m, file) {
             Ok(f) => unsafe { f(self_, 0, std::ptr::null(), QNIL) },
             Err(e) => e,
@@ -378,6 +385,8 @@ fn eval_hook(src: &[u8], mode: u8, self_: V, locals: V, file: Option<&str>, line
     let mut key = full.clone();
     key.extend_from_slice(b"\0");
     key.extend_from_slice(file.as_bytes());
+    key.extend_from_slice(b"\0");
+    key.extend_from_slice(cref_key.as_bytes());
     let vals = ary_new(vals);
     match compiled((mode, key), &full, m, file) {
         Ok(f) => unsafe { f(self_, names.len().min(1) as u64, &vals as *const V, QNIL) },

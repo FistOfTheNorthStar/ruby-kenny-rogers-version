@@ -1,0 +1,8 @@
+[[[false, false, false, false], false, false, false, 1], ["nil", false], 200000, [200010000, 200010001, 200010002], 42, :locked]
+true
+true
+true
+3
+"child"
+:parent
+5

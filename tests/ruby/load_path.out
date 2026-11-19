@@ -1,0 +1,6 @@
+true
+:rake_ok
+1
+2
+[LoadError, "cannot load such file -- tasks/missing.rake"]
+2

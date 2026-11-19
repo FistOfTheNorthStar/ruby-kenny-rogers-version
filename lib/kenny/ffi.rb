@@ -57,6 +57,8 @@ module FFI
     TypeDefs[add] = find_type(old)
   end
 
+  def self.type_size(type) = find_type(type).size
+
   def self.find_type(t, mod = nil)
     case t
     when Type, Enum, Class then t

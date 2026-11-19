@@ -46,6 +46,9 @@ struct Sink {
     /// stops at 256 levels, gumbo at 400), which also keeps the HTML5 algorithm's stack scans
     /// from going quadratic on pathological input
     depth: RefCell<Vec<u16>>,
+    /// a start tag was ignored for nesting deeper than MAX_DEPTH (gumbo stops there with
+    /// "Document tree depth limit exceeded": nokogiri.rs `gumbo_parse`)
+    too_deep: Cell<bool>,
 }
 
 const MAX_DEPTH: u16 = 400;
@@ -64,6 +67,7 @@ impl Sink {
             cur_created: RefCell::new(Vec::new()),
             synthetic: RefCell::new(Vec::new()),
             depth: RefCell::new(vec![0]),
+            too_deep: Cell::new(false),
         }
     }
     fn add(&self, mut n: Node, name: Option<QualName>) -> u32 {
@@ -288,6 +292,7 @@ impl TokenSink for Spy {
             let t = DepthTracer { sink, max: Cell::new(0) };
             self.tb.trace_handles(&t);
             if t.max.get() >= MAX_DEPTH {
+                sink.too_deep.set(true);
                 return TokenSinkResult::Continue;
             }
         }
@@ -328,6 +333,8 @@ pub struct Parsed {
     pub dom: Dom,
     pub quirks: i64,
     pub errors: Vec<String>,
+    /// elements nested deeper than MAX_DEPTH were left out
+    pub too_deep: bool,
 }
 
 fn quirks_code(q: QuirksMode) -> i64 {
@@ -343,6 +350,7 @@ pub fn parse_document(src: &str, html4: bool) -> Parsed {
     let tb = TreeBuilder::new(Sink::new(html4), tb_opts());
     let sink = run(Tokenizer::new(Spy { tb }, TokenizerOpts::default()), src);
     let quirks = quirks_code(sink.quirks.get());
+    let too_deep = sink.too_deep.get();
     let errors = sink.errors.into_inner();
     let synthetic = sink.synthetic.into_inner();
     let mut dom = sink.dom.into_inner();
@@ -350,7 +358,7 @@ pub fn parse_document(src: &str, html4: bool) -> Parsed {
         html4_common_fixups(&mut dom, src, &synthetic);
         html4_fixups(&mut dom, &synthetic);
     }
-    Parsed { dom, quirks, errors }
+    Parsed { dom, quirks, errors, too_deep }
 }
 
 fn find_elements(dom: &Dom, id: u32, name: &str, out: &mut Vec<u32>) {
@@ -472,7 +480,8 @@ pub fn add_default_dtd(dom: &mut Dom) {
 
 /// Parse `src` as the children of a `ctx_name` element (in namespace `ctx_ns`, default HTML).
 /// Returns the parsed dom and its top-level nodes (children of the synthetic root).
-pub fn parse_fragment(src: &str, ctx_name: &str, ctx_ns: &str, html4: bool) -> (Dom, Vec<u32>, Vec<String>) {
+/// (dom, the fragment's top nodes, parse errors, whether elements nested too deep were left out)
+pub fn parse_fragment(src: &str, ctx_name: &str, ctx_ns: &str, html4: bool) -> (Dom, Vec<u32>, Vec<String>, bool) {
     let ns = match ctx_ns {
         SVG_NS => ns!(svg),
         MATHML_NS => ns!(mathml),
@@ -485,6 +494,7 @@ pub fn parse_fragment(src: &str, ctx_name: &str, ctx_ns: &str, html4: bool) -> (
     let initial = tb.tokenizer_state_for_context_elem(false);
     let tok = Tokenizer::new(Spy { tb }, TokenizerOpts { initial_state: Some(initial), ..Default::default() });
     let sink = run(tok, src);
+    let too_deep = sink.too_deep.get();
     let errors = sink.errors.into_inner();
     let synthetic = sink.synthetic.into_inner();
     let mut dom = sink.dom.into_inner();
@@ -494,5 +504,5 @@ pub fn parse_fragment(src: &str, ctx_name: &str, ctx_ns: &str, html4: bool) -> (
     // the fragment algorithm puts everything under a synthetic <html> root
     let root = dom.n(0).first;
     let kids = if root == NONE { Vec::new() } else { dom.children(root) };
-    (dom, kids, errors)
+    (dom, kids, errors, too_deep)
 }

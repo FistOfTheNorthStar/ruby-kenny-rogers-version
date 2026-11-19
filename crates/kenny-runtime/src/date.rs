@@ -294,6 +294,8 @@ fn date_err() -> V {
 enum Num {
     Int(i128),
     Frac(i128, i128),
+    /// a Rational with Bignum parts (`Rational(0.1, 86400)`), exactly
+    Big(num_bigint::BigInt, num_bigint::BigInt),
     Flt(f64),
 }
 fn num_of(v: V) -> Option<Num> {
@@ -313,6 +315,22 @@ fn num_of(v: V) -> Option<Num> {
         if is_fix(n) && is_fix(d) && fix(d) != 0 {
             return Some(Num::Frac(fix(n) as i128, fix(d) as i128));
         }
+        // (Bignum parts, `Rational(0.1, 86400)`)
+        let big = |x: V| -> Option<num_bigint::BigInt> {
+            if is_fix(x) {
+                Some(num_bigint::BigInt::from(fix(x)))
+            } else if is_big(x) {
+                Some(rbig(x).n.clone())
+            } else {
+                None
+            }
+        };
+        if let (Some(bn), Some(bd)) = (big(n), big(d)) {
+            use num_traits::Zero;
+            if !bd.is_zero() {
+                return Some(Num::Big(bn, bd));
+            }
+        }
         if n == UNDEF || d == UNDEF {
             pst().pending = Throw::None;
         }
@@ -324,6 +342,11 @@ fn num_times(n: &Num, unit: i128) -> i128 {
     match *n {
         Num::Int(i) => i * unit,
         Num::Frac(a, b) => (a * unit).div_euclid(b),
+        Num::Big(ref a, ref b) => {
+            use num_integer::Integer;
+            use num_traits::ToPrimitive;
+            (a * num_bigint::BigInt::from(unit)).div_floor(b).to_i128().unwrap_or(0)
+        }
         Num::Flt(f) => (f * unit as f64).round() as i128,
     }
 }
@@ -331,6 +354,7 @@ fn num_is_zero(n: &Num) -> bool {
     match *n {
         Num::Int(i) => i == 0,
         Num::Frac(a, _) => a == 0,
+        Num::Big(ref a, _) => num_traits::Zero::is_zero(a),
         Num::Flt(f) => f == 0.0,
     }
 }
@@ -368,6 +392,7 @@ fn int_arg(v: V, what: &str) -> Result<i64, V> {
         Some(Num::Int(_)) => Err(raise(rt().c.range_error, &format!("{what} out of range"))),
         Some(Num::Flt(f)) => Ok(f.floor() as i64),
         Some(Num::Frac(a, b)) => Ok(a.div_euclid(b) as i64),
+        Some(Num::Big(..)) => Err(raise(rt().c.range_error, &format!("{what} out of range"))),
         None => Err(type_error(&format!("invalid {what} (not numeric)"))),
     }
 }
@@ -2120,6 +2145,10 @@ fn cmp_d(s: V, o: V) -> Option<std::cmp::Ordering> {
     match num_of(o)? {
         Num::Int(i) => Some(x.cmp(&(i * DAY_NS))),
         Num::Frac(a, b) => Some((x * b).cmp(&(a * DAY_NS))),
+        Num::Big(ref a, ref b) => {
+            let x = num_bigint::BigInt::from(x);
+            Some((x * b).cmp(&(a * num_bigint::BigInt::from(DAY_NS))))
+        }
         Num::Flt(f) => (x as f64 / DAY_NS as f64).partial_cmp(&f),
     }
 }
@@ -2219,6 +2248,10 @@ pub fn init() {
 
     // ---- constructors ----
     fn civil(s: V, a: &[V], _: V) -> V {
+        // (a Date's: year, month, day, start)
+        if !dt_class(s) && strip_kw(a).len() > 4 {
+            return arg_error(&format!("wrong number of arguments (given {}, expected 0..4)", strip_kw(a).len()));
+        }
         let d = ok!(civil_args(strip_kw(a), dt_class(s)));
         dnew(s as *mut Class, d)
     }
@@ -2426,7 +2459,21 @@ pub fn init() {
         Some(o) => mkfix(o as i64),
         None => QNIL,
     });
-    defn(dc, "==", 1, 1, |s, a, _| bool_v(cmp_d(s, a[0]) == Some(std::cmp::Ordering::Equal)));
+    // (Comparable's, through `<=>`, which ActiveSupport redefines on DateTime to compare
+    // with a Time)
+    defn(dc, "==", 1, 1, |s, a, _| {
+        if s == a[0] {
+            return QTRUE;
+        }
+        if is_date(a[0]) {
+            return bool_v(cmp_d(s, a[0]) == Some(std::cmp::Ordering::Equal));
+        }
+        let r = send(s, sym("<=>"), &[a[0]], QNIL);
+        if r == UNDEF {
+            return r;
+        }
+        bool_v(is_fix(r) && fix(r) == 0)
+    });
     defn(dc, "===", 1, 1, |s, a, _| {
         let jd = dget(s).jd;
         if is_date(a[0]) {
@@ -2509,16 +2556,18 @@ pub fn init() {
             let ab = d.abs();
             let secs = ab.div_euclid(NS) as i64 - UNIX_EPOCH_JD * DAY;
             let ns = ab.rem_euclid(NS);
-            return time_at(if ns == 0 { mkfix(secs) } else { float_new(secs as f64 + ns as f64 / 1e9) });
+            // exactly, and at the DateTime's offset (as CRuby: `Time.new(..., sec +
+            // sec_fraction, offset)`)
+            let t = send(rt().c.time as V, sym("at"), &[mkfix(secs), mkfix(ns as i64), mksym(sym("nsec"))], QNIL);
+            if t == UNDEF {
+                return t;
+            }
+            return send(t, sym("getlocal"), &[mkfix(d.of)], QNIL);
         }
-        let (y, m, md) = d.civil();
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        tm.tm_year = (y - 1900) as i32;
-        tm.tm_mon = (m - 1) as i32;
-        tm.tm_mday = md as i32;
-        tm.tm_isdst = -1;
-        let t = unsafe { libc::mktime(&mut tm) };
-        time_at(mkfix(t as i64))
+        // (local midnight of the day, by its Julian Day: a date before the calendar reform is
+        // its proleptic Gregorian day, as CRuby, which converts it with `gregorian` first)
+        let wall = (d.jd - UNIX_EPOCH_JD) * DAY;
+        time_at(mkfix(crate::extra::local_wall_secs(wall, wall - local_offset(wall))))
     });
     defn(dc, "new_offset", 0, 1, |s, a, _| {
         let of = match a.first() {
@@ -2565,19 +2614,24 @@ pub fn init() {
     });
 
     // ---- Time interop ----
+    // (seconds and nanoseconds exactly: a Float of today's time has no room for its
+    // nanoseconds, and `Time#to_datetime.to_time` must give the same time back)
     fn time_parts(t: V) -> Result<(i64, i64, i64), V> {
-        let f = send0(t, "to_f");
-        if f == UNDEF {
+        let secs = send0(t, "to_i");
+        if secs == UNDEF {
             return Err(UNDEF);
         }
-        let f = crate::fmt::num_to_f(f).unwrap_or(0.0);
+        let ns = send0(t, "nsec");
+        if ns == UNDEF {
+            return Err(UNDEF);
+        }
         let off = send0(t, "utc_offset");
         if off == UNDEF {
             return Err(UNDEF);
         }
-        let secs = f.floor();
-        let ns = (((f - secs) * 1e9).round() as i64).min(999_999_999);
-        Ok((secs as i64, ns, if is_fix(off) { fix(off) } else { 0 }))
+        let secs = if is_fix(secs) { fix(secs) } else { crate::fmt::num_to_f(secs).unwrap_or(0.0) as i64 };
+        let ns = if is_fix(ns) { fix(ns).clamp(0, 999_999_999) } else { 0 };
+        Ok((secs, ns, if is_fix(off) { fix(off) } else { 0 }))
     }
     defn(r.c.time, "to_date", 0, 0, |s, _, _| {
         let (secs, _, off) = ok!(time_parts(s));

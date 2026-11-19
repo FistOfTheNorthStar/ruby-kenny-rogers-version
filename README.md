@@ -159,8 +159,9 @@ version prints a warning: the program gets that Ruby's libraries but behaves as 
 4.0 (newer).
 
 **Gems.** When the program has a `Gemfile.lock` next to it (or in a parent directory),
-`kenny build` resolves the locked gems itself from the installed gem directories (that Ruby's
-first, then `GEM_HOME`/`GEM_PATH`, `~/.gem`, rvm, rbenv) and compiles them in. Groups listed in
+`kenny build` resolves the locked gems itself from the installed gem directories (`BUNDLE_PATH`'s
+first, from the environment or the app's `.bundle/config`, then that Ruby's, `GEM_HOME`/`GEM_PATH`,
+`~/.gem`, rvm, rbenv) and compiles them in. Groups listed in
 `BUNDLE_WITHOUT` (default `development:test`) are left out, and `require "bundler/setup"` /
 `Bundler.require(*Rails.groups)` work in the binary. Without a lock file, `-I` adds load paths:
 `tools/gem-paths.rb NAME VERSION` prints the `-I` flags for an installed gem and its
@@ -375,7 +376,9 @@ without a Gemfile so are the gems that Ruby bundles in place of former stdlib pa
 - cgi/escape, erb/escape (Rails' `html_escape`), plus `Gem::Version`/`Gem::Requirement`
 - **Nokogiri** (html5ever and quick-xml underneath, its own XPath 1.0 engine, a SAX
   scanner that reports what libxml2's does, and nokogiri's Ruby layer on top), so loofah, the
-  Rails HTML sanitizers and the AWS SDK's XML parsing work without libxml2
+  Rails HTML sanitizers and the AWS SDK's XML parsing work without libxml2. HTML5 parsing
+  enforces `max_attributes` and `max_tree_depth` as Gumbo does, but a deeper document is cut at
+  400 levels even when `max_tree_depth` is -1 or more than 400
 - **sqlite3**: the gem's C extension, on the bundled SQLite library, for both the
   1.x and 2.x gem APIs; the gem's own Ruby files load on top of it
 </details>

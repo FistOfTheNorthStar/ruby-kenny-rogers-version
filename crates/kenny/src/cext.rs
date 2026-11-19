@@ -193,6 +193,12 @@ pub fn from_gem(gem: &str, dir: &Path, work: &Path) -> Result<Ext, String> {
             if !(l.starts_with("ruby") || ["pthread", "m", "dl", "c", "objc", "stdc++", "c++", "gmp", "crypt"].contains(&l)) && !libs.contains(&w) {
                 libs.push(w);
             }
+        } else if w.ends_with(".a") && !w.starts_with('-') {
+            // a static library the extconf built (hiredis' vendored libhiredis.a)
+            let p = rel(&w).display().to_string();
+            if !libs.contains(&p) && Path::new(&p).is_file() {
+                libs.push(p);
+            }
         } else if w == "-framework" {
             if let Some(f) = ws.next() {
                 if !libs.contains(&f) {
@@ -450,6 +456,10 @@ pub fn compile(exts: Vec<Ext>, work: &Path, ruby_h: &str, shim: &str) -> Result<
                 let Some(j) = jobs.get(i) else { break };
                 let mut c = if j.cxx { Command::new(std::env::var("CXX").unwrap_or_else(|_| "c++".into())) } else { crate::cc() };
                 c.args([if j.cxx { "-std=gnu++17" } else { "-std=gnu17" }, "-O2", "-fPIC", "-w", "-c"]);
+                // (CRuby's config.h defines it: a -std=c99 from extconf.rb doesn't hide
+                // CLOCK_MONOTONIC and the like)
+                #[cfg(target_os = "linux")]
+                c.arg("-D_GNU_SOURCE");
                 // (after the gem's flags: frame records on every frame, whose chain the GC
                 // walks, kenny-runtime stackmap.rs)
                 c.arg("-I").arg(&inc).args(&j.flags).arg("-fno-omit-frame-pointer").arg(&j.src).arg("-o").arg(&j.obj);

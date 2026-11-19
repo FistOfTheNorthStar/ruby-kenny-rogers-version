@@ -328,6 +328,28 @@ pub extern "C" fn kn_eval_locals(locals: V, src: V) -> V {
     p.eval_src = src;
     QNIL
 }
+/// The class body a `Kernel#eval` call site is lexically in, for the string `src` it is about
+/// to eval (after kn_eval_locals): `class X` in the string defines it there, and its
+/// constants resolve from there, as CRuby's eval inherits the caller's cref.
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_eval_cref(cref: V, src: V) -> V {
+    let p = pst();
+    if p.eval_src == src && is_class(cref) && cref != rt().c.object as V {
+        p.eval_cref = cref;
+    }
+    QNIL
+}
+/// (an eval unit's top scope, on entry) Its cref slot gets the class of the eval that is
+/// running, if its call site gave one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kn_eval_cref_into(slot: *mut [V; 2]) -> V {
+    let p = pst();
+    let c = std::mem::replace(&mut p.eval_cref_run, QNIL);
+    if is_class(c) {
+        unsafe { (*slot)[0] = c };
+    }
+    QNIL
+}
 /// A Binding's locals as eval takes them ([name Symbol, value, ...], or nil).
 pub fn binding_locals(b: V) -> V {
     let h = ivar_get(b, sym("@__locals"));
@@ -1002,6 +1024,21 @@ fn kernel_load(a: &[V]) -> V {
     }
     match load_compiled(&name) {
         Some(r) => r,
+        // a relative name is also looked for under the $LOAD_PATH directories (railties
+        // loads "rails/tasks/framework.rake" so), as in CRuby
+        None if !name.starts_with('/') && !name.starts_with("./") && !name.starts_with("../") && (*LOAD_HOOK.get()).is_some() => {
+            let lp = rt().gvars.get(&sym("$LOAD_PATH")).copied().filter(|v| is_ary(*v)).map(|v| rary(v).v.clone()).unwrap_or_default();
+            for d in lp.into_iter().filter(|d| is_str(*d)) {
+                let full = format!("{}/{name}", String::from_utf8_lossy(&rstr(d).b));
+                if let Some((abs, src, _)) = disk_source(&full, false) {
+                    return ((*LOAD_HOOK.get()).unwrap())(&src, &abs);
+                }
+            }
+            let le = const_lookup(rt().c.object, sym("LoadError")).unwrap();
+            let e = exc_new(le as *mut Class, &format!("cannot load such file -- {name}"));
+            ivar_set(e, sym("@path"), str_from(&name));
+            raise_exc(e)
+        }
         None => {
             let le = const_lookup(rt().c.object, sym("LoadError")).unwrap();
             let e = exc_new(le as *mut Class, &format!("cannot load such file -- {name}"));

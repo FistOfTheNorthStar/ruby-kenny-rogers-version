@@ -1257,20 +1257,42 @@ pub extern "C" fn rb_attr_get(obj: V, id: V) -> V {
 
 // ---------- the running C method (rb_frame_this_func, rb_current_receiver) ----------
 
-thread_local! {
-    static FRAMES: std::cell::RefCell<Vec<(u32, V, *mut Class)>> = const { std::cell::RefCell::new(Vec::new()) };
+/// What C extension code runs with, per Ruby thread and fiber (saved and restored when they
+/// switch): a thread blocked in C code may continue on another P.
+#[repr(C)]
+pub struct CContext {
+    /// (kenny_capi.c `kn_ctx`) the innermost frame an exception jumps to
+    top: *mut c_void,
+    /// (kenny_capi.c `kn_ctx`) the throw rb_protect stopped, for rb_jump_tag
+    saved_throw: V,
+    /// the running C methods: name, receiver (also on the caller's stack), owner (a class)
+    frames: Vec<(u32, V, *mut Class)>,
+}
+impl CContext {
+    pub const fn new() -> Self {
+        CContext { top: std::ptr::null_mut(), saved_throw: QNIL, frames: Vec::new() }
+    }
+}
+impl Default for CContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kn_capi_ctx() -> *mut CContext {
+    &mut pst().c_context
 }
 /// A C method is called (its name, receiver and owner; the receiver is also on the caller's
 /// stack, the owner is a class).
 pub fn enter_frame(name: u32, recv: V, owner: *mut Class) {
-    FRAMES.with(|f| f.borrow_mut().push((name, recv, owner)));
+    pst().c_context.frames.push((name, recv, owner));
 }
 pub fn leave_frame() {
-    FRAMES.with(|f| f.borrow_mut().pop());
+    pst().c_context.frames.pop();
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_frame_this_func() -> V {
-    FRAMES.with(|f| f.borrow().last().map_or(0, |x| x.0 as V))
+    pst().c_context.frames.last().map_or(0, |x| x.0 as V)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_frame_callee() -> V {
@@ -1279,7 +1301,7 @@ pub extern "C" fn rb_frame_callee() -> V {
 /// `super` from the running C method (with its arguments and block).
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_call_super(argc: c_int, argv: *const V) -> V {
-    let Some((mid, recv, owner)) = FRAMES.with(|f| f.borrow().last().copied()) else {
+    let Some((mid, recv, owner)) = pst().c_context.frames.last().copied() else {
         return raise(rt().c.runtime_error, "super called outside of method");
     };
     let args: &[V] = if argc <= 0 || argv.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(argv, argc as usize) } };
@@ -1293,7 +1315,7 @@ pub extern "C" fn rb_call_super(argc: c_int, argv: *const V) -> V {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_current_receiver() -> V {
-    FRAMES.with(|f| f.borrow().last().map_or(rt().main_obj, |x| x.1))
+    pst().c_context.frames.last().map_or(rt().main_obj, |x| x.1)
 }
 
 // ---------- encodings ----------

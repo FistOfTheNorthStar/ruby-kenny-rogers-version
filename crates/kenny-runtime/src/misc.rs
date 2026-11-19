@@ -78,10 +78,12 @@ pub fn cbrt(x: f64) -> f64 {
 }
 
 pub fn each_to_vec(v: V) -> Result<Vec<V>, V> {
-    if is_ary(v) {
+    // (an Array's or Hash's items directly, unless its class redefines `each`)
+    let builtin_each = |k: *mut Class| real_class(v) == k || find_method(class_of(v), sym("each")) == find_method(k, sym("each"));
+    if is_ary(v) && builtin_each(rt().c.array) {
         return Ok(rary(v).v.clone());
     }
-    if is_hash(v) {
+    if is_hash(v) && builtin_each(rt().c.hash) {
         return Ok(crate::hash::pairs(v).into_iter().map(|(k, x)| ary_new(vec![k, x])).collect());
     }
     if is_range(v) {
@@ -374,10 +376,8 @@ fn range_cover_range(s: V, v: V) -> V {
     if o.lo != QNIL && !truthy(tri!(range_cover(s, o.lo))) {
         return QFALSE;
     }
-    let cmp_end = match tri_r!(r_less(r.hi, o.hi)) {
-        Some(c) => c,
-        None => return QFALSE,
-    };
+    // (incomparable is greater, as CRuby's r_less: an endless range's end covers any end)
+    let cmp_end = tri_r!(r_less(r.hi, o.hi)).unwrap_or(i32::MAX as _);
     if r.excl == o.excl {
         return bool_v(cmp_end >= 0);
     }
@@ -528,12 +528,34 @@ pub fn strftime(t: V, f: &str) -> String {
     let subns = ns.rem_euclid(1_000_000_000) as i64;
     let utc = truthy(ivar_get(t, sym("@__utc")));
     let off = tm.tm_gmtoff;
+    let zobj = ivar_get(t, sym("@__zobj"));
     let zone = if utc {
         "UTC".to_string()
+    } else if zobj != QNIL && is_heap(zobj) {
+        // a timezone object's abbreviation: its `abbr(time)` (ActiveSupport::TimeZone,
+        // TZInfo), else its name, as CRuby's rb_time_zone_abbreviation
+        let utc_t = crate::extra::time_utc_copy(t);
+        let r = if respond_to(zobj, sym("abbr")) {
+            send(zobj, sym("abbr"), &[utc_t], QNIL)
+        } else if respond_to(zobj, sym("name")) {
+            send0(zobj, "name")
+        } else {
+            QNIL
+        };
+        if r == UNDEF {
+            pst().pending = Throw::None;
+            String::new()
+        } else if is_str(r) {
+            String::from_utf8_lossy(&rstr(r).b).into_owned()
+        } else if r == QNIL {
+            String::new()
+        } else {
+            to_s(r).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
+        }
     } else if tm.tm_zone.is_null() {
         String::new()
     } else {
-        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone as *const std::ffi::c_char).to_string_lossy().into_owned() }
+        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone.cast()).to_string_lossy().into_owned() }
     };
     let mut out = String::new();
     let mut it = f.chars().peekable();
@@ -1986,7 +2008,7 @@ pub fn blockless_enumerators() {
         ("sort_by!", 0),
         ("each_index", 0),
     ];
-    let string: &[(&'static str, usize)] = &[("gsub", 1)];
+    let string: &[(&'static str, usize)] = &[("gsub", 1), ("gsub!", 1)];
     let table: [(*mut Class, &[(&'static str, usize)]); 8] = [
         (c.hash, common),
         (c.hash, hash),

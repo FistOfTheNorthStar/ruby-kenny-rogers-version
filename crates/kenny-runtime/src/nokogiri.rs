@@ -643,10 +643,48 @@ fn html_read(cls: V, a: &[V]) -> V {
     doc
 }
 
+/// A `max_attributes` / `max_tree_depth` argument of Gumbo.parse / Gumbo.fragment: -1 is no limit.
+fn limit_arg(a: &[V], i: usize, default: i64) -> i64 {
+    a.get(i).filter(|v| is_fix(**v)).map(|v| fix(*v)).unwrap_or(default)
+}
+
+/// Gumbo's limits, which Nokogiri reports as ArgumentError with gumbo's status message
+/// (Mastodon's trends preview rescues it): more than `max_attrs` attributes on an element, or
+/// elements nested deeper than `max_depth` (counting from `html`). A negative limit is none.
+/// The parser itself leaves out elements nested deeper than 400 (`too_deep`): within a
+/// limit up to that, the real tree was too deep; a larger one gets the shallower tree.
+fn gumbo_limits(dom: &Dom, tops: &[u32], depth0: i64, max_attrs: i64, max_depth: i64, too_deep: bool) -> Result<(), &'static str> {
+    if too_deep && (0..=400).contains(&max_depth) {
+        return Err("Document tree depth limit exceeded");
+    }
+    let mut stack: Vec<(u32, i64)> = tops.iter().map(|&t| (t, depth0)).collect();
+    while let Some((id, d)) = stack.pop() {
+        let n = dom.n(id);
+        let d = if n.t == T::Element { d + 1 } else { d };
+        if n.t == T::Element {
+            if max_attrs >= 0 && n.attrs.len() as i64 > max_attrs {
+                return Err("Attributes per element limit exceeded");
+            }
+            if max_depth >= 0 && d > max_depth {
+                return Err("Document tree depth limit exceeded");
+            }
+        }
+        let mut c = n.first;
+        while c != NONE {
+            stack.push((c, d));
+            c = dom.n(c).next;
+        }
+    }
+    Ok(())
+}
+
 fn gumbo_parse(a: &[V]) -> V {
     let src = rs(a[0]);
     let cls = if a.len() > 5 && is_class(a[5]) { a[5] } else { class_named("Nokogiri::HTML5::Document").map(|c| c as V).unwrap_or(c().html_document as V) };
     let parsed = html::parse_document(&src, false);
+    if let Err(m) = gumbo_limits(&parsed.dom, &[0], 0, limit_arg(a, 2, 400), limit_arg(a, 4, 400), parsed.too_deep) {
+        return arg_error(m);
+    }
     let mut dom = parsed.dom;
     dom.html = true;
     let doc = new_doc_obj(cls as *mut Class, dom);
@@ -698,7 +736,11 @@ fn gumbo_fragment(a: &[V]) -> V {
             ("body".to_string(), html::HTML_NS.to_string())
         }
     };
-    let (sdom, kids, errors) = html::parse_fragment(&src, &name, &nsh, false);
+    let (sdom, kids, errors, too_deep) = html::parse_fragment(&src, &name, &nsh, false);
+    // (the parser's open elements start with `html`)
+    if let Err(m) = gumbo_limits(&sdom, &kids, 1, limit_arg(a, 3, 400), limit_arg(a, 5, 400), too_deep) {
+        return arg_error(m);
+    }
     let ids = import_nodes(doc, &sdom, &kids);
     let dom = dom_of(doc);
     for id in ids {
@@ -729,7 +771,7 @@ fn in_context(node: V, a: &[V]) -> V {
         } else {
             ("body".to_string(), html::HTML_NS.to_string())
         };
-        let (sdom, kids, _errors) = html::parse_fragment(&src, &name, &nsh, html4);
+        let (sdom, kids, _errors, _) = html::parse_fragment(&src, &name, &nsh, html4);
         let ids = import_nodes(doc, &sdom, &kids);
         return node_set_of(doc, &ids);
     }

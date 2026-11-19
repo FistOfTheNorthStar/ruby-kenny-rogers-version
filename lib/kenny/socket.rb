@@ -260,11 +260,7 @@ class Socket < BasicSocket
           begin
             s.connect_nonblock(ai)
           rescue IO::WaitWritable
-            raise Errno::ETIMEDOUT, "user specified timeout" unless s.wait_writable(connect_timeout)
-            begin
-              s.connect_nonblock(ai)
-            rescue Errno::EISCONN
-            end
+            s.__kenny_finish_connect(ai, connect_timeout)
           end
         else
           s.connect(ai)
@@ -347,6 +343,14 @@ class Socket < BasicSocket
 
   def connect_nonblock(addr, exception: true)
     Kenny::SocketNative.connect(fileno, Socket.__kenny_sockaddr(addr), true, exception)
+  end
+
+  # A connect_nonblock in progress: wait for it, and its result is the socket's SO_ERROR (a
+  # second connect(2) on a socket whose connection failed says something else on each system).
+  def __kenny_finish_connect(ai, timeout)
+    raise Errno::ETIMEDOUT, "user specified timeout" unless wait_writable(timeout)
+    err = getsockopt(SOL_SOCKET, SO_ERROR).int
+    raise SystemCallError.new("connect(2) for #{ai.inspect_sockaddr}", err) unless err == 0
   end
 
   def bind(addr) = Kenny::SocketNative.bind(fileno, Socket.__kenny_sockaddr(addr))
@@ -559,11 +563,7 @@ class Addrinfo
         begin
           sock.connect_nonblock(self)
         rescue IO::WaitWritable
-          raise Errno::ETIMEDOUT, "user specified timeout" unless sock.wait_writable(timeout)
-          begin
-            sock.connect_nonblock(self)
-          rescue Errno::EISCONN
-          end
+          sock.__kenny_finish_connect(self, timeout)
         end
       else
         sock.connect(self)

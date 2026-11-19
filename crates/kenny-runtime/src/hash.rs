@@ -153,10 +153,17 @@ pub fn init() {
             return merge_into(h, a[0], QNIL);
         }
         if a.len() == 1 && is_ary(a[0]) {
-            for p in crate::gc::Rooted::of(rary(a[0]).v.clone()) {
-                if is_ary(p) && rary(p).v.len() == 2 {
-                    hset(h, rary(p).v[0], rary(p).v[1]);
+            // ([key] is key => nil, as CRuby)
+            for (i, p) in crate::gc::Rooted::of(rary(a[0]).v.clone()).iter().enumerate() {
+                if !is_ary(*p) {
+                    return arg_error(&format!("wrong element type {} at {i} (expected array)", class_name(real_class(*p))));
                 }
+                let pv = rary(*p).v.clone();
+                match pv.len() {
+                    1 => hset(h, pv[0], QNIL),
+                    2 => hset(h, pv[0], pv[1]),
+                    n => return arg_error(&format!("invalid number of elements ({n} for 1..2)")),
+                };
             }
             return h;
         }
@@ -277,7 +284,20 @@ pub fn init() {
     });
     defn(c, "delete_if", 0, 0, |s, _, b| filter_bang(s, b, false).0);
     defn(c, "to_a", 0, 0, |s, _, _| ary_new(pair_ary(s)));
-    defn(c, "entries", 0, 0, |s, _, _| ary_new(pair_ary(s)));
+    // (Enumerable's, through `each`, in a subclass that redefines it: ActiveSupport's
+    // InheritableOptions)
+    fn own_each(s: V) -> bool {
+        let each = sym("each");
+        real_class(s) == rt().c.hash || find_method(class_of(s), each) == find_method(rt().c.hash, each)
+    }
+    fn via_enumerable(s: V, name: &str, a: &[V], b: V) -> V {
+        let m = find_method(rt().c.enumerable, sym(name));
+        if m.is_null() {
+            return raise(rt().c.no_method_error, &format!("undefined method '{name}'"));
+        }
+        invoke(m, s, a, b)
+    }
+    defn(c, "entries", 0, -1, |s, a, b| if own_each(s) && a.is_empty() { ary_new(pair_ary(s)) } else { via_enumerable(s, "entries", a, b) });
     defn(c, "to_h", 0, 0, |s, _, b| {
         if !is_proc(b) {
             if real_class(s) == rt().c.hash {
@@ -365,6 +385,20 @@ pub fn init() {
         transform_keys_into(s, a, b, hash_new())
     }
     fn transform_keys_into(s: V, a: &[V], b: V, out: V) -> V {
+        let a: &[V] = &match a.first() {
+            Some(&m) if !is_hash(m) => {
+                if is_heap(m) && respond_to(m, sym("to_hash")) {
+                    let h = tri!(send0(m, "to_hash"));
+                    if !is_hash(h) {
+                        return type_error(&format!("can't convert {} to Hash", class_name(real_class(m))));
+                    }
+                    vec![h]
+                } else {
+                    return type_error(&format!("no implicit conversion of {} into Hash", crate::extra::cname(m)));
+                }
+            }
+            _ => a.to_vec(),
+        };
         for (k, v) in pairs(s) {
             let nk = if let Some(&m) = a.first().filter(|m| is_hash(**m)) {
                 match rhash(m).m.get(&HKey(k)) {
@@ -443,6 +477,9 @@ pub fn init() {
         QFALSE
     });
     defn(c, "count", 0, 1, |s, a, b| {
+        if !own_each(s) {
+            return via_enumerable(s, "count", a, b);
+        }
         if !is_proc(b) && a.is_empty() {
             return mkfix(rhash(s).m.len() as i64);
         }
@@ -463,7 +500,14 @@ pub fn init() {
     });
     defn(c, "detect", 0, 1, |s, a, b| send(s, sym("find"), a, b));
     defn(c, "sum", 0, 1, |s, a, b| send(ary_new(pair_ary(s)), sym("sum"), a, b));
-    defn(c, "default", 0, 1, |s, _, _| rhash(s).default);
+    // (with a key: the default proc's value for it, as CRuby)
+    defn(c, "default", 0, 1, |s, a, _| {
+        let p = rhash(s).default_proc;
+        match a.first() {
+            Some(&k) if is_proc(p) => call_block(p, &[s, k]),
+            _ => rhash(s).default,
+        }
+    });
     defn(c, "default=", 1, 1, |s, a, _| {
         crate::gc::wb_obj(s);
         rhash(s).default = a[0];

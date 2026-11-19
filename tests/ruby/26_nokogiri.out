@@ -337,3 +337,9 @@ true
 "B"
 "t"
 "c"
+[ArgumentError, "Attributes per element limit exceeded"]
+400
+800
+[ArgumentError, "Document tree depth limit exceeded"]
+398
+[ArgumentError, "Attributes per element limit exceeded"]

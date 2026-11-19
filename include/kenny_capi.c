@@ -46,13 +46,25 @@ VALUE kn_capi_save_throw(void);
 void kn_capi_restore_throw(VALUE t);
 
 #define KN_MAX_DEPTH 4096
-/* (per OS thread: Kenny's threads run Ruby, and C extension code, in parallel) */
-static __thread jmp_buf *kn_jmp_stack[KN_MAX_DEPTH];
-static __thread int kn_jmp_depth = 0;
+/* Where an exception goes: a list of frames on the C stack, kept per Ruby thread and fiber by
+ * the runtime (they aren't OS threads: a Ruby thread blocked in C code can continue on another
+ * one, and other threads and fibers run in between). Ask for it again after anything that can
+ * run Ruby. */
+typedef struct kn_frame { jmp_buf jb; struct kn_frame *prev; int depth; } kn_frame;
+typedef struct { kn_frame *top; VALUE saved_throw; } kn_ctx;
+kn_ctx *kn_capi_ctx(void);
+static inline void kn_push(kn_frame *f) {
+  kn_ctx *c = kn_capi_ctx();
+  f->prev = c->top;
+  f->depth = f->prev ? f->prev->depth + 1 : 1;
+  c->top = f;
+}
+static inline void kn_pop(kn_frame *f) { kn_capi_ctx()->top = f->prev; }
 
 static void kn_unwind(void) __attribute__((noreturn));
 static void kn_unwind(void) {
-  if (kn_jmp_depth > 0) longjmp(*kn_jmp_stack[kn_jmp_depth - 1], 1);
+  kn_frame *top = kn_capi_ctx()->top;
+  if (top) longjmp(top->jb, 1);
   fprintf(stderr, "kenny: exception raised outside of any C method call\n");
   abort();
 }
@@ -77,11 +89,12 @@ typedef VALUE (*fb)(VALUE, VALUE, int, const VALUE *, VALUE);
  * args end with the block argument). Returns Qundef when it raised (the exception is
  * pending in the runtime). */
 static VALUE kn_call(const void *f, int arity, VALUE self, int argc, const VALUE *a) {
-  jmp_buf jb;
+  kn_frame fr;
   volatile VALUE r = Qundef;
-  if (kn_jmp_depth >= KN_MAX_DEPTH) return kn_capi_raise(rb_eRuntimeError, "C call stack too deep");
-  kn_jmp_stack[kn_jmp_depth++] = &jb;
-  if (setjmp(jb) == 0) {
+  kn_frame *top = kn_capi_ctx()->top;
+  if (top && top->depth >= KN_MAX_DEPTH) return kn_capi_raise(rb_eRuntimeError, "C call stack too deep");
+  kn_push(&fr);
+  if (setjmp(fr.jb) == 0) {
     switch (arity) {
       case -3: {
         int n = argc - 1;
@@ -106,7 +119,7 @@ static VALUE kn_call(const void *f, int arity, VALUE self, int argc, const VALUE
   } else {
     r = Qundef; /* an exception is pending in the runtime */
   }
-  kn_jmp_depth--;
+  kn_pop(&fr);
   return r;
 }
 
@@ -510,51 +523,50 @@ VALUE *rb_ruby_debug_ptr(void) { kn_debug = rb_gv_get("$DEBUG"); return &kn_debu
  * rb_errinfo(); a throw / break unwinding through is TAG_THROW (7), resumed by rb_jump_tag. */
 #define KN_TAG_RAISE 6
 #define KN_TAG_THROW 7
-static __thread VALUE kn_saved_throw = Qnil;
 /* (exc: the exception, now also $!; prev: $! before it) */
 static int kn_take_state(VALUE *exc, VALUE *prev) {
   if (prev) *prev = rb_errinfo();
   VALUE e = kn_capi_take_pending();
   if (e != Qnil) { if (exc) *exc = e; return KN_TAG_RAISE; }
-  kn_saved_throw = kn_capi_save_throw();
+  kn_capi_ctx()->saved_throw = kn_capi_save_throw();
   if (exc) *exc = Qnil;
   return KN_TAG_THROW;
 }
 void rb_jump_tag(int state) {
   if (state == KN_TAG_RAISE) rb_exc_raise(rb_errinfo());
-  if (state == KN_TAG_THROW) kn_capi_restore_throw(kn_saved_throw);
+  if (state == KN_TAG_THROW) kn_capi_restore_throw(kn_capi_ctx()->saved_throw);
   kn_unwind();
 }
 VALUE rb_protect(VALUE (*func)(VALUE), VALUE arg, int *state) {
-  jmp_buf jb;
+  kn_frame fr;
   volatile VALUE r = Qnil;
-  kn_jmp_stack[kn_jmp_depth++] = &jb;
-  if (setjmp(jb) == 0) {
+  kn_push(&fr);
+  if (setjmp(fr.jb) == 0) {
     r = func(arg);
-    kn_jmp_depth--;
+    kn_pop(&fr);
     if (state) *state = 0;
     return r;
   }
-  kn_jmp_depth--;
+  kn_pop(&fr);
   int st = kn_take_state(NULL, NULL);
   if (state) *state = st;
   return Qnil;
 }
 VALUE rb_ensure(VALUE (*b_proc)(VALUE), VALUE data1, VALUE (*e_proc)(VALUE), VALUE data2) {
-  jmp_buf jb;
+  kn_frame fr;
   volatile VALUE r = Qnil;
-  kn_jmp_stack[kn_jmp_depth++] = &jb;
-  if (setjmp(jb) == 0) {
+  kn_push(&fr);
+  if (setjmp(fr.jb) == 0) {
     r = b_proc(data1);
-    kn_jmp_depth--;
+    kn_pop(&fr);
     e_proc(data2);
     return r;
   }
-  kn_jmp_depth--;
+  kn_pop(&fr);
   VALUE e = Qnil;
   VALUE prev = Qnil;
   int st = kn_take_state(&e, &prev);
-  VALUE saved = kn_saved_throw;
+  VALUE saved = kn_capi_ctx()->saved_throw;
   e_proc(data2);
   if (st == KN_TAG_RAISE) {
     rb_set_errinfo(prev);
@@ -565,15 +577,15 @@ VALUE rb_ensure(VALUE (*b_proc)(VALUE), VALUE data1, VALUE (*e_proc)(VALUE), VAL
 }
 #define KN_MAX_RESCUE 8
 static VALUE kn_rescue(VALUE (*b_proc)(VALUE), VALUE data1, VALUE (*r_proc)(VALUE, VALUE), VALUE data2, const VALUE *classes, int n) {
-  jmp_buf jb;
+  kn_frame fr;
   volatile VALUE r = Qnil;
-  kn_jmp_stack[kn_jmp_depth++] = &jb;
-  if (setjmp(jb) == 0) {
+  kn_push(&fr);
+  if (setjmp(fr.jb) == 0) {
     r = b_proc(data1);
-    kn_jmp_depth--;
+    kn_pop(&fr);
     return r;
   }
-  kn_jmp_depth--;
+  kn_pop(&fr);
   VALUE e = Qnil;
   VALUE prev = Qnil;
   int st = kn_take_state(&e, &prev);
@@ -842,6 +854,11 @@ VALUE rb_str_export_to_enc(VALUE str, rb_encoding *enc) { return rb_str_encode(s
 static VALUE kn_conv_enc(VALUE args) {
   VALUE *a = (VALUE *)args;
   return rb_str_encode(a[0], a[1], 0, Qnil);
+}
+VALUE rb_external_str_new_with_enc(const char *p, long len, rb_encoding *enc) {
+    VALUE s = rb_enc_str_new(p, len, enc);
+    rb_encoding *in = rb_default_internal_encoding();
+    return in ? rb_str_conv_enc(s, enc, in) : s;
 }
 VALUE rb_str_conv_enc(VALUE str, rb_encoding *from, rb_encoding *to) {
   (void)from;
@@ -1224,6 +1241,318 @@ void rb_gc_writebarrier_unprotect(VALUE obj) { (void)obj; }
 size_t rb_gc_count(void) { return NUM2SIZET(rb_funcall(rb_mGC, rb_intern("count"), 0)); }
 int rb_during_gc(void) { return 0; }
 
+/* ---------- st_table ---------- */
+
+struct kn_st_entry { st_index_t hash; st_data_t key, value; int live; };
+#define KN_BIN_EMPTY (-1)
+#define KN_BIN_GONE (-2)
+
+static int kn_str_cmp(st_data_t a, st_data_t b) { return strcmp((const char *)a, (const char *)b); }
+static st_index_t kn_str_hash(st_data_t s) { return st_hash((const char *)s, strlen((const char *)s), 0); }
+int st_locale_insensitive_strcasecmp(const char *a, const char *b) {
+  for (;; a++, b++) {
+    int x = *a >= 'A' && *a <= 'Z' ? *a + 32 : (unsigned char)*a, y = *b >= 'A' && *b <= 'Z' ? *b + 32 : (unsigned char)*b;
+    if (x != y) return x < y ? -1 : 1;
+    if (!x) return 0;
+  }
+}
+int st_locale_insensitive_strncasecmp(const char *a, const char *b, size_t n) {
+  for (; n > 0; a++, b++, n--) {
+    int x = *a >= 'A' && *a <= 'Z' ? *a + 32 : (unsigned char)*a, y = *b >= 'A' && *b <= 'Z' ? *b + 32 : (unsigned char)*b;
+    if (x != y) return x < y ? -1 : 1;
+    if (!x) return 0;
+  }
+  return 0;
+}
+static int kn_strcase_cmp(st_data_t a, st_data_t b) { return st_locale_insensitive_strcasecmp((const char *)a, (const char *)b); }
+static st_index_t kn_strcase_hash(st_data_t s) {
+  st_index_t h = 0xcbf29ce484222325ULL;
+  for (const char *p = (const char *)s; *p; p++) h = (h ^ (st_index_t)(*p >= 'A' && *p <= 'Z' ? *p + 32 : (unsigned char)*p)) * 0x100000001b3ULL;
+  return h;
+}
+int st_numcmp(st_data_t a, st_data_t b) { return a != b; }
+st_index_t st_numhash(st_data_t n) { return (n >> 3) ^ (n << 61) ^ (n * 0x9e3779b97f4a7c15ULL); }
+static const struct st_hash_type kn_st_num = { st_numcmp, st_numhash };
+static const struct st_hash_type kn_st_str = { kn_str_cmp, kn_str_hash };
+static const struct st_hash_type kn_st_strcase = { kn_strcase_cmp, kn_strcase_hash };
+
+/* Index the live entries in a bin array of twice the room, dropping the dead ones (unless an
+ * st_foreach is walking the entries by position). */
+static void kn_st_rebuild(st_table *t, st_index_t room) {
+  if (t->iterating) {
+    if (room < t->ent_used + 8) room = t->ent_used + 8;
+  } else {
+    st_index_t n = 0;
+    for (st_index_t i = 0; i < t->ent_used; i++)
+      if (t->entries[i].live) t->entries[n++] = t->entries[i];
+    t->ent_used = n;
+  }
+  st_index_t cap = 16;
+  while (cap < room * 2) cap *= 2;
+  if (room > t->ent_cap) {
+    t->entries = (struct kn_st_entry *)realloc(t->entries, room * sizeof(struct kn_st_entry));
+    t->ent_cap = room;
+  }
+  if (cap != t->bin_cap) {
+    t->bins = (int32_t *)realloc(t->bins, cap * sizeof(int32_t));
+    t->bin_cap = cap;
+  }
+  for (st_index_t i = 0; i < cap; i++) t->bins[i] = KN_BIN_EMPTY;
+  for (st_index_t i = 0; i < t->ent_used; i++) {
+    if (!t->entries[i].live) continue;
+    st_index_t b = t->entries[i].hash & (cap - 1);
+    while (t->bins[b] != KN_BIN_EMPTY) b = (b + 1) & (cap - 1);
+    t->bins[b] = (int32_t)i;
+  }
+}
+st_table *st_init_table_with_size(const struct st_hash_type *type, st_index_t size) {
+  st_table *t = (st_table *)calloc(1, sizeof(st_table));
+  t->type = type;
+  kn_st_rebuild(t, size < 8 ? 8 : size);
+  return t;
+}
+st_table *st_init_table(const struct st_hash_type *type) { return st_init_table_with_size(type, 0); }
+st_table *st_init_numtable(void) { return st_init_table(&kn_st_num); }
+st_table *st_init_numtable_with_size(st_index_t size) { return st_init_table_with_size(&kn_st_num, size); }
+st_table *st_init_strtable(void) { return st_init_table(&kn_st_str); }
+st_table *st_init_strtable_with_size(st_index_t size) { return st_init_table_with_size(&kn_st_str, size); }
+st_table *st_init_strcasetable(void) { return st_init_table(&kn_st_strcase); }
+st_table *st_init_strcasetable_with_size(st_index_t size) { return st_init_table_with_size(&kn_st_strcase, size); }
+void st_free_table(st_table *t) { free(t->entries); free(t->bins); free(t); }
+void st_clear(st_table *t) {
+  t->num_entries = 0;
+  t->ent_used = 0;
+  for (st_index_t i = 0; i < t->bin_cap; i++) t->bins[i] = KN_BIN_EMPTY;
+}
+void st_cleanup_safe(st_table *t, st_data_t never) { (void)t; (void)never; }
+st_table *st_copy(st_table *o) {
+  st_table *t = (st_table *)malloc(sizeof(st_table));
+  *t = *o;
+  t->entries = (struct kn_st_entry *)malloc(o->ent_cap * sizeof(struct kn_st_entry));
+  memcpy(t->entries, o->entries, o->ent_used * sizeof(struct kn_st_entry));
+  t->bins = (int32_t *)malloc(o->bin_cap * sizeof(int32_t));
+  memcpy(t->bins, o->bins, o->bin_cap * sizeof(int32_t));
+  return t;
+}
+size_t st_memsize(const st_table *t) { return sizeof(st_table) + t->ent_cap * sizeof(struct kn_st_entry) + t->bin_cap * sizeof(int32_t); }
+/* (compare can call back into the table's user: the table isn't touched between its calls) */
+static long kn_st_find(st_table *t, st_data_t key, st_index_t h, st_index_t *bin) {
+  st_index_t mask = t->bin_cap - 1, b = h & mask;
+  for (;; b = (b + 1) & mask) {
+    int32_t i = t->bins[b];
+    if (i == KN_BIN_EMPTY) return -1;
+    if (i == KN_BIN_GONE) continue;
+    struct kn_st_entry *e = &t->entries[i];
+    if (e->hash == h && (e->key == key || t->type->compare(key, e->key) == 0)) {
+      if (bin) *bin = b;
+      return i;
+    }
+  }
+}
+static void kn_st_append(st_table *t, st_data_t key, st_data_t value, st_index_t h) {
+  if (t->ent_used == t->ent_cap || (t->ent_used + 1) * 2 > t->bin_cap) kn_st_rebuild(t, t->num_entries < 4 ? 8 : t->num_entries * 2);
+  st_index_t mask = t->bin_cap - 1, b = h & mask;
+  while (t->bins[b] >= 0) b = (b + 1) & mask;
+  t->bins[b] = (int32_t)t->ent_used;
+  struct kn_st_entry *e = &t->entries[t->ent_used++];
+  e->hash = h; e->key = key; e->value = value; e->live = 1;
+  t->num_entries++;
+}
+int st_lookup(st_table *t, st_data_t key, st_data_t *value) {
+  long i = kn_st_find(t, key, t->type->hash(key), NULL);
+  if (i < 0) return 0;
+  if (value) *value = t->entries[i].value;
+  return 1;
+}
+int st_get_key(st_table *t, st_data_t key, st_data_t *result) {
+  long i = kn_st_find(t, key, t->type->hash(key), NULL);
+  if (i < 0) return 0;
+  if (result) *result = t->entries[i].key;
+  return 1;
+}
+int st_insert(st_table *t, st_data_t key, st_data_t value) {
+  st_index_t h = t->type->hash(key);
+  long i = kn_st_find(t, key, h, NULL);
+  if (i >= 0) { t->entries[i].value = value; return 1; }
+  kn_st_append(t, key, value, h);
+  return 0;
+}
+int st_insert2(st_table *t, st_data_t key, st_data_t value, st_data_t (*func)(st_data_t)) {
+  st_index_t h = t->type->hash(key);
+  long i = kn_st_find(t, key, h, NULL);
+  if (i >= 0) { t->entries[i].value = value; return 1; }
+  kn_st_append(t, func(key), value, h);
+  return 0;
+}
+void st_add_direct(st_table *t, st_data_t key, st_data_t value) { kn_st_append(t, key, value, t->type->hash(key)); }
+static void kn_st_remove(st_table *t, long i, st_index_t bin) {
+  t->bins[bin] = KN_BIN_GONE;
+  t->entries[i].live = 0;
+  t->num_entries--;
+}
+int st_delete(st_table *t, st_data_t *key, st_data_t *value) {
+  st_index_t bin;
+  long i = kn_st_find(t, *key, t->type->hash(*key), &bin);
+  if (i < 0) { if (value) *value = 0; return 0; }
+  if (value) *value = t->entries[i].value;
+  *key = t->entries[i].key;
+  kn_st_remove(t, i, bin);
+  return 1;
+}
+int st_shift(st_table *t, st_data_t *key, st_data_t *value) {
+  for (st_index_t i = 0; i < t->ent_used; i++) {
+    if (t->entries[i].live) {
+      *key = t->entries[i].key;
+      return st_delete(t, key, value);
+    }
+  }
+  if (value) *value = 0;
+  return 0;
+}
+int st_update(st_table *t, st_data_t key, st_update_callback_func *func, st_data_t arg) {
+  st_index_t h = t->type->hash(key), bin = 0;
+  long i = kn_st_find(t, key, h, &bin);
+  int existing = i >= 0;
+  st_data_t k = existing ? t->entries[i].key : key, v = existing ? t->entries[i].value : 0;
+  int r = func(&k, &v, arg, existing);
+  if (r == ST_CONTINUE) {
+    if (existing) { t->entries[i].key = k; t->entries[i].value = v; }
+    else kn_st_append(t, k, v, h);
+  } else if (r == ST_DELETE && existing) {
+    kn_st_remove(t, i, bin);
+  }
+  return existing;
+}
+/* By position: func may add to the table, or delete from it, as it goes. */
+int st_foreach(st_table *t, st_foreach_callback_func *func, st_data_t arg) {
+  t->iterating++;
+  for (st_index_t i = 0; i < t->ent_used; i++) {
+    if (!t->entries[i].live) continue;
+    st_data_t key = t->entries[i].key;
+    st_index_t h = t->entries[i].hash;
+    int r = func(key, t->entries[i].value, arg);
+    if (r == ST_STOP) break;
+    if (r == ST_DELETE && t->entries[i].live) {
+      st_index_t bin;
+      long j = kn_st_find(t, key, h, &bin);
+      if (j >= 0) kn_st_remove(t, j, bin);
+    }
+  }
+  t->iterating--;
+  return 0;
+}
+int st_foreach_safe(st_table *t, st_foreach_callback_func *func, st_data_t arg) { return st_foreach(t, func, arg); }
+int st_foreach_check(st_table *t, st_foreach_callback_func *func, st_data_t arg, st_data_t never) { (void)never; return st_foreach(t, func, arg); }
+st_index_t st_keys(st_table *t, st_data_t *keys, st_index_t size) {
+  st_index_t n = 0;
+  for (st_index_t i = 0; i < t->ent_used && n < size; i++) if (t->entries[i].live) keys[n++] = t->entries[i].key;
+  return n;
+}
+st_index_t st_values(st_table *t, st_data_t *values, st_index_t size) {
+  st_index_t n = 0;
+  for (st_index_t i = 0; i < t->ent_used && n < size; i++) if (t->entries[i].live) values[n++] = t->entries[i].value;
+  return n;
+}
+
+/* ---------- rb_fdset_t ---------- */
+
+#define KN_FD_BYTES(n) ((((n) / NFDBITS) + 1) * sizeof(fd_mask))
+static size_t kn_fdset_size(int maxfd) {
+  size_t s = KN_FD_BYTES(maxfd > 0 ? maxfd : 1);
+  return s < sizeof(fd_set) ? sizeof(fd_set) : s;
+}
+void rb_fd_init(rb_fdset_t *set) { set->maxfd = 0; set->fdset = (fd_set *)calloc(1, sizeof(fd_set)); }
+void rb_fd_term(rb_fdset_t *set) { free(set->fdset); set->fdset = NULL; set->maxfd = 0; }
+void rb_fd_zero(rb_fdset_t *set) { if (set->fdset) memset(set->fdset, 0, kn_fdset_size(set->maxfd)); }
+static void kn_fd_room(int fd, rb_fdset_t *set) {
+  if (fd < set->maxfd) return;
+  size_t old = kn_fdset_size(set->maxfd), want = kn_fdset_size(fd + 1);
+  if (want > old) {
+    set->fdset = (fd_set *)realloc(set->fdset, want);
+    memset((char *)set->fdset + old, 0, want - old);
+  }
+  set->maxfd = fd + 1;
+}
+/* (the bit macros, by hand: FD_SET checks against FD_SETSIZE on some systems) */
+void rb_fd_set(int fd, rb_fdset_t *set) { kn_fd_room(fd, set); ((fd_mask *)set->fdset)[fd / NFDBITS] |= (fd_mask)1 << (fd % NFDBITS); }
+void rb_fd_clr(int fd, rb_fdset_t *set) { if (fd < set->maxfd) ((fd_mask *)set->fdset)[fd / NFDBITS] &= ~((fd_mask)1 << (fd % NFDBITS)); }
+int rb_fd_isset(int fd, const rb_fdset_t *set) { return fd < set->maxfd && (((const fd_mask *)set->fdset)[fd / NFDBITS] >> (fd % NFDBITS)) & 1; }
+void rb_fd_copy(rb_fdset_t *dst, const fd_set *src, int max) {
+  size_t s = kn_fdset_size(max);
+  dst->fdset = (fd_set *)realloc(dst->fdset, s);
+  memcpy(dst->fdset, src, s < sizeof(fd_set) ? s : sizeof(fd_set));
+  dst->maxfd = max;
+}
+void rb_fd_dup(rb_fdset_t *dst, const rb_fdset_t *src) {
+  size_t s = kn_fdset_size(src->maxfd);
+  dst->fdset = (fd_set *)realloc(dst->fdset, s);
+  memcpy(dst->fdset, src->fdset, s);
+  dst->maxfd = src->maxfd;
+}
+int rb_fd_select(int n, rb_fdset_t *r, rb_fdset_t *w, rb_fdset_t *e, struct timeval *timeout) {
+  return select(n, r ? r->fdset : NULL, w ? w->fdset : NULL, e ? e->fdset : NULL, timeout);
+}
+/* In short steps with a safepoint between them, so that other threads can collect and this
+ * one can be interrupted: Ruby-level sockets wait the same way (docs/LANGUAGE.md). */
+int rb_thread_fd_select(int n, rb_fdset_t *r, rb_fdset_t *w, rb_fdset_t *e, struct timeval *timeout) {
+  struct timeval end = {0, 0}, now;
+  if (timeout) {
+    gettimeofday(&now, NULL);
+    timeradd(&now, timeout, &end);
+  }
+  rb_fdset_t cr = {0, NULL}, cw = {0, NULL}, ce = {0, NULL};
+  int result;
+  for (;;) {
+    if (r) rb_fd_dup(&cr, r);
+    if (w) rb_fd_dup(&cw, w);
+    if (e) rb_fd_dup(&ce, e);
+    struct timeval step = {0, 2000};
+    if (timeout) {
+      gettimeofday(&now, NULL);
+      struct timeval left;
+      if (timercmp(&now, &end, >=)) { timerclear(&left); } else { timersub(&end, &now, &left); }
+      if (timercmp(&left, &step, <)) step = left;
+    }
+    result = select(n, r ? cr.fdset : NULL, w ? cw.fdset : NULL, e ? ce.fdset : NULL, &step);
+    if (result != 0 && !(result < 0 && errno == EINTR)) break;
+    if (timeout) {
+      gettimeofday(&now, NULL);
+      if (timercmp(&now, &end, >=)) { result = 0; break; }
+    }
+    rb_thread_check_ints();
+  }
+  if (result >= 0) {
+    if (r) rb_fd_dup(r, &cr);
+    if (w) rb_fd_dup(w, &cw);
+    if (e) rb_fd_dup(e, &ce);
+  }
+  int saved = errno;
+  free(cr.fdset); free(cw.fdset); free(ce.fdset);
+  errno = saved;
+  return result;
+}
+
+/* The events ready on `fd`, 0 on a timeout, -1 on an error. */
+int rb_wait_for_single_fd(int fd, int events, struct timeval *timeout) {
+  rb_fdset_t r = {0, NULL}, w = {0, NULL}, e = {0, NULL};
+  rb_fd_init(&r); rb_fd_init(&w); rb_fd_init(&e);
+  if (events & RB_WAITFD_IN) rb_fd_set(fd, &r);
+  if (events & RB_WAITFD_OUT) rb_fd_set(fd, &w);
+  if (events & RB_WAITFD_PRI) rb_fd_set(fd, &e);
+  int n = rb_thread_fd_select(fd + 1, &r, &w, &e, timeout), ready = 0;
+  if (n > 0) {
+    if (rb_fd_isset(fd, &r)) ready |= RB_WAITFD_IN;
+    if (rb_fd_isset(fd, &w)) ready |= RB_WAITFD_OUT;
+    if (rb_fd_isset(fd, &e)) ready |= RB_WAITFD_PRI;
+  }
+  int saved = errno;
+  rb_fd_term(&r); rb_fd_term(&w); rb_fd_term(&e);
+  errno = saved;
+  return n < 0 ? -1 : ready;
+}
+int rb_thread_wait_fd(int fd) { return rb_wait_for_single_fd(fd, RB_WAITFD_IN, NULL); }
+int rb_thread_fd_writable(int fd) { return rb_wait_for_single_fd(fd, RB_WAITFD_OUT, NULL); }
+
 /* ---------- threads, mutexes, time ---------- */
 
 void *rb_thread_call_without_gvl(void *(*func)(void *), void *data1, void (*ubf)(void *), void *data2) {
@@ -1240,6 +1569,8 @@ void *rb_nogvl(void *(*func)(void *), void *data1, void (*ubf)(void *), void *da
   (void)flags;
   return rb_thread_call_without_gvl(func, data1, ubf, data2);
 }
+VALUE rb_ary_aref(int argc, const VALUE *argv, VALUE ary) { return rb_funcallv(ary, rb_intern("[]"), argc, argv); }
+int rb_thread_alone(void) { return RARRAY_LEN(rb_funcall(rb_cThread, rb_intern("list"), 0)) == 1; }
 VALUE rb_thread_current(void) { return rb_funcall(rb_cThread, rb_intern("current"), 0); }
 VALUE rb_thread_main(void) { return rb_funcall(rb_cThread, rb_intern("main"), 0); }
 void rb_thread_schedule(void) { rb_funcall(rb_cThread, rb_intern("pass"), 0); }

@@ -2661,14 +2661,29 @@ fn print_uncaught() {
         err_out(format!("{} ({})\n", msg, class_name(real_class(e))).as_bytes());
     }
 }
-fn k_fork(blk: V) -> V {
+/// `Process._fork`: the fork itself, the pid (0 in the child). `fork` calls it as a method,
+/// as CRuby 3.1+ does, so what is prepended to it runs in both processes (ActiveSupport's
+/// ForkTracker: Rails' connection pools and other after-fork hooks).
+fn process_fork_raw() -> V {
     flush_all();
-    let pid = unsafe { libc::fork() };
+    let pid = crate::gc::fork_world_stopped();
     if pid < 0 {
         return raise_errno(errno(), None, b"fork(2)");
     }
     if pid == 0 {
+        crate::thread::after_fork_child();
         set_gvar("$$", mkfix(std::process::id() as i64));
+    }
+    mkfix(pid as i64)
+}
+fn k_fork(blk: V) -> V {
+    let Some(process) = const_lookup(rt().c.object, sym("Process")) else { return process_fork_raw() };
+    let r = send(process, sym("_fork"), &[], QNIL);
+    if r == UNDEF {
+        return UNDEF;
+    }
+    let pid = if is_fix(r) { fix(r) } else { return r };
+    if pid == 0 {
         if is_proc(blk) {
             let r = call_block(blk, &[]);
             let mut code = 0;
@@ -2690,7 +2705,7 @@ fn k_fork(blk: V) -> V {
         }
         return QNIL;
     }
-    mkfix(pid as i64)
+    mkfix(pid)
 }
 fn signo(v: V) -> Result<i32, V> {
     if is_fix(v) {
@@ -2903,17 +2918,28 @@ pub fn init() {
         const_set(k, sym("Errno"), mkfix(n as i64));
         ERRNO_MAP.get().push((n, k));
     }
-    defn(sce, "initialize", 0, 2, |s, a, _| {
+    // Errno::X.new(message, func); SystemCallError.new(message, errno, func), which makes the
+    // Errno class of that number (and SystemCallError.new(errno))
+    defn(sce, "initialize", 0, 3, |s, a, _| {
         let own = const_get_under(real_class(s), sym("Errno")).filter(|x| is_fix(*x)).map(|x| fix(x) as i32);
-        let e = own.or_else(|| a.get(1).filter(|x| is_fix(**x)).map(|x| fix(*x) as i32));
-        let base = match e {
+        let (m, e, func) = match own {
+            Some(n) => (a.first().copied(), Some(n), a.get(1).copied()),
+            None if a.len() == 1 && is_fix(a[0]) => (None, Some(fix(a[0]) as i32), None),
+            None => (a.first().copied(), a.get(1).filter(|x| is_fix(**x)).map(|x| fix(*x) as i32), a.get(2).copied()),
+        };
+        if let (None, Some(e), true) = (own, e, real_class(s) == *C_SCE.get()) {
+            hdr(s).klass = errno_class(e);
+        }
+        let mut msg = match e {
             Some(e) => strerror(e),
             None => "unknown error".to_string(),
         };
-        let msg = match a.first() {
-            Some(&m) if m != QNIL => format!("{base} - {}", bstr(&ok!(to_s_bytes(m)))),
-            _ => base,
-        };
+        if let Some(f) = func.filter(|f| *f != QNIL) {
+            msg.push_str(&format!(" @ {}", bstr(&ok!(to_s_bytes(f)))));
+        }
+        if let Some(m) = m.filter(|m| *m != QNIL) {
+            msg.push_str(&format!(" - {}", bstr(&ok!(to_s_bytes(m)))));
+        }
         ivar_set(s, sym("@__message"), new_str_v(msg));
         if let Some(e) = e {
             ivar_set(s, sym("@__errno"), mkfix(e as i64));
@@ -2993,6 +3019,9 @@ pub fn init() {
             const_set(io, sym(&name.replace("EAGAIN", "EWOULDBLOCK")), k as V);
         }
     }
+    // (what an IO#timeout= expiry raises, Ruby 3.2+; Discourse rescues it)
+    let te = new_class("IO::TimeoutError", rt().c.io_error);
+    const_set(io, sym("TimeoutError"), te as V);
     bump_serial();
 
     let mk_std = |fd: i32, std: u8, r: bool, w: bool| {
@@ -4868,6 +4897,7 @@ pub fn init() {
         t
     });
     defs(pr, "fork", 0, 0, |_, _, b| k_fork(b));
+    defs(pr, "_fork", 0, 0, |_, _, _| process_fork_raw());
     defs(pr, "spawn", 1, -1, |_, a, _| k_spawn(a));
     defs(pr, "exec", 1, -1, |_, a, _| k_exec(a));
     defs(pr, "exit", 0, 1, |_, a, _| send(rt().main_obj, sym("exit"), a, QNIL));

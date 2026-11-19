@@ -1,0 +1,12 @@
+[EvT]
+[EvT]
+[EvT]
+[EvT]
+[]
+[:BLK, :Inner1, :Inner3, :Inner4]
+false
+[1, [Outer::In, Outer], Outer::In::Deep]
+[Outer::In, Outer]
+[1, [Outer::In, Outer], Outer::In::Deep]
+[]
+"TopE"

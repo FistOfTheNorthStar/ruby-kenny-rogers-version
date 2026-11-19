@@ -49,7 +49,19 @@ pub fn method_location(m: *const Method) -> V {
 }
 
 fn mptr(v: V) -> *const Method {
-    fix(ivar_get(v, sym("@__m"))) as usize as *const Method
+    let m = fix(ivar_get(v, sym("@__m"))) as usize as *mut Method;
+    // A method taken off its class (`remove_method`, or defined again: Sinatra's routes) is
+    // only reachable through this object, whose @__body the collector keeps alive and updates
+    // when the proc moves; the collector no longer sees the Method's own pointer.
+    if !m.is_null() {
+        if let Body::Proc(p) = unsafe { &mut (*m).body } {
+            let b = ivar_get(v, sym("@__body"));
+            if is_proc(b) && *p != b {
+                *p = b;
+            }
+        }
+    }
+    m
 }
 /// `Method#super_method` / `UnboundMethod#super_method`: the method `super` would call from
 /// this one (the next definition after its owner in the receiver's ancestors), or nil.
@@ -90,6 +102,10 @@ fn wrap(class: *mut Class, recv: V, m: *const Method, name: u32) -> V {
             ivar_set(o, sym("@__body"), *p);
         }
         crate::gc::note_method_object(m);
+        // (and a define_method's block, which its class stops marking if the method is removed)
+        if let Body::Proc(p) = unsafe { &(*m).body } {
+            ivar_set(o, sym("@__body"), *p);
+        }
     }
     o
 }

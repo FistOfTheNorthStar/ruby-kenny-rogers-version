@@ -217,7 +217,13 @@ impl<M: Module> Compiler<M> {
             }
             let n = self.iconst(fx, vals.len() as i64);
             let buf = self.args_buf(fx, &vals);
-            return self.call(fx, "kn_ary_new", &[n, buf]);
+            let a = self.call(fx, "kn_ary_new", &[n, buf]);
+            // in an eval'd string, then the scopes of the class the eval runs in
+            if self.eval_unit && !self.file_unit {
+                let p = self.slot_ptr(fx, slot);
+                return self.call(fx, "kn_nesting_tail", &[a, p]);
+            }
+            return a;
         }
         // `refine X do ... end`: inside the block the module's refinements are active (CRuby
         // activates them in refine blocks), so its calls are refined call sites
@@ -588,6 +594,11 @@ impl<M: Module> Compiler<M> {
                 let l = self.locals_snapshot(fx);
                 let src = args.vals[0];
                 self.call(fx, "kn_eval_locals", &[l, src]);
+                // a Kernel#eval'd string runs in the call site's class body (its cref)
+                if name.as_slice() == b"eval" && recv_node.as_ref().is_none_or(|r| r.as_self_node().is_some()) {
+                    let cref = self.cref(fx);
+                    self.call(fx, "kn_eval_cref", &[cref, src]);
+                }
                 // a string class_eval'd on an anonymous module sees the caller's constants
                 if matches!(name.as_slice(), b"class_eval" | b"module_eval") {
                     let cref = self.cref(fx);
