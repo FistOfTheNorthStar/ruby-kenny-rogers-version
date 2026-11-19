@@ -455,17 +455,27 @@ fn relax_quoted_indent(src: &str, at: usize, col: usize) -> Option<String> {
 }
 
 /// Parse a stream into documents (root node indices into `nodes`).
+/// (A QUOTED_INDENT error relaxes that scalar and parses again. Relaxing only adds spaces
+/// after it, so the next such error is at a later quote, or relaxing didn't help and the
+/// error stands: at most one pass per quote character.)
 fn parse_stream(src: &str, first_only: bool, nodes: &mut Vec<Node>) -> Result<Vec<usize>, PErr> {
     let base = nodes.len();
-    match parse_stream1(src, first_only, nodes) {
-        Err(e) if e.problem == QUOTED_INDENT => match relax_quoted_indent(src, e.offset, e.col - 1) {
-            Some(fixed) => {
-                nodes.truncate(base);
-                parse_stream(&fixed, first_only, nodes)
+    let mut text = std::borrow::Cow::Borrowed(src);
+    let mut last: Option<usize> = None;
+    loop {
+        match parse_stream1(&text, first_only, nodes) {
+            Err(e) if e.problem == QUOTED_INDENT && last.map_or(true, |l| e.offset > l) => {
+                match relax_quoted_indent(&text, e.offset, e.col.saturating_sub(1)) {
+                    Some(fixed) => {
+                        nodes.truncate(base);
+                        last = Some(e.offset);
+                        text = std::borrow::Cow::Owned(fixed);
+                    }
+                    None => return Err(e),
+                }
             }
-            None => Err(e),
-        },
-        r => r,
+            r => return r,
+        }
     }
 }
 
@@ -2644,16 +2654,22 @@ fn kn_events(src: V, path: V) -> V {
             text = t;
         }
     }
+    // (as in parse_stream: each retry is at a later quote, so this ends)
+    let mut last: Option<usize> = None;
     loop {
-        match events_of(&text, path) {
+        match events_of(&text, path, last) {
             Ok(v) => return v,
-            Err(fixed) => text = fixed,
+            Err((at, fixed)) => {
+                last = Some(at);
+                text = fixed;
+            }
         }
     }
 }
 
-/// (Err: the source to parse again, see relax_quoted_indent)
-fn events_of(text: &str, path: V) -> Result<V, String> {
+/// (Err: where the quoted scalar starts and the source to parse again, see
+/// relax_quoted_indent; only for a scalar after `last`, the previous one relaxed)
+fn events_of(text: &str, path: V, last: Option<usize>) -> Result<V, (usize, String)> {
     let text = text.to_string();
     let chars: Vec<char> = text.chars().collect();
     let mut line_starts = vec![0usize];
@@ -2694,9 +2710,9 @@ fn events_of(text: &str, path: V) -> Result<V, String> {
                     Some((ctx, prob)) if ctx.starts_with("while ") => (prob.to_string(), Some(ctx.to_string())),
                     _ => (info, None),
                 };
-                if problem == QUOTED_INDENT {
+                if problem == QUOTED_INDENT && last.map_or(true, |l| mk.index() > l) {
                     if let Some(fixed) = relax_quoted_indent(&text, mk.index(), mk.col()) {
-                        return Err(fixed);
+                        return Err((mk.index(), fixed));
                     }
                 }
                 err = ary_new(vec![
