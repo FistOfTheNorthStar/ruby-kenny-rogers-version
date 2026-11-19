@@ -144,7 +144,7 @@ anywhere, `=0` off. The gems' files always come from the binary.
 
 ## Ruby versions and gems
 
-Kenny supports **Ruby 3.4 and Ruby 4.0** (the repository's `.ruby-version` is 3.4.12) and builds
+Kenny supports **Ruby 3.4 and Ruby 4.0** (the repository's `.ruby-version` is 3.4.13) and builds
 against an installed Ruby. It picks, in order:
 
 1. the one `KENNY_RUBY` names,
