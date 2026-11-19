@@ -48,9 +48,9 @@ fn release_of(version: &str, patchlevel: i64, date: &str) -> RubyRelease {
     }
 }
 
-/// The Ruby the program was built against (Ruby 3.4.12 when the build named none).
+/// The Ruby the program was built against (Ruby 3.4.13 when the build named none).
 pub fn ruby_release() -> &'static RubyRelease {
-    RELEASE.get_or_init(|| release_of("3.4.12", 148, "2026-10-23"))
+    RELEASE.get_or_init(|| release_of("3.4.13", 195, "2026-11-19"))
 }
 
 /// Whether the program has Ruby 4.0's behavior (built against Ruby 4.0 or later).
