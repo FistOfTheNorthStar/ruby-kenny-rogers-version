@@ -85,7 +85,7 @@ const NATIVE: &[&str] = &[
     "nokogiri", "racc", "bigdecimal", "json", "date", "strscan", "sqlite3", "openssl", "psych", "stringio",
     "io-console", "io-wait", "io-nonblock", "nio4r", "digest", "zlib", "etc", "erb", "cgi", "pathname", "ripper",
     "prism", "ffi", "fiddle", "bootsnap", "byebug", "debug", "debug_inspector", "puma", "monitor", "socket", "pty",
-    "fcntl", "syslog", "readline-ext", "objspace", "coverage",
+    "fcntl", "syslog", "readline-ext", "objspace", "coverage", "sassc",
 ];
 
 /// Project directories that are never compiled in (tests, generated files, vendored gems).

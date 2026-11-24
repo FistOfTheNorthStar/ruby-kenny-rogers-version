@@ -3,9 +3,10 @@
 # SassC in a Kenny binary: the sassc gem's Ruby API (SassC::Engine, SassC::Importer, the
 # SassC::Script values and custom functions) on a native Sass compiler — grass, in the runtime
 # (crates/kenny-runtime/src/assets.rs) — instead of libsass through FFI. The CSS is the same up
-# to formatting. Imports are resolved by the compiler on the load paths (a custom importer such
-# as sassc-rails' only learns the imported files afterwards, as dependencies), so the ERB and
-# glob imports of sassc-rails' importer are not supported.
+# to formatting. Imports are resolved by the compiler on the load paths: a custom importer's
+# `imports` is not called. What sassc-rails' importer (SassC::Rails::Importer) adds to Sass's
+# own imports works with it all the same: ERB files (`x.scss.erb`, `x.sass.erb`, `x.css.erb`),
+# `x.css.scss` / `x.css.sass`, and globs (`@import "dir/*"`, `@import "dir/**/*"`).
 
 module SassC
   # The global load paths for Sass files (see the sassc gem).
@@ -86,11 +87,11 @@ module SassC
 
       status, css, line_or_deps, file = ::Kenny::Sass.render(
         @template.to_s, filename&.to_s, sass? ? "sass" : "scss", output_style.to_s.sub("sass_style_", ""),
-        load_path_list, specs, callback
+        load_path_list, specs, callback, rails_importer
       )
       raise SyntaxError.new(css, filename: file || filename, line: line_or_deps) if status == "error"
 
-      @dependencies = line_or_deps
+      @dependencies = line_or_deps | @glob_dependencies.to_a
       @source_map = nil
       if (context = @options.dig(:sprockets, :context)) && context.respond_to?(:depend_on)
         @dependencies.each { |dep| context.depend_on(dep) }
@@ -152,6 +153,45 @@ module SassC
     end
 
     private
+
+    # The file names sassc-rails' importer imports (longest first: `a.css.scss` is not a `.css`).
+    RAILS_IMPORT_EXTENSIONS = %w[.css.scss .css.sass .sass.erb .scss.erb .css.erb .scss .sass .css].freeze
+
+    # With sassc-rails' importer: what the native compiler calls for the imports Sass itself
+    # doesn't have. `("erb", file, nil, nil)` -> the ERB file's result; `("glob", dir, "*" or
+    # "**/*", skip)` -> a stylesheet that imports the Sass files of `dir`, sorted, without those
+    # in `skip` (the file the glob is in).
+    def rails_importer
+      importer = @options[:importer]
+      return nil unless importer.is_a?(Class) && defined?(::SassC::Rails::Importer) && importer <= ::SassC::Rails::Importer
+
+      context = @options.dig(:sprockets, :context)
+      depend_on = ->(path) { context.depend_on(path) if context.respond_to?(:depend_on) }
+      erb = ->(file) { Tilt::ERBTemplate.new(file).render(context, {}) }
+      @glob_dependencies = []
+      lambda do |kind, path, glob, skip|
+        next erb.call(path) if kind == "erb"
+
+        depend_on.call(path)
+        files = Dir["#{path}/#{glob}"].sort.select do |f|
+          if File.directory?(f)
+            depend_on.call(f)
+            false
+          else
+            f.end_with?(*RAILS_IMPORT_EXTENSIONS)
+          end
+        end
+        (files - skip).map do |f|
+          if f.end_with?(".css", ".css.erb")
+            # (`@import "x.css"` is a CSS import in Sass: the file's text goes in as it is)
+            @glob_dependencies << f
+            f.end_with?(".erb") ? erb.call(f) : File.binread(f)
+          else
+            %(@import "#{f.delete_suffix('.erb').gsub(/["\\]/) { "\\#{_1}" }}";)
+          end
+        end.join("\n")
+      end
+    end
 
     def functions_wrapper
       # an anonymous class, as in sassc's FunctionsHandler (no shared state between threads)
