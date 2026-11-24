@@ -27,6 +27,11 @@ const FL_MOVED: u32 = 1 << 26;
 /// such a class again: its tables are covered by the class-table write barrier, and the
 /// classes it links to are never freed.
 const FL_CLASS_TRACED: u32 = 1 << 20;
+/// (generational) A young object that survived one minor collection: kept (marked) but not
+/// promoted. The next minor collection unmarks it again, and promotes it if it survives that
+/// one too. A server's minor collections find the objects of the requests in flight alive;
+/// most of them die before the next one, so they never fill the old generation.
+const FL_SURVIVOR: u32 = 1 << 27;
 
 /// Set when a collection is due; checked at safepoints (also by compiled loop back-edges).
 /// Bit 1: collection due. PREEMPT_BIT (2): thread timer. STW_BIT: a collector is waiting for
@@ -124,6 +129,10 @@ pub struct Heap {
     /// KENNY_GC_STATS=1: time spent collecting, and the most pages ever held
     pub gc_nanos: u128,
     pub peak_pages: usize,
+    /// (aging) The objects the last minor collection kept young (FL_SURVIVOR), and the
+    /// classes whose tables reference one of them (traced again by the next minor collection).
+    pub survivors: Vec<usize>,
+    pub retrace_classes: Vec<*mut Class>,
 }
 
 /// Per-OS-thread allocation and root state (part of `PState`).
@@ -144,6 +153,8 @@ pub struct PHeap {
     pub stack_base: usize,
     /// RUNNING, PARKED (stopped for a collection) or IDLE (waiting, not touching the heap).
     pub status: AtomicU8,
+    /// The OS thread, for waking it when parked (set when it first parks).
+    pub waker: std::sync::OnceLock<std::thread::Thread>,
     /// While parked or idle: where its stack ends, and its callee-saved registers.
     pub saved_sp: usize,
     pub regs: [usize; 16],
@@ -168,6 +179,7 @@ impl PHeap {
             saved_throws: SavedThrows::default(),
             stack_base: 0,
             status: AtomicU8::new(RUNNING),
+            waker: std::sync::OnceLock::new(),
             saved_sp: 0,
             regs: [0; 16],
             retired: Vec::new(),
@@ -215,6 +227,8 @@ pub fn heap() -> &'static mut Heap {
             stack_provider: None,
             gc_nanos: 0,
             peak_pages: 0,
+            survivors: Vec::new(),
+            retrace_classes: Vec::new(),
         }
     })
 }
@@ -538,6 +552,18 @@ fn take_free_slots(ph: &mut PHeap, ci: usize, pg: &mut Page) -> Option<usize> {
     fl.pop()
 }
 
+/// The index of the page at `base` (a multiple of PAGE within page_lo..page_hi).
+#[inline]
+fn page_at(h: &Heap, base: usize) -> Option<usize> {
+    if h.page_table.is_empty() {
+        h.page_index.get(&base).copied()
+    } else {
+        match h.page_table[(base - h.page_lo) / PAGE] {
+            0 => None,
+            i => Some(i as usize - 1),
+        }
+    }
+}
 /// Is `w` the address of a live heap object? (For the collector, or with one thread.)
 #[inline]
 pub fn is_object(w: usize) -> bool {
@@ -549,26 +575,56 @@ pub fn is_object(w: usize) -> bool {
         return false;
     }
     let base = w & !(PAGE - 1);
-    let found = if h.page_table.is_empty() {
-        h.page_index.get(&base).copied()
-    } else {
-        match h.page_table[(base - h.page_lo) / PAGE] {
-            0 => None,
-            i => Some(i as usize - 1),
-        }
-    };
-    match found {
-        Some(pi) => {
-            let pg = &h.pages[pi];
-            let off = w - base;
-            if off % pg.slot != 0 {
-                return false;
-            }
-            let i = off / pg.slot;
-            i < pg.nslots && pg.alloc[i / 64] & (1 << (i % 64)) != 0
-        }
+    match page_at(h, base) {
+        Some(pi) => slot_live(&h.pages[pi], w - base),
         None => false,
     }
+}
+/// Does a live object start `off` bytes into this page?
+#[inline(always)]
+fn slot_live(pg: &Page, off: usize) -> bool {
+    // (the size classes' divisions are by constants: multiplications, not divisions)
+    let (i, rem) = match pg.slot {
+        s if s == SIZE_CLASSES[0] => (off / SIZE_CLASSES[0], off % SIZE_CLASSES[0]),
+        s if s == SIZE_CLASSES[1] => (off / SIZE_CLASSES[1], off % SIZE_CLASSES[1]),
+        s if s == SIZE_CLASSES[2] => (off / SIZE_CLASSES[2], off % SIZE_CLASSES[2]),
+        s if s == SIZE_CLASSES[3] => (off / SIZE_CLASSES[3], off % SIZE_CLASSES[3]),
+        s => (off / s, off % s),
+    };
+    rem == 0 && i < pg.nslots && pg.alloc[i / 64] & (1 << (i % 64)) != 0
+}
+/// The heap object a stack word refers to: one starting at `w`, or a GC-heap environment
+/// whose data starts at `w` (what compiled code holds). One page lookup for both.
+#[inline]
+fn stack_object(w: usize) -> Option<V> {
+    // (objects are 16-aligned: neither can be one otherwise)
+    if w & 15 != 0 {
+        return None;
+    }
+    let h = heap();
+    if w < h.page_lo || w >= h.page_hi + 16 {
+        return None;
+    }
+    let base = w & !(PAGE - 1);
+    let off = w - base;
+    let env_at = |p: usize| (hdr(p as V).kind == Kind::Env).then_some(p as V);
+    if w < h.page_hi {
+        match page_at(h, base) {
+            Some(pi) => {
+                let pg = &h.pages[pi];
+                if slot_live(pg, off) {
+                    return Some(w as V);
+                }
+                if off >= 16 {
+                    return if slot_live(pg, off - 16) { env_at(w - 16) } else { None };
+                }
+            }
+            None if off >= 16 => return None,
+            None => {}
+        }
+    }
+    // at a page's start (or just past the last page): w - 16 is on the page before
+    if is_object(w - 16) { env_at(w - 16) } else { None }
 }
 // ---------- malloc pressure ----------
 //
@@ -786,6 +842,11 @@ fn generational() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| std::env::var("KENNY_GC_GENERATIONAL").map(|v| v != "0").unwrap_or(true))
 }
+/// Young objects must survive two minor collections to be promoted (KENNY_GC_AGING=0: one).
+fn aging_enabled() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("KENNY_GC_AGING").map(|v| v != "0").unwrap_or(true))
+}
 fn verify_mode() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| std::env::var_os("KENNY_GC_VERIFY").is_some())
@@ -982,6 +1043,15 @@ fn compact_now_mode(request: u8) -> Option<(usize, usize)> {
     heap().last_compact.take()
 }
 
+/// GC.start(full_mark: false): a minor collection now (a major one if one is due anyway).
+pub fn collect_minor_now() {
+    if crate::mt::multi() {
+        KN_GC_PENDING.fetch_or(1, Ordering::SeqCst);
+        stop_the_world_collect();
+    } else {
+        collect();
+    }
+}
 pub fn collect_now() {
     heap().force_major = true;
     if crate::mt::multi() {
@@ -997,6 +1067,8 @@ pub fn collect_now() {
 static COLLECTING: AtomicBool = AtomicBool::new(false);
 /// Total time spent waiting for other threads to stop (KENNY_GC_STATS).
 static STOP_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The same for the last collection (KENNY_GC_STATS=2).
+static LAST_STOP_NANOS: AtomicU64 = AtomicU64::new(0);
 
 /// The Ps, while the collector holds the ALL_PS lock (only the collector reads it).
 static GC_PS: G<Vec<usize>> = G::new(Vec::new());
@@ -1008,7 +1080,6 @@ fn lock_ps() -> std::sync::MutexGuard<'static, Vec<usize>> {
     *GC_PS.get() = g.clone();
     g
 }
-static STW_EPOCH: crate::mt::ForkLock<u64> = crate::mt::ForkLock::new(0);
 /// How many times every other OS thread running Ruby code has stopped: a point after which
 /// none of them still holds a value it read before (abi.rs `kn_static_fill` waits for one
 /// before refilling a slot it cleared). Counted while they are stopped.
@@ -1016,7 +1087,19 @@ static STOPS: AtomicU64 = AtomicU64::new(0);
 pub fn stops() -> u64 {
     STOPS.load(Ordering::SeqCst)
 }
-static STW_CV: std::sync::Condvar = std::sync::Condvar::new();
+/// Wake the threads parked for this collection (to help with it, or to go on after it), each
+/// with its own wake-up: with a condition variable they took its mutex one after another
+/// when the collection ended, the last ~0.3 ms later (macOS, 12 cores).
+fn wake_parked() {
+    for &p in gc_ps().iter() {
+        let ph = unsafe { &(*(p as *const PState)).heap };
+        if ph.status.load(Ordering::SeqCst) == PARKED {
+            if let Some(t) = ph.waker.get() {
+                t.unpark();
+            }
+        }
+    }
+}
 
 /// At a safepoint with a collection due: become the collector (stop every other thread,
 /// collect, restart them) or, if another thread is collecting, stop until it is done.
@@ -1046,18 +1129,20 @@ fn stop_the_world_collect() {
             std::thread::yield_now();
         }
     }
-    STOP_NANOS.fetch_add(t_stop.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let stop = t_stop.elapsed().as_nanos() as u64;
+    STOP_NANOS.fetch_add(stop, Ordering::Relaxed);
+    LAST_STOP_NANOS.store(stop, Ordering::Relaxed);
     STOPS.fetch_add(1, Ordering::SeqCst);
     if KN_GC_PENDING.load(Ordering::Relaxed) & 1 != 0 {
         GC_TOP.store(approx_sp_here(), Ordering::Relaxed);
         collect_locked();
     }
-    drop(ps_guard);
-    let mut e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
-    *e += 1;
     KN_GC_PENDING.fetch_and(!STW_BIT, Ordering::SeqCst);
-    COLLECTING.store(false, Ordering::Release);
-    STW_CV.notify_all();
+    COLLECTING.store(false, Ordering::SeqCst);
+    // (a thread that parks from now on sees the flags clear; one parked before is woken, the
+    // list still valid while the lock is held)
+    wake_parked();
+    drop(ps_guard);
 }
 
 /// Forks this process is down from (the child's threads and channels are its own).
@@ -1085,36 +1170,36 @@ pub fn fork_world_stopped() -> libc::pid_t {
         }
     }
     let bg = bg_sweep_pause();
-    // (the parked threads take this one now and then while they wait)
-    let epoch = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         FORKS.fetch_add(1, Ordering::Relaxed);
         BG_STARTED.store(false, Ordering::Release);
         // (the locks are the parent's thread's: made again, unlocked, with what they hold)
-        let n = *epoch;
-        std::mem::forget(epoch);
         std::mem::forget(bg);
-        unsafe {
-            STW_EPOCH.reset(n);
-            BG_LOCK.reset(());
-        }
+        unsafe { BG_LOCK.reset(()) };
         if let Some(g) = ps_guard.take() {
             let ps = g.clone();
             std::mem::forget(g);
+            // (the other Ps' threads didn't come along: nothing to wake, and their wake-up
+            // handles are the parent's; on macOS one holds a semaphore that isn't the child's)
+            let me = crate::core::pst() as *mut PState as usize;
+            for &p in ps.iter().filter(|&&p| p != me) {
+                unsafe { std::ptr::write(std::ptr::addr_of_mut!((*(p as *mut PState)).heap.waker), std::sync::OnceLock::new()) };
+            }
             unsafe { crate::core::ALL_PS.reset(ps) };
         }
+        if multi {
+            KN_GC_PENDING.fetch_and(!STW_BIT, Ordering::SeqCst);
+            COLLECTING.store(false, Ordering::SeqCst);
+        }
     } else {
-        drop(epoch);
         drop(bg);
-    }
-    if multi {
-        drop(ps_guard);
-        let mut e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
-        *e += 1;
-        KN_GC_PENDING.fetch_and(!STW_BIT, Ordering::SeqCst);
-        COLLECTING.store(false, Ordering::Release);
-        STW_CV.notify_all();
+        if multi {
+            KN_GC_PENDING.fetch_and(!STW_BIT, Ordering::SeqCst);
+            COLLECTING.store(false, Ordering::SeqCst);
+            wake_parked();
+            drop(ps_guard);
+        }
     }
     pid
 }
@@ -1133,12 +1218,11 @@ struct ScanFilter {
     retired_hi: usize,
     code_lo: usize,
     code_hi: usize,
-    envs: bool,
     classes: bool,
     /// objects may move: a word pointing into one pins it (`Marker::word`)
     compacting: bool,
 }
-static SCAN_FILTER: G<ScanFilter> = G::new(ScanFilter { page_lo: 0, page_hi: 0, retired_lo: 1, retired_hi: 0, code_lo: 1, code_hi: 0, envs: false, classes: false, compacting: false });
+static SCAN_FILTER: G<ScanFilter> = G::new(ScanFilter { page_lo: 0, page_hi: 0, retired_lo: 1, retired_hi: 0, code_lo: 1, code_hi: 0, classes: false, compacting: false });
 static SCAN_RANGES: G<Vec<(usize, usize)>> = G::new(Vec::new());
 static SCAN_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// The scan job's chunks, claimed one at a time (`claim`).
@@ -1176,6 +1260,14 @@ fn claim(a: &AtomicU64) -> Option<usize> {
     }
 }
 
+/// The lowest and highest address of a closure environment in `Heap::envs` (set when a
+/// collection starts).
+static ENV_BOUNDS: G<(usize, usize)> = G::new((usize::MAX, 0));
+#[inline]
+fn maybe_env(w: usize) -> bool {
+    let (lo, hi) = *ENV_BOUNDS.get();
+    w >= lo && w <= hi
+}
 #[inline]
 fn scan_candidate(f: &ScanFilter, w: usize) -> bool {
     if w >= f.retired_lo && w <= f.retired_hi {
@@ -1187,10 +1279,10 @@ fn scan_candidate(f: &ScanFilter, w: usize) -> bool {
     if w & 7 != 0 || w < 4096 {
         return false;
     }
-    if w >= f.page_lo && w < f.page_hi + 16 && (f.compacting || is_object(w) || is_object(w - 16)) {
+    if w >= f.page_lo && w < f.page_hi + 16 && (f.compacting || stack_object(w).is_some()) {
         return true;
     }
-    (f.envs && heap().envs.contains_key(&w)) || (f.classes && heap().class_set.contains(&w))
+    (maybe_env(w) && heap().envs.contains_key(&w)) || (f.classes && heap().class_set.contains(&w))
 }
 
 /// Filter stack chunks (a stopped thread helping, or the collector). True if it did any.
@@ -1233,7 +1325,6 @@ fn scan_ranges_parallel(m: &mut Marker, ranges: &[(usize, usize)]) {
         retired_hi: if m.retired.is_empty() { 0 } else { m.retired_hi },
         code_lo: m.code_lo,
         code_hi: m.code_hi,
-        envs: !h.envs.is_empty(),
         classes: m.major,
         compacting: m.compacting,
     };
@@ -1255,7 +1346,7 @@ fn scan_ranges_parallel(m: &mut Marker, ranges: &[(usize, usize)]) {
     SCAN_PENDING.store(chunks.len(), Ordering::SeqCst);
     publish_job(&SCAN_CLAIM, chunks.len());
     SCAN_ACTIVE.store(true, Ordering::SeqCst);
-    STW_CV.notify_all();
+    wake_parked();
     scan_help();
     let mut spins = 0u32;
     while SCAN_PENDING.load(Ordering::Acquire) != 0 {
@@ -1361,30 +1452,19 @@ fn park() {
     let ph = &mut crate::core::pst().heap;
     spill_registers(&mut ph.regs);
     ph.saved_sp = approx_sp_here();
+    ph.waker.get_or_init(std::thread::current);
     loop {
     ph.status.store(PARKED, Ordering::SeqCst);
-    {
-        let mut e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
-        while KN_GC_PENDING.load(Ordering::SeqCst) & STW_BIT != 0 || COLLECTING.load(Ordering::SeqCst) {
-            if SCAN_ACTIVE.load(Ordering::Acquire) {
-                drop(e);
-                let worked = scan_help();
-                e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
-                if worked {
-                    continue;
-                }
-            }
-            if SWEEP_ACTIVE.load(Ordering::Acquire) {
-                drop(e);
-                let worked = sweep_help();
-                e = STW_EPOCH.lock().unwrap_or_else(|e| e.into_inner());
-                if worked {
-                    continue;
-                }
-            }
-            let (g, _) = STW_CV.wait_timeout(e, std::time::Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
-            e = g;
+    // (`wake_parked` wakes us once the flags change or a job is up; a wake-up that comes
+    // before we sleep makes the sleep return at once)
+    while KN_GC_PENDING.load(Ordering::SeqCst) & STW_BIT != 0 || COLLECTING.load(Ordering::SeqCst) {
+        if SCAN_ACTIVE.load(Ordering::Acquire) && scan_help() {
+            continue;
         }
+        if SWEEP_ACTIVE.load(Ordering::Acquire) && sweep_help() {
+            continue;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(1));
     }
     ph.status.store(RUNNING, Ordering::SeqCst);
     // A new collection may have started between the check above and announcing RUNNING, and
@@ -1670,20 +1750,34 @@ pub fn throw_values(t: Throw, out: &mut Vec<V>) {
 
 // ---------- marking ----------
 
+/// Retired buffers are found by 4 KB granule (`Marker::retired_tab`)...
+const GRANULE_SHIFT: u32 = 12;
+/// ...except larger ones (rare), checked one by one.
+const BIG_RETIRED: usize = 64 << GRANULE_SHIFT;
+#[inline]
+fn granule_slot(g: usize, bits: u32) -> usize {
+    (g.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - bits)) as usize
+}
+
 struct Marker {
     stack: Vec<V>,
     envs: Vec<usize>,
     marked_envs: FxHashSet<usize>,
     seen_classes: FxHashSet<usize>,
-    /// Retired buffers (start, bytes, align), sorted; `keep[i]` once a stack word points into one.
+    /// Retired buffers (start, bytes, align); `keep[i]` once a stack word points into one.
     retired: Vec<(usize, usize, usize)>,
     keep: Vec<bool>,
     retired_lo: usize,
     retired_hi: usize,
-    /// retired[buckets[b]..] start at or after retired_lo + (b << retired_shift): narrows the
-    /// search for the buffer a stack word points into to one or two buckets
-    retired_buckets: Vec<u32>,
-    retired_shift: u32,
+    /// The buffers by 4 KB granule, a hash table: those overlapping granule g are among
+    /// `retired_idx[retired_tab[s]..retired_tab[s + 1]]`, s = `granule_slot(g)` (buffers of
+    /// other granules may share the slot). Buffers too large to list per granule are in
+    /// `retired_big`. (Sorting them instead took a third of a minor collection's pause: the
+    /// blog on 12 cores retires ~17,000 buffers between two.)
+    retired_tab: Vec<u32>,
+    retired_idx: Vec<u32>,
+    retired_bits: u32,
+    retired_big: Vec<u32>,
     /// KENNY_GC_VERIFY: a full traversal (by its own visited set) that reports reachable
     /// objects the minor collection left unmarked.
     verify: Option<FxHashSet<usize>>,
@@ -1709,27 +1803,77 @@ struct Marker {
     /// is being followed).
     compacting: bool,
     pinning: bool,
+    /// (aging, minor collections) What is being traced, when it stays old after this
+    /// collection: a reference from it to an object kept young (FL_SURVIVOR) must be in the
+    /// next collection's remembered set, since the next minor collection unmarks that object.
+    aging: bool,
+    parent: Parent,
+    /// A remembered container (Parent::Entry) referenced an object kept young.
+    entry_hit: bool,
+    survivors: Vec<usize>,
+    rem_next: Vec<(u8, usize)>,
+    retrace: Vec<*mut Class>,
+    retrace_seen: FxHashSet<usize>,
+}
+
+/// (aging) Whom a marked reference comes from (see `Marker::parent`).
+#[derive(Clone, Copy)]
+enum Parent {
+    /// A root, a stack, an object kept young, or something every minor collection traces
+    /// again (old closure environments, C-extension data): nothing to record.
+    Root,
+    /// An old object (or one promoted now).
+    Obj(usize),
+    /// The remembered container being rescanned.
+    Entry,
+    /// A class's tables.
+    Class(usize),
 }
 
 impl Marker {
-    fn new(retired: Vec<(usize, usize, usize)>, keep: Vec<bool>, retired_lo: usize, retired_hi: usize) -> Self {
-        const NB: usize = 1 << 14;
-        let span = retired_hi.saturating_sub(retired_lo) + 1;
-        let retired_shift = (usize::BITS - (span / NB).leading_zeros()).min(63);
-        let mut retired_buckets = Vec::new();
+    fn new(retired: Vec<(usize, usize, usize)>, keep: Vec<bool>) -> Self {
+        // (a counting sort by slot: one pass counts, the next places each buffer, leaving
+        // retired_tab[s] at the start of slot s)
+        let retired_bits = retired.len().next_power_of_two().max(2).trailing_zeros();
+        let nslots = 1usize << retired_bits;
+        let granules = |r: &(usize, usize, usize)| (r.0 >> GRANULE_SHIFT)..=((r.0 + r.1) >> GRANULE_SHIFT);
+        let (mut retired_lo, mut retired_hi) = (usize::MAX, 0);
+        let mut retired_tab = Vec::new();
+        let mut retired_idx = Vec::new();
+        let mut retired_big = Vec::new();
         if !retired.is_empty() {
-            let nb = (span >> retired_shift) + 2;
-            retired_buckets = vec![0u32; nb];
-            let mut i = 0usize;
-            for (b, slot) in retired_buckets.iter_mut().enumerate() {
-                let start = retired_lo.saturating_add(b << retired_shift);
-                while i < retired.len() && retired[i].0 < start {
-                    i += 1;
+            retired_tab = vec![0u32; nslots + 1];
+            let mut total = 0u32;
+            for (i, r) in retired.iter().enumerate() {
+                retired_lo = retired_lo.min(r.0);
+                retired_hi = retired_hi.max(r.0 + r.1);
+                if r.1 > BIG_RETIRED {
+                    retired_big.push(i as u32);
+                    continue;
                 }
-                *slot = i as u32;
+                for g in granules(r) {
+                    retired_tab[granule_slot(g, retired_bits)] += 1;
+                    total += 1;
+                }
+            }
+            let mut end = 0u32;
+            for t in retired_tab[..nslots].iter_mut() {
+                end += *t;
+                *t = end;
+            }
+            retired_tab[nslots] = total;
+            retired_idx = vec![0u32; total as usize];
+            for (i, r) in retired.iter().enumerate() {
+                if r.1 <= BIG_RETIRED {
+                    for g in granules(r) {
+                        let t = &mut retired_tab[granule_slot(g, retired_bits)];
+                        *t -= 1;
+                        retired_idx[*t as usize] = i as u32;
+                    }
+                }
             }
         }
-        Marker { stack: Vec::new(), envs: Vec::new(), marked_envs: FxHashSet::default(), seen_classes: FxHashSet::default(), retired, keep, retired_lo, retired_hi, retired_buckets, retired_shift, verify: None, verify_fail: 0, newly_marked: 0, cur: 0, parents: FxHashMap::default(), minor: false, major: false, code: Vec::new(), code_lo: usize::MAX, code_hi: 0, code_hit: Vec::new(), compacting: false, pinning: true }
+        Marker { stack: Vec::new(), envs: Vec::new(), marked_envs: FxHashSet::default(), seen_classes: FxHashSet::default(), retired, keep, retired_lo, retired_hi, retired_tab, retired_idx, retired_bits, retired_big, verify: None, verify_fail: 0, newly_marked: 0, cur: 0, parents: FxHashMap::default(), minor: false, major: false, code: Vec::new(), code_lo: usize::MAX, code_hi: 0, code_hit: Vec::new(), compacting: false, pinning: true, aging: false, parent: Parent::Root, entry_hit: false, survivors: Vec::new(), rem_next: Vec::new(), retrace: Vec::new(), retrace_seen: FxHashSet::default() }
     }
     #[inline]
     fn value(&mut self, v: V) {
@@ -1737,50 +1881,89 @@ impl Marker {
             return;
         }
         if is_object(v as usize) {
-            if let Some(seen) = &mut self.verify {
-                if seen.insert(v as usize) {
-                    self.parents.insert(v as usize, self.cur);
-                    if hdr(v).flags & FL_MARK == 0 {
-                        self.verify_fail += 1;
-                        if self.verify_fail <= 5 {
-                            eprintln!("[gc verify] reachable object {:#x} ({:?}, class {}) was not marked by the minor collection; reached via:", v, hdr(v).kind, class_name(hdr(v).klass));
-                            let mut p = self.cur;
-                            let mut n = 0;
-                            while p >= 4096 && n < 8 {
-                                let marked = hdr(p as V).flags & FL_MARK != 0;
-                                let extra = match hdr(p as V).kind {
-                                    Kind::Array => format!(" svec_flags={:#x}", rary(p as V).v.capacity()),
-                                    Kind::Hash => format!(" kmap_gen={} remembered_this_gc={}", rhash(p as V).m.gen_bits(), DBG_REMEMBERED.raw().contains(&(&rhash(p as V).m as *const _ as usize))),
-                                    _ => String::new(),
-                                };
-                                eprintln!("    {:#x} {:?} {} marked={}{}", p, hdr(p as V).kind, class_name(hdr(p as V).klass), marked, extra);
-                                p = self.parents.get(&p).copied().unwrap_or(0);
-                                n += 1;
-                            }
-                            eprintln!("    root kind {}", p);
-                        }
-                    }
-                    self.stack.push(v);
-                }
-                return;
-            }
-            let hd = hdr(v);
-            if self.compacting && self.pinning {
-                hd.flags |= FL_PIN;
-            }
-            if hd.flags & FL_MARK == 0 {
-                hd.flags |= FL_MARK;
-                self.newly_marked += 1;
-                self.stack.push(v);
-            }
+            self.object(v);
         } else if is_kind_unchecked_class(v) {
             self.class(v as *mut Class);
+        }
+    }
+    /// A live heap object (`is_object`).
+    #[inline]
+    fn object(&mut self, v: V) {
+        if let Some(seen) = &mut self.verify {
+            if seen.insert(v as usize) {
+                self.parents.insert(v as usize, self.cur);
+                if hdr(v).flags & FL_MARK == 0 {
+                    self.verify_fail += 1;
+                    if self.verify_fail <= 5 {
+                        eprintln!("[gc verify] reachable object {:#x} ({:?}, class {}) was not marked by the minor collection; reached via:", v, hdr(v).kind, class_name(hdr(v).klass));
+                        let mut p = self.cur;
+                        let mut n = 0;
+                        while p >= 4096 && n < 8 {
+                            let marked = hdr(p as V).flags & FL_MARK != 0;
+                            let extra = match hdr(p as V).kind {
+                                Kind::Array => format!(" svec_flags={:#x}", rary(p as V).v.capacity()),
+                                Kind::Hash => format!(" kmap_gen={} remembered_this_gc={}", rhash(p as V).m.gen_bits(), DBG_REMEMBERED.raw().contains(&(&rhash(p as V).m as *const _ as usize))),
+                                _ => String::new(),
+                            };
+                            eprintln!("    {:#x} {:?} {} marked={}{}", p, hdr(p as V).kind, class_name(hdr(p as V).klass), marked, extra);
+                            p = self.parents.get(&p).copied().unwrap_or(0);
+                            n += 1;
+                        }
+                        eprintln!("    root kind {}", p);
+                    }
+                }
+                self.stack.push(v);
+            }
+            return;
+        }
+        let hd = hdr(v);
+        if self.compacting && self.pinning {
+            hd.flags |= FL_PIN;
+        }
+        if hd.flags & FL_MARK == 0 {
+            if self.aging {
+                if hd.flags & FL_SURVIVOR != 0 {
+                    // survived a second minor collection: old now
+                    hd.flags &= !FL_SURVIVOR;
+                } else {
+                    hd.flags |= FL_SURVIVOR;
+                    self.survivors.push(v as usize);
+                }
+            }
+            hd.flags |= FL_MARK;
+            self.newly_marked += 1;
+            self.stack.push(v);
+        }
+        if self.aging && hd.flags & FL_SURVIVOR != 0 && !matches!(self.parent, Parent::Root) {
+            self.old_parent_hit();
+        }
+    }
+    /// An old object, remembered container or class references an object kept young: the
+    /// next minor collection must trace it again.
+    #[cold]
+    fn old_parent_hit(&mut self) {
+        match self.parent {
+            Parent::Root => {}
+            Parent::Obj(p) => {
+                let f = &mut hdr(p as V).flags;
+                if *f & FL_REMEMBERED == 0 {
+                    *f |= FL_REMEMBERED;
+                    self.rem_next.push((REM_OBJ, p));
+                }
+            }
+            Parent::Entry => self.entry_hit = true,
+            Parent::Class(c) => {
+                if self.retrace_seen.insert(c) {
+                    self.retrace.push(c as *mut Class);
+                }
+            }
         }
     }
     /// A word that might be a pointer (stack / data section).
     #[inline]
     fn word(&mut self, w: usize) {
-        if !self.retired.is_empty() {
+        // (no retired buffers: lo > hi)
+        if w >= self.retired_lo && w <= self.retired_hi {
             self.retired_word(w);
         }
         if w >= self.code_lo && w < self.code_hi {
@@ -1789,14 +1972,9 @@ impl Marker {
         if w & 7 != 0 || w < 4096 {
             return;
         }
-        if is_object(w) {
-            self.value(w as V);
-        } else if is_object(w - 16) {
-            // the data of a GC-heap environment (what compiled code holds)
-            if hdr((w - 16) as V).kind == Kind::Env {
-                self.value((w - 16) as V);
-            }
-        } else if !heap().envs.is_empty() && heap().envs.contains_key(&w) {
+        if let Some(v) = stack_object(w) {
+            self.object(v);
+        } else if maybe_env(w) && heap().envs.contains_key(&w) {
             self.env(w);
         } else if self.major && heap().class_set.contains(&w) {
             self.class(w as *mut Class);
@@ -1811,18 +1989,12 @@ impl Marker {
     /// still be reading it.
     #[inline(never)]
     fn retired_word(&mut self, w: usize) {
-        if w < self.retired_lo || w > self.retired_hi {
-            return;
-        }
-        // the last buffer starting at or before w starts in w's bucket or an earlier one
-        let b = (w - self.retired_lo) >> self.retired_shift;
-        let lo = (self.retired_buckets[b] as usize).saturating_sub(1);
-        let hi = (self.retired_buckets[b + 1] as usize).max(lo);
-        let i = lo + self.retired[lo..hi].partition_point(|r| r.0 <= w);
-        if i > 0 {
-            let (start, bytes, _) = self.retired[i - 1];
-            if w <= start + bytes {
-                self.keep[i - 1] = true;
+        let s = granule_slot(w >> GRANULE_SHIFT, self.retired_bits);
+        let (lo, hi) = (self.retired_tab[s] as usize, self.retired_tab[s + 1] as usize);
+        for &i in self.retired_idx[lo..hi].iter().chain(self.retired_big.iter()) {
+            let (start, bytes, _) = self.retired[i as usize];
+            if w >= start && w <= start + bytes {
+                self.keep[i as usize] = true;
             }
         }
     }
@@ -1857,7 +2029,9 @@ impl Marker {
             return;
         }
         let pinning = std::mem::replace(&mut self.pinning, true);
+        let parent = std::mem::replace(&mut self.parent, Parent::Class(c as usize));
         self.class_tables(c);
+        self.parent = parent;
         self.pinning = pinning;
     }
     fn class_tables(&mut self, c: *mut Class) {
@@ -1898,11 +2072,16 @@ impl Marker {
         loop {
             if let Some(v) = self.stack.pop() {
                 self.cur = v as usize;
+                if self.aging {
+                    self.parent = if hdr(v).flags & FL_SURVIVOR != 0 { Parent::Root } else { Parent::Obj(v as usize) };
+                }
                 self.trace(v);
+                self.parent = Parent::Root;
                 self.cur = 0;
                 continue;
             }
             if let Some(e) = self.envs.pop() {
+                self.parent = Parent::Root;
                 self.pinning = true;
                 self.cur = 2; // an environment
                 let n = heap().envs[&e] as usize;
@@ -1938,7 +2117,9 @@ impl Marker {
         if !k.is_null() && unsafe { (*k).is_singleton } {
             self.class(k);
         }
-        let promote = self.verify.is_none();
+        // (an object kept young needs no write barrier: the next minor collection traces it
+        // if anything reaches it)
+        let promote = self.verify.is_none() && hdr(v).flags & FL_SURVIVOR == 0;
         match hdr(v).kind {
             Kind::Object => {
                 if promote {
@@ -2161,14 +2342,26 @@ fn collect_locked() {
         return;
     }
     IN_COLLECT.store(true, Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
     let bg_guard = bg_sweep_pause();
     // roots dropped on another P since the last collection: forget them (and free them)
-    for (owner, p) in std::mem::take(&mut *ORPHAN_ROOTS.lock().unwrap_or_else(|e| e.into_inner())) {
-        unregister_root(owner as *mut PHeap, p as *const Vec<V>);
-        drop(unsafe { Box::from_raw(p as *mut Vec<V>) });
+    // (by owner, in one pass over its list; freed after the pause: the blog on 12 cores drops
+    // ~1,000 between two minor collections, which took ~0.1 ms of each pause one by one)
+    let orphans = std::mem::take(&mut *ORPHAN_ROOTS.lock().unwrap_or_else(|e| e.into_inner()));
+    if !orphans.is_empty() {
+        let mut by_owner: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
+        for (owner, p) in orphans {
+            by_owner.entry(owner).or_default().insert(p);
+        }
+        let mut boxes = Vec::new();
+        for (owner, dead) in by_owner {
+            unsafe { &mut (*(owner as *mut PHeap)).roots }.retain(|r| !dead.contains(&(*r as usize)));
+            // (each a Box of an emptied Vec: `RVec::drop`)
+            boxes.extend(dead.into_iter().map(|p| (p, std::mem::size_of::<Vec<V>>(), std::mem::align_of::<Vec<V>>())));
+        }
+        send_garbage(Garbage::Buffers(boxes));
     }
     KN_GC_PENDING.fetch_and(!1, Ordering::Relaxed);
-    let t0 = std::time::Instant::now();
     // every thread's environments created since the last collection join the shared list
     // (they are the young ones)
     let mut young_envs: FxHashSet<usize> = FxHashSet::default();
@@ -2179,6 +2372,9 @@ fn collect_locked() {
             h.envs.extend(ph.envs.drain());
         }
     }
+    // (most stack words are no environment: a range check spares them the table lookup)
+    let env_bounds = h.envs.keys().fold((usize::MAX, 0), |(lo, hi), &e| (lo.min(e), hi.max(e)));
+    *ENV_BOUNDS.get() = env_bounds;
     // generational: a minor collection unless the old generation has doubled since the last
     // major one (or a major one is due for another reason)
     let n_young_envs = young_envs.len();
@@ -2187,8 +2383,32 @@ fn collect_locked() {
         || h.minors >= 100
         || h.live > h.major_live.saturating_mul(2).max(min_threshold());
     h.force_major = false;
+    let aging = !major && aging_enabled();
+    let mut retrace = Vec::new();
     if major {
         clear_marks(h);
+        h.survivors.clear();
+        h.retrace_classes.clear();
+    } else {
+        // the objects the last minor collection kept young are young again (their pages are
+        // swept after this one), and classes that reference them are traced again
+        let survivors = std::mem::take(&mut h.survivors);
+        let mut n = 0;
+        for &p in &survivors {
+            let f = &mut hdr(p as V).flags;
+            if *f & (FL_SURVIVOR | FL_MARK) == FL_SURVIVOR | FL_MARK {
+                *f &= !FL_MARK;
+                n += 1;
+                if let Some(pi) = page_at(h, p & !(PAGE - 1)) {
+                    h.pages[pi].young = true;
+                }
+            }
+        }
+        h.live = h.live.saturating_sub(n);
+        retrace = std::mem::take(&mut h.retrace_classes);
+        for &c in &retrace {
+            unsafe { (*c).h.flags &= !FL_CLASS_TRACED };
+        }
     }
     // the write barrier's entries since the last collection
     let mut remembered = std::mem::take(&mut *REMEMBERED.lock().unwrap_or_else(|e| e.into_inner()));
@@ -2204,23 +2424,20 @@ fn collect_locked() {
         let ph = unsafe { &mut (*(p as *mut PState)).heap };
         retired.append(&mut ph.retired);
     }
-    retired.sort_unstable();
     let n_retired = (retired.len(), retired.iter().map(|r| r.1).sum::<usize>() >> 10);
     let keep = vec![false; retired.len()];
-    let (retired_lo, retired_hi) = match (retired.first(), retired.iter().map(|r| r.0 + r.1).max()) {
-        (Some(f), Some(h)) => (f.0, h),
-        _ => (usize::MAX, 0),
-    };
-    let mut m = Marker::new(retired, keep, retired_lo, retired_hi);
+    let mut m = Marker::new(retired, keep);
 
     let mut lap = std::time::Instant::now();
-    let mut phases: Vec<(&str, f64)> = Vec::new();
+    // (what was done since the pause began: the threads' lists gathered, the old young again)
+    let mut phases: Vec<(&str, f64)> = vec![("prep", t0.elapsed().as_secs_f64() * 1e3)];
     let mut phase = |name: &'static str, lap: &mut std::time::Instant| {
         phases.push((name, lap.elapsed().as_secs_f64() * 1e3));
         *lap = std::time::Instant::now();
     };
     m.minor = !major;
     m.major = major;
+    m.aging = aging;
     m.compacting = major && compaction_mode(h) != CompactMode::Off && compaction_safe();
     let orphans = if major { std::mem::take(&mut *ORPHANS.raw()) } else { Vec::new() };
     if !orphans.is_empty() {
@@ -2236,53 +2453,78 @@ fn collect_locked() {
     }
     mark_roots(&mut m, h, major);
     h.new_classes.clear();
+    for c in retrace {
+        m.class(c);
+    }
     phase("roots", &mut lap);
     let region_words: usize = h.regions.iter().map(|r| r.1).sum();
     if !major {
         // old objects are not traced again: what they reference was marked when they were,
         // except what the write barrier recorded since, old closure environments (compiled
         // code writes them directly) and C-extension data (their mark functions)
+        // (a container that references an object kept young stays remembered for the next
+        // minor collection)
         for &(kind, p) in &remembered {
+            m.parent = Parent::Entry;
+            m.entry_hit = false;
             match kind {
                 REM_SVEC => {
                     let sv = unsafe { &*(p as *const SVec<V>) };
-                    sv.clear_remembered();
                     for &x in sv.as_slice() {
                         m.value(x);
+                    }
+                    if !m.entry_hit {
+                        sv.clear_remembered();
                     }
                 }
                 REM_KMAP => {
                     let km = unsafe { &*(p as *const crate::khash::KMap) };
-                    km.clear_remembered();
                     for (k, x) in km.iter() {
                         m.value(k.0);
                         m.value(*x);
                     }
+                    if !m.entry_hit {
+                        km.clear_remembered();
+                    }
                 }
                 REM_CMAP_VALUES => {
                     let cm = unsafe { &*(p as *const CMap<u32, V>) };
-                    cm.clear_remembered();
                     for &x in cm.values() {
                         m.value(x);
+                    }
+                    if !m.entry_hit {
+                        cm.clear_remembered();
                     }
                 }
                 REM_CMAP_METHODS => {
                     let cm = unsafe { &*(p as *const CMap<u32, *const Method>) };
-                    cm.clear_remembered();
                     for &meth in cm.values() {
                         if let Body::Proc(pr) = unsafe { &(*meth).body } {
                             m.value(*pr);
                         }
                     }
+                    if !m.entry_hit {
+                        cm.clear_remembered();
+                    }
                 }
                 _ => {
                     if kind == REM_OBJ {
                         hdr(p as V).flags &= !FL_REMEMBERED;
+                        // (an object kept young by the last collection, written since: it is
+                        // traced if something reaches it)
+                        if hdr(p as V).flags & FL_MARK == 0 {
+                            continue;
+                        }
+                        m.parent = Parent::Obj(p);
                     }
                     m.trace(p as V)
                 }
             }
+            if m.entry_hit {
+                m.rem_next.push((kind, p));
+            }
         }
+        m.parent = Parent::Root;
         phase("remembered", &mut lap);
         let old_envs: Vec<usize> = h.envs.keys().copied().filter(|e| !young_envs.contains(e)).collect();
         for e in old_envs {
@@ -2322,6 +2564,15 @@ fn collect_locked() {
     phase("stacks", &mut lap);
     m.drain();
     phase("trace", &mut lap);
+    let n_aged = m.survivors.len();
+    if aging {
+        h.survivors = std::mem::take(&mut m.survivors);
+        h.retrace_classes = std::mem::take(&mut m.retrace);
+        let rem_next = std::mem::take(&mut m.rem_next);
+        if !rem_next.is_empty() {
+            REMEMBERED.lock().unwrap_or_else(|e| e.into_inner()).extend(rem_next);
+        }
+    }
     if !major && verify_mode() {
         verify_minor(h);
     }
@@ -2360,7 +2611,7 @@ fn collect_locked() {
         SWEEP_HELPED.store(0, Ordering::Relaxed);
         publish_job(&SWEEP_CLAIM, n.div_ceil(SWEEP_CHUNK));
         SWEEP_ACTIVE.store(true, Ordering::SeqCst);
-        STW_CV.notify_all();
+        wake_parked();
         let _ = sweep_help();
         let mut spins = 0u32;
         while SWEEP_PENDING.load(Ordering::Acquire) != 0 {
@@ -2473,9 +2724,10 @@ fn collect_locked() {
     if *STATS_EVERY.get() {
         let txt: Vec<String> = phases.iter().map(|(n, t)| format!("{n}={t:.2}")).collect();
         eprintln!(
-            "[gc] {} phases ms: {} (scanned_words={} retired={:?} (n, KB) data_marked={} malloc_envs={}/{} classes={} (freed {}) region_words={} remembered={} promoted={} swept_pages={}/{} freed={} lazily_freed={} helped={}/{})",
+            "[gc] {} phases ms: {} (stop={:.2} scanned_words={} retired={:?} (n, KB) data_marked={} malloc_envs={}/{} classes={} (freed {}) region_words={} remembered={} promoted={} aged={} swept_pages={}/{} freed={} lazily_freed={} helped={}/{})",
             if major { "major" } else { "minor" },
             txt.join(" "),
+            LAST_STOP_NANOS.swap(0, Ordering::Relaxed) as f64 / 1e6,
             SCANNED_WORDS.swap(0, Ordering::Relaxed),
             n_retired,
             DBG_NDATA.load(std::sync::atomic::Ordering::Relaxed),
@@ -2485,7 +2737,8 @@ fn collect_locked() {
             freed_classes,
             region_words,
             remembered.len(),
-            m.newly_marked,
+            m.newly_marked - n_aged,
+            n_aged,
             sweep_pages.len(),
             h.pages.len(),
             freed_count,
@@ -3257,7 +3510,7 @@ fn clear_marks(h: &mut Heap) {
                 let b = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 let p = pg.base + (wi * 64 + b) * pg.slot;
-                unsafe { (*(p as *mut Header)).flags &= !FL_MARK };
+                unsafe { (*(p as *mut Header)).flags &= !(FL_MARK | FL_SURVIVOR) };
             }
         }
     }
@@ -3267,7 +3520,7 @@ fn clear_marks(h: &mut Heap) {
 /// a major collection, with its own visited set) and abort if a reachable object is
 /// unmarked, i.e. the write barrier missed a store.
 fn verify_minor(h: &mut Heap) {
-    let mut v = Marker::new(Vec::new(), Vec::new(), usize::MAX, 0);
+    let mut v = Marker::new(Vec::new(), Vec::new());
     v.verify = Some(FxHashSet::default());
     mark_roots(&mut v, h, true);
     scan_with_registers(&mut v);
