@@ -792,7 +792,7 @@ fn p_loop(idx: usize) {
                 }
                 resume_thread(i);
                 if idx >= sraw().map(|s| s.max_ps).unwrap_or(usize::MAX) {
-                    give_back(i);
+                    give_back(i, idx);
                 }
             }
             Pick::Wait(t) => {
@@ -1271,14 +1271,16 @@ fn steal(s: &mut Sched, idx: usize) -> Option<usize> {
     STEALS.fetch_add(1, Ordering::Relaxed);
     Some(tid)
 }
-/// A spare P ran thread `tid` until it suspended: hand it back to the least loaded regular P.
-fn give_back(tid: usize) {
+/// Spare P `me` ran thread `tid` until it suspended: hand it back to the least loaded regular P.
+fn give_back(tid: usize, me: usize) {
     let pk = locked!(s => {
         let t = &s.threads[tid];
-        if t.state == St::Done || t.pinned || !t.fiber_stack.is_empty() {
+        // (a thread that suspended runnable may have been taken by an idle P since, and be
+        // running there: it is that P's now. Moving it would make its next timed wait end on
+        // yet another P, also when it must stay where it is: see `stay_here`.)
+        if t.p != me || t.state == St::Running || t.state == St::Done || t.pinned || !t.fiber_stack.is_empty() {
             return;
         }
-        let me = t.p;
         let to = (0..s.max_ps).filter(|&v| s.ps[v].started).min_by_key(|&v| s.ps[v].nthreads).unwrap_or(0);
         let queued = s.ps[me].runq.iter().position(|&x| x == tid);
         if let Some(i) = queued {
