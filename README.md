@@ -458,9 +458,6 @@ CRuby's, and `Ripper#state`/`#token` are nil.
 - Sass source maps (the Sass compiler doesn't write them), and `imports` of a custom
   `SassC::Importer` other than sassc-rails': imports are resolved by the Sass compiler on the
   load paths.
-- In development: debuggers (`byebug` loads, but calling `byebug` raises LoadError: its core
-  is a C extension), and Action Cable's redis adapter (untested: the redis gem isn't installed
-  here).
 - Compacting while requests run is partial: a major collection moves objects only when no
   thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
   them). In the blog example under load that is every major so far: on macOS 102 of 102 on
@@ -479,7 +476,9 @@ CRuby's, and `Ripper#state`/`#token` are nil.
   far less than 12 Puma workers. On Linux (aarch64, 12 cores) the blog peaks at ~350 MB with
   mimalloc, the default, and ~255 MB with glibc's malloc (`KENNY_MALLOC=system`), which serves
   about 30% fewer requests; one core takes ~190 MB.
-- `ObjectSpace`, `TracePoint` (dropped by design).
+- `ObjectSpace`, `TracePoint` (dropped by design), and so debuggers that step through code:
+  `byebug` loads, but calling `byebug` raises LoadError (its core is a C extension on
+  `TracePoint`).
 
 ## Testing
 
@@ -576,8 +575,6 @@ An uncaught exception and a failed request always print the full backtrace.
 1. Memory on many cores: serving on 12 takes about 1.7x the memory of one, since each core
    has its own young-generation space; bring it closer to one core's without the throughput
    `KENNY_GC_YOUNG_SCALE=1` gives up
-2. Development tools: calling `byebug` (its core is a C extension), and Action Cable's redis
-   adapter tested against a running Redis
-3. Sass: source maps
-4. Compaction without frame pointers: a runtime built without them scans native frames word by
+2. Sass: source maps
+3. Compaction without frame pointers: a runtime built without them scans native frames word by
    word and rarely compacts a busy server

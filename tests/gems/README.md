@@ -14,7 +14,7 @@ tests/gems/run.sh rack json       # some
 
 Outputs land in `target/gems/<gem>.{ruby,build,kenny}` (stderr in `.ruby.err`, `.kenny.err`).
 The gems must be installed for the Ruby the tests run against (`bundle install` in a gem's directory).
-`pg` and `sidekiq` need a server: PostgreSQL on its default socket, Redis on `localhost:6379`.
+`pg`, `sidekiq` and `actioncable-redis` need a server: PostgreSQL on its default socket, Redis on `localhost:6379`.
 
 ## Results (Ruby 3.4.12, 2026-11-01): 135 of 137 pass
 
