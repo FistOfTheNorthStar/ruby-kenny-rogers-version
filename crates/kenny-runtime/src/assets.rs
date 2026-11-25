@@ -40,7 +40,7 @@ pub extern "C" fn Init_kenny_assets() {
     let kenny = kenny_module();
     let sass = new_module("Kenny::Sass");
     const_set(kenny, sym("Sass"), sass as V);
-    defs(sass, "render", 7, 7, sass_render);
+    defs(sass, "render", 8, 8, sass_render);
     let js = new_module("Kenny::JS");
     const_set(kenny, sym("JS"), js as V);
     defs(js, "context", 0, 0, |_, _, _| js_context());
@@ -51,11 +51,92 @@ pub extern "C" fn Init_kenny_assets() {
 
 /// The file system grass sees: the entry file is the template in memory; every other file read
 /// is recorded (the stylesheet's dependencies).
+///
+/// With `importer` (sassc-rails' importer is in use, lib/kenny/sassc.rb) it also shows grass
+/// files that aren't there, for what that importer accepts beyond Sass's own imports:
+/// - `x.scss` / `x.sass` / `x.css` where only `x.scss.erb` / `x.sass.erb` / `x.css.erb` exists:
+///   the ERB's result (`importer.call("erb", path, nil, nil)`);
+/// - `x.scss` / `x.sass` where only `x.css.scss` / `x.css.sass` exists: that file;
+/// - `dir/*.scss` and `dir/**/*.scss`, what grass looks for on `@import "dir/*"` and
+///   `@import "dir/**/*"`: a stylesheet importing every Sass file there
+///   (`importer.call("glob", dir, "*" or "**/*", [files not to import])`).
 #[derive(Debug)]
 struct SassFs {
     entry: PathBuf,
     src: Vec<u8>,
     read: RefCell<Vec<PathBuf>>,
+    importer: V,
+    /// Files read so far that have a glob import: a glob never imports the file it is in
+    /// (grass doesn't say which file an import is in; any of these could be it).
+    globbers: RefCell<Vec<PathBuf>>,
+}
+
+enum Virtual {
+    File(PathBuf),
+    Erb(PathBuf),
+    Glob(PathBuf, &'static str),
+}
+
+fn has_glob_import(src: &[u8]) -> bool {
+    src.split(|b| *b == b'\n').any(|l| l.contains(&b'*') && l.windows(7).any(|w| w == b"@import"))
+}
+
+impl SassFs {
+    fn virtual_file(&self, path: &Path) -> Option<Virtual> {
+        if self.importer == QNIL {
+            return None;
+        }
+        let name = path.file_name()?.to_str()?;
+        let dir = path.parent()?;
+        if name == "*.scss" {
+            let (base, glob) = if dir.file_name().is_some_and(|d| d == "**") { (dir.parent()?, "**/*") } else { (dir, "*") };
+            // (a directory that isn't there imports nothing, as with sassc-rails)
+            return Some(Virtual::Glob(base.to_path_buf(), glob));
+        }
+        let (stem, ext) = name.rsplit_once('.')?;
+        if !matches!(ext, "scss" | "sass" | "css") {
+            return None;
+        }
+        if ext != "css" {
+            let p = dir.join(format!("{stem}.css.{ext}"));
+            if p.is_file() {
+                return Some(Virtual::File(p));
+            }
+        }
+        let p = dir.join(format!("{name}.erb"));
+        p.is_file().then_some(Virtual::Erb(p))
+    }
+
+    fn record(&self, path: &Path, src: &[u8]) {
+        let mut r = self.read.borrow_mut();
+        if !r.iter().any(|p| p == path) {
+            r.push(path.to_path_buf());
+        }
+        if self.importer != QNIL && has_glob_import(src) {
+            self.globbers.borrow_mut().push(path.to_path_buf());
+        }
+    }
+
+    /// `importer.call(...)` -> the source it returns. What it raises is re-raised after grass
+    /// returns (see `SassCall::pending`); nothing more is asked of the importer then.
+    fn call_importer(&self, args: &[V]) -> std::io::Result<Vec<u8>> {
+        if SASS_CALLS.with(|c| c.borrow().last().is_some_and(|c| c.pending.is_some())) {
+            return Ok(Vec::new());
+        }
+        let r = send(self.importer, sym("call"), args, QNIL);
+        let pending = std::mem::replace(&mut pst().pending, Throw::None);
+        if !matches!(pending, Throw::None) || r == UNDEF {
+            SASS_CALLS.with(|c| {
+                if let Some(c) = c.borrow_mut().last_mut() {
+                    c.pending = Some(pending);
+                }
+            });
+            // (grass panics on an error from a read here: the file is empty instead, and the
+            // render's result is dropped for the exception)
+            return Ok(Vec::new());
+        }
+        Ok(if is_str(r) { rstr(r).b.to_vec() } else { Vec::new() })
+    }
 }
 
 impl grass::Fs for SassFs {
@@ -63,18 +144,35 @@ impl grass::Fs for SassFs {
         path.is_dir()
     }
     fn is_file(&self, path: &Path) -> bool {
-        path == self.entry || path.is_file()
+        path == self.entry || path.is_file() || self.virtual_file(path).is_some()
     }
     fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         if path == self.entry {
             return Ok(self.src.clone());
         }
-        let b = std::fs::read(path)?;
-        let mut r = self.read.borrow_mut();
-        if !r.iter().any(|p| p == path) {
-            r.push(path.to_path_buf());
+        let virt = if path.is_file() { None } else { self.virtual_file(path) };
+        match virt {
+            None => {
+                let b = std::fs::read(path)?;
+                self.record(path, &b);
+                Ok(b)
+            }
+            Some(Virtual::File(p)) => {
+                let b = std::fs::read(&p)?;
+                self.record(&p, &b);
+                Ok(b)
+            }
+            Some(Virtual::Erb(p)) => {
+                let b = self.call_importer(&[str_from("erb"), str_from(&p.to_string_lossy()), QNIL, QNIL])?;
+                self.record(&p, &b);
+                Ok(b)
+            }
+            Some(Virtual::Glob(base, glob)) => {
+                let mut skip = vec![str_from(&self.entry.to_string_lossy())];
+                skip.extend(self.globbers.borrow().iter().map(|p| str_from(&p.to_string_lossy())));
+                self.call_importer(&[str_from("glob"), str_from(&base.to_string_lossy()), str_from(glob), ary_new(skip)])
+            }
         }
-        Ok(b)
     }
 }
 
@@ -258,9 +356,10 @@ fn error_value(msg: &str, span: Option<Span>) -> grass::Result<Value> {
     }
 }
 
-/// `Kenny::Sass.render(template, filename, syntax, style, load_paths, functions, callback)`
+/// `Kenny::Sass.render(template, filename, syntax, style, load_paths, functions, callback, importer)`
 /// -> `["ok", css, [dependency paths]]` or `["error", message, line, file]`. `functions` is
-/// `[[name, [param names]], ...]`; `callback.call(index, [tagged args])` runs one.
+/// `[[name, [param names]], ...]`; `callback.call(index, [tagged args])` runs one. `importer`
+/// is nil or what gives the ERB and glob imports of sassc-rails their source (see `SassFs`).
 fn sass_render(_: V, a: &[V], _: V) -> V {
     let template = if is_str(a[0]) { rstr(a[0]).b.to_vec() } else { Vec::new() };
     let filename = if is_str(a[1]) { Some(string_of(a[1])) } else { None };
@@ -301,7 +400,7 @@ fn sass_render(_: V, a: &[V], _: V) -> V {
             params.push(ps);
         }
     }
-    let fs = SassFs { entry: entry.clone(), src: template, read: RefCell::new(Vec::new()) };
+    let fs = SassFs { entry: entry.clone(), src: template, read: RefCell::new(Vec::new()), importer: a[7], globbers: RefCell::new(Vec::new()) };
     let mut opts = grass::Options::default()
         .fs(&fs)
         .style(if style == "compressed" { grass::OutputStyle::Compressed } else { grass::OutputStyle::Expanded })
@@ -319,6 +418,7 @@ fn sass_render(_: V, a: &[V], _: V) -> V {
     let result = grass::from_path(&entry, &opts);
     let call = SASS_CALLS.with(|c| c.borrow_mut().pop());
     std::hint::black_box(callback);
+    std::hint::black_box(a[7]);
     if let Some(Some(p)) = call.map(|c| c.pending) {
         if !matches!(p, Throw::None) {
             pst().pending = p;
