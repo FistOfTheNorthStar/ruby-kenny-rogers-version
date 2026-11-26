@@ -572,9 +572,17 @@ An uncaught exception and a failed request always print the full backtrace.
 
 ## Roadmap
 
-1. Memory on many cores: serving on 12 takes about 1.7x the memory of one, since each core
-   has its own young-generation space; bring it closer to one core's without the throughput
-   `KENNY_GC_YOUNG_SCALE=1` gives up
+1. Memory on many cores: serving on 12 takes about 1.7x the memory of one; bring it closer to
+   one core's without the throughput `KENNY_GC_YOUNG_SCALE=1` gives up. Measured on macOS with
+   the blog (peak RSS after 40,000 requests): 137 MB on 1 core, ~165 on 2, ~203 on 4, 206-225
+   on 12, so most of the gap opens as soon as several cores run. Of the 12-core excess, about
+   20 MB is the larger young generation; the rest is the allocators: the system allocator
+   holds 55-80 MB for 31-42 MB in use, and mimalloc's heap from before the switch stays ~39 MB
+   resident. `MallocMaxMagazines` and `MallocAggressiveMadvise` change nothing,
+   `MallocSpaceEfficient=1` halves the requests served, and `KENNY_MALLOC=system` saves ~3 MB
+   on 12 cores but serves ~5% fewer requests on one. Open: `KENNY_SERVER_THREADS=0` served
+   11-12k req/s against ~9.5k for the default on 12 cores at the same memory, with requests
+   that never block; check it with slow requests before changing the default
 2. Sass: source maps
 3. Compaction without frame pointers: a runtime built without them scans native frames word by
    word and rarely compacts a busy server
