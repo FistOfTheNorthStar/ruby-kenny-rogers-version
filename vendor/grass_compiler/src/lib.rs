@@ -97,6 +97,7 @@ pub mod sass_ast {
 }
 
 pub use codemap;
+pub use source_map::{Mapping, Source, SourceMap};
 
 mod ast;
 mod builtin;
@@ -113,6 +114,7 @@ mod options;
 mod parse;
 mod selector;
 mod serializer;
+mod source_map;
 mod unit;
 mod utils;
 mod value;
@@ -163,6 +165,16 @@ fn from_string_with_file_name<P: AsRef<Path>>(
     file_name: P,
     options: &Options,
 ) -> Result<String> {
+    compile(input, file_name, options, false).map(|(css, _)| css)
+}
+
+/// The CSS, and with `source_map` the map of where it came from.
+fn compile<P: AsRef<Path>>(
+    input: String,
+    file_name: P,
+    options: &Options,
+    source_map: bool,
+) -> Result<(String, Option<SourceMap>)> {
     let mut map = CodeMap::new();
     let path = file_name.as_ref();
     let file = map.add_file(path.to_string_lossy().into_owned(), input);
@@ -195,9 +207,11 @@ fn from_string_with_file_name<P: AsRef<Path>>(
         Ok(_) => {}
         Err(e) => return Err(raw_to_parse_error(&map, *e, options.unicode_error_messages)),
     }
+    let mut files = vec![file];
+    files.append(&mut visitor.files);
     let stmts = visitor.finish();
 
-    let mut serializer = Serializer::new(options, &map, false, empty_span);
+    let mut serializer = Serializer::for_stylesheet(options, &map, empty_span, source_map);
 
     let mut prev_was_group_end = false;
     let mut prev_requires_semicolon = false;
@@ -217,7 +231,9 @@ fn from_string_with_file_name<P: AsRef<Path>>(
         prev_requires_semicolon = requires_semicolon;
     }
 
-    Ok(serializer.finish(prev_requires_semicolon))
+    let (css, marks) = serializer.finish_with_marks(prev_requires_semicolon);
+    let source_map = source_map.then(|| SourceMap::build(&css, &marks, &files));
+    Ok((css, source_map))
 }
 
 /// Compile CSS from a path
@@ -234,6 +250,16 @@ fn from_string_with_file_name<P: AsRef<Path>>(
 #[inline]
 pub fn from_path<P: AsRef<Path>>(p: P, options: &Options) -> Result<String> {
     from_string_with_file_name(String::from_utf8(options.fs.read(p.as_ref())?)?, p, options)
+}
+
+/// Like [`from_path`], and also returns where each rule, declaration and value of the CSS came
+/// from.
+pub fn from_path_with_source_map<P: AsRef<Path>>(
+    p: P,
+    options: &Options,
+) -> Result<(String, SourceMap)> {
+    let input = String::from_utf8(options.fs.read(p.as_ref())?)?;
+    compile(input, p, options, true).map(|(css, map)| (css, map.unwrap_or_default()))
 }
 
 /// Compile CSS from a string

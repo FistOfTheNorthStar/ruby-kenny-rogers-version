@@ -1,3 +1,5 @@
+use codemap::Span;
+
 use crate::ast::CssStmt;
 
 #[derive(Debug, Clone)]
@@ -11,4 +13,6 @@ pub(crate) struct UnknownAtRule {
     /// Whether or not this @-rule was declared with curly
     /// braces. A body may not necessarily have contents
     pub has_body: bool,
+
+    pub span: Span,
 }

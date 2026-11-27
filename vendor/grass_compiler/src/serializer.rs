@@ -130,6 +130,8 @@ pub(crate) struct Serializer<'a> {
     buffer: Vec<u8>,
     map: &'a CodeMap,
     span: Span,
+    /// With source maps on: (offset in `buffer`, where that text came from), in order
+    marks: Option<Vec<(usize, Span)>>,
 }
 
 impl<'a> Serializer<'a> {
@@ -143,6 +145,24 @@ impl<'a> Serializer<'a> {
             buffer: Vec::new(),
             map,
             span,
+            marks: None,
+        }
+    }
+
+    /// A serializer of the whole stylesheet that records, with `source_map`, where each
+    /// rule, declaration and value it writes came from.
+    pub fn for_stylesheet(options: &'a Options<'a>, map: &'a CodeMap, span: Span, source_map: bool) -> Self {
+        let mut serializer = Self::new(options, map, false, span);
+        if source_map {
+            serializer.marks = Some(Vec::new());
+        }
+        serializer
+    }
+
+    /// The text written next comes from `span`.
+    fn mark(&mut self, span: Span) {
+        if let Some(marks) = &mut self.marks {
+            marks.push((self.buffer.len(), span));
         }
     }
 
@@ -632,7 +652,9 @@ impl<'a> Serializer<'a> {
         unsafe { String::from_utf8_unchecked(self.buffer) }
     }
 
-    pub fn finish(mut self, prev_requires_semicolon: bool) -> String {
+    /// The CSS, and the source marks with their offsets into it.
+    pub fn finish_with_marks(mut self, prev_requires_semicolon: bool) -> (String, Vec<(usize, Span)>) {
+        let mut marks = self.marks.take().unwrap_or_default();
         let is_not_ascii = self.buffer.iter().any(|&c| !c.is_ascii());
 
         if prev_requires_semicolon {
@@ -646,13 +668,19 @@ impl<'a> Serializer<'a> {
         // SAFETY: todo
         let mut as_string = unsafe { String::from_utf8_unchecked(self.buffer) };
 
-        if is_not_ascii && self.options.is_compressed() && self.options.allows_charset {
-            as_string.insert(0, '\u{FEFF}');
+        let prefix = if is_not_ascii && self.options.is_compressed() && self.options.allows_charset {
+            "\u{FEFF}"
         } else if is_not_ascii && self.options.allows_charset {
-            as_string.insert_str(0, "@charset \"UTF-8\";\n");
+            "@charset \"UTF-8\";\n"
+        } else {
+            ""
+        };
+        as_string.insert_str(0, prefix);
+        for (offset, _) in &mut marks {
+            *offset += prefix.len();
         }
 
-        as_string
+        (as_string, marks)
     }
 
     fn write_indentation(&mut self) {
@@ -966,6 +994,7 @@ impl<'a> Serializer<'a> {
             self.write_indentation();
         }
 
+        self.mark(style.span);
         self.buffer
             .extend_from_slice(style.property.resolve_ref().as_bytes());
         self.buffer.push(b':');
@@ -975,13 +1004,15 @@ impl<'a> Serializer<'a> {
             self.buffer.push(b' ');
         }
 
+        self.mark(style.value.span);
         self.visit_value(&style.value.node, style.value.span)?;
 
         Ok(())
     }
 
-    fn write_import(&mut self, import: &str, modifiers: Option<String>) -> SassResult<()> {
+    fn write_import(&mut self, import: &str, modifiers: Option<String>, span: Span) -> SassResult<()> {
         self.write_indentation();
+        self.mark(span);
         self.buffer.extend_from_slice(b"@import ");
         write!(&mut self.buffer, "{}", import)?;
 
@@ -999,6 +1030,7 @@ impl<'a> Serializer<'a> {
         }
 
         self.write_indentation();
+        self.mark(span);
         let col = self.map.look_up_pos(span.low()).position.column;
         let mut lines = comment.lines();
 
@@ -1023,7 +1055,7 @@ impl<'a> Serializer<'a> {
 
     pub fn requires_semicolon(stmt: &CssStmt) -> bool {
         match stmt {
-            CssStmt::Style(_) | CssStmt::Import(_, _) => true,
+            CssStmt::Style(_) | CssStmt::Import(..) => true,
             CssStmt::UnknownAtRule(rule, _) => !rule.has_body,
             _ => false,
         }
@@ -1094,6 +1126,7 @@ impl<'a> Serializer<'a> {
 
     fn write_supports_rule(&mut self, supports_rule: SupportsRule) -> SassResult<()> {
         self.write_indentation();
+        self.mark(supports_rule.span);
         self.buffer.extend_from_slice(b"@supports");
 
         if !supports_rule.params.is_empty() {
@@ -1114,14 +1147,21 @@ impl<'a> Serializer<'a> {
         }
 
         match stmt {
-            CssStmt::RuleSet { selector, body, .. } => {
+            CssStmt::RuleSet {
+                selector,
+                body,
+                span,
+                ..
+            } => {
                 self.write_indentation();
+                self.mark(span);
                 self.write_selector_list(&selector.as_selector_list());
 
                 self.write_children(body)?;
             }
             CssStmt::Media(media_rule, ..) => {
                 self.write_indentation();
+                self.mark(media_rule.span);
                 self.buffer.extend_from_slice(b"@media ");
 
                 if let Some((last, rest)) = media_rule.query.split_last() {
@@ -1140,6 +1180,7 @@ impl<'a> Serializer<'a> {
             }
             CssStmt::UnknownAtRule(unknown_at_rule, ..) => {
                 self.write_indentation();
+                self.mark(unknown_at_rule.span);
                 self.buffer.push(b'@');
                 self.buffer
                     .extend_from_slice(unknown_at_rule.name.as_bytes());
@@ -1162,6 +1203,7 @@ impl<'a> Serializer<'a> {
             CssStmt::Comment(comment, span) => self.write_comment(&comment, span)?,
             CssStmt::KeyframesRuleSet(keyframes_rule_set) => {
                 self.write_indentation();
+                self.mark(keyframes_rule_set.span);
                 // todo: i bet we can do something like write_with_separator to avoid extra allocation
                 let selector = keyframes_rule_set
                     .selector
@@ -1174,7 +1216,7 @@ impl<'a> Serializer<'a> {
 
                 self.write_children(keyframes_rule_set.body)?;
             }
-            CssStmt::Import(import, modifier) => self.write_import(&import, modifier)?,
+            CssStmt::Import(import, modifier, span) => self.write_import(&import, modifier, span)?,
             CssStmt::Supports(supports_rule, _) => self.write_supports_rule(supports_rule)?,
         }
 

@@ -1378,7 +1378,7 @@ pub(crate) trait StylesheetParser<'a>: BaseParser + Sized {
         Ok(condition)
     }
 
-    fn parse_supports_rule(&mut self) -> SassResult<AstStmt> {
+    fn parse_supports_rule(&mut self, start: usize) -> SassResult<AstStmt> {
         let condition = self.parse_supports_condition()?;
         self.whitespace()?;
         let children = self.with_children(Self::parse_statement)?;
@@ -1386,7 +1386,8 @@ pub(crate) trait StylesheetParser<'a>: BaseParser + Sized {
         Ok(AstStmt::Supports(AstSupportsRule {
             condition,
             body: children.node,
-            span: children.span,
+            // (from the `@`, like the other at-rules; it was the body's span)
+            span: self.toks_mut().span_from(start),
         }))
     }
 
@@ -1714,7 +1715,7 @@ pub(crate) trait StylesheetParser<'a>: BaseParser + Sized {
             Some("mixin") => self.parse_mixin_rule(start),
             // todo: support -moz-document
             // Some("-moz-document") => self.parse_moz_document_rule(name),
-            Some("supports") => self.parse_supports_rule(),
+            Some("supports") => self.parse_supports_rule(start),
             Some("use") => {
                 self.flags_mut()
                     .set(ContextFlags::IS_USE_ALLOWED, was_use_allowed);

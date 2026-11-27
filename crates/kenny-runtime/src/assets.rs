@@ -40,7 +40,7 @@ pub extern "C" fn Init_kenny_assets() {
     let kenny = kenny_module();
     let sass = new_module("Kenny::Sass");
     const_set(kenny, sym("Sass"), sass as V);
-    defs(sass, "render", 8, 8, sass_render);
+    defs(sass, "render", 9, 9, sass_render);
     let js = new_module("Kenny::JS");
     const_set(kenny, sym("JS"), js as V);
     defs(js, "context", 0, 0, |_, _, _| js_context());
@@ -356,10 +356,12 @@ fn error_value(msg: &str, span: Option<Span>) -> grass::Result<Value> {
     }
 }
 
-/// `Kenny::Sass.render(template, filename, syntax, style, load_paths, functions, callback, importer)`
-/// -> `["ok", css, [dependency paths]]` or `["error", message, line, file]`. `functions` is
-/// `[[name, [param names]], ...]`; `callback.call(index, [tagged args])` runs one. `importer`
-/// is nil or what gives the ERB and glob imports of sassc-rails their source (see `SassFs`).
+/// `Kenny::Sass.render(template, filename, syntax, style, load_paths, functions, callback, importer, source_map)`
+/// -> `["ok", css, [dependency paths], source map JSON or nil]` or `["error", message, line, file]`.
+/// `functions` is `[[name, [param names]], ...]`; `callback.call(index, [tagged args])` runs one.
+/// `importer` is nil or what gives the ERB and glob imports of sassc-rails their source (see
+/// `SassFs`). `source_map` is nil or `[map file or nil, contents?, embed?, omit url?]`, sassc's
+/// options of those names (see `SourceMapOpts`).
 fn sass_render(_: V, a: &[V], _: V) -> V {
     let template = if is_str(a[0]) { rstr(a[0]).b.to_vec() } else { Vec::new() };
     let filename = if is_str(a[1]) { Some(string_of(a[1])) } else { None };
@@ -414,8 +416,12 @@ fn sass_render(_: V, a: &[V], _: V) -> V {
             opts = opts.add_custom_fn(name.clone(), grass::Builtin::new(TRAMPOLINES[i]));
         }
     }
+    let map_opts = SourceMapOpts::from_ruby(a[8]);
     SASS_CALLS.with(|c| c.borrow_mut().push(SassCall { callback, params, pending: None }));
-    let result = grass::from_path(&entry, &opts);
+    let result = match &map_opts {
+        Some(_) => grass::from_path_with_source_map(&entry, &opts).map(|(css, map)| (css, Some(map))),
+        None => grass::from_path(&entry, &opts).map(|css| (css, None)),
+    };
     let call = SASS_CALLS.with(|c| c.borrow_mut().pop());
     std::hint::black_box(callback);
     std::hint::black_box(a[7]);
@@ -426,9 +432,15 @@ fn sass_render(_: V, a: &[V], _: V) -> V {
         }
     }
     match result {
-        Ok(css) => {
+        Ok((mut css, map)) => {
             let deps: Vec<V> = fs.read.borrow().iter().map(|p| str_from(&p.to_string_lossy())).collect();
-            ary_new(vec![str_from("ok"), str_new(css.into_bytes()), ary_new(deps)])
+            let json = match (map, &map_opts) {
+                (Some(map), Some(o)) => Some(o.finish(&mut css, &map, filename.is_some(), &entry)),
+                _ => None,
+            };
+            // with only `source_map_embed` the map is in the CSS, and sassc's #source_map raises
+            let json = json.filter(|_| map_opts.as_ref().is_some_and(|o| o.file.is_some()));
+            ary_new(vec![str_from("ok"), str_new(css.into_bytes()), ary_new(deps), json.map_or(QNIL, |j| str_new(j.into_bytes()))])
         }
         Err(e) => match e.kind() {
             grass::ErrorKind::ParseError { message, loc, .. } => ary_new(vec![
@@ -442,6 +454,123 @@ fn sass_render(_: V, a: &[V], _: V) -> V {
             _ => ary_new(vec![str_from("error"), str_from("Error: Sass compilation failed"), QNIL, QNIL]),
         },
     }
+}
+
+/// What sassc's source map options ask for. Like libsass: a map is made when `source_map_file`
+/// is given or with `source_map_embed`; its `file` and `sources` are relative to the map file's
+/// directory, and the CSS ends with a `sourceMappingURL` comment (the map relative to the CSS,
+/// which is the input file with `.css`) unless `omit_source_map_url`.
+struct SourceMapOpts {
+    file: Option<PathBuf>,
+    contents: bool,
+    embed: bool,
+    omit_url: bool,
+}
+
+impl SourceMapOpts {
+    fn from_ruby(v: V) -> Option<Self> {
+        if !is_ary(v) {
+            return None;
+        }
+        let v = &rary(v).v;
+        let flag = |i: usize| v.get(i).is_some_and(|x| truthy(*x));
+        let file = v.first().filter(|x| is_str(**x)).map(|x| string_of(*x)).filter(|f| !f.is_empty()).map(PathBuf::from);
+        let o = SourceMapOpts { file, contents: flag(1), embed: flag(2), omit_url: flag(3) };
+        (o.file.is_some() || o.embed).then_some(o)
+    }
+
+    /// The map's JSON (formatted as libsass does); adds the `sourceMappingURL` comment to `css`.
+    /// Without a filename the entry is `stdin`, as with libsass.
+    fn finish(&self, css: &mut String, map: &grass::SourceMap, named: bool, entry: &Path) -> String {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let map_path = self.file.as_deref().map_or_else(|| cwd.clone(), |f| absolute(&cwd, f));
+        // the directory part of the path as given (for sassc-rails' `source_map_file: "."`, the
+        // current directory)
+        let map_dir = absolute(&cwd, self.file.as_deref().and_then(Path::parent).unwrap_or(Path::new("")));
+        let output = if named { entry.with_extension("css") } else { cwd.join("stdin.css") };
+
+        let mut json = String::from("{\n\t\"version\": 3,\n\t\"file\": ");
+        json_str(&mut json, &relative(&map_dir, &output));
+        json.push_str(",\n\t\"sources\": [");
+        for (i, src) in map.sources.iter().enumerate() {
+            json.push_str(if i == 0 { "\n\t\t" } else { ",\n\t\t" });
+            if i == 0 && !named {
+                json_str(&mut json, "stdin");
+            } else {
+                json_str(&mut json, &relative(&map_dir, &absolute(&cwd, Path::new(&src.name))));
+            }
+        }
+        json.push_str("\n\t],");
+        if self.contents {
+            json.push_str("\n\t\"sourcesContent\": [");
+            for (i, src) in map.sources.iter().enumerate() {
+                json.push_str(if i == 0 { "\n\t\t" } else { ",\n\t\t" });
+                json_str(&mut json, &src.contents);
+            }
+            json.push_str("\n\t],");
+        }
+        json.push_str("\n\t\"names\": [],\n\t\"mappings\": ");
+        json_str(&mut json, &map.encode_mappings());
+        json.push_str("\n}");
+
+        if self.embed || !self.omit_url {
+            let url = if self.embed {
+                let b64 = crate::digest::base64(json.as_bytes());
+                format!("data:application/json;base64,{}", String::from_utf8_lossy(&b64))
+            } else {
+                relative(output.parent().unwrap_or(&cwd), &map_path)
+            };
+            if !css.ends_with('\n') {
+                css.push('\n');
+            }
+            css.push_str(&format!("\n/*# sourceMappingURL={url} */"));
+        }
+        json
+    }
+}
+
+/// `p` against `cwd`, with `.` and `..` resolved as text (as libsass does: no symlinks followed).
+fn absolute(cwd: &Path, p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in cwd.join(p).components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `to` relative to the directory `from` (both absolute), with `/`.
+fn relative(from: &Path, to: &Path) -> String {
+    let (f, t): (Vec<_>, Vec<_>) = (from.components().collect(), to.components().collect());
+    let common = f.iter().zip(&t).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<String> = vec!["..".into(); f.len() - common];
+    parts.extend(t[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()));
+    if parts.is_empty() { ".".into() } else { parts.join("/") }
+}
+
+/// `s` as a JSON string (non-ASCII as is, as libsass writes it).
+fn json_str(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 // ---------- JavaScript ----------

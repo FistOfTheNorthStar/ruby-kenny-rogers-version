@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/kenny-runtime", "crates/kenny-runtime-jit", "crates/kenny-compiler", "crates/kenny"]
+exclude = ["vendor"]
 
 [profile.release]
 opt-level = 3

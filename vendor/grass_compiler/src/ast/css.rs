@@ -10,6 +10,8 @@ pub(crate) enum CssStmt {
         selector: ExtendedSelector,
         body: Vec<Self>,
         is_group_end: bool,
+        /// Where the rule was written (its selector), for source maps
+        span: Span,
     },
     Style(Style),
     Media(MediaRule, bool),
@@ -20,7 +22,7 @@ pub(crate) enum CssStmt {
     /// A plain import such as `@import "foo.css";` or
     /// `@import url(https://fonts.google.com/foo?bar);`
     // todo: named fields, 0: url, 1: modifiers
-    Import(String, Option<String>),
+    Import(String, Option<String>, Span),
 }
 
 impl CssStmt {
@@ -37,7 +39,7 @@ impl CssStmt {
             CssStmt::Style(_)
             | CssStmt::Comment(_, _)
             | CssStmt::KeyframesRuleSet(_)
-            | CssStmt::Import(_, _) => {}
+            | CssStmt::Import(..) => {}
         }
     }
 
@@ -71,17 +73,20 @@ impl CssStmt {
             CssStmt::RuleSet {
                 selector,
                 is_group_end,
+                span,
                 ..
             } => CssStmt::RuleSet {
                 selector: selector.clone(),
                 body: Vec::new(),
                 is_group_end: *is_group_end,
+                span: *span,
             },
             CssStmt::Style(..) | CssStmt::Comment(..) | CssStmt::Import(..) => unreachable!(),
             CssStmt::Media(media, is_group_end) => CssStmt::Media(
                 MediaRule {
                     query: media.query.clone(),
                     body: Vec::new(),
+                    span: media.span,
                 },
                 *is_group_end,
             ),
@@ -91,6 +96,7 @@ impl CssStmt {
                     params: at_rule.params.clone(),
                     body: Vec::new(),
                     has_body: at_rule.has_body,
+                    span: at_rule.span,
                 },
                 *is_group_end,
             ),
@@ -98,12 +104,14 @@ impl CssStmt {
                 SupportsRule {
                     params: supports.params.clone(),
                     body: Vec::new(),
+                    span: supports.span,
                 },
                 *is_group_end,
             ),
             CssStmt::KeyframesRuleSet(keyframes) => CssStmt::KeyframesRuleSet(KeyframesRuleSet {
                 selector: keyframes.selector.clone(),
                 body: Vec::new(),
+                span: keyframes.span,
             }),
         }
     }
@@ -113,6 +121,7 @@ impl CssStmt {
 pub(crate) struct KeyframesRuleSet {
     pub selector: Vec<KeyframesSelector>,
     pub body: Vec<CssStmt>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -126,4 +135,5 @@ pub(crate) enum KeyframesSelector {
 pub(crate) struct SupportsRule {
     pub params: String,
     pub body: Vec<CssStmt>,
+    pub span: Span,
 }

@@ -107,3 +107,26 @@ AssetsApp.initialize!
 squeeze = ->(css) { css.gsub(/-\h{64}/, "-DIGEST").gsub(/\s+/, " ").gsub("; }", " }").gsub("} ", "}\n") }
 puts squeeze[Rails.application.assets["application.css"].to_s]
 FileUtils.rm_rf(ROOT)
+
+# Sprockets' own Sass processor (a Sprockets environment without sassc-rails) asks the
+# compiler for a source map and combines it with its own: each rule maps back to the file and
+# line it was written on.
+Dir.mktmpdir do |dir|
+  File.write(File.join(dir, "site.scss"), "@import \"colors\";\n\n.site {\n  width: 1px;\n  .title { color: $ink; }\n}\n")
+  File.write(File.join(dir, "_colors.scss"), "$ink: red;\n.c {\n  color: $ink;\n}\n")
+  env = Sprockets::Environment.new(dir)
+  env.append_path(dir)
+  asset = env["site.css"]
+  map = asset.metadata[:map]
+  section = map["sections"][0]["map"]
+  p section.slice("file", "sources")
+  mappings = Sprockets::SourceMapUtils.decode_vlq_mappings(section["mappings"], sources: section["sources"])
+  asset.to_s.lines.each_with_index do |line, i|
+    # (a rule's selector, at the start of its line: Sprockets' default style is nested,
+    # which libsass indents and Kenny's compiler writes as expanded)
+    next unless line =~ /\A( *)(\.[^{]*)\{/
+    selector = $2.strip
+    m = mappings.select { _1[:generated] == [i + 1, $1.size] }.last
+    puts "#{selector} <- #{m && [m[:source], m[:original][0]].inspect}"
+  end
+end

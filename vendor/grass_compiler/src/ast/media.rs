@@ -8,6 +8,7 @@ use crate::{ast::CssStmt, error::SassResult, lexer::Lexer, parse::MediaQueryPars
 pub(crate) struct MediaRule {
     pub query: Vec<MediaQuery>,
     pub body: Vec<CssStmt>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]

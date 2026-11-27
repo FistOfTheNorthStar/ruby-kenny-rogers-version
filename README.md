@@ -393,7 +393,10 @@ without a Gemfile so are the gems that Ruby bundles in place of former stdlib pa
 The `sassc` gem's API runs on a native Sass
 compiler ([grass](https://github.com/connorskees/grass)), with Sass functions such as
 `asset-path` calling back into Ruby and sassc-rails' imports (`.scss.erb` files, and globs
-such as `@import "dir/*"`), and ExecJS runs on an embedded JavaScript engine
+such as `@import "dir/*"`). It writes source maps as sassc's options ask
+(`source_map_file`, `source_map_embed`, `source_map_contents`, `omit_source_map_url`): each
+rule, declaration and value maps to where it was written (grass is vendored with this added,
+[vendor/grass_compiler/KENNY.md](vendor/grass_compiler/KENNY.md)). ExecJS runs on an embedded JavaScript engine
 ([QuickJS](https://github.com/quickjs-ng/quickjs)), so ExecJS users such as `uglifier` and
 `terser` work in-process. `kenny build` of a Rails app with app/assets precompiles its assets (what
 `rails assets:precompile` does, run by the new binary itself) when public/assets has no
@@ -455,9 +458,8 @@ CRuby's, and `Ripper#state`/`#token` are nil.
 
 ### 🚧 Not yet
 
-- Sass source maps (the Sass compiler doesn't write them), and `imports` of a custom
-  `SassC::Importer` other than sassc-rails': imports are resolved by the Sass compiler on the
-  load paths.
+- `imports` of a custom `SassC::Importer` other than sassc-rails': imports are resolved by
+  the Sass compiler on the load paths.
 - Compacting while requests run is partial: a major collection moves objects only when no
   thread is inside a native method that isn't audited (`KENNY_GC_COMPACT_STATS=2` names
   them). In the blog example under load that is every major so far: on macOS 102 of 102 on
@@ -575,6 +577,5 @@ An uncaught exception and a failed request always print the full backtrace.
 1. Memory on many cores: serving on 12 takes about 1.7x the memory of one, since each core
    has its own young-generation space; bring it closer to one core's without the throughput
    `KENNY_GC_YOUNG_SCALE=1` gives up
-2. Sass: source maps
-3. Compaction without frame pointers: a runtime built without them scans native frames word by
+2. Compaction without frame pointers: a runtime built without them scans native frames word by
    word and rarely compacts a busy server

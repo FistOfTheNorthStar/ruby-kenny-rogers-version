@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-use codemap::{CodeMap, Span, Spanned};
+use codemap::{CodeMap, File, Span, Spanned};
 use indexmap::IndexSet;
 
 use crate::{
@@ -107,6 +107,8 @@ pub struct Visitor<'a> {
     pub(crate) flags: ContextFlags,
     pub(crate) env: Environment,
     pub(crate) style_rule_ignoring_at_root: Option<ExtendedSelector>,
+    /// Where that style rule was written (a copy of it inside an at-rule maps there)
+    style_rule_span: Option<Span>,
     // avoid emitting duplicate warnings for the same span
     pub(crate) warnings_emitted: HashSet<Span>,
     pub(crate) media_queries: Option<Vec<MediaQuery>>,
@@ -132,6 +134,8 @@ pub struct Visitor<'a> {
     /// has been seen in the past. In the majority of cases, files are imported
     /// at most once.
     files_seen: BTreeSet<PathBuf>,
+    /// Every file loaded, in load order (for source maps)
+    pub(crate) files: Vec<Arc<File>>,
 }
 
 impl<'a> Visitor<'a> {
@@ -151,6 +155,7 @@ impl<'a> Visitor<'a> {
         Self {
             declaration_name: None,
             style_rule_ignoring_at_root: None,
+            style_rule_span: None,
             flags,
             warnings_emitted: HashSet::new(),
             media_queries: None,
@@ -170,6 +175,7 @@ impl<'a> Visitor<'a> {
             map,
             import_cache: BTreeMap::new(),
             files_seen: BTreeSet::new(),
+            files: Vec::new(),
         }
     }
 
@@ -488,6 +494,7 @@ impl<'a> Visitor<'a> {
             SupportsRule {
                 params: condition,
                 body: Vec::new(),
+                span: supports_rule.span,
             },
             false,
         );
@@ -514,6 +521,7 @@ impl<'a> Visitor<'a> {
                         selector,
                         body: Vec::new(),
                         is_group_end: false,
+                        span: visitor.style_rule_span.unwrap_or(supports_rule.span),
                     };
 
                     visitor.with_parent(
@@ -897,6 +905,7 @@ impl<'a> Visitor<'a> {
                 name.to_string_lossy().into(),
                 String::from_utf8(self.options.fs.read(&name)?)?,
             );
+            self.files.push(file.clone());
 
             let old_is_use_allowed = self.flags.is_use_allowed();
             self.flags.set(ContextFlags::IS_USE_ALLOWED, true);
@@ -1019,7 +1028,7 @@ impl<'a> Visitor<'a> {
             .map(|modifiers| self.interpolation_to_value(modifiers, false, false))
             .transpose()?;
 
-        let node = CssStmt::Import(import, modifiers);
+        let node = CssStmt::Import(import, modifiers, static_import.span);
 
         if self.parent.is_some() && self.parent != Some(CssTree::ROOT) {
             self.css_tree.add_stmt(node, self.parent);
@@ -1395,6 +1404,7 @@ impl<'a> Visitor<'a> {
         };
 
         let children = media_rule.body;
+        let media_span = media_rule.span;
 
         let query = merged_queries.clone().unwrap_or_else(|| queries1.clone());
 
@@ -1402,6 +1412,7 @@ impl<'a> Visitor<'a> {
             MediaRule {
                 query,
                 body: Vec::new(),
+                span: media_span,
             },
             false,
         );
@@ -1430,6 +1441,7 @@ impl<'a> Visitor<'a> {
                                 selector,
                                 body: Vec::new(),
                                 is_group_end: false,
+                                span: visitor.style_rule_span.unwrap_or(media_span),
                             };
 
                             visitor.with_parent(
@@ -1494,6 +1506,7 @@ impl<'a> Visitor<'a> {
                     params: value.unwrap_or_default(),
                     body: Vec::new(),
                     has_body: false,
+                    span: unknown_at_rule.span,
                 },
                 false,
             );
@@ -1520,6 +1533,7 @@ impl<'a> Visitor<'a> {
                 params: value.unwrap_or_default(),
                 body: Vec::new(),
                 has_body: true,
+                span: unknown_at_rule.span,
             },
             false,
         );
@@ -1544,6 +1558,7 @@ impl<'a> Visitor<'a> {
                         selector,
                         body: Vec::new(),
                         is_group_end: false,
+                        span: visitor.style_rule_span.unwrap_or(unknown_at_rule.span),
                     };
 
                     visitor.with_parent(
@@ -2916,6 +2931,7 @@ impl<'a> Visitor<'a> {
             let keyframes_ruleset = CssStmt::KeyframesRuleSet(KeyframesRuleSet {
                 selector: parsed_selector,
                 body: Vec::new(),
+                span,
             });
 
             self.with_parent(
@@ -2959,6 +2975,7 @@ impl<'a> Visitor<'a> {
             selector: selector.clone(),
             body: Vec::new(),
             is_group_end: false,
+            span: ruleset.selector_span,
         };
 
         let old_at_root_excluding_style_rule = self.flags.at_root_excluding_style_rule();
@@ -2968,6 +2985,7 @@ impl<'a> Visitor<'a> {
 
         let old_style_rule_ignoring_at_root = self.style_rule_ignoring_at_root.take();
         self.style_rule_ignoring_at_root = Some(selector);
+        let old_style_rule_span = self.style_rule_span.replace(ruleset.selector_span);
 
         self.with_parent(
             rule,
@@ -2984,6 +3002,7 @@ impl<'a> Visitor<'a> {
         )?;
 
         self.style_rule_ignoring_at_root = old_style_rule_ignoring_at_root;
+        self.style_rule_span = old_style_rule_span;
         self.flags.set(
             ContextFlags::AT_ROOT_EXCLUDING_STYLE_RULE,
             old_at_root_excluding_style_rule,
@@ -3053,6 +3072,7 @@ impl<'a> Visitor<'a> {
                         property: InternedString::get_or_intern(&name),
                         value: Box::new(value),
                         declared_as_custom_property: is_custom_property,
+                        span: style.span,
                     }),
                     self.parent,
                 );

@@ -1,0 +1,136 @@
+== a map file beside the CSS
+.part {
+  color: red;
+}
+.part a {
+  b: c;
+}
+
+/* kept */
+.main {
+  width: 10px;
+}
+.main .inner, .main .x {
+  height: 5px;
+}
+@media (min-width: 10px) {
+  .main {
+    top: 0;
+  }
+}
+
+@supports (display: grid) {
+  .g {
+    display: grid;
+  }
+}
+@keyframes spin {
+  from {
+    left: 0;
+  }
+  to {
+    left: 1px;
+  }
+}
+
+/*# sourceMappingURL=main.css.map */
+["version", "file", "sources", "names", "mappings"]
+"main.css"
+["main.scss", "_part.scss"]
+  1:0 ".part" <- _part.scss:2:0 ".part"
+  2:2 "color" <- _part.scss:3:2 "color"
+  2:9 "red" <- _part.scss:3:9 "$c"
+  4:0 ".part" <- _part.scss:4:2 "a"
+  5:2 "b" <- _part.scss:4:6 "b"
+  5:5 "c" <- _part.scss:4:9 "c"
+  8:0 "/*" <- main.scss:3:0 "/*"
+  9:0 ".main" <- main.scss:4:0 ".main"
+  10:2 "width" <- main.scss:5:2 "width"
+  10:9 "10px" <- main.scss:5:9 "10px"
+  12:0 ".main" <- main.scss:6:2 ".inner"
+  13:2 "height" <- main.scss:7:4 "height"
+  13:10 "5px" <- main.scss:7:12 "2px"
+  15:0 "@media" <- main.scss:9:2 "@media"
+  16:2 ".main" <- main.scss:4:0 ".main"
+  17:4 "top" <- main.scss:10:4 "top"
+  17:9 "0" <- main.scss:10:9 "0"
+  21:0 "@supports" <- main.scss:13:0 "@supports"
+  22:2 ".g" <- main.scss:13:28 ".g"
+  23:4 "display" <- main.scss:13:33 "display"
+  23:13 "grid" <- main.scss:13:42 "grid"
+  26:0 "@keyframes" <- main.scss:14:0 "@keyframes"
+  27:2 "from" <- main.scss:14:18 "from"
+  28:4 "left" <- main.scss:14:25 "left"
+  28:10 "0" <- main.scss:14:31 "0"
+  30:2 "to" <- main.scss:14:36 "to"
+  31:4 "left" <- main.scss:14:41 "left"
+  31:10 "1px" <- main.scss:14:47 "1px"
+== a map file elsewhere, an absolute filename
+/*# sourceMappingURL=../maps/x/out.map */
+["../../css/main.css", ["../../css/main.scss", "../../css/_part.scss"]]
+== omit_source_map_url, source_map_contents (what sprockets asks for, with contents)
+false
+["version", "file", "sources", "sourcesContent", "names", "mappings"]
+true
+== compressed
+.part{color:red}.part a{b:c}.main{width:10px}.main .inner,.main .x{height:5px}@media (min-width: 10px){.main{top:0}}@supports (display: grid){.g{display:grid}}@keyframes spin{from{left:0}to{left:1px}}
+
+/*# sourceMappingURL=main.css.map */
+  1:0 ".part" <- _part.scss:2:0 ".part"
+  1:6 "color" <- _part.scss:3:2 "color"
+  1:12 "red}.part" <- _part.scss:3:9 "$c"
+  1:16 ".part" <- _part.scss:4:2 "a"
+  1:24 "b" <- _part.scss:4:6 "b"
+  1:26 "c}.main" <- _part.scss:4:9 "c"
+  1:28 ".main" <- main.scss:4:0 ".main"
+  1:34 "width" <- main.scss:5:2 "width"
+  1:40 "10px}.main" <- main.scss:5:9 "10px"
+  1:45 ".main" <- main.scss:6:2 ".inner"
+  1:67 "height" <- main.scss:7:4 "height"
+  1:74 "5px}@media" <- main.scss:7:12 "2px"
+  1:78 "@media" <- main.scss:9:2 "@media"
+  1:103 ".main" <- main.scss:4:0 ".main"
+  1:109 "top" <- main.scss:10:4 "top"
+  1:113 "0}}@supports" <- main.scss:10:9 "0"
+  1:116 "@supports" <- main.scss:13:0 "@supports"
+  1:142 ".g" <- main.scss:13:28 ".g"
+  1:145 "display" <- main.scss:13:33 "display"
+  1:153 "grid}}@keyframes" <- main.scss:13:42 "grid"
+  1:159 "@keyframes" <- main.scss:14:0 "@keyframes"
+  1:175 "from" <- main.scss:14:18 "from"
+  1:180 "left" <- main.scss:14:25 "left"
+  1:185 "0}to" <- main.scss:14:31 "0"
+  1:187 "to" <- main.scss:14:36 "to"
+  1:190 "left" <- main.scss:14:41 "left"
+  1:195 "1px}}" <- main.scss:14:47 "1px"
+== embedded (sassc-rails' inline_source_maps)
+true
+["css/main.css", ["css/main.scss", "css/_part.scss"]]
+true
+nil
+== no filename
+a {
+  b: c;
+}
+
+/*# sourceMappingURL=out.map */
+["stdin.css", ["stdin"]]
+  1:0 "a" <- stdin:1:0 "a"
+  2:2 "b" <- stdin:2:2 "b"
+  2:5 "c" <- stdin:2:5 "c"
+== non-ASCII: the @charset line, and columns in UTF-16
+@charset "UTF-8";
+.é😀 {
+  content: "😀";
+  b: c;
+}
+
+/*# sourceMappingURL=u.map */
+  2:0 ".é😀" <- u.scss:1:0 ".é😀"
+  3:2 "content" <- u.scss:1:7 "content"
+  3:11 "\"😀\"" <- u.scss:1:16 "\"😀\""
+  4:2 "b" <- u.scss:1:22 "b"
+  4:5 "c" <- u.scss:1:25 "c"
+== without a source map option
+false
+nil

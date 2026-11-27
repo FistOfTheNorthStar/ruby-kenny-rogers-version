@@ -85,14 +85,15 @@ module SassC
         end
       end
 
-      status, css, line_or_deps, file = ::Kenny::Sass.render(
+      status, css, line_or_deps, file_or_map = ::Kenny::Sass.render(
         @template.to_s, filename&.to_s, sass? ? "sass" : "scss", output_style.to_s.sub("sass_style_", ""),
-        load_path_list, specs, callback, rails_importer
+        load_path_list, specs, callback, rails_importer, source_map_options
       )
-      raise SyntaxError.new(css, filename: file || filename, line: line_or_deps) if status == "error"
+      raise SyntaxError.new(css, filename: file_or_map || filename, line: line_or_deps) if status == "error"
 
       @dependencies = line_or_deps | @glob_dependencies.to_a
-      @source_map = nil
+      @source_map = file_or_map
+      @source_map&.force_encoding(@template.encoding)
       if (context = @options.dig(:sprockets, :context)) && context.respond_to?(:depend_on)
         @dependencies.each { |dep| context.depend_on(dep) }
       end
@@ -106,7 +107,8 @@ module SassC
       Dependency.from_filenames(@dependencies)
     end
 
-    # Source maps are not generated.
+    # The source map's JSON, when :source_map_file was given (as with libsass, a map that is
+    # only embedded with :source_map_embed isn't returned here).
     def source_map
       raise NotRenderedError unless @source_map
       @source_map
@@ -202,6 +204,15 @@ module SassC
       end.new
       wrapper.options = @options
       wrapper
+    end
+
+    # [file, contents?, embed?, omit url?] for the native compiler, or nil for no map
+    def source_map_options
+      file = @options[:source_map_file]&.to_s
+      file = nil if file&.empty?
+      embed = !!@options[:source_map_embed]
+      return nil unless file || embed
+      [file, !!@options[:source_map_contents], embed, !!@options[:omit_source_map_url]]
     end
 
     def quiet?
