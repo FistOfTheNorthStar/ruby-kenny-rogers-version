@@ -11,3 +11,7 @@ lto = "thin"
 
 [profile.dev]
 panic = "abort"
+
+# grass 0.13.4 with source maps (vendor/grass_compiler/KENNY.md)
+[patch.crates-io]
+grass_compiler = { path = "vendor/grass_compiler" }
